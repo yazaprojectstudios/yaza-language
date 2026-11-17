@@ -1,0 +1,907 @@
+# Provider-neutral database vocabulary.
+# This module defines shared names and safety helpers, not database drivers.
+
+variant DbProvider:
+    PostgreSQL
+    SQLite
+    MySQL
+    MariaDB
+    SQLServer
+    Redis
+    Oracle
+    MongoDB
+
+variant DbDriverReadiness:
+    ProtocolFoundation
+    NotImplemented
+
+variant DbErrorKind:
+    Configuration
+    Connection
+    Authentication
+    TLS
+    Timeout
+    Cancelled
+    Unavailable
+    Protocol
+    Constraint
+    Serialization
+    UnsupportedFeature
+    Internal
+
+variant DbValueKind:
+    Null
+    Boolean
+    Int32
+    Int64
+    Float64
+    Decimal
+    Date
+    Time
+    TimeTz
+    Timestamp
+    TimestampTz
+    Json
+    Jsonb
+    Text
+    Bytes
+
+# SQL NULL is represented by its own case, never by an empty Text or zero value.
+# Decimal is an exact, bounded base-10 text value; it does not imply decimal arithmetic.
+# Temporal database values retain validated textual forms; no timezone database
+# or calendar arithmetic is implied.
+# JSON and JSONB retain validated JSON source text and remain distinct SQL kinds.
+variant DbValue:
+    Null
+    BooleanValue(value: Boolean)
+    Int32Value(value: Int32)
+    Int64Value(value: Number)
+    Float64Value(value: Float64)
+    DecimalValue(value: Text)
+    DateValue(value: Text)
+    TimeValue(value: Text)
+    TimeTzValue(value: Text)
+    TimestampValue(value: Text)
+    TimestampTzValue(value: Text)
+    JsonValue(value: Text)
+    JsonbValue(value: Text)
+    TextValue(value: Text)
+    BytesValue(value: Bytes)
+
+fn json_is_valid(value: Text) -> Boolean:
+    let length: Number = text_length(value)
+    if length == 0 or length > 65536:
+        return false
+    let trimmed: Text = text_trim(value)
+    let tlen: Number = text_length(trimmed)
+    if tlen == 0:
+        return false
+    let first: Number = text_byte(trimmed, 0)
+    let last: Number = text_byte(trimmed, tlen - 1)
+    if first == 123 and last == 125:
+        return true
+    if first == 91 and last == 93:
+        return true
+    if first == 34 and last == 34 and tlen >= 2:
+        return true
+    if trimmed == "true" or trimmed == "false" or trimmed == "null":
+        return true
+    let parsed: Result[Number, Text] = number_try_parse(trimmed)
+    if result_is_ok(parsed):
+        return true
+    let fparsed: Result[Float64, Text] = float64_try_parse(trimmed)
+    if result_is_ok(fparsed):
+        return true
+    return false
+
+shape DbCapabilities:
+    transactions: Boolean
+    savepoints: Boolean
+    prepared_statements: Boolean
+    streaming_results: Boolean
+    returning_rows: Boolean
+    batch_execution: Boolean
+    isolation_read_committed: Boolean
+    isolation_repeatable_read: Boolean
+    isolation_serializable: Boolean
+
+shape DbError:
+    kind: DbErrorKind
+    message: Text
+    provider_code: Option[Text]
+    retryable: Boolean
+
+# Provider-neutral result metadata. Duplicate names are preserved because they
+# are valid in SQL projections; name lookup reports ambiguity instead of
+# silently selecting one of them.
+shape DbColumn:
+    name: Text
+    value: DbValue
+
+shape DbRow:
+    columns: List[DbColumn]
+
+variant DbColumnLookup:
+    ColumnMissing
+    ColumnFound(value: DbValue)
+    ColumnAmbiguous
+
+fn db_provider_name(provider: DbProvider) -> Text:
+    match provider:
+        PostgreSQL:
+            return "postgresql"
+        SQLite:
+            return "sqlite"
+        MySQL:
+            return "mysql"
+        MariaDB:
+            return "mariadb"
+        SQLServer:
+            return "sqlserver"
+        Redis:
+            return "redis"
+        Oracle:
+            return "oracle"
+        MongoDB:
+            return "mongodb"
+    return "unknown"
+
+fn db_driver_readiness(provider: DbProvider) -> DbDriverReadiness:
+    match provider:
+        PostgreSQL:
+            return DbDriverReadiness::ProtocolFoundation
+        SQLite:
+            return DbDriverReadiness::NotImplemented
+        MySQL:
+            return DbDriverReadiness::ProtocolFoundation
+        MariaDB:
+            return DbDriverReadiness::NotImplemented
+        SQLServer:
+            return DbDriverReadiness::ProtocolFoundation
+        Redis:
+            return DbDriverReadiness::ProtocolFoundation
+        Oracle:
+            return DbDriverReadiness::NotImplemented
+        MongoDB:
+            return DbDriverReadiness::ProtocolFoundation
+    return DbDriverReadiness::NotImplemented
+
+fn db_empty_capabilities() -> DbCapabilities:
+    return DbCapabilities(false, false, false, false, false, false, false, false, false)
+
+fn db_capabilities_valid(capabilities: DbCapabilities) -> Boolean:
+    if capabilities.savepoints and not capabilities.transactions:
+        return false
+    if (capabilities.isolation_read_committed or capabilities.isolation_repeatable_read or capabilities.isolation_serializable) and not capabilities.transactions:
+        return false
+    return true
+
+# These are features exposed by the currently implemented client surface, not a
+# claim that every server-supported SQL feature is available through this API.
+fn db_provider_capabilities(provider: DbProvider) -> DbCapabilities:
+    match provider:
+        PostgreSQL:
+            return DbCapabilities(true, true, true, false, true, false, false, false, false)
+        SQLite:
+            return db_empty_capabilities()
+        MySQL:
+            return DbCapabilities(true, true, true, false, false, false, false, false, false)
+        MariaDB:
+            return db_empty_capabilities()
+        SQLServer:
+            return DbCapabilities(true, true, true, false, false, false, false, false, false)
+        Redis:
+            return db_empty_capabilities()
+        Oracle:
+            return db_empty_capabilities()
+        MongoDB:
+            return db_empty_capabilities()
+    return db_empty_capabilities()
+
+fn db_value_kind(value: DbValue) -> DbValueKind:
+    match value:
+        Null:
+            return DbValueKind::Null
+        BooleanValue(_):
+            return DbValueKind::Boolean
+        Int32Value(_):
+            return DbValueKind::Int32
+        Int64Value(_):
+            return DbValueKind::Int64
+        Float64Value(_):
+            return DbValueKind::Float64
+        DecimalValue(_):
+            return DbValueKind::Decimal
+        DateValue(_):
+            return DbValueKind::Date
+        TimeValue(_):
+            return DbValueKind::Time
+        TimeTzValue(_):
+            return DbValueKind::TimeTz
+        TimestampValue(_):
+            return DbValueKind::Timestamp
+        TimestampTzValue(_):
+            return DbValueKind::TimestampTz
+        JsonValue(_):
+            return DbValueKind::Json
+        JsonbValue(_):
+            return DbValueKind::Jsonb
+        TextValue(_):
+            return DbValueKind::Text
+        BytesValue(_):
+            return DbValueKind::Bytes
+    return DbValueKind::Null
+
+fn db_value_is_null(value: DbValue) -> Boolean:
+    match value:
+        Null:
+            return true
+        BooleanValue(_):
+            return false
+        Int32Value(_):
+            return false
+        Int64Value(_):
+            return false
+        Float64Value(_):
+            return false
+        DecimalValue(_):
+            return false
+        DateValue(_):
+            return false
+        TimeValue(_):
+            return false
+        TimeTzValue(_):
+            return false
+        TimestampValue(_):
+            return false
+        TimestampTzValue(_):
+            return false
+        JsonValue(_):
+            return false
+        JsonbValue(_):
+            return false
+        TextValue(_):
+            return false
+        BytesValue(_):
+            return false
+    return false
+
+fn db_value_as_boolean(value: DbValue) -> Option[Boolean]:
+    match value:
+        BooleanValue(inner):
+            return some(inner)
+        Null:
+            return none
+        Int32Value(_):
+            return none
+        Int64Value(_):
+            return none
+        Float64Value(_):
+            return none
+        DecimalValue(_):
+            return none
+        DateValue(_):
+            return none
+        TimeValue(_):
+            return none
+        TimeTzValue(_):
+            return none
+        TimestampValue(_):
+            return none
+        TimestampTzValue(_):
+            return none
+        JsonValue(_):
+            return none
+        JsonbValue(_):
+            return none
+        TextValue(_):
+            return none
+        BytesValue(_):
+            return none
+    return none
+
+fn db_value_as_int32(value: DbValue) -> Option[Int32]:
+    match value:
+        Int32Value(inner):
+            return some(inner)
+        Null:
+            return none
+        BooleanValue(_):
+            return none
+        Int64Value(_):
+            return none
+        Float64Value(_):
+            return none
+        DecimalValue(_):
+            return none
+        DateValue(_):
+            return none
+        TimeValue(_):
+            return none
+        TimeTzValue(_):
+            return none
+        TimestampValue(_):
+            return none
+        TimestampTzValue(_):
+            return none
+        JsonValue(_):
+            return none
+        JsonbValue(_):
+            return none
+        TextValue(_):
+            return none
+        BytesValue(_):
+            return none
+    return none
+
+fn db_value_as_int64(value: DbValue) -> Option[Number]:
+    match value:
+        Int64Value(inner):
+            return some(inner)
+        Null:
+            return none
+        BooleanValue(_):
+            return none
+        Int32Value(_):
+            return none
+        Float64Value(_):
+            return none
+        DecimalValue(_):
+            return none
+        DateValue(_):
+            return none
+        TimeValue(_):
+            return none
+        TimeTzValue(_):
+            return none
+        TimestampValue(_):
+            return none
+        TimestampTzValue(_):
+            return none
+        JsonValue(_):
+            return none
+        JsonbValue(_):
+            return none
+        TextValue(_):
+            return none
+        BytesValue(_):
+            return none
+    return none
+
+fn db_value_as_float64(value: DbValue) -> Option[Float64]:
+    match value:
+        Float64Value(inner):
+            return some(inner)
+        Null:
+            return none
+        DecimalValue(_):
+            return none
+        DateValue(_):
+            return none
+        TimeValue(_):
+            return none
+        TimeTzValue(_):
+            return none
+        TimestampValue(_):
+            return none
+        TimestampTzValue(_):
+            return none
+        JsonValue(_):
+            return none
+        JsonbValue(_):
+            return none
+        BooleanValue(_):
+            return none
+        Int32Value(_):
+            return none
+        Int64Value(_):
+            return none
+        TextValue(_):
+            return none
+        BytesValue(_):
+            return none
+    return none
+
+fn db_value_as_text(value: DbValue) -> Option[Text]:
+    match value:
+        TextValue(inner):
+            return some(inner)
+        Null:
+            return none
+        BooleanValue(_):
+            return none
+        Int32Value(_):
+            return none
+        Int64Value(_):
+            return none
+        Float64Value(_):
+            return none
+        DecimalValue(_):
+            return none
+        DateValue(_):
+            return none
+        TimeValue(_):
+            return none
+        TimeTzValue(_):
+            return none
+        TimestampValue(_):
+            return none
+        TimestampTzValue(_):
+            return none
+        JsonValue(_):
+            return none
+        JsonbValue(_):
+            return none
+        BytesValue(_):
+            return none
+    return none
+
+fn db_decimal_text_valid(value: Text) -> Boolean:
+    # Keep exact decimal values bounded and finite. Scientific notation stays
+    # textual, so validation never rounds through Float64.
+    let byte_length: Number = bytes_length(bytes_from_text(value))
+    if byte_length < 1 or byte_length > 147456 or text_length(value) != byte_length:
+        return false
+    var index: Number = 0
+    if text_byte(value, index) == 43 or text_byte(value, index) == 45:
+        set index = index + 1
+    var integer_digits: Number = 0
+    while index < byte_length and text_byte(value, index) >= 48 and text_byte(value, index) <= 57:
+        set integer_digits = integer_digits + 1
+        set index = index + 1
+    var fraction_digits: Number = 0
+    if index < byte_length and text_byte(value, index) == 46:
+        set index = index + 1
+        while index < byte_length and text_byte(value, index) >= 48 and text_byte(value, index) <= 57:
+            set fraction_digits = fraction_digits + 1
+            set index = index + 1
+    if integer_digits == 0 and fraction_digits == 0:
+        return false
+    if index < byte_length and (text_byte(value, index) == 69 or text_byte(value, index) == 101):
+        set index = index + 1
+        var exponent_sign: Number = 1
+        if index < byte_length and text_byte(value, index) == 45:
+            set exponent_sign = -1
+            set index = index + 1
+        else:
+            if index < byte_length and text_byte(value, index) == 43:
+                set index = index + 1
+        var exponent: Number = 0
+        var exponent_digits: Number = 0
+        while index < byte_length and text_byte(value, index) >= 48 and text_byte(value, index) <= 57:
+            if exponent > 131072:
+                return false
+            set exponent = exponent * 10 + text_byte(value, index) - 48
+            if exponent > 131072:
+                return false
+            set exponent_digits = exponent_digits + 1
+            set index = index + 1
+        if exponent_digits == 0:
+            return false
+        if exponent_sign < 0 and exponent > 16383:
+            return false
+    return index == byte_length
+
+fn db_temporal_text_ascii(value: Text, minimum_bytes: Number, maximum_bytes: Number) -> Boolean:
+    let byte_length: Number = bytes_length(bytes_from_text(value))
+    if byte_length < minimum_bytes or byte_length > maximum_bytes:
+        return false
+    return text_length(value) == byte_length
+
+fn db_temporal_two_digits(value: Text, index: Number) -> Number:
+    let length: Number = text_length(value)
+    if index < 0 or index + 1 >= length:
+        return -1
+    let first: Number = text_byte(value, index)
+    let second: Number = text_byte(value, index + 1)
+    if first < 48 or first > 57 or second < 48 or second > 57:
+        return -1
+    return (first - 48) * 10 + second - 48
+
+fn db_date_text_valid(value: Text) -> Boolean:
+    if not db_temporal_text_ascii(value, 10, 10):
+        return false
+    if text_byte(value, 4) != 45 or text_byte(value, 7) != 45:
+        return false
+    var year: Number = 0
+    var index: Number = 0
+    while index < 4:
+        let digit: Number = text_byte(value, index)
+        if digit < 48 or digit > 57:
+            return false
+        set year = year * 10 + digit - 48
+        set index = index + 1
+    let month: Number = db_temporal_two_digits(value, 5)
+    let day: Number = db_temporal_two_digits(value, 8)
+    if year < 1 or month < 1 or month > 12 or day < 1:
+        return false
+    var days_in_month: Number = 31
+    if month == 4 or month == 6 or month == 9 or month == 11:
+        set days_in_month = 30
+    else:
+        if month == 2:
+            set days_in_month = 28
+            if year % 400 == 0 or (year % 4 == 0 and year % 100 != 0):
+                set days_in_month = 29
+    return day <= days_in_month
+
+fn db_time_components_valid(value: Text, start: Number, end: Number) -> Boolean:
+    if start < 0 or end > text_length(value) or end - start < 8:
+        return false
+    if text_byte(value, start + 2) != 58 or text_byte(value, start + 5) != 58:
+        return false
+    let hours: Number = db_temporal_two_digits(value, start)
+    let minutes: Number = db_temporal_two_digits(value, start + 3)
+    let seconds: Number = db_temporal_two_digits(value, start + 6)
+    if hours < 0 or hours > 24 or minutes < 0 or minutes > 59 or seconds < 0 or seconds > 59:
+        return false
+    if hours == 24 and (minutes != 0 or seconds != 0):
+        return false
+    if end - start == 8:
+        return true
+    if text_byte(value, start + 8) != 46:
+        return false
+    let fraction_start: Number = start + 9
+    let fraction_count: Number = end - fraction_start
+    if fraction_count < 1 or fraction_count > 6:
+        return false
+    var index: Number = fraction_start
+    while index < end:
+        let digit: Number = text_byte(value, index)
+        if digit < 48 or digit > 57:
+            return false
+        if hours == 24 and digit != 48:
+            return false
+        set index = index + 1
+    return true
+
+fn db_timezone_offset_valid(value: Text, start: Number, end: Number) -> Boolean:
+    if start < 0 or start + 3 > end or end > text_length(value):
+        return false
+    if text_byte(value, start) != 43 and text_byte(value, start) != 45:
+        return false
+    let hours: Number = db_temporal_two_digits(value, start + 1)
+    if hours < 0 or hours > 15:
+        return false
+    let offset_length: Number = end - start
+    if offset_length == 3:
+        return true
+    if offset_length != 6 and offset_length != 9:
+        return false
+    if text_byte(value, start + 3) != 58:
+        return false
+    let minutes: Number = db_temporal_two_digits(value, start + 4)
+    if minutes < 0 or minutes > 59:
+        return false
+    if offset_length == 6:
+        return true
+    if text_byte(value, start + 6) != 58:
+        return false
+    let seconds: Number = db_temporal_two_digits(value, start + 7)
+    return seconds >= 0 and seconds <= 59
+
+fn db_time_text_valid(value: Text) -> Boolean:
+    if not db_temporal_text_ascii(value, 8, 15):
+        return false
+    return db_time_components_valid(value, 0, text_length(value))
+
+fn db_time_tz_text_valid(value: Text) -> Boolean:
+    if not db_temporal_text_ascii(value, 11, 24):
+        return false
+    var offset_start: Number = -1
+    var index: Number = 8
+    while index < text_length(value):
+        if text_byte(value, index) == 43 or text_byte(value, index) == 45:
+            set offset_start = index
+            set index = text_length(value)
+        else:
+            set index = index + 1
+    if offset_start < 0:
+        return false
+    if not db_time_components_valid(value, 0, offset_start):
+        return false
+    return db_timezone_offset_valid(value, offset_start, text_length(value))
+
+fn db_timestamp_base_valid(value: Text, time_end: Number) -> Boolean:
+    if time_end < 19 or time_end > 26:
+        return false
+    if not db_date_text_valid(text_slice(value, 0, 10)) or text_byte(value, 10) != 32:
+        return false
+    return db_time_components_valid(value, 11, time_end)
+
+fn db_timestamp_text_valid(value: Text) -> Boolean:
+    if not db_temporal_text_ascii(value, 19, 26):
+        return false
+    return db_timestamp_base_valid(value, text_length(value))
+
+fn db_timestamp_tz_text_valid(value: Text) -> Boolean:
+    if not db_temporal_text_ascii(value, 22, 35):
+        return false
+    var offset_start: Number = -1
+    var index: Number = 19
+    while index < text_length(value):
+        if text_byte(value, index) == 43 or text_byte(value, index) == 45:
+            set offset_start = index
+            set index = text_length(value)
+        else:
+            set index = index + 1
+    if offset_start < 0 or not db_timestamp_base_valid(value, offset_start):
+        return false
+    return db_timezone_offset_valid(value, offset_start, text_length(value))
+
+fn db_value_is_valid(value: DbValue) -> Boolean:
+    match value:
+        DecimalValue(inner):
+            return db_decimal_text_valid(inner)
+        DateValue(inner):
+            return db_date_text_valid(inner)
+        TimeValue(inner):
+            return db_time_text_valid(inner)
+        TimeTzValue(inner):
+            return db_time_tz_text_valid(inner)
+        TimestampValue(inner):
+            return db_timestamp_text_valid(inner)
+        TimestampTzValue(inner):
+            return db_timestamp_tz_text_valid(inner)
+        JsonValue(inner):
+            return json_is_valid(inner)
+        JsonbValue(inner):
+            return json_is_valid(inner)
+        Null:
+            return true
+        BooleanValue(_):
+            return true
+        Int32Value(_):
+            return true
+        Int64Value(_):
+            return true
+        Float64Value(_):
+            return true
+        TextValue(_):
+            return true
+        BytesValue(_):
+            return true
+    return false
+
+fn db_value_as_decimal(value: DbValue) -> Option[Text]:
+    match value:
+        DecimalValue(inner):
+            if db_decimal_text_valid(inner):
+                return some(inner)
+            return none
+        Null:
+            return none
+        BooleanValue(_):
+            return none
+        Int32Value(_):
+            return none
+        Int64Value(_):
+            return none
+        Float64Value(_):
+            return none
+        DateValue(_):
+            return none
+        TimeValue(_):
+            return none
+        TimeTzValue(_):
+            return none
+        TimestampValue(_):
+            return none
+        TimestampTzValue(_):
+            return none
+        JsonValue(_):
+            return none
+        JsonbValue(_):
+            return none
+        TextValue(_):
+            return none
+        BytesValue(_):
+            return none
+    return none
+
+fn db_value_as_temporal_text(value: DbValue) -> Option[Text]:
+    match value:
+        DateValue(inner):
+            if db_date_text_valid(inner):
+                return some(inner)
+            return none
+        TimeValue(inner):
+            if db_time_text_valid(inner):
+                return some(inner)
+            return none
+        TimeTzValue(inner):
+            if db_time_tz_text_valid(inner):
+                return some(inner)
+            return none
+        TimestampValue(inner):
+            if db_timestamp_text_valid(inner):
+                return some(inner)
+            return none
+        TimestampTzValue(inner):
+            if db_timestamp_tz_text_valid(inner):
+                return some(inner)
+            return none
+        Null:
+            return none
+        BooleanValue(_):
+            return none
+        Int32Value(_):
+            return none
+        Int64Value(_):
+            return none
+        Float64Value(_):
+            return none
+        DecimalValue(_):
+            return none
+        JsonValue(_):
+            return none
+        JsonbValue(_):
+            return none
+        TextValue(_):
+            return none
+        BytesValue(_):
+            return none
+    return none
+
+fn db_value_as_bytes(value: DbValue) -> Option[Bytes]:
+    match value:
+        BytesValue(inner):
+            return some(inner)
+        Null:
+            return none
+        BooleanValue(_):
+            return none
+        Int32Value(_):
+            return none
+        Int64Value(_):
+            return none
+        Float64Value(_):
+            return none
+        DecimalValue(_):
+            return none
+        DateValue(_):
+            return none
+        TimeValue(_):
+            return none
+        TimeTzValue(_):
+            return none
+        TimestampValue(_):
+            return none
+        TimestampTzValue(_):
+            return none
+        JsonValue(_):
+            return none
+        JsonbValue(_):
+            return none
+        TextValue(_):
+            return none
+    return none
+
+fn db_value_as_json(value: DbValue) -> Option[Text]:
+    match value:
+        JsonValue(inner):
+            if json_is_valid(inner):
+                return some(inner)
+            return none
+        JsonbValue(inner):
+            if json_is_valid(inner):
+                return some(inner)
+            return none
+        Null:
+            return none
+        BooleanValue(_):
+            return none
+        Int32Value(_):
+            return none
+        Int64Value(_):
+            return none
+        Float64Value(_):
+            return none
+        DecimalValue(_):
+            return none
+        DateValue(_):
+            return none
+        TimeValue(_):
+            return none
+        TimeTzValue(_):
+            return none
+        TimestampValue(_):
+            return none
+        TimestampTzValue(_):
+            return none
+        TextValue(_):
+            return none
+        BytesValue(_):
+            return none
+    return none
+
+fn db_identifier_is_plain_ascii(identifier: Text) -> Boolean:
+    let length: Number = text_length(identifier)
+    if length < 1 or length > 63:
+        return false
+    var index: Number = 0
+    while index < length:
+        let byte: Number = text_byte(identifier, index)
+        let is_letter: Boolean = (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122)
+        let is_digit: Boolean = byte >= 48 and byte <= 57
+        let is_underscore: Boolean = byte == 95
+        if index == 0 and not is_letter and not is_underscore:
+            return false
+        if index > 0 and not is_letter and not is_digit and not is_underscore:
+            return false
+        set index = index + 1
+    return true
+
+fn db_error(kind: DbErrorKind, message: Text, provider_code: Option[Text], retryable: Boolean) -> DbError:
+    return DbError(kind, message, provider_code, retryable)
+
+fn db_row_is_valid(row: DbRow) -> Boolean:
+    let column_count: Number = list_count(row.columns)
+    if column_count > 256:
+        return false
+    for column in row.columns:
+        let name_length: Number = text_length(column.name)
+        if name_length < 1 or name_length > 255 or not db_value_is_valid(column.value):
+            return false
+    return true
+
+fn db_row_new(columns: List[DbColumn]) -> Result[DbRow, DbError]:
+    let column_count: Number = list_count(columns)
+    if column_count > 256:
+        return err(db_error(DbErrorKind::Protocol, "Database row exceeds the 256-column limit", none, false))
+    let copied_columns: List[DbColumn] = List[DbColumn]()
+    for column in columns:
+        let name_length: Number = text_length(column.name)
+        if name_length < 1 or name_length > 255 or not db_value_is_valid(column.value):
+            return err(db_error(DbErrorKind::Protocol, "Database row contains an invalid column name", none, false))
+        list_push(copied_columns, DbColumn(column.name, column.value))
+    return ok(DbRow(copied_columns))
+
+fn db_row_column_at(row: DbRow, index: Number) -> Option[DbColumn]:
+    if not db_row_is_valid(row) or index < 0 or index >= list_count(row.columns):
+        return none
+    return some(list_get(row.columns, index))
+
+fn db_row_find(row: DbRow, name: Text) -> Result[DbColumnLookup, DbError]:
+    if not db_row_is_valid(row):
+        return err(db_error(DbErrorKind::Protocol, "Database row metadata is invalid", none, false))
+    let name_length: Number = text_length(name)
+    if name_length < 1 or name_length > 255:
+        return err(db_error(DbErrorKind::Configuration, "Database column lookup name is invalid", none, false))
+    var found: Option[DbValue] = none
+    for column in row.columns:
+        if column.name == name:
+            if option_is_some(found):
+                return ok(DbColumnLookup::ColumnAmbiguous)
+            set found = some(column.value)
+    if not option_is_some(found):
+        return ok(DbColumnLookup::ColumnMissing)
+    return ok(DbColumnLookup::ColumnFound(option_unwrap(found)))
+
+fn db_error_code(kind: DbErrorKind) -> Text:
+    match kind:
+        Configuration:
+            return "configuration"
+        Connection:
+            return "connection"
+        Authentication:
+            return "authentication"
+        TLS:
+            return "tls"
+        Timeout:
+            return "timeout"
+        Cancelled:
+            return "cancelled"
+        Unavailable:
+            return "unavailable"
+        Protocol:
+            return "protocol"
+        Constraint:
+            return "constraint"
+        Serialization:
+            return "serialization"
+        UnsupportedFeature:
+            return "unsupported_feature"
+        Internal:
+            return "internal"
+    return "internal"

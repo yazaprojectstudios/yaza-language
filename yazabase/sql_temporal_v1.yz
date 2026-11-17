@@ -1,0 +1,135 @@
+# Provisional SQL TIME/TIMESTAMP codecs.
+# TIME is a timezone-free time of day. TIMESTAMP is a timezone-free civil
+# datetime. TIMESTAMPTZ is an instant normalized to UTC. All use microseconds.
+use "./sql_date_v1"
+
+fn yaza_sql_temporal_micros_per_second_v1() -> Number:
+    return 1000000
+
+fn yaza_sql_temporal_micros_per_day_v1() -> Number:
+    return 86400000000
+
+fn yaza_sql_temporal_parse_digits_v1(source: Text, offset: Number, count: Number) -> Number:
+    if offset < 0 or count < 1 or offset > text_length(source) or count > text_length(source) - offset: return -1
+    var value: Number = 0
+    var index: Number = 0
+    while index < count:
+        let byte: Number = text_byte(source, offset + index)
+        if byte < 48 or byte > 57: return -1
+        set value = value * 10 + byte - 48
+        set index = index + 1
+    return value
+
+fn yaza_sql_temporal_parse_fraction_v1(source: Text, offset: Number, count: Number) -> Result[Number, Text]:
+    if count < 0 or count > 6 or offset < 0 or offset > text_length(source) or count > text_length(source) - offset:
+        return err("YazaBase temporal fractional precision exceeds six digits")
+    if count == 0: return ok(0)
+    let parsed: Number = yaza_sql_temporal_parse_digits_v1(source, offset, count)
+    if parsed < 0: return err("YazaBase temporal fractional seconds must contain digits only")
+    var micros: Number = parsed
+    var padding: Number = count
+    while padding < 6:
+        set micros = micros * 10
+        set padding = padding + 1
+    return ok(micros)
+
+fn yaza_sql_time_parse_v1(source: Text) -> Result[Number, Text]:
+    let length: Number = text_length(source)
+    if length < 8 or length > 15 or text_byte(source, 2) != 58 or text_byte(source, 5) != 58:
+        return err("YazaBase TIME requires HH:MM:SS with up to six fractional digits")
+    let hour: Number = yaza_sql_temporal_parse_digits_v1(source, 0, 2)
+    let minute: Number = yaza_sql_temporal_parse_digits_v1(source, 3, 2)
+    let second: Number = yaza_sql_temporal_parse_digits_v1(source, 6, 2)
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59 or second < 0 or second > 59:
+        return err("YazaBase TIME is outside 00:00:00 through 23:59:59")
+    var fraction: Number = 0
+    if length > 8:
+        if text_byte(source, 8) != 46 or length == 9: return err("YazaBase TIME fractional seconds have invalid syntax")
+        let fraction_result: Result[Number, Text] = yaza_sql_temporal_parse_fraction_v1(source, 9, length - 9)
+        if not result_is_ok(fraction_result): return err(result_unwrap_error(fraction_result))
+        set fraction = result_unwrap(fraction_result)
+    let micros: Number = ((hour * 60 + minute) * 60 + second) * yaza_sql_temporal_micros_per_second_v1() + fraction
+    if micros < 0 or micros >= yaza_sql_temporal_micros_per_day_v1(): return err("YazaBase TIME value is outside one day")
+    return ok(micros)
+
+fn yaza_sql_temporal_six_digits_v1(value: Number) -> Result[Text, Text]:
+    if value < 0 or value > 999999: return err("YazaBase temporal microsecond fraction is outside six digits")
+    let digits: Text = number_text(value)
+    if value < 10: return ok("00000" + digits)
+    if value < 100: return ok("0000" + digits)
+    if value < 1000: return ok("000" + digits)
+    if value < 10000: return ok("00" + digits)
+    if value < 100000: return ok("0" + digits)
+    return ok(digits)
+
+fn yaza_sql_time_to_text_v1(micros_since_midnight: Number) -> Result[Text, Text]:
+    if micros_since_midnight < 0 or micros_since_midnight >= yaza_sql_temporal_micros_per_day_v1():
+        return err("YazaBase TIME value is outside 00:00:00 through 23:59:59.999999")
+    let whole_seconds: Number = micros_since_midnight / yaza_sql_temporal_micros_per_second_v1()
+    let fraction: Number = micros_since_midnight % yaza_sql_temporal_micros_per_second_v1()
+    let hour: Number = whole_seconds / 3600
+    let minute: Number = (whole_seconds % 3600) / 60
+    let second: Number = whole_seconds % 60
+    let fraction_text: Text = yaza_sql_temporal_six_digits_v1(fraction)?
+    return ok(yaza_sql_date_two_digits_v1(hour) + ":" + yaza_sql_date_two_digits_v1(minute) + ":" + yaza_sql_date_two_digits_v1(second) + "." + fraction_text)
+
+fn yaza_sql_timestamp_parse_v1(source: Text) -> Result[Number, Text]:
+    let length: Number = text_length(source)
+    if length < 19 or length > 26: return err("YazaBase TIMESTAMP requires YYYY-MM-DD HH:MM:SS with up to six fractional digits and no offset")
+    let separator: Number = text_byte(source, 10)
+    if separator != 32 and separator != 84 and separator != 116: return err("YazaBase TIMESTAMP requires a space or T between date and time")
+    let date_text: Text = text_try_slice(source, 0, 10)?
+    let days: Number = yaza_sql_date_parse_v1(date_text)?
+    let time_text: Text = text_try_slice(source, 11, length - 11)?
+    let time_micros: Number = yaza_sql_time_parse_v1(time_text)?
+    let timestamp_micros: Number = days * yaza_sql_temporal_micros_per_day_v1() + time_micros
+    let formatted: Result[Text, Text] = yaza_sql_timestamp_to_text_v1(timestamp_micros)
+    if not result_is_ok(formatted): return err("YazaBase TIMESTAMP is outside years 0001 through 9999")
+    return ok(timestamp_micros)
+
+fn yaza_sql_timestamp_to_text_v1(micros_from_epoch: Number) -> Result[Text, Text]:
+    let micros_per_day: Number = yaza_sql_temporal_micros_per_day_v1()
+    var days: Number = micros_from_epoch / micros_per_day
+    var time_micros: Number = micros_from_epoch % micros_per_day
+    if time_micros < 0:
+        set days = days - 1
+        set time_micros = time_micros + micros_per_day
+    if not yaza_sql_date_valid_days_v1(days): return err("YazaBase TIMESTAMP is outside years 0001 through 9999")
+    let date_text: Text = yaza_sql_date_to_text_v1(days)?
+    let time_text: Text = yaza_sql_time_to_text_v1(time_micros)?
+    return ok(date_text + " " + time_text)
+
+fn yaza_sql_timestamptz_parse_v1(source: Text) -> Result[Number, Text]:
+    let length: Number = text_length(source)
+    if length < 20 or length > 32: return err("YazaBase TIMESTAMPTZ requires an explicit Z or ±HH:MM offset")
+    let separator: Number = text_byte(source, 10)
+    if separator != 84 and separator != 116: return err("YazaBase TIMESTAMPTZ requires T between date and time")
+    var local_end: Number = 0
+    var offset_minutes: Number = 0
+    let last_byte: Number = text_byte(source, length - 1)
+    if last_byte == 90 or last_byte == 122:
+        set local_end = length - 1
+    else:
+        if length < 25: return err("YazaBase TIMESTAMPTZ requires a complete ±HH:MM offset")
+        set local_end = length - 6
+        let sign: Number = text_byte(source, local_end)
+        if (sign != 43 and sign != 45) or text_byte(source, length - 3) != 58:
+            return err("YazaBase TIMESTAMPTZ offset must use ±HH:MM")
+        let offset_hour: Number = yaza_sql_temporal_parse_digits_v1(source, local_end + 1, 2)
+        let offset_minute: Number = yaza_sql_temporal_parse_digits_v1(source, length - 2, 2)
+        if offset_hour < 0 or offset_hour > 14 or offset_minute < 0 or offset_minute > 59 or (offset_hour == 14 and offset_minute != 0):
+            return err("YazaBase TIMESTAMPTZ offset is outside ±14:00")
+        set offset_minutes = offset_hour * 60 + offset_minute
+        if sign == 45: set offset_minutes = -offset_minutes
+    let local_text: Text = text_try_slice(source, 0, local_end)?
+    let local_micros: Number = yaza_sql_timestamp_parse_v1(local_text)?
+    let utc_micros: Number = local_micros - offset_minutes * 60 * yaza_sql_temporal_micros_per_second_v1()
+    let formatted: Result[Text, Text] = yaza_sql_timestamp_to_text_v1(utc_micros)
+    if not result_is_ok(formatted): return err("YazaBase TIMESTAMPTZ normalized UTC instant is outside years 0001 through 9999")
+    return ok(utc_micros)
+
+fn yaza_sql_timestamptz_to_text_v1(utc_micros: Number) -> Result[Text, Text]:
+    let civil: Text = yaza_sql_timestamp_to_text_v1(utc_micros)?
+    let date_part: Text = text_try_slice(civil, 0, 10)?
+    let time_part: Text = text_try_slice(civil, 11, text_length(civil) - 11)?
+    return ok(date_part + "T" + time_part + "Z")

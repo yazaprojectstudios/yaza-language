@@ -1,0 +1,288 @@
+# Strict, bounded conversion helpers for API and binary-data boundaries.
+
+shape ConvertBase64QuartetV1:
+    valid: Boolean
+    error_code: Number
+    first: Number
+    second: Number
+    third: Number
+    fourth: Number
+    output_bytes: Number
+
+fn convert_try_parse_boolean(value: Text) -> Result[Boolean, Text]:
+    if value == "true": return ok(true)
+    if value == "false": return ok(false)
+    return err("Boolean text must be exactly 'true' or 'false'")
+
+fn convert_base64_value_v1(byte_value: Number, url_safe: Boolean) -> Number:
+    if byte_value >= 65 and byte_value <= 90: return byte_value - 65
+    if byte_value >= 97 and byte_value <= 122: return byte_value - 97 + 26
+    if byte_value >= 48 and byte_value <= 57: return byte_value - 48 + 52
+    if not url_safe and byte_value == 43: return 62
+    if not url_safe and byte_value == 47: return 63
+    if url_safe and byte_value == 45: return 62
+    if url_safe and byte_value == 95: return 63
+    return -1
+
+fn convert_base64_error_text_v1(error_code: Number, url_safe: Boolean) -> Text:
+    if url_safe:
+        if error_code == 1: return "Base64URL contains a byte outside the URL-safe alphabet"
+        if error_code == 2: return "Base64URL padding is not allowed"
+        return "Base64URL has non-canonical unused bits"
+    if error_code == 1: return "Base64 contains a byte outside the standard alphabet"
+    if error_code == 2: return "Base64 padding is only allowed in the final one or two bytes"
+    return "Base64 has non-canonical padding bits"
+
+fn convert_base64_quartet_v1(encoded: Text, offset: Number, is_last: Boolean, url_safe: Boolean) -> ConvertBase64QuartetV1:
+    let first_byte: Number = text_byte(encoded, offset)
+    let second_byte: Number = text_byte(encoded, offset + 1)
+    let third_byte: Number = text_byte(encoded, offset + 2)
+    let fourth_byte: Number = text_byte(encoded, offset + 3)
+    let first_value: Number = convert_base64_value_v1(first_byte, url_safe)
+    let second_value: Number = convert_base64_value_v1(second_byte, url_safe)
+    if first_value < 0 or second_value < 0:
+        return ConvertBase64QuartetV1(false, 1, 0, 0, 0, 0, 0)
+
+    if third_byte == 61:
+        if not is_last or fourth_byte != 61:
+            return ConvertBase64QuartetV1(false, 2, 0, 0, 0, 0, 0)
+        if second_value - (second_value / 16) * 16 != 0:
+            return ConvertBase64QuartetV1(false, 3, 0, 0, 0, 0, 0)
+        return ConvertBase64QuartetV1(true, 0, first_value, second_value, 0, 0, 1)
+
+    let third_value: Number = convert_base64_value_v1(third_byte, url_safe)
+    if third_value < 0: return ConvertBase64QuartetV1(false, 1, 0, 0, 0, 0, 0)
+    if fourth_byte == 61:
+        if not is_last: return ConvertBase64QuartetV1(false, 2, 0, 0, 0, 0, 0)
+        if third_value - (third_value / 4) * 4 != 0:
+            return ConvertBase64QuartetV1(false, 3, 0, 0, 0, 0, 0)
+        return ConvertBase64QuartetV1(true, 0, first_value, second_value, third_value, 0, 2)
+
+    let fourth_value: Number = convert_base64_value_v1(fourth_byte, url_safe)
+    if fourth_value < 0: return ConvertBase64QuartetV1(false, 1, 0, 0, 0, 0, 0)
+    return ConvertBase64QuartetV1(true, 0, first_value, second_value, third_value, fourth_value, 3)
+
+fn convert_try_base64_encode_with_options_v1(value: Bytes, alphabet: Text, padded: Boolean) -> Result[Text, Text]:
+    let input_length: Number = bytes_length(value)
+    # A 64 MiB Text result can encode at most 50,331,648 input bytes.
+    if input_length < 0 or input_length > 50331648:
+        return err("Base64 output exceeds the 64 MiB Text limit")
+    let complete_groups: Number = input_length / 3
+    let remainder: Number = input_length - complete_groups * 3
+    var output_length: Number = complete_groups * 4
+    if remainder > 0:
+        if padded: set output_length = output_length + 4
+        elif remainder == 1: set output_length = output_length + 2
+        else: set output_length = output_length + 3
+    let output_result: Result[Bytes, Text] = bytes_try_new_zeroed(output_length)
+    if not result_is_ok(output_result): return err(result_unwrap_error(output_result))
+    let output: Bytes = result_unwrap(output_result)
+
+    var input_index: Number = 0
+    var output_index: Number = 0
+    while input_index < input_length:
+        let first: Number = bytes_get(value, input_index)
+        var second: Number = 0
+        var third: Number = 0
+        if input_index + 1 < input_length: set second = bytes_get(value, input_index + 1)
+        if input_index + 2 < input_length: set third = bytes_get(value, input_index + 2)
+
+        let first_quartet_value: Number = first / 4
+        let second_quartet_value: Number = (first - first_quartet_value * 4) * 16 + second / 16
+        let third_group: Number = second - (second / 16) * 16
+        let third_quartet_value: Number = third_group * 4 + third / 64
+        let fourth_quartet_value: Number = third - (third / 64) * 64
+        if not bytes_try_set(output, output_index, text_byte(alphabet, first_quartet_value)):
+            return err("Base64 encoder could not write its bounded output")
+        if not bytes_try_set(output, output_index + 1, text_byte(alphabet, second_quartet_value)):
+            return err("Base64 encoder could not write its bounded output")
+        if input_index + 1 < input_length:
+            if not bytes_try_set(output, output_index + 2, text_byte(alphabet, third_quartet_value)):
+                return err("Base64 encoder could not write its bounded output")
+        elif padded:
+            if not bytes_try_set(output, output_index + 2, 61):
+                return err("Base64 encoder could not write its bounded output")
+        if input_index + 2 < input_length:
+            if not bytes_try_set(output, output_index + 3, text_byte(alphabet, fourth_quartet_value)):
+                return err("Base64 encoder could not write its bounded output")
+        elif padded:
+            if not bytes_try_set(output, output_index + 3, 61):
+                return err("Base64 encoder could not write its bounded output")
+        set input_index = input_index + 3
+        set output_index = output_index + 4
+
+    return bytes_try_to_text(output)
+
+# Standard RFC 4648 Base64 keeps '=' padding for interoperability.
+fn convert_try_base64_encode(value: Bytes) -> Result[Text, Text]:
+    return convert_try_base64_encode_with_options_v1(value, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/", true)
+
+# Base64URL emits '-' and '_' and omits '=' padding, as required by JOSE encodings.
+fn convert_try_base64url_encode(value: Bytes) -> Result[Text, Text]:
+    return convert_try_base64_encode_with_options_v1(value, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_", false)
+
+fn convert_try_base64_decode(encoded: Text) -> Result[Bytes, Text]:
+    let input_length: Number = text_length(encoded)
+    if input_length % 4 != 0:
+        return err("Base64 length must be a multiple of four")
+
+    let group_count: Number = input_length / 4
+    var output_length: Number = 0
+    var group_index: Number = 0
+    while group_index < group_count:
+        let decoded_group: ConvertBase64QuartetV1 = convert_base64_quartet_v1(encoded, group_index * 4, group_index == group_count - 1, false)
+        if not decoded_group.valid:
+            return err(convert_base64_error_text_v1(decoded_group.error_code, false))
+        set output_length = output_length + decoded_group.output_bytes
+        set group_index = group_index + 1
+
+    let output_result: Result[Bytes, Text] = bytes_try_new_zeroed(output_length)
+    if not result_is_ok(output_result): return err(result_unwrap_error(output_result))
+    let output: Bytes = result_unwrap(output_result)
+    set group_index = 0
+    var output_index: Number = 0
+    while group_index < group_count:
+        let decoded_group: ConvertBase64QuartetV1 = convert_base64_quartet_v1(encoded, group_index * 4, group_index == group_count - 1, false)
+        let first_output: Number = decoded_group.first * 4 + decoded_group.second / 16
+        if not bytes_try_set(output, output_index, first_output):
+            return err("Base64 decoder could not write its validated output")
+        set output_index = output_index + 1
+        if decoded_group.output_bytes > 1:
+            let second_bits: Number = decoded_group.second - (decoded_group.second / 16) * 16
+            let second_output: Number = second_bits * 16 + decoded_group.third / 4
+            if not bytes_try_set(output, output_index, second_output):
+                return err("Base64 decoder could not write its validated output")
+            set output_index = output_index + 1
+        if decoded_group.output_bytes > 2:
+            let third_bits: Number = decoded_group.third - (decoded_group.third / 4) * 4
+            let third_output: Number = third_bits * 64 + decoded_group.fourth
+            if not bytes_try_set(output, output_index, third_output):
+                return err("Base64 decoder could not write its validated output")
+            set output_index = output_index + 1
+        set group_index = group_index + 1
+    return ok(output)
+
+fn convert_base64url_tail_v1(encoded: Text, offset: Number, tail_length: Number) -> Result[ConvertBase64QuartetV1, Text]:
+    let first_value: Number = convert_base64_value_v1(text_byte(encoded, offset), true)
+    let second_value: Number = convert_base64_value_v1(text_byte(encoded, offset + 1), true)
+    if first_value < 0 or second_value < 0:
+        return err("Base64URL contains a byte outside the URL-safe alphabet")
+    if tail_length == 2:
+        if second_value % 16 != 0:
+            return err("Base64URL has non-canonical unused bits")
+        return ok(ConvertBase64QuartetV1(true, 0, first_value, second_value, 0, 0, 1))
+
+    let third_value: Number = convert_base64_value_v1(text_byte(encoded, offset + 2), true)
+    if third_value < 0:
+        return err("Base64URL contains a byte outside the URL-safe alphabet")
+    if third_value % 4 != 0:
+        return err("Base64URL has non-canonical unused bits")
+    return ok(ConvertBase64QuartetV1(true, 0, first_value, second_value, third_value, 0, 2))
+
+# Accepts canonical, unpadded Base64URL only; reject before allocating the output.
+fn convert_try_base64url_decode(encoded: Text) -> Result[Bytes, Text]:
+    let input_length: Number = text_length(encoded)
+    # Unpadded Base64URL for a 64 MiB decoded value is at most 89,478,486 bytes.
+    if input_length < 0 or input_length > 89478486:
+        return err("Base64URL decoded output exceeds the 64 MiB Bytes limit")
+    let tail_length: Number = input_length % 4
+    if tail_length == 1:
+        return err("Base64URL length cannot have a one-byte remainder")
+
+    let group_count: Number = input_length / 4
+    var output_length: Number = group_count * 3
+    if tail_length == 2: set output_length = output_length + 1
+    elif tail_length == 3: set output_length = output_length + 2
+
+    var group_index: Number = 0
+    while group_index < group_count:
+        let decoded_group: ConvertBase64QuartetV1 = convert_base64_quartet_v1(encoded, group_index * 4, false, true)
+        if not decoded_group.valid:
+            return err(convert_base64_error_text_v1(decoded_group.error_code, true))
+        set group_index = group_index + 1
+
+    if tail_length > 0:
+        let checked_tail: Result[ConvertBase64QuartetV1, Text] = convert_base64url_tail_v1(encoded, group_count * 4, tail_length)
+        if not result_is_ok(checked_tail): return err(result_unwrap_error(checked_tail))
+
+    let output_result: Result[Bytes, Text] = bytes_try_new_zeroed(output_length)
+    if not result_is_ok(output_result): return err(result_unwrap_error(output_result))
+    let output: Bytes = result_unwrap(output_result)
+    set group_index = 0
+    var output_index: Number = 0
+    while group_index < group_count:
+        let decoded_group: ConvertBase64QuartetV1 = convert_base64_quartet_v1(encoded, group_index * 4, false, true)
+        let first_output: Number = decoded_group.first * 4 + decoded_group.second / 16
+        let second_bits: Number = decoded_group.second - (decoded_group.second / 16) * 16
+        let second_output: Number = second_bits * 16 + decoded_group.third / 4
+        let third_bits: Number = decoded_group.third - (decoded_group.third / 4) * 4
+        let third_output: Number = third_bits * 64 + decoded_group.fourth
+        if not bytes_try_set(output, output_index, first_output) or not bytes_try_set(output, output_index + 1, second_output) or not bytes_try_set(output, output_index + 2, third_output):
+            return err("Base64URL decoder could not write its validated output")
+        set output_index = output_index + 3
+        set group_index = group_index + 1
+
+    if tail_length > 0:
+        let tail: ConvertBase64QuartetV1 = result_unwrap(convert_base64url_tail_v1(encoded, group_count * 4, tail_length))
+        let first_tail_output: Number = tail.first * 4 + tail.second / 16
+        if not bytes_try_set(output, output_index, first_tail_output):
+            return err("Base64URL decoder could not write its validated output")
+        if tail_length == 3:
+            let second_bits: Number = tail.second - (tail.second / 16) * 16
+            let second_tail_output: Number = second_bits * 16 + tail.third / 4
+            if not bytes_try_set(output, output_index + 1, second_tail_output):
+                return err("Base64URL decoder could not write its validated output")
+    return ok(output)
+
+fn convert_hex_nibble_v1(byte_value: Number) -> Number:
+    if byte_value >= 48 and byte_value <= 57: return byte_value - 48
+    if byte_value >= 65 and byte_value <= 70: return byte_value - 65 + 10
+    if byte_value >= 97 and byte_value <= 102: return byte_value - 97 + 10
+    return -1
+
+# Hex encoding is canonical lowercase and never expands beyond the Text limit.
+fn convert_try_hex_encode(value: Bytes) -> Result[Text, Text]:
+    let input_length: Number = bytes_length(value)
+    if input_length < 0 or input_length > 33554432:
+        return err("Hex output exceeds the 64 MiB Text limit")
+    let output_result: Result[Bytes, Text] = bytes_try_new_zeroed(input_length * 2)
+    if not result_is_ok(output_result): return err(result_unwrap_error(output_result))
+    let output: Bytes = result_unwrap(output_result)
+    let alphabet: Text = "0123456789abcdef"
+    var index: Number = 0
+    while index < input_length:
+        let byte_value: Number = bytes_get(value, index)
+        let high_nibble: Number = byte_value / 16
+        let low_nibble: Number = byte_value - high_nibble * 16
+        let output_index: Number = index * 2
+        if not bytes_try_set(output, output_index, text_byte(alphabet, high_nibble)) or not bytes_try_set(output, output_index + 1, text_byte(alphabet, low_nibble)):
+            return err("Hex encoder could not write its bounded output")
+        set index = index + 1
+    return bytes_try_to_text(output)
+
+# Accept either hex case, reject odd length and invalid digits before allocating.
+fn convert_try_hex_decode(encoded: Text) -> Result[Bytes, Text]:
+    let input_length: Number = text_length(encoded)
+    if input_length < 0 or input_length > 67108864:
+        return err("Hex input exceeds the 64 MiB Text limit")
+    if input_length % 2 != 0: return err("Hex input must contain an even number of digits")
+
+    var input_index: Number = 0
+    while input_index < input_length:
+        if convert_hex_nibble_v1(text_byte(encoded, input_index)) < 0 or convert_hex_nibble_v1(text_byte(encoded, input_index + 1)) < 0:
+            return err("Hex input contains a character outside 0-9, A-F, or a-f")
+        set input_index = input_index + 2
+
+    let output_result: Result[Bytes, Text] = bytes_try_new_zeroed(input_length / 2)
+    if not result_is_ok(output_result): return err(result_unwrap_error(output_result))
+    let output: Bytes = result_unwrap(output_result)
+    set input_index = 0
+    var output_index: Number = 0
+    while input_index < input_length:
+        let high_nibble: Number = convert_hex_nibble_v1(text_byte(encoded, input_index))
+        let low_nibble: Number = convert_hex_nibble_v1(text_byte(encoded, input_index + 1))
+        if not bytes_try_set(output, output_index, high_nibble * 16 + low_nibble):
+            return err("Hex decoder could not write its validated output")
+        set input_index = input_index + 2
+        set output_index = output_index + 1
+    return ok(output)

@@ -1,0 +1,191 @@
+# Scheduler-driven PostgreSQL TCP + SSLRequest + verified TLS setup.
+# Authentication/startup packets remain in transport.yz's synchronous path.
+use "std/net/connect"
+use "std/net/io"
+use "std/task"
+use "async_transport"
+use "protocol"
+
+shape PgTlsConnectState:
+    phase: Number
+    token: Number
+    handle: Number
+    deadline_ms: Number
+    hostname: Text
+    write_state: Option[PgWriteState]
+    read_state: Option[PgReadState]
+    tls_state: Option[PgTlsUpgradeState]
+
+variant PgTlsConnectStep:
+    Progress(state: PgTlsConnectState)
+    WaitConnect(state: PgTlsConnectState)
+    WaitRead(state: PgTlsConnectState)
+    WaitWrite(state: PgTlsConnectState)
+    Complete(handle: Number)
+
+fn pg_tls_connect_async_abort(state: PgTlsConnectState, message: Text) -> Result[PgTlsConnectStep, Text]:
+    if state.token > 0:
+        let cancelled: Boolean = net_tcp_connect_async_cancel(state.token)
+    if state.handle > 0:
+        let closed: Number = net_close(state.handle)
+    return err("postgres async connect: " + message)
+
+fn pg_tls_connect_async_begin(hostname: Text, port: Number, timeout_ms: Number) -> Result[PgTlsConnectState, Text]:
+    if hostname == "" or text_length(hostname) > 253:
+        return err("postgres async connect: hostname must contain 1 to 253 characters")
+    if port < 1 or port > 65535:
+        return err("postgres async connect: port must be between 1 and 65535")
+    if timeout_ms < 1 or timeout_ms > 3600000:
+        return err("postgres async connect: timeout must be between 1 and 3600000 milliseconds")
+
+    let token_result: Result[Number, Text] = net_tcp_connect_async_begin(hostname, port, timeout_ms)
+    if not result_is_ok(token_result):
+        return err(result_unwrap_error(token_result))
+    let started: Number = monotonic_ms()
+    let max_int64: Number = 9223372036854775 * 1000 + 807
+    if started < 0 or started > max_int64 - timeout_ms - 1:
+        let cancelled: Boolean = net_tcp_connect_async_cancel(result_unwrap(token_result))
+        return err("postgres async connect: monotonic deadline is unavailable")
+    let deadline_ms: Number = started + timeout_ms + 1
+    return ok(PgTlsConnectState(0, result_unwrap(token_result), 0, deadline_ms, hostname, none, none, none))
+
+fn pg_tls_connect_async_step(state: PgTlsConnectState) -> Result[PgTlsConnectStep, Text]:
+    if state.phase < 0 or state.phase > 3 or state.deadline_ms <= 0 or state.hostname == "" or text_length(state.hostname) > 253:
+        return err("postgres async connect: state is invalid")
+    if state.phase == 0:
+        if state.token <= 0 or state.handle != 0 or option_is_some(state.write_state) or option_is_some(state.read_state) or option_is_some(state.tls_state):
+            return err("postgres async connect: TCP state is invalid")
+    if state.phase == 1:
+        if state.token != 0 or state.handle <= 0 or not option_is_some(state.write_state) or option_is_some(state.read_state) or option_is_some(state.tls_state):
+            return err("postgres async connect: SSLRequest write state is invalid")
+        let write: PgWriteState = option_unwrap(state.write_state)
+        if write.handle != state.handle or write.deadline_ms != state.deadline_ms:
+            return err("postgres async connect: SSLRequest write continuation does not match its connection")
+    if state.phase == 2:
+        if state.token != 0 or state.handle <= 0 or option_is_some(state.write_state) or not option_is_some(state.read_state) or option_is_some(state.tls_state):
+            return err("postgres async connect: SSL response state is invalid")
+        let read: PgReadState = option_unwrap(state.read_state)
+        if read.handle != state.handle or read.expected_bytes != 1 or read.deadline_ms != state.deadline_ms:
+            return err("postgres async connect: SSL response continuation does not match its connection")
+    if state.phase == 3:
+        if state.token != 0 or state.handle <= 0 or option_is_some(state.write_state) or option_is_some(state.read_state) or not option_is_some(state.tls_state):
+            return err("postgres async connect: TLS handshake state is invalid")
+        let tls: PgTlsUpgradeState = option_unwrap(state.tls_state)
+        if tls.handle != state.handle or tls.hostname != state.hostname or tls.timeout_ms < 1 or tls.timeout_ms > 3600000:
+            return err("postgres async connect: TLS continuation does not match its connection")
+
+    if task_or_request_cancelled():
+        return pg_tls_connect_async_abort(state, "connection was cancelled")
+    if task_deadline_expired():
+        return pg_tls_connect_async_abort(state, "scheduler task deadline expired")
+    let now: Number = monotonic_ms()
+    if now < 0 or now >= state.deadline_ms:
+        return pg_tls_connect_async_abort(state, "connection timed out")
+    if state.deadline_ms - now > 3600001:
+        return pg_tls_connect_async_abort(state, "connection deadline exceeds the one-hour limit")
+
+    if state.phase == 0:
+        let connected: Result[NetConnectPoll, Text] = net_tcp_connect_async_step(state.token)
+        if not result_is_ok(connected):
+            return pg_tls_connect_async_abort(state, result_unwrap_error(connected))
+        match result_unwrap(connected):
+            Pending:
+                return ok(PgTlsConnectStep::WaitConnect(state))
+            Connected(handle):
+                if handle <= 0:
+                    return pg_tls_connect_async_abort(state, "TCP connector returned an invalid socket")
+                let request: Result[Bytes, Text] = pg_ssl_request()
+                if not result_is_ok(request):
+                    let failed: PgTlsConnectState = PgTlsConnectState(0, 0, handle, state.deadline_ms, state.hostname, none, none, none)
+                    return pg_tls_connect_async_abort(failed, result_unwrap_error(request))
+                let write: Result[PgWriteState, Text] = pg_transport_write_begin_at(handle, result_unwrap(request), state.deadline_ms)
+                if not result_is_ok(write):
+                    let failed: PgTlsConnectState = PgTlsConnectState(0, 0, handle, state.deadline_ms, state.hostname, none, none, none)
+                    return pg_tls_connect_async_abort(failed, result_unwrap_error(write))
+                let next: PgTlsConnectState = PgTlsConnectState(1, 0, handle, state.deadline_ms, state.hostname, some(result_unwrap(write)), none, none)
+                return ok(PgTlsConnectStep::Progress(next))
+
+    if state.phase == 1:
+        let advanced: Result[PgWriteStep, Text] = pg_transport_write_step(option_unwrap(state.write_state))
+        if not result_is_ok(advanced):
+            return pg_tls_connect_async_abort(state, result_unwrap_error(advanced))
+        match result_unwrap(advanced):
+            Progress(write):
+                let next: PgTlsConnectState = PgTlsConnectState(1, 0, state.handle, state.deadline_ms, state.hostname, some(write), none, none)
+                return ok(PgTlsConnectStep::Progress(next))
+            WaitRead(write):
+                let next: PgTlsConnectState = PgTlsConnectState(1, 0, state.handle, state.deadline_ms, state.hostname, some(write), none, none)
+                return ok(PgTlsConnectStep::WaitRead(next))
+            WaitWrite(write):
+                let next: PgTlsConnectState = PgTlsConnectState(1, 0, state.handle, state.deadline_ms, state.hostname, some(write), none, none)
+                return ok(PgTlsConnectStep::WaitWrite(next))
+            Complete:
+                let read: Result[PgReadState, Text] = pg_transport_read_exact_begin_at(state.handle, 1, state.deadline_ms)
+                if not result_is_ok(read):
+                    return pg_tls_connect_async_abort(state, result_unwrap_error(read))
+                let next: PgTlsConnectState = PgTlsConnectState(2, 0, state.handle, state.deadline_ms, state.hostname, none, some(result_unwrap(read)), none)
+                return ok(PgTlsConnectStep::Progress(next))
+
+    if state.phase == 2:
+        let advanced: Result[PgReadStep, Text] = pg_transport_read_exact_step(option_unwrap(state.read_state))
+        if not result_is_ok(advanced):
+            return pg_tls_connect_async_abort(state, result_unwrap_error(advanced))
+        match result_unwrap(advanced):
+            Progress(read):
+                let next: PgTlsConnectState = PgTlsConnectState(2, 0, state.handle, state.deadline_ms, state.hostname, none, some(read), none)
+                return ok(PgTlsConnectStep::Progress(next))
+            WaitRead(read):
+                let next: PgTlsConnectState = PgTlsConnectState(2, 0, state.handle, state.deadline_ms, state.hostname, none, some(read), none)
+                return ok(PgTlsConnectStep::WaitRead(next))
+            WaitWrite(read):
+                let next: PgTlsConnectState = PgTlsConnectState(2, 0, state.handle, state.deadline_ms, state.hostname, none, some(read), none)
+                return ok(PgTlsConnectStep::WaitWrite(next))
+            Complete(response):
+                let accepted: Result[Boolean, Text] = pg_parse_ssl_response(response)
+                if not result_is_ok(accepted):
+                    return pg_tls_connect_async_abort(state, result_unwrap_error(accepted))
+                if not result_unwrap(accepted):
+                    return pg_tls_connect_async_abort(state, "PostgreSQL server refused TLS; refusing plaintext fallback")
+                let remaining_ms: Number = state.deadline_ms - now
+                let tls: Result[PgTlsUpgradeState, Text] = pg_tls_upgrade_begin(state.handle, state.hostname, env_get("PGSSLROOTCERT"), remaining_ms)
+                if not result_is_ok(tls):
+                    return pg_tls_connect_async_abort(state, result_unwrap_error(tls))
+                let next: PgTlsConnectState = PgTlsConnectState(3, 0, state.handle, state.deadline_ms, state.hostname, none, none, some(result_unwrap(tls)))
+                return ok(PgTlsConnectStep::Progress(next))
+
+    let tls_state: PgTlsUpgradeState = option_unwrap(state.tls_state)
+    let handshake: Result[PgTlsUpgradeStep, Text] = pg_tls_upgrade_step(tls_state)
+    if not result_is_ok(handshake):
+        return pg_tls_connect_async_abort(state, result_unwrap_error(handshake))
+    match result_unwrap(handshake):
+        Ready:
+            if not net_tls_is_active(state.handle):
+                return pg_tls_connect_async_abort(state, "TLS provider reported completion without an active verified session")
+            return ok(PgTlsConnectStep::Complete(state.handle))
+        WaitRead:
+            return ok(PgTlsConnectStep::WaitRead(state))
+        WaitWrite:
+            return ok(PgTlsConnectStep::WaitWrite(state))
+
+# Call after WaitConnect, WaitRead, or WaitWrite. A true result means yield the
+# current scheduler task; false means immediately call step again.
+fn pg_tls_connect_async_wait(state: PgTlsConnectState, writable: Boolean) -> Result[Boolean, Text]:
+    let now: Number = monotonic_ms()
+    if now < 0 or now >= state.deadline_ms:
+        let cancelled: Boolean = pg_tls_connect_async_cancel(state)
+        return err("postgres async connect: connection timed out before readiness wait")
+    if not task_deadline_at_or_before(state.deadline_ms):
+        let cancelled: Boolean = pg_tls_connect_async_cancel(state)
+        return err("postgres async connect: scheduler task needs a deadline no later than the connection timeout")
+    if state.phase == 0:
+        return net_tcp_connect_async_wait(state.token)
+    if state.handle <= 0:
+        return err("postgres async connect: readiness wait has no socket")
+    return net_wait_current_task(state.handle, writable)
+
+fn pg_tls_connect_async_cancel(state: PgTlsConnectState) -> Boolean:
+    if state.token > 0:
+        return net_tcp_connect_async_cancel(state.token)
+    if state.handle > 0:
+        return net_close(state.handle) >= 0
+    return false

@@ -1,0 +1,215 @@
+# YAZA API Configuration & Resource Profile Smoke Test
+# Validates TOML parsing, profile resolution (balanced, throughput, low_memory),
+# invariant checks, and HTTP server enforcement (503 Overload, 413 Payload, 406 Format, /config, /metrics).
+
+use "std/fs"
+use "std/net"
+use "std/http"
+use "std/json"
+use "std/ybif"
+use "std/ywt"
+use "std/time"
+use "std/config/api_config"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/session_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/wal_v1"
+use "../yazabase/api_v1"
+
+shape ApiExchangeOutcome:
+    session: YazaDbSessionV1
+    state: YazaApiServerStateV1
+    headers_text: Text
+    body_text: Text
+
+fn test_find_body_offset(b: Bytes) -> Number:
+    let len: Number = bytes_length(b)
+    var i: Number = 0
+    while i + 3 < len:
+        if bytes_get(b, i) == 13 and bytes_get(b, i + 1) == 10 and bytes_get(b, i + 2) == 13 and bytes_get(b, i + 3) == 10:
+            return i + 4
+        set i = i + 1
+    return 0
+
+fn test_api_call_state(session: YazaDbSessionV1, db_name: Text, request_raw: Text, auth_secret: Text, state: YazaApiServerStateV1) -> Result[ApiExchangeOutcome, Text]:
+    let s1_res: Result[Number, Text] = tcp_pair_create()
+    if not result_is_ok(s1_res): return err("tcp_pair_create failed: " + result_unwrap_error(s1_res))
+    let s1: Number = result_unwrap(s1_res)
+
+    let s2_res: Result[Number, Text] = tcp_pair_peer(s1)
+    if not result_is_ok(s2_res): return err("tcp_pair_peer failed: " + result_unwrap_error(s2_res))
+    let s2: Number = result_unwrap(s2_res)
+
+    let req_bytes: Bytes = bytes_from_text(request_raw)
+    let w_res: Result[Number, Text] = tcp_write(s2, req_bytes, 2000)
+    if not result_is_ok(w_res): return err("tcp_write failed: " + result_unwrap_error(w_res))
+
+    let handle_res: Result[YazaApiConnectionResultV1, Text] = yaza_api_handle_connection_state(session, "", db_name, s1, auth_secret, state)
+    if not result_is_ok(handle_res): return err("yaza_api_handle_connection_state failed: " + result_unwrap_error(handle_res))
+    let outcome: YazaApiConnectionResultV1 = result_unwrap(handle_res)
+
+    let r_res: Result[Bytes, Text] = tcp_read(s2, 65536, 2000)
+    if not result_is_ok(r_res): return err("tcp_read failed: " + result_unwrap_error(r_res))
+    let resp_bytes: Bytes = result_unwrap(r_res)
+
+    let _c1: Result[Boolean, Text] = tcp_close(s1)
+    let _c2: Result[Boolean, Text] = tcp_close(s2)
+
+    let body_offset: Number = test_find_body_offset(resp_bytes)
+    var headers_text: Text = ""
+    var body_text: Text = ""
+    if body_offset > 0:
+        let h_slice: Bytes = bytes_slice(resp_bytes, 0, body_offset)
+        set headers_text = bytes_to_text(h_slice)
+        let b_len: Number = bytes_length(resp_bytes) - body_offset
+        if b_len > 0:
+            let b_slice: Bytes = bytes_slice(resp_bytes, body_offset, b_len)
+            let b_res: Result[Text, Text] = bytes_try_to_text(b_slice)
+            if result_is_ok(b_res): set body_text = result_unwrap(b_res)
+    else:
+        let full_res: Result[Text, Text] = bytes_try_to_text(resp_bytes)
+        if result_is_ok(full_res): set headers_text = result_unwrap(full_res)
+
+    return ok(ApiExchangeOutcome(outcome.session, outcome.state, headers_text, body_text))
+
+fn run_api_config_smoke(root_path: Text) -> Result[Number, Text]:
+    # Gate 1: Balanced Profile Resolution
+    let toml_balanced: Text = "[service]\nname = \"orders-api\"\n[api.resources]\nprofile = \"balanced\"\n"
+    let p_bal: Result[ApiServiceConfig, Text] = api_config_parse(toml_balanced)
+    if not result_is_ok(p_bal): return err("Gate 1: failed parsing balanced profile: " + result_unwrap_error(p_bal))
+    let cfg_bal: ApiServiceConfig = result_unwrap(p_bal)
+    if cfg_bal.resources.profile != "balanced": return err("Gate 1: expected profile balanced")
+    if cfg_bal.resources.arena_mode != "adaptive": return err("Gate 1: expected arena_mode adaptive under balanced")
+    if cfg_bal.resources.process_arena_limit != 536870912: return err("Gate 1: expected 512 MiB process arena limit")
+    if cfg_bal.resources.request_arena_initial != 1048576: return err("Gate 1: expected 1 MiB request initial")
+    if cfg_bal.resources.request_arena_floor != 262144: return err("Gate 1: expected 256 KiB request floor")
+    if cfg_bal.resources.request_arena_ceiling != 67108864: return err("Gate 1: expected 64 MiB request ceiling")
+    if cfg_bal.resources.max_in_flight != 32: return err("Gate 1: expected 32 max in flight")
+    if cfg_bal.resources.max_query_work_units != 100000000: return err("Gate 1: expected 100000000 work units")
+
+    # Gate 2: Throughput Profile Resolution
+    let toml_throughput: Text = "[service]\nname = \"analytics-api\"\n[api.resources]\nprofile = \"throughput\"\n"
+    let p_thru: Result[ApiServiceConfig, Text] = api_config_parse(toml_throughput)
+    if not result_is_ok(p_thru): return err("Gate 2: failed parsing throughput profile: " + result_unwrap_error(p_thru))
+    let cfg_thru: ApiServiceConfig = result_unwrap(p_thru)
+    if cfg_thru.resources.profile != "throughput": return err("Gate 2: expected profile throughput")
+    if cfg_thru.resources.arena_mode != "adaptive": return err("Gate 2: expected arena_mode adaptive")
+    if cfg_thru.resources.process_arena_limit != 2147483648: return err("Gate 2: expected 2 GiB process limit")
+    if cfg_thru.resources.request_arena_initial != 4194304: return err("Gate 2: expected 4 MiB request initial")
+    if cfg_thru.resources.request_arena_floor != 1048576: return err("Gate 2: expected 1 MiB request floor")
+    if cfg_thru.resources.request_arena_ceiling != 268435456: return err("Gate 2: expected 256 MiB request ceiling")
+    if cfg_thru.resources.max_in_flight != 128: return err("Gate 2: expected 128 max in flight")
+    if cfg_thru.resources.max_query_work_units != 500000000: return err("Gate 2: expected 500000000 work units")
+
+    # Gate 3: Low Memory Profile Resolution
+    let toml_lowmem: Text = "[service]\nname = \"iot-edge\"\n[api.resources]\nprofile = \"low_memory\"\n"
+    let p_low: Result[ApiServiceConfig, Text] = api_config_parse(toml_lowmem)
+    if not result_is_ok(p_low): return err("Gate 3: failed parsing low_memory profile: " + result_unwrap_error(p_low))
+    let cfg_low: ApiServiceConfig = result_unwrap(p_low)
+    if cfg_low.resources.profile != "low_memory": return err("Gate 3: expected profile low_memory")
+    if cfg_low.resources.arena_mode != "fixed": return err("Gate 3: expected arena_mode fixed under low_memory")
+    if cfg_low.resources.process_arena_limit != 134217728: return err("Gate 3: expected 128 MiB process limit")
+    if cfg_low.resources.request_arena_initial != 262144: return err("Gate 3: expected 256 KiB request initial")
+    if cfg_low.resources.request_arena_floor != 65536: return err("Gate 3: expected 64 KiB request floor")
+    if cfg_low.resources.request_arena_ceiling != 8388608: return err("Gate 3: expected 8 MiB request ceiling")
+    if cfg_low.resources.max_in_flight != 8: return err("Gate 3: expected 8 max in flight")
+    if cfg_low.resources.max_query_work_units != 10000000: return err("Gate 3: expected 10000000 work units")
+
+    # Gate 4: Explicit Overrides & Custom Byte Units
+    let toml_custom: Text = "[service]\nname = \"custom-api\"\n[api]\nmax_request_body_bytes = \"2MiB\"\n[api.resources]\nprofile = \"balanced\"\nprocess_arena_limit = \"1GiB\"\nrequest_arena_ceiling = \"128MiB\"\nmax_in_flight = 48\n"
+    let p_cust: Result[ApiServiceConfig, Text] = api_config_parse(toml_custom)
+    if not result_is_ok(p_cust): return err("Gate 4: failed parsing custom overrides: " + result_unwrap_error(p_cust))
+    let cfg_cust: ApiServiceConfig = result_unwrap(p_cust)
+    if cfg_cust.max_request_body_bytes != 2097152: return err("Gate 4: expected 2 MiB request body limit")
+    if cfg_cust.resources.process_arena_limit != 1073741824: return err("Gate 4: expected 1 GiB process limit")
+    if cfg_cust.resources.request_arena_ceiling != 134217728: return err("Gate 4: expected 128 MiB request ceiling")
+    if cfg_cust.resources.max_in_flight != 48: return err("Gate 4: expected 48 max in flight")
+    if cfg_cust.resources.process_limit_source != "explicit": return err("Gate 4: expected explicit process limit source")
+
+    # Gate 5: Rejection of Invalid Invariants
+    let toml_bad_profile: Text = "[api.resources]\nprofile = \"hyperdrive\"\n"
+    if result_is_ok(api_config_parse(toml_bad_profile)): return err("Gate 5a: expected rejection of unknown profile")
+
+    let toml_bad_mode: Text = "[api.resources]\narena_mode = \"dynamic\"\n"
+    if result_is_ok(api_config_parse(toml_bad_mode)): return err("Gate 5b: expected rejection of unknown arena mode")
+
+    let toml_floor_gt_init: Text = "[api.resources]\nrequest_arena_floor = \"4MiB\"\nrequest_arena_initial = \"1MiB\"\n"
+    if result_is_ok(api_config_parse(toml_floor_gt_init)): return err("Gate 5c: expected rejection of floor > initial")
+
+    let toml_ceil_gt_proc: Text = "[api.resources]\nprocess_arena_limit = \"64MiB\"\nrequest_arena_ceiling = \"128MiB\"\n"
+    if result_is_ok(api_config_parse(toml_ceil_gt_proc)): return err("Gate 5d: expected rejection of ceiling > process_limit")
+
+    # Gate 6: HTTP Runtime Integration & Telemetry
+    let initial_root: Number = root_open(root_path)?
+    let db_name: Text = "api-config-smoke.ydb"
+    let header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_from_text("cfg-smoke-uuid-1"), 0, 1, 1, 0, 2, 1)
+    let empty_storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(initial_root, db_name, header)?
+    let _ec: Boolean = yaza_db_storage_close_v1(empty_storage)?
+    let bootstrap: YazaDbCatalogBootstrapV1 = yaza_db_catalog_initialize_v1(initial_root, db_name)?
+    let _wc: Boolean = yaza_db_wal_log_close_v1(bootstrap.wal)?
+    let _sc: Boolean = yaza_db_storage_close_v1(bootstrap.storage)?
+
+    var session: YazaDbSessionV1 = yaza_db_session_open_v1(initial_root, db_name)?
+    let auth_secret: Text = "smoke-test-secret-0123456789abcd"
+    let now_s: Number = time_now_unix_ms() / 1000
+    let auth_token: Text = ywt_create("smoke_admin", "yazabase", now_s + 3600, auth_secret)
+    let auth_hdr: Text = "Authorization: Bearer " + auth_token + "\r\n"
+    var state: YazaApiServerStateV1 = yaza_api_server_state_with_config(cfg_thru)
+
+    # Unauthenticated /config must be rejected (401 Unauthorized)
+    let r_unauth: ApiExchangeOutcome = test_api_call_state(session, db_name, "GET /config HTTP/1.1\r\nHost: localhost\r\n\r\n", auth_secret, state)?
+    set session = r_unauth.session
+    set state = r_unauth.state
+    if text_find(r_unauth.headers_text, "401 Unauthorized") < 0: return err("Gate 6a: expected 401 Unauthorized on unauthenticated /config")
+
+    # 6a: GET /config endpoint returns full JSON configuration when authorized
+    let r_cfg: ApiExchangeOutcome = test_api_call_state(session, db_name, "GET /config HTTP/1.1\r\nHost: localhost\r\n" + auth_hdr + "\r\n", auth_secret, state)?
+    set session = r_cfg.session
+    set state = r_cfg.state
+    if text_find(r_cfg.headers_text, "200 OK") < 0: return err("Gate 6a: expected 200 OK on /config")
+    if text_find(r_cfg.body_text, "\"yaza.api_config\"") < 0: return err("Gate 6a: expected schema yaza.api_config in body")
+    if text_find(r_cfg.body_text, "\"throughput\"") < 0: return err("Gate 6a: expected profile throughput in /config body")
+
+    # 6b: GET /metrics reports profile and AQB Prometheus metrics
+    let r_met: ApiExchangeOutcome = test_api_call_state(session, db_name, "GET /metrics HTTP/1.1\r\nHost: localhost\r\n" + auth_hdr + "\r\n", auth_secret, state)?
+    set session = r_met.session
+    set state = r_met.state
+    if text_find(r_met.headers_text, "200 OK") < 0: return err("Gate 6b: expected 200 OK on /metrics")
+    if text_find(r_met.body_text, "yazabase_profile_info{profile=\"throughput\"") < 0: return err("Gate 6b: expected yazabase_profile_info in /metrics")
+    if text_find(r_met.body_text, "yazabase_max_in_flight 128") < 0: return err("Gate 6b: expected yazabase_max_in_flight 128 in /metrics")
+
+    # 6c: GET /api/v1/metrics reports JSON metrics
+    let r_met_json: ApiExchangeOutcome = test_api_call_state(session, db_name, "GET /api/v1/metrics HTTP/1.1\r\nHost: localhost\r\n" + auth_hdr + "\r\n", auth_secret, state)?
+    set session = r_met_json.session
+    set state = r_met_json.state
+    if text_find(r_met_json.headers_text, "200 OK") < 0: return err("Gate 6c: expected 200 OK on /api/v1/metrics")
+    if text_find(r_met_json.body_text, "\"profile\":\"throughput\"") < 0: return err("Gate 6c: expected profile throughput in JSON metrics")
+
+    # 6d: Concurrency Overload Check (HTTP 503)
+    var saturated_state: YazaApiServerStateV1 = state
+    set saturated_state.in_flight_requests = saturated_state.config.resources.max_in_flight
+    let r_overload: ApiExchangeOutcome = test_api_call_state(session, db_name, "GET /readyz HTTP/1.1\r\nHost: localhost\r\n\r\n", auth_secret, saturated_state)?
+    set session = r_overload.session
+    if text_find(r_overload.headers_text, "503 Service Unavailable") < 0: return err("Gate 6d: expected 503 Service Unavailable when in-flight capacity is reached")
+    if text_find(r_overload.body_text, "OVERLOAD") < 0: return err("Gate 6d: expected OVERLOAD error code in body")
+    if r_overload.state.overload_rejections <= 0: return err("Gate 6d: expected overload_rejections counter to increment")
+
+    # 6e: Format Negotiation Policy (HTTP 406 Not Acceptable)
+    let r_notacc: ApiExchangeOutcome = test_api_call_state(session, db_name, "GET /readyz HTTP/1.1\r\nHost: localhost\r\nAccept: application/xml\r\n\r\n", auth_secret, state)?
+    set session = r_notacc.session
+    set state = r_notacc.state
+    if text_find(r_notacc.headers_text, "406 Not Acceptable") < 0: return err("Gate 6e: expected 406 Not Acceptable for unsupported Accept header")
+
+    let _cls: Result[Boolean, Text] = yaza_db_session_close_v1(session)
+    let _clr: Result[Boolean, Text] = close(initial_root)
+
+    say "api-config-profile-smoke: PASS"
+    return ok(0)
+
+start:
+    var root: Text = "/tmp/api-config-smoke-root"
+    if arg_count() >= 1: set root = arg(1)
+    let res: Result[Number, Text] = run_api_config_smoke(root)
+    if not result_is_ok(res):
+        fail("api-config-profile-smoke FAIL: " + result_unwrap_error(res))
+    exit(0)

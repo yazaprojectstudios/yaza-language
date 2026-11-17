@@ -1,0 +1,77 @@
+use "../yazabase/sql_binder_v1"
+use "../yazabase/sql_insert_v1"
+use "../yazabase/sql_insert_bind_v1"
+
+fn yaza_base_sql_insert_bind_v1_catalog() -> YazaSqlCatalogSnapshotV1:
+    let columns: List[YazaSqlColumnSchemaV1] = List[YazaSqlColumnSchemaV1]()
+    list_push(columns, YazaSqlColumnSchemaV1("id", 4, false, 0, 0, 0, ""))
+    list_push(columns, YazaSqlColumnSchemaV1("name", 9, true, 1, 0, 0, ""))
+    list_push(columns, YazaSqlColumnSchemaV1("active", 1, false, 2, 0, 0, ""))
+    let tables: List[YazaSqlTableSchemaV1] = List[YazaSqlTableSchemaV1]()
+    list_push(tables, YazaSqlTableSchemaV1(11, "users", columns))
+    return YazaSqlCatalogSnapshotV1(23, tables, List[YazaSqlColumnDefaultV1]())
+
+fn yaza_base_sql_insert_bind_v1_multirow(catalog: YazaSqlCatalogSnapshotV1) -> Boolean:
+    let source: Text = "INSERT INTO users (id, name, active) VALUES (1, :name, TRUE), (2, NULL, FALSE)"
+    let parsed: Result[YazaSqlInsertAstV1, Text] = yaza_sql_parse_insert_v1(source)
+    if not result_is_ok(parsed): return false
+    let bound: Result[YazaSqlBoundInsertPlanV1, Text] = yaza_sql_bind_insert_v1(source, result_unwrap(parsed), catalog)
+    if not result_is_ok(bound): return false
+    let plan: YazaSqlBoundInsertPlanV1 = result_unwrap(bound)
+    if plan.version != 1 or plan.catalog_version != 23 or plan.table_id != 11: return false
+    if list_count(plan.input_column_ordinals) != 3 or list_count(plan.rows) != 2: return false
+    if list_get(plan.input_column_ordinals, 0) != 0 or list_get(plan.input_column_ordinals, 2) != 2: return false
+    if list_count(plan.parameters) != 1 or plan.parameter_style != 3: return false
+    let parameter: YazaSqlBoundParameterV1 = list_get(plan.parameters, 0)
+    if parameter.key != "name" or parameter.type_id != 9 or parameter.occurrence_count != 1: return false
+    let first_row: YazaSqlBoundInsertRowV1 = list_get(plan.rows, 0)
+    let first_name: YazaSqlBoundInsertCellV1 = list_get(first_row.cells, 1)
+    if first_name.column_ordinal != 1 or first_name.type_id != 9 or first_name.parameter_ordinal != 0 or first_name.is_null_literal: return false
+    let second_row: YazaSqlBoundInsertRowV1 = list_get(plan.rows, 1)
+    let second_name: YazaSqlBoundInsertCellV1 = list_get(second_row.cells, 1)
+    return second_name.is_null_literal and second_name.parameter_ordinal == -1
+
+fn yaza_base_sql_insert_bind_v1_nullable_omission(catalog: YazaSqlCatalogSnapshotV1) -> Boolean:
+    let source: Text = "INSERT INTO users (id, active) VALUES (3, TRUE)"
+    let parsed: Result[YazaSqlInsertAstV1, Text] = yaza_sql_parse_insert_v1(source)
+    if not result_is_ok(parsed): return false
+    let bound: Result[YazaSqlBoundInsertPlanV1, Text] = yaza_sql_bind_insert_v1(source, result_unwrap(parsed), catalog)
+    if not result_is_ok(bound): return false
+    let plan: YazaSqlBoundInsertPlanV1 = result_unwrap(bound)
+    return list_count(list_get(plan.rows, 0).cells) == 2 and list_get(plan.input_column_ordinals, 1) == 2
+
+fn yaza_base_sql_insert_bind_v1_rejects(catalog: YazaSqlCatalogSnapshotV1) -> Boolean:
+    let omitted_required_source: Text = "INSERT INTO users (name) VALUES ('Ada')"
+    let omitted_required_parse: Result[YazaSqlInsertAstV1, Text] = yaza_sql_parse_insert_v1(omitted_required_source)
+    if not result_is_ok(omitted_required_parse): return false
+    if result_is_ok(yaza_sql_bind_insert_v1(omitted_required_source, result_unwrap(omitted_required_parse), catalog)): return false
+
+    let null_required_source: Text = "INSERT INTO users (id, name, active) VALUES (1, NULL, NULL)"
+    let null_required_parse: Result[YazaSqlInsertAstV1, Text] = yaza_sql_parse_insert_v1(null_required_source)
+    if not result_is_ok(null_required_parse): return false
+    if result_is_ok(yaza_sql_bind_insert_v1(null_required_source, result_unwrap(null_required_parse), catalog)): return false
+
+    let numeric_mismatch_source: Text = "INSERT INTO users (id, name, active) VALUES (1.5, 'Ada', TRUE)"
+    let numeric_mismatch_parse: Result[YazaSqlInsertAstV1, Text] = yaza_sql_parse_insert_v1(numeric_mismatch_source)
+    if not result_is_ok(numeric_mismatch_parse): return false
+    if result_is_ok(yaza_sql_bind_insert_v1(numeric_mismatch_source, result_unwrap(numeric_mismatch_parse), catalog)): return false
+
+    let mixed_parameters_source: Text = "INSERT INTO users (id, name, active) VALUES ($1, :name, TRUE)"
+    let mixed_parameters_parse: Result[YazaSqlInsertAstV1, Text] = yaza_sql_parse_insert_v1(mixed_parameters_source)
+    if not result_is_ok(mixed_parameters_parse): return false
+    if result_is_ok(yaza_sql_bind_insert_v1(mixed_parameters_source, result_unwrap(mixed_parameters_parse), catalog)): return false
+
+    let missing_column_source: Text = "INSERT INTO users (missing) VALUES (1)"
+    let missing_column_parse: Result[YazaSqlInsertAstV1, Text] = yaza_sql_parse_insert_v1(missing_column_source)
+    if not result_is_ok(missing_column_parse): return false
+    return not result_is_ok(yaza_sql_bind_insert_v1(missing_column_source, result_unwrap(missing_column_parse), catalog))
+
+start:
+    let initial_used: Number = arena_used()
+    arena_scope 524288:
+        let catalog: YazaSqlCatalogSnapshotV1 = yaza_base_sql_insert_bind_v1_catalog()
+        assert yaza_base_sql_insert_bind_v1_multirow(catalog)
+        assert yaza_base_sql_insert_bind_v1_nullable_omission(catalog)
+        assert yaza_base_sql_insert_bind_v1_rejects(catalog)
+    assert arena_used() == initial_used
+    say "yazabase-sql-insert-bind-v1-ok"

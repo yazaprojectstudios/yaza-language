@@ -1,0 +1,52 @@
+use "std/fs"
+use "../yazabase/wal_v1"
+
+fn yaza_base_wal_rotation_check(root_path: Text) -> Result[Number, Text]:
+    let root: Number = root_open(root_path)?
+    let payload: Bytes = bytes_try_new_zeroed(yaza_db_wal_max_record_size_v1() - yaza_db_wal_header_size_v1())?
+    let opened: YazaDbWalLogV1 = yaza_db_wal_log_open_v1(root)?
+    let first_input: YazaDbWalRecordV1 = YazaDbWalRecordV1(0, 0, 7, yaza_db_wal_type_leaf_insert_v1(), 0, payload)
+    let first: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(opened, first_input)?
+    if first.record.lsn != 0 or first.log.next_lsn != yaza_db_wal_max_record_size_v1(): return err("YDBv1 WAL first full record did not start at LSN zero")
+    let second_input: YazaDbWalRecordV1 = YazaDbWalRecordV1(0, first.record.lsn, 7, yaza_db_wal_type_leaf_insert_v1(), 0, payload)
+    let second: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(first.log, second_input)?
+    let third_input: YazaDbWalRecordV1 = YazaDbWalRecordV1(0, second.record.lsn, 7, yaza_db_wal_type_leaf_insert_v1(), 0, payload)
+    let third: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(second.log, third_input)?
+    let fourth_payload: Bytes = bytes_try_new_zeroed(yaza_db_wal_max_record_size_v1() - yaza_db_wal_header_size_v1() - 4 * 1048576)?
+    let fourth_input: YazaDbWalRecordV1 = YazaDbWalRecordV1(0, third.record.lsn, 7, yaza_db_wal_type_leaf_insert_v1(), 0, fourth_payload)
+    let fourth: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(third.log, fourth_input)?
+    let boundary_lsn: Number = yaza_db_wal_segment_size_v1()
+    let short_segment_end: Number = boundary_lsn - 4 * 1048576
+    if fourth.record.lsn != yaza_db_wal_max_record_size_v1() * 3 or fourth.log.next_lsn != short_segment_end: return err("YDBv1 WAL rotation fixture did not create the expected short segment tail")
+    let crossing_input: YazaDbWalRecordV1 = YazaDbWalRecordV1(0, fourth.record.lsn, 7, yaza_db_wal_type_leaf_insert_v1(), 0, payload)
+    let rotated: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(fourth.log, crossing_input)?
+    if rotated.log.segment_index != 1 or rotated.record.lsn != yaza_db_wal_segment_size_v1(): return err("YDBv1 WAL appender did not rotate to the next segment boundary")
+    let rotated_size: Number = file_size(rotated.log.file)?
+    if rotated_size != yaza_db_wal_max_record_size_v1(): return err("YDBv1 rotated WAL physical length does not match its written record end")
+    let expected_end: Number = yaza_db_wal_segment_size_v1() + yaza_db_wal_max_record_size_v1()
+    if rotated.log.next_lsn != expected_end: return err("YDBv1 WAL rotated append returned the wrong next LSN")
+    let closed: Boolean = yaza_db_wal_log_close_v1(rotated.log)?
+    if not closed: return err("YDBv1 rotated WAL close failed")
+    let reopened: YazaDbWalLogV1 = yaza_db_wal_log_open_v1(root)?
+    if reopened.segment_index != 1 or reopened.next_lsn != expected_end: return err("YDBv1 multi-segment recovery found the wrong active end")
+    let rotated_by_lsn: YazaDbWalRecordV1 = yaza_db_wal_read_record_at_v1(root, reopened.db_uuid, rotated.record.lsn, expected_end)?
+    if rotated_by_lsn.lsn != boundary_lsn or rotated_by_lsn.rec_type != rotated.record.rec_type or bytes_length(rotated_by_lsn.payload) != bytes_length(rotated.record.payload): return err("YDBv1 WAL absolute-LSN reader failed across a segment rotation")
+    let closed_reopened: Boolean = yaza_db_wal_log_close_v1(reopened)?
+    if not closed_reopened: return err("YDBv1 reopened rotated WAL close failed")
+    let first_name: Text = yaza_db_wal_segment_name_v1(0)?
+    let second_name: Text = yaza_db_wal_segment_name_v1(1)?
+    let removed_first: Boolean = remove(root, first_name)?
+    let removed_second: Boolean = remove(root, second_name)?
+    if not removed_first or not removed_second: return err("YDBv1 WAL rotation fixture could not remove segment files")
+    let synced_directory: Boolean = sync_directory(root)?
+    if not synced_directory: return err("YDBv1 WAL rotation fixture cleanup directory sync failed")
+    let root_closed: Boolean = close(root)?
+    if not root_closed: return err("YDBv1 WAL rotation fixture root close failed")
+    return ok(expected_end)
+
+start:
+    let outcome: Result[Number, Text] = yaza_base_wal_rotation_check(arg(1))
+    if result_is_ok(outcome):
+        say "yazabase-wal-rotation-ok next-lsn=" + number_text(result_unwrap(outcome))
+    else:
+        say result_unwrap_error(outcome)

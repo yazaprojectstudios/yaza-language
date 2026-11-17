@@ -1,0 +1,121 @@
+# Bounded UPDATE parser for typed literals and existing SELECT predicates.
+# UPDATE requires WHERE and leaves predicate
+# binding to the existing SELECT parser/binder/executor.
+use "./sql_parser_v3"
+
+shape YazaSqlUpdateAssignmentV1:
+    column_name: YazaSqlNameV2
+    expression_column: YazaSqlNameV2
+    expression_operator: Number
+    expression_right_column: YazaSqlNameV2
+    expression_right_is_column: Boolean
+    value: YazaSqlTokenV1
+
+shape YazaSqlUpdateAstV1:
+    version: Number
+    table_name: YazaSqlNameV2
+    assignments: List[YazaSqlUpdateAssignmentV1]
+    predicate_select_source: Text
+    where_start_byte: Number
+
+fn yaza_sql_parse_update_v1(source: Text) -> Result[YazaSqlUpdateAstV1, Text]:
+    let source_length: Number = text_length(source)
+    if source_length < 1 or source_length > 65520: return err("SQL UPDATE source exceeds its bounded length")
+    let lexed: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(source)
+    if not result_is_ok(lexed): return err(result_unwrap_error(lexed))
+    let tokens: List[YazaSqlTokenV1] = result_unwrap(lexed)
+    let token_count: Number = list_count(tokens)
+    if token_count < 6: return err("SQL UPDATE requires a target, SET assignment, and WHERE predicate")
+    if not yaza_sql_v2_is_keyword(source, tokens, 0, "UPDATE"): return err("SQL UPDATE parser expected UPDATE at the start of the statement")
+    let table_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, 1, false)
+    if not result_is_ok(table_result): return err(result_unwrap_error(table_result))
+    let table_name: YazaSqlNameV2 = result_unwrap(table_result)
+    if table_name.part_count != 1: return err(yaza_sql_v2_parse_error(source, tokens, 1, "SQL UPDATE supports one-part table names only at byte "))
+    var cursor: Number = 1 + table_name.consumed_tokens
+    if not yaza_sql_v2_is_keyword(source, tokens, cursor, "SET"): return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL UPDATE expected SET after its target at byte "))
+    set cursor = cursor + 1
+    let assignments_result: Result[List[YazaSqlUpdateAssignmentV1], Text] = list_try_new()
+    if not result_is_ok(assignments_result): return err("SQL UPDATE could not allocate assignment metadata")
+    let assignments: List[YazaSqlUpdateAssignmentV1] = result_unwrap(assignments_result)
+    var where_token_index: Number = -1
+    var assignments_done: Boolean = false
+    while not assignments_done:
+        let name_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, cursor, false)
+        if not result_is_ok(name_result): return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL UPDATE expected a column name at byte "))
+        let column_name: YazaSqlNameV2 = result_unwrap(name_result)
+        if column_name.part_count != 1: return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL UPDATE supports unqualified column names only at byte "))
+        set cursor = cursor + column_name.consumed_tokens
+        if not yaza_sql_v2_is_symbol(source, tokens, cursor, 61): return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL UPDATE expected '=' after its column name at byte "))
+        set cursor = cursor + 1
+        if cursor >= token_count - 1: return err("SQL UPDATE assignment is missing its value")
+        let empty_expression_column: YazaSqlNameV2 = YazaSqlNameV2(YazaSqlTokenV1(0, 0, 0), YazaSqlTokenV1(0, 0, 0), YazaSqlTokenV1(0, 0, 0), 0, false, 0, 0, 0)
+        let first_value: YazaSqlTokenV1 = list_get(tokens, cursor)
+        var expression_column: YazaSqlNameV2 = empty_expression_column
+        var expression_right_column: YazaSqlNameV2 = empty_expression_column
+        var expression_right_is_column: Boolean = false
+        var expression_operator: Number = 0
+        var value_index: Number = cursor
+        var value_advance: Number = 1
+        if (first_value.kind == 1 or first_value.kind == 2) and not yaza_sql_v2_is_keyword(source, tokens, cursor, "NULL") and not yaza_sql_v2_is_keyword(source, tokens, cursor, "TRUE") and not yaza_sql_v2_is_keyword(source, tokens, cursor, "FALSE") and not yaza_sql_v2_is_keyword(source, tokens, cursor, "DEFAULT"):
+            let expression_column_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, cursor, false)
+            if not result_is_ok(expression_column_result): return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL UPDATE expected a source column at byte "))
+            let parsed_expression_column: YazaSqlNameV2 = result_unwrap(expression_column_result)
+            if parsed_expression_column.part_count != 1: return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL UPDATE expressions support unqualified source columns only at byte "))
+            let operator_index: Number = cursor + parsed_expression_column.consumed_tokens
+            if yaza_sql_v2_is_symbol(source, tokens, operator_index, 43): set expression_operator = 43
+            elif yaza_sql_v2_is_symbol(source, tokens, operator_index, 45): set expression_operator = 45
+            elif yaza_sql_v2_is_symbol(source, tokens, operator_index, 42): set expression_operator = 42
+            elif yaza_sql_v2_is_symbol(source, tokens, operator_index, 47): set expression_operator = 47
+            elif yaza_sql_v2_is_symbol(source, tokens, operator_index, 37): set expression_operator = 37
+            if expression_operator != 0:
+                set expression_column = parsed_expression_column
+                set value_index = operator_index + 1
+                set value_advance = parsed_expression_column.consumed_tokens + 2
+            else:
+                set expression_right_column = parsed_expression_column
+                set expression_right_is_column = true
+                set value_advance = parsed_expression_column.consumed_tokens
+        if value_index >= token_count - 1: return err("SQL UPDATE expression is missing its right operand")
+        let first_operand: YazaSqlTokenV1 = list_get(tokens, value_index)
+        var value: YazaSqlTokenV1 = first_operand
+        var value_valid: Boolean = false
+        if expression_operator != 0 and (first_operand.kind == 1 or first_operand.kind == 2) and not yaza_sql_v2_is_keyword(source, tokens, value_index, "NULL") and not yaza_sql_v2_is_keyword(source, tokens, value_index, "TRUE") and not yaza_sql_v2_is_keyword(source, tokens, value_index, "FALSE") and not yaza_sql_v2_is_keyword(source, tokens, value_index, "DEFAULT"):
+            let right_column_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, value_index, false)
+            if not result_is_ok(right_column_result): return err(yaza_sql_v2_parse_error(source, tokens, value_index, "SQL UPDATE expected a right source column at byte "))
+            let parsed_right_column: YazaSqlNameV2 = result_unwrap(right_column_result)
+            if parsed_right_column.part_count != 1: return err(yaza_sql_v2_parse_error(source, tokens, value_index, "SQL UPDATE expressions support unqualified source columns only at byte "))
+            set expression_right_column = parsed_right_column
+            set expression_right_is_column = true
+            set value_advance = expression_column.consumed_tokens + 1 + parsed_right_column.consumed_tokens
+        else:
+            set value_valid = first_operand.kind == 3 or first_operand.kind == 4 or first_operand.kind == 5
+        if not expression_right_is_column and yaza_sql_v2_is_symbol(source, tokens, value_index, 45) and value_index + 1 < token_count - 1:
+            let magnitude: YazaSqlTokenV1 = list_get(tokens, value_index + 1)
+            if magnitude.kind == 3:
+                set value = YazaSqlTokenV1(3, first_operand.start_byte, magnitude.end_byte)
+                set value_advance = value_advance + 1
+                set value_valid = true
+        if yaza_sql_v2_is_keyword(source, tokens, value_index, "NULL") or yaza_sql_v2_is_keyword(source, tokens, value_index, "TRUE") or yaza_sql_v2_is_keyword(source, tokens, value_index, "FALSE") or yaza_sql_v2_is_keyword(source, tokens, value_index, "DEFAULT"):
+            set value_valid = true
+        if not expression_right_is_column and not value_valid: return err(yaza_sql_v2_parse_error(source, tokens, value_index, "SQL UPDATE SET accepts a typed literal, bind parameter, DEFAULT, or source column at byte "))
+        if expression_operator != 0 and not expression_right_is_column and first_operand.kind != 3 and first_operand.kind != 5 and not yaza_sql_v2_is_symbol(source, tokens, value_index, 45): return err(yaza_sql_v2_parse_error(source, tokens, value_index, "SQL UPDATE arithmetic expression requires a numeric literal, bind parameter, or same-typed source column at byte "))
+        if list_count(assignments) >= 1024 or not list_try_push(assignments, YazaSqlUpdateAssignmentV1(column_name, expression_column, expression_operator, expression_right_column, expression_right_is_column, value)): return err("SQL UPDATE assignment count or allocation exceeds its bound")
+        set cursor = cursor + value_advance
+        if yaza_sql_v2_is_symbol(source, tokens, cursor, 44):
+            set cursor = cursor + 1
+        elif yaza_sql_v2_is_keyword(source, tokens, cursor, "WHERE"):
+            set where_token_index = cursor
+            set assignments_done = true
+        else:
+            return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL UPDATE expected ',' or WHERE after an assignment at byte "))
+    if list_count(assignments) == 0 or where_token_index < 0: return err("SQL UPDATE requires at least one assignment and a WHERE predicate")
+    let where_token: YazaSqlTokenV1 = list_get(tokens, where_token_index)
+    if where_token_index + 1 >= token_count - 1: return err("SQL UPDATE WHERE clause requires a predicate")
+    let table_text_result: Result[Text, Text] = text_try_slice(source, table_name.start_byte, table_name.end_byte - table_name.start_byte)
+    let predicate_text_result: Result[Text, Text] = text_try_slice(source, where_token.start_byte, source_length - where_token.start_byte)
+    if not result_is_ok(table_text_result) or not result_is_ok(predicate_text_result): return err("SQL UPDATE could not read its target or predicate")
+    let select_source: Text = "SELECT * FROM " + result_unwrap(table_text_result) + " " + result_unwrap(predicate_text_result)
+    let parsed: YazaSqlSelectAstV3 = yaza_sql_parse_select_v3(select_source)?
+    if parsed.distinct or parsed.has_limit or list_count(parsed.order_by) != 0: return err("SQL UPDATE predicate does not support DISTINCT, ORDER BY, or LIMIT")
+    if list_count(parsed.projections) != 1 or not list_get(parsed.projections, 0).name.wildcard: return err("SQL UPDATE internal predicate query must project every row column")
+    return ok(YazaSqlUpdateAstV1(1, table_name, assignments, select_source, where_token.start_byte))

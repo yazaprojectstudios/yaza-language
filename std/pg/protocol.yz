@@ -1,0 +1,1088 @@
+# PostgreSQL v3 frontend/backend wire framing.
+# This module implements protocol bytes in YAZA; transport and TLS are separate.
+
+shape PgColumnDescription:
+    name: Text
+    table_oid: Number
+    attribute_number: Number
+    type_oid: Number
+    type_size: Number
+    type_modifier: Number
+    format_code: Number
+
+shape PgServerError:
+    severity: Text
+    sqlstate: Text
+    message: Text
+    detail: Option[Text]
+    hint: Option[Text]
+
+shape PgBackendKeyData:
+    process_id: Number
+    secret_key: Number
+
+shape PgParameterStatus:
+    name: Text
+    value: Text
+
+shape PgQueryResult:
+    column_metadata: TextList
+    cell_values: TextList
+    cell_is_null: TextList
+    command_tag: Text
+    command_count: Number
+    row_count: Number
+    transaction_status: PgTransactionStatus
+
+shape PgParameters:
+    values: TextList
+    null_flags: TextList
+    type_oids: TextList
+
+shape PgBackendFrame:
+    tag: Number
+    payload: Bytes
+
+variant PgAuthentication:
+    Accepted
+    CleartextPassword
+    Md5Password(salt: Bytes)
+    Sasl(mechanisms: Bytes)
+    SaslContinue(data: Bytes)
+    SaslFinal(data: Bytes)
+    Unsupported(code: Number)
+
+variant PgTransactionStatus:
+    Idle
+    InTransaction
+    FailedTransaction
+
+variant PgValue:
+    Null
+    TextValue(value: Text)
+    NumberValue(value: Number)
+    BooleanValue(value: Boolean)
+    BytesValue(value: Bytes)
+
+fn pg_parameters_new() -> PgParameters:
+    return PgParameters(text_list(), text_list(), text_list())
+
+fn pg_parameters_validate(parameters: PgParameters) -> Result[Boolean, Text]:
+    let parameter_count: Number = list_count(parameters.values)
+    if parameter_count > 1024 or list_count(parameters.null_flags) != parameter_count or list_count(parameters.type_oids) != parameter_count:
+        return err("postgres parameters: values, null flags, and type OIDs must have matching counts up to 1024")
+    var aggregate_bytes: Number = 0
+    var index: Number = 0
+    while index < parameter_count:
+        let null_flag: Text = list_get(parameters.null_flags, index)
+        if null_flag != "0" and null_flag != "1":
+            return err("postgres parameters: null flag must be 0 or 1")
+        let parsed_oid: Result[Number, Text] = pg_parse_int64_text(list_get(parameters.type_oids, index))
+        if not result_is_ok(parsed_oid):
+            return err("postgres parameters: type OID must be a decimal integer")
+        let type_oid: Number = result_unwrap(parsed_oid)
+        if type_oid < 0 or type_oid > 4294967295:
+            return err("postgres parameters: type OID is outside the uint32 range")
+        if null_flag == "0":
+            let value: Text = list_get(parameters.values, index)
+            if pg_text_contains_nul(value):
+                return err("postgres parameters: text-format values must not contain NUL")
+            let value_bytes: Number = bytes_length(bytes_from_text(value))
+            if value_bytes > 1048576 or aggregate_bytes > 1048576 - value_bytes:
+                return err("postgres parameters: encoded values exceed the 1 MiB aggregate limit")
+            set aggregate_bytes = aggregate_bytes + value_bytes
+        set index = index + 1
+    return ok(true)
+
+fn pg_parameters_add_value(parameters: PgParameters, value: Text, null_flag: Text, type_oid: Number) -> Result[Boolean, Text]:
+    let valid: Result[Boolean, Text] = pg_parameters_validate(parameters)
+    if not result_is_ok(valid):
+        return err(result_unwrap_error(valid))
+    if list_count(parameters.values) >= 1024:
+        return err("postgres parameters: maximum parameter count is 1024")
+    if null_flag != "0" and null_flag != "1":
+        return err("postgres parameters: null flag must be 0 or 1")
+    if type_oid < 0 or type_oid > 4294967295:
+        return err("postgres parameters: type OID is outside the uint32 range")
+    if null_flag == "0":
+        if pg_text_contains_nul(value):
+            return err("postgres parameters: text-format values must not contain NUL")
+        let value_bytes: Number = bytes_length(bytes_from_text(value))
+        if value_bytes > 1048576:
+            return err("postgres parameters: one encoded value exceeds the 1 MiB limit")
+        var aggregate_bytes: Number = value_bytes
+        var index: Number = 0
+        while index < list_count(parameters.values):
+            if list_get(parameters.null_flags, index) == "0":
+                let prior_bytes: Number = bytes_length(bytes_from_text(list_get(parameters.values, index)))
+                if aggregate_bytes > 1048576 - prior_bytes:
+                    return err("postgres parameters: encoded values exceed the 1 MiB aggregate limit")
+                set aggregate_bytes = aggregate_bytes + prior_bytes
+            set index = index + 1
+    list_push(parameters.values, value)
+    list_push(parameters.null_flags, null_flag)
+    list_push(parameters.type_oids, number_text(type_oid))
+    return ok(true)
+
+fn pg_parameters_add_text(parameters: PgParameters, value: Text) -> Result[Boolean, Text]:
+    return pg_parameters_add_text_as(parameters, value, 25)
+
+fn pg_parameters_add_text_as(parameters: PgParameters, value: Text, type_oid: Number) -> Result[Boolean, Text]:
+    return pg_parameters_add_value(parameters, value, "0", type_oid)
+
+fn pg_parameters_add_number(parameters: PgParameters, value: Number) -> Result[Boolean, Text]:
+    return pg_parameters_add_value(parameters, number_text(value), "0", 20)
+
+fn pg_parameters_add_int32(parameters: PgParameters, value: Int32) -> Result[Boolean, Text]:
+    return pg_parameters_add_value(parameters, int32_text(value), "0", 23)
+
+fn pg_parameters_add_float64(parameters: PgParameters, value: Float64) -> Result[Boolean, Text]:
+    return pg_parameters_add_value(parameters, float64_text(value), "0", 701)
+
+fn pg_parameters_add_boolean(parameters: PgParameters, value: Boolean) -> Result[Boolean, Text]:
+    if value:
+        return pg_parameters_add_value(parameters, "true", "0", 16)
+    return pg_parameters_add_value(parameters, "false", "0", 16)
+
+fn pg_parameters_add_null(parameters: PgParameters, type_oid: Number) -> Result[Boolean, Text]:
+    return pg_parameters_add_value(parameters, "", "1", type_oid)
+
+fn pg_parameters_add_bytes(parameters: PgParameters, value: Bytes) -> Result[Boolean, Text]:
+    let byte_count: Number = bytes_length(value)
+    if byte_count > 524287:
+        return err("postgres parameters: bytea value exceeds the 1 MiB text-encoding limit")
+    let slash: Option[Text] = bytes_to_text_checked(bytes_from_number(92))
+    if not option_is_some(slash):
+        return err("postgres parameters: runtime cannot encode the bytea prefix")
+    let alphabet: Text = "0123456789abcdef"
+    var encoded: Text = option_unwrap(slash) + "x"
+    var index: Number = 0
+    while index < byte_count:
+        let byte: Number = bytes_get(value, index)
+        set encoded = encoded + text_slice(alphabet, byte / 16, 1) + text_slice(alphabet, byte % 16, 1)
+        set index = index + 1
+    return pg_parameters_add_value(parameters, encoded, "0", 17)
+
+fn pg_simple_query_message(sql: Text) -> Result[Bytes, Text]:
+    let sql_bytes: Bytes = bytes_from_text(sql)
+    let sql_length: Number = bytes_length(sql_bytes)
+    if sql_length == 0:
+        return err("postgres protocol: SQL text must not be empty")
+    if sql_length > 1048576:
+        return err("postgres protocol: SQL text exceeds the 1 MiB limit")
+    var index: Number = 0
+    while index < sql_length:
+        if bytes_get(sql_bytes, index) == 0:
+            return err("postgres protocol: SQL text must not contain NUL")
+        set index = index + 1
+    return pg_frontend_message("Q", pg_cstring(sql))
+
+fn pg_query_column_count(result: PgQueryResult) -> Number:
+    if list_count(result.column_metadata) % 7 != 0:
+        return -1
+    return list_count(result.column_metadata) / 7
+
+fn pg_query_column(result: PgQueryResult, index: Number) -> Result[PgColumnDescription, Text]:
+    let count: Number = pg_query_column_count(result)
+    if count < 0 or count > 1024:
+        return err("postgres query: column metadata is malformed or exceeds 1024 columns")
+    if index < 0 or index >= count:
+        return err("postgres query: column index is out of range")
+    let offset: Number = index * 7
+    let metadata: TextList = result.column_metadata
+    let table_oid: Result[Number, Text] = pg_parse_int64_text(list_get(metadata, offset + 1))
+    let attribute_number: Result[Number, Text] = pg_parse_int64_text(list_get(metadata, offset + 2))
+    let type_oid: Result[Number, Text] = pg_parse_int64_text(list_get(metadata, offset + 3))
+    let type_size: Result[Number, Text] = pg_parse_int64_text(list_get(metadata, offset + 4))
+    let type_modifier: Result[Number, Text] = pg_parse_int64_text(list_get(metadata, offset + 5))
+    let format_code: Result[Number, Text] = pg_parse_int64_text(list_get(metadata, offset + 6))
+    if not result_is_ok(table_oid) or not result_is_ok(attribute_number) or not result_is_ok(type_oid) or not result_is_ok(type_size) or not result_is_ok(type_modifier) or not result_is_ok(format_code):
+        return err("postgres query: column metadata contains a malformed integer")
+    let table_value: Number = result_unwrap(table_oid)
+    let attribute_value: Number = result_unwrap(attribute_number)
+    let type_value: Number = result_unwrap(type_oid)
+    let size_value: Number = result_unwrap(type_size)
+    let modifier_value: Number = result_unwrap(type_modifier)
+    let format_value: Number = result_unwrap(format_code)
+    if table_value < 0 or table_value > 4294967295 or attribute_value < -32768 or attribute_value > 32767 or type_value < 0 or type_value > 4294967295 or size_value < -32768 or size_value > 32767 or modifier_value < -2147483648 or modifier_value > 2147483647 or (format_value != 0 and format_value != 1):
+        return err("postgres query: column metadata integer is outside its protocol range")
+    return ok(PgColumnDescription(list_get(metadata, offset), table_value, attribute_value, type_value, size_value, modifier_value, format_value))
+
+fn pg_query_value(result: PgQueryResult, row_index: Number, column_index: Number) -> Result[PgValue, Text]:
+    let column_count: Number = pg_query_column_count(result)
+    if column_count < 0 or column_count > 1024 or result.row_count < 0 or result.row_count > 10000:
+        return err("postgres query: result shape is outside its declared bounds")
+    if row_index < 0 or row_index >= result.row_count:
+        return err("postgres query: row index is out of range")
+    if column_index < 0 or column_index >= column_count:
+        return err("postgres query: column index is out of range")
+    if column_count > 0 and result.row_count > 10000 / column_count:
+        return err("postgres query: result cell count exceeds its declared bound")
+    let expected_cells: Number = result.row_count * column_count
+    if list_count(result.cell_values) != expected_cells or list_count(result.cell_is_null) != expected_cells:
+        return err("postgres query: result cell storage is inconsistent")
+    let cell_index: Number = row_index * column_count + column_index
+    let null_marker: Text = list_get(result.cell_is_null, cell_index)
+    if null_marker != "0" and null_marker != "1":
+        return err("postgres query: result null marker is invalid")
+    let column_result: Result[PgColumnDescription, Text] = pg_query_column(result, column_index)
+    if not result_is_ok(column_result):
+        return err(result_unwrap_error(column_result))
+    var row_payload: Bytes = result_unwrap(pg_u16_be(1))
+    if null_marker == "1":
+        set row_payload = bytes_concat(row_payload, result_unwrap(pg_u32_be(4294967295)))
+    else:
+        let value: Bytes = bytes_from_text(list_get(result.cell_values, cell_index))
+        if bytes_length(value) > 67108864:
+            return err("postgres query: cell exceeds the 64 MiB protocol limit")
+        set row_payload = bytes_concat(row_payload, result_unwrap(pg_u32_be(bytes_length(value))))
+        set row_payload = bytes_concat(row_payload, value)
+    return pg_decode_data_row_value(result_unwrap(column_result), row_payload, 0)
+
+fn pg_query_number(result: PgQueryResult, row_index: Number, column_index: Number) -> Result[Option[Number], Text]:
+    let decoded: Result[PgValue, Text] = pg_query_value(result, row_index, column_index)
+    if not result_is_ok(decoded):
+        return err(result_unwrap_error(decoded))
+    match result_unwrap(decoded):
+        Null:
+            return ok(none)
+        NumberValue(value):
+            return ok(some(value))
+        TextValue(_):
+            return err("postgres query: selected column is not an integer value")
+        BooleanValue(_):
+            return err("postgres query: selected column is not an integer value")
+        BytesValue(_):
+            return err("postgres query: selected column is not an integer value")
+    return err("postgres query: unsupported column value variant")
+
+fn pg_query_boolean(result: PgQueryResult, row_index: Number, column_index: Number) -> Result[Option[Boolean], Text]:
+    let decoded: Result[PgValue, Text] = pg_query_value(result, row_index, column_index)
+    if not result_is_ok(decoded):
+        return err(result_unwrap_error(decoded))
+    match result_unwrap(decoded):
+        Null:
+            return ok(none)
+        BooleanValue(value):
+            return ok(some(value))
+        TextValue(_):
+            return err("postgres query: selected column is not a Boolean value")
+        NumberValue(_):
+            return err("postgres query: selected column is not a Boolean value")
+        BytesValue(_):
+            return err("postgres query: selected column is not a Boolean value")
+    return err("postgres query: unsupported column value variant")
+
+fn pg_query_text(result: PgQueryResult, row_index: Number, column_index: Number) -> Result[Option[Text], Text]:
+    let decoded: Result[PgValue, Text] = pg_query_value(result, row_index, column_index)
+    if not result_is_ok(decoded):
+        return err(result_unwrap_error(decoded))
+    match result_unwrap(decoded):
+        Null:
+            return ok(none)
+        TextValue(value):
+            return ok(some(value))
+        NumberValue(_):
+            return err("postgres query: selected column is not a text value")
+        BooleanValue(_):
+            return err("postgres query: selected column is not a text value")
+        BytesValue(_):
+            return err("postgres query: selected column is not a text value")
+    return err("postgres query: unsupported column value variant")
+
+fn pg_query_bytes(result: PgQueryResult, row_index: Number, column_index: Number) -> Result[Option[Bytes], Text]:
+    let decoded: Result[PgValue, Text] = pg_query_value(result, row_index, column_index)
+    if not result_is_ok(decoded):
+        return err(result_unwrap_error(decoded))
+    match result_unwrap(decoded):
+        Null:
+            return ok(none)
+        BytesValue(value):
+            return ok(some(value))
+        TextValue(_):
+            return err("postgres query: selected column is not a byte value")
+        NumberValue(_):
+            return err("postgres query: selected column is not a byte value")
+        BooleanValue(_):
+            return err("postgres query: selected column is not a byte value")
+    return err("postgres query: unsupported column value variant")
+
+fn pg_u32_be(value: Number) -> Result[Bytes, Text]:
+    if value < 0 or value > 4294967295:
+        return err("postgres protocol: uint32 value is out of range")
+    let first: Number = value / 16777216
+    let second: Number = (value / 65536) % 256
+    let third: Number = (value / 256) % 256
+    let fourth: Number = value % 256
+    let bytes: Bytes = bytes_concat(bytes_from_number(first), bytes_from_number(second))
+    let with_third: Bytes = bytes_concat(bytes, bytes_from_number(third))
+    return ok(bytes_concat(with_third, bytes_from_number(fourth)))
+
+fn pg_u16_be(value: Number) -> Result[Bytes, Text]:
+    if value < 0 or value > 65535:
+        return err("postgres protocol: uint16 value is out of range")
+    let high: Number = value / 256
+    let low: Number = value % 256
+    return ok(bytes_concat(bytes_from_number(high), bytes_from_number(low)))
+
+fn pg_read_u32_be(input: Bytes, offset: Number) -> Result[Number, Text]:
+    let length: Number = bytes_length(input)
+    if offset < 0 or offset > length - 4:
+        return err("postgres protocol: uint32 read is outside the input")
+    let first: Number = bytes_get(input, offset)
+    let second: Number = bytes_get(input, offset + 1)
+    let third: Number = bytes_get(input, offset + 2)
+    let fourth: Number = bytes_get(input, offset + 3)
+    return ok(first * 16777216 + second * 65536 + third * 256 + fourth)
+
+fn pg_read_u16_be(input: Bytes, offset: Number) -> Result[Number, Text]:
+    let length: Number = bytes_length(input)
+    if offset < 0 or offset > length - 2:
+        return err("postgres protocol: uint16 read is outside the input")
+    let first: Number = bytes_get(input, offset)
+    let second: Number = bytes_get(input, offset + 1)
+    return ok(first * 256 + second)
+
+fn pg_read_i16_be(input: Bytes, offset: Number) -> Result[Number, Text]:
+    let encoded: Result[Number, Text] = pg_read_u16_be(input, offset)
+    if not result_is_ok(encoded):
+        return err(result_unwrap_error(encoded))
+    let value: Number = result_unwrap(encoded)
+    if value >= 32768:
+        return ok(value - 65536)
+    return ok(value)
+
+fn pg_read_i32_be(input: Bytes, offset: Number) -> Result[Number, Text]:
+    let encoded: Result[Number, Text] = pg_read_u32_be(input, offset)
+    if not result_is_ok(encoded):
+        return err(result_unwrap_error(encoded))
+    let value: Number = result_unwrap(encoded)
+    if value >= 2147483648:
+        return ok(value - 4294967296)
+    return ok(value)
+
+fn pg_cstring(value: Text) -> Bytes:
+    let text_bytes: Bytes = bytes_from_text(value)
+    return bytes_concat(text_bytes, bytes_from_number(0))
+
+fn pg_text_contains_nul(value: Text) -> Boolean:
+    let input: Bytes = bytes_from_text(value)
+    var index: Number = 0
+    while index < bytes_length(input):
+        if bytes_get(input, index) == 0:
+            return true
+        set index = index + 1
+    return false
+
+fn pg_startup_packet(username: Text, database: Text) -> Result[Bytes, Text]:
+    if text_length(username) == 0 or text_length(database) == 0:
+        return err("postgres protocol: username and database must not be empty")
+    if pg_text_contains_nul(username) or pg_text_contains_nul(database):
+        return err("postgres protocol: startup values must not contain NUL")
+    if bytes_length(bytes_from_text(username)) > 1023 or bytes_length(bytes_from_text(database)) > 1023:
+        return err("postgres protocol: username or database exceeds the 1023-byte limit")
+    let version: Result[Bytes, Text] = pg_u32_be(196608)
+    if not result_is_ok(version):
+        return err(result_unwrap_error(version))
+    var body: Bytes = result_unwrap(version)
+    set body = bytes_concat(body, pg_cstring("user"))
+    set body = bytes_concat(body, pg_cstring(username))
+    set body = bytes_concat(body, pg_cstring("database"))
+    set body = bytes_concat(body, pg_cstring(database))
+    set body = bytes_concat(body, pg_cstring("application_name"))
+    set body = bytes_concat(body, pg_cstring("YAZA"))
+    set body = bytes_concat(body, pg_cstring("client_encoding"))
+    set body = bytes_concat(body, pg_cstring("UTF8"))
+    set body = bytes_concat(body, bytes_from_number(0))
+    let packet_length: Number = bytes_length(body) + 4
+    if packet_length > 10000:
+        return err("postgres protocol: startup packet exceeds the PostgreSQL 10,000-byte limit")
+    let length: Result[Bytes, Text] = pg_u32_be(packet_length)
+    if not result_is_ok(length):
+        return err(result_unwrap_error(length))
+    return ok(bytes_concat(result_unwrap(length), body))
+
+fn pg_ssl_request() -> Result[Bytes, Text]:
+    let length: Result[Bytes, Text] = pg_u32_be(8)
+    if not result_is_ok(length):
+        return err(result_unwrap_error(length))
+    let code: Result[Bytes, Text] = pg_u32_be(80877103)
+    if not result_is_ok(code):
+        return err(result_unwrap_error(code))
+    return ok(bytes_concat(result_unwrap(length), result_unwrap(code)))
+
+fn pg_parse_ssl_response(response: Bytes) -> Result[Boolean, Text]:
+    if bytes_length(response) != 1:
+        return err("postgres protocol: SSL response must be exactly one byte")
+    let code: Number = bytes_get(response, 0)
+    if code == 83:
+        return ok(true)
+    if code == 78:
+        return ok(false)
+    return err("postgres protocol: SSL response must be S or N")
+
+fn pg_gssenc_request() -> Result[Bytes, Text]:
+    let length: Result[Bytes, Text] = pg_u32_be(8)
+    if not result_is_ok(length):
+        return err(result_unwrap_error(length))
+    let code: Result[Bytes, Text] = pg_u32_be(80877104)
+    if not result_is_ok(code):
+        return err(result_unwrap_error(code))
+    return ok(bytes_concat(result_unwrap(length), result_unwrap(code)))
+
+fn pg_cancel_request(process_id: Number, secret_key: Number) -> Result[Bytes, Text]:
+    let length: Result[Bytes, Text] = pg_u32_be(16)
+    if not result_is_ok(length):
+        return err(result_unwrap_error(length))
+    let code: Result[Bytes, Text] = pg_u32_be(80877102)
+    if not result_is_ok(code):
+        return err(result_unwrap_error(code))
+    let process: Result[Bytes, Text] = pg_u32_be(process_id)
+    if not result_is_ok(process):
+        return err(result_unwrap_error(process))
+    let key: Result[Bytes, Text] = pg_u32_be(secret_key)
+    if not result_is_ok(key):
+        return err(result_unwrap_error(key))
+    let initial: Bytes = bytes_concat(result_unwrap(length), result_unwrap(code))
+    let with_process: Bytes = bytes_concat(initial, result_unwrap(process))
+    return ok(bytes_concat(with_process, result_unwrap(key)))
+
+fn pg_frontend_message(tag: Text, payload: Bytes) -> Result[Bytes, Text]:
+    if text_length(tag) != 1:
+        return err("postgres protocol: message tag must be one byte")
+    let tag_byte: Number = text_byte(tag, 0)
+    if tag_byte < 33 or tag_byte > 126:
+        return err("postgres protocol: message tag must be printable ASCII")
+    let payload_length: Number = bytes_length(payload)
+    if payload_length > 67108860:
+        return err("postgres protocol: message exceeds the 64 MiB limit")
+    let length: Result[Bytes, Text] = pg_u32_be(payload_length + 4)
+    if not result_is_ok(length):
+        return err(result_unwrap_error(length))
+    let tag_bytes: Bytes = bytes_from_number(tag_byte)
+    let with_length: Bytes = bytes_concat(tag_bytes, result_unwrap(length))
+    return ok(bytes_concat(with_length, payload))
+
+fn pg_parse_message(statement_name: Text, sql: Text) -> Result[Bytes, Text]:
+    return pg_parse_message_with_oids(statement_name, sql, text_list())
+
+fn pg_parse_message_with_oids(statement_name: Text, sql: Text, parameter_type_oids: TextList) -> Result[Bytes, Text]:
+    if bytes_length(bytes_from_text(statement_name)) > 1023:
+        return err("postgres protocol: statement name exceeds 1023 bytes")
+    if pg_text_contains_nul(statement_name):
+        return err("postgres protocol: statement name must not contain NUL")
+    if bytes_length(bytes_from_text(sql)) > 1048576:
+        return err("postgres protocol: SQL text exceeds 1 MiB")
+    if pg_text_contains_nul(sql):
+        return err("postgres protocol: SQL text must not contain NUL")
+    let parameter_count: Number = list_count(parameter_type_oids)
+    if parameter_count > 1024:
+        return err("postgres protocol: Parse exceeds the 1024-parameter limit")
+    let count_bytes: Result[Bytes, Text] = pg_u16_be(parameter_count)
+    if not result_is_ok(count_bytes):
+        return err(result_unwrap_error(count_bytes))
+    var parameter_types: Bytes = bytes_from_text("")
+    var parameter_index: Number = 0
+    while parameter_index < parameter_count:
+        let parsed_oid: Result[Number, Text] = pg_parse_int64_text(list_get(parameter_type_oids, parameter_index))
+        if not result_is_ok(parsed_oid):
+            return err("postgres protocol: parameter type OID must be a decimal integer")
+        let oid: Number = result_unwrap(parsed_oid)
+        if oid < 0 or oid > 4294967295:
+            return err("postgres protocol: parameter type OID is outside the uint32 range")
+        let encoded_oid: Result[Bytes, Text] = pg_u32_be(oid)
+        if not result_is_ok(encoded_oid):
+            return err(result_unwrap_error(encoded_oid))
+        set parameter_types = bytes_concat(parameter_types, result_unwrap(encoded_oid))
+        set parameter_index = parameter_index + 1
+    let statement: Bytes = pg_cstring(statement_name)
+    let statement_and_sql: Bytes = bytes_concat(statement, pg_cstring(sql))
+    let payload: Bytes = bytes_concat(statement_and_sql, result_unwrap(count_bytes))
+    return pg_frontend_message("P", bytes_concat(payload, parameter_types))
+
+fn pg_bind_text_message(portal_name: Text, statement_name: Text, parameters: TextList) -> Result[Bytes, Text]:
+    if list_count(parameters) > 1024:
+        return err("postgres protocol: Bind exceeds the 1024-parameter limit")
+    let null_flags: TextList = text_list()
+    var index: Number = 0
+    while index < list_count(parameters):
+        list_push(null_flags, "0")
+        set index = index + 1
+    return pg_bind_values_message(portal_name, statement_name, parameters, null_flags)
+
+fn pg_bind_values_message(portal_name: Text, statement_name: Text, parameters: TextList, null_flags: TextList) -> Result[Bytes, Text]:
+    if bytes_length(bytes_from_text(portal_name)) > 1023 or bytes_length(bytes_from_text(statement_name)) > 1023:
+        return err("postgres protocol: portal or statement name exceeds 1023 bytes")
+    if pg_text_contains_nul(portal_name) or pg_text_contains_nul(statement_name):
+        return err("postgres protocol: portal and statement names must not contain NUL")
+    let parameter_count: Number = list_count(parameters)
+    if parameter_count > 1024 or list_count(null_flags) != parameter_count:
+        return err("postgres protocol: Bind parameter values and null flags have inconsistent counts")
+    let zero_formats: Result[Bytes, Text] = pg_u16_be(0)
+    let count_bytes: Result[Bytes, Text] = pg_u16_be(parameter_count)
+    if not result_is_ok(zero_formats) or not result_is_ok(count_bytes):
+        return err("postgres protocol: Bind format or parameter count is out of range")
+    var payload: Bytes = bytes_concat(pg_cstring(portal_name), pg_cstring(statement_name))
+    set payload = bytes_concat(payload, result_unwrap(zero_formats))
+    set payload = bytes_concat(payload, result_unwrap(count_bytes))
+    var total_value_bytes: Number = 0
+    var index: Number = 0
+    while index < parameter_count:
+        let null_flag: Text = list_get(null_flags, index)
+        if null_flag != "0" and null_flag != "1":
+            return err("postgres protocol: Bind null flag must be 0 or 1")
+        if null_flag == "1":
+            set payload = bytes_concat(payload, result_unwrap(pg_u32_be(4294967295)))
+        else:
+            let value: Bytes = bytes_from_text(list_get(parameters, index))
+            let value_length: Number = bytes_length(value)
+            if value_length > 1048576 or total_value_bytes > 1048576 - value_length:
+                return err("postgres protocol: Bind values exceed the 1 MiB aggregate limit")
+            if pg_text_contains_nul(list_get(parameters, index)):
+                return err("postgres protocol: Bind text values must not contain NUL")
+            set total_value_bytes = total_value_bytes + value_length
+            let field_length: Result[Bytes, Text] = pg_u32_be(value_length)
+            if not result_is_ok(field_length):
+                return err(result_unwrap_error(field_length))
+            set payload = bytes_concat(payload, result_unwrap(field_length))
+            set payload = bytes_concat(payload, value)
+        if bytes_length(payload) > 1048576:
+            return err("postgres protocol: Bind payload exceeds the 1 MiB limit")
+        set index = index + 1
+    let result_format_count: Result[Bytes, Text] = pg_u16_be(0)
+    if not result_is_ok(result_format_count):
+        return err(result_unwrap_error(result_format_count))
+    set payload = bytes_concat(payload, result_unwrap(result_format_count))
+    return pg_frontend_message("B", payload)
+
+fn pg_describe_message(target: Text, name: Text) -> Result[Bytes, Text]:
+    if target != "S" and target != "P":
+        return err("postgres protocol: Describe target must be statement or portal")
+    if bytes_length(bytes_from_text(name)) > 1023:
+        return err("postgres protocol: Describe name exceeds 1023 bytes")
+    let target_byte: Bytes = bytes_from_number(text_byte(target, 0))
+    return pg_frontend_message("D", bytes_concat(target_byte, pg_cstring(name)))
+
+fn pg_execute_message(portal_name: Text, max_rows: Number) -> Result[Bytes, Text]:
+    if bytes_length(bytes_from_text(portal_name)) > 1023:
+        return err("postgres protocol: Execute portal name exceeds 1023 bytes")
+    let row_limit: Result[Bytes, Text] = pg_u32_be(max_rows)
+    if not result_is_ok(row_limit):
+        return err(result_unwrap_error(row_limit))
+    return pg_frontend_message("E", bytes_concat(pg_cstring(portal_name), result_unwrap(row_limit)))
+
+fn pg_sync_message() -> Result[Bytes, Text]:
+    return pg_frontend_message("S", bytes_from_text(""))
+
+fn pg_extended_query_message(sql: Text, parameters: TextList, null_flags: TextList) -> Result[Bytes, Text]:
+    return pg_extended_query_message_with_oids(sql, parameters, null_flags, text_list())
+
+fn pg_extended_query_message_with_oids(sql: Text, parameters: TextList, null_flags: TextList, parameter_type_oids: TextList) -> Result[Bytes, Text]:
+    if list_count(parameter_type_oids) != 0 and list_count(parameter_type_oids) != list_count(parameters):
+        return err("postgres protocol: parameter type OID count must be zero or match the parameter count")
+    let parse: Result[Bytes, Text] = pg_parse_message_with_oids("", sql, parameter_type_oids)
+    if not result_is_ok(parse):
+        return err(result_unwrap_error(parse))
+    let bind: Result[Bytes, Text] = pg_bind_values_message("", "", parameters, null_flags)
+    if not result_is_ok(bind):
+        return err(result_unwrap_error(bind))
+    let describe: Result[Bytes, Text] = pg_describe_message("P", "")
+    if not result_is_ok(describe):
+        return err(result_unwrap_error(describe))
+    let execute: Result[Bytes, Text] = pg_execute_message("", 0)
+    if not result_is_ok(execute):
+        return err(result_unwrap_error(execute))
+    let sync: Result[Bytes, Text] = pg_sync_message()
+    if not result_is_ok(sync):
+        return err(result_unwrap_error(sync))
+    var exchange: Bytes = result_unwrap(parse)
+    set exchange = bytes_concat(exchange, result_unwrap(bind))
+    set exchange = bytes_concat(exchange, result_unwrap(describe))
+    set exchange = bytes_concat(exchange, result_unwrap(execute))
+    return ok(bytes_concat(exchange, result_unwrap(sync)))
+
+fn pg_parameters_message(sql: Text, parameters: PgParameters) -> Result[Bytes, Text]:
+    let valid: Result[Boolean, Text] = pg_parameters_validate(parameters)
+    if not result_is_ok(valid):
+        return err(result_unwrap_error(valid))
+    return pg_extended_query_message_with_oids(sql, parameters.values, parameters.null_flags, parameters.type_oids)
+
+fn pg_flush_message() -> Result[Bytes, Text]:
+    return pg_frontend_message("H", bytes_from_text(""))
+
+fn pg_close_message(target: Text, name: Text) -> Result[Bytes, Text]:
+    if target != "S" and target != "P":
+        return err("postgres protocol: Close target must be statement or portal")
+    if bytes_length(bytes_from_text(name)) > 1023:
+        return err("postgres protocol: Close name exceeds 1023 bytes")
+    let target_byte: Bytes = bytes_from_number(text_byte(target, 0))
+    return pg_frontend_message("C", bytes_concat(target_byte, pg_cstring(name)))
+
+fn pg_query_message(sql: Text) -> Result[Bytes, Text]:
+    return pg_simple_query_message(sql)
+
+fn pg_parse_backend_frame(input: Bytes) -> Result[PgBackendFrame, Text]:
+    let input_length: Number = bytes_length(input)
+    if input_length < 5:
+        return err("postgres protocol: incomplete backend message header")
+    let tag: Number = bytes_get(input, 0)
+    if tag < 33 or tag > 126:
+        return err("postgres protocol: backend message tag is not printable ASCII")
+    let message_length_result: Result[Number, Text] = pg_read_u32_be(input, 1)
+    if not result_is_ok(message_length_result):
+        return err(result_unwrap_error(message_length_result))
+    let message_length: Number = result_unwrap(message_length_result)
+    if message_length < 4:
+        return err("postgres protocol: backend message length is smaller than its header")
+    if message_length > 67108864:
+        return err("postgres protocol: backend message exceeds the 64 MiB limit")
+    if message_length + 1 != input_length:
+        return err("postgres protocol: input must contain exactly one complete backend message")
+    let payload: Bytes = bytes_slice(input, 5, message_length - 4)
+    return ok(PgBackendFrame(tag, payload))
+
+fn pg_read_cstring(input: Bytes, offset: Number) -> Result[TextList, Text]:
+    let length: Number = bytes_length(input)
+    if offset < 0 or offset >= length:
+        return err("postgres protocol: C string offset is outside the input")
+    var cursor: Number = offset
+    while cursor < length and bytes_get(input, cursor) != 0:
+        set cursor = cursor + 1
+    if cursor >= length:
+        return err("postgres protocol: unterminated C string")
+    if cursor - offset > 1023:
+        return err("postgres protocol: C string exceeds the 1023-byte limit")
+    let raw_text: Bytes = bytes_slice(input, offset, cursor - offset)
+    let decoded: Option[Text] = bytes_to_text_checked(raw_text)
+    if not option_is_some(decoded):
+        return err("postgres protocol: C string is not valid non-NUL UTF-8")
+    let result: TextList = text_list()
+    list_push(result, option_unwrap(decoded))
+    list_push(result, number_text(cursor + 1))
+    return ok(result)
+
+fn pg_validate_row_description(input: Bytes) -> Result[Number, Text]:
+    let total_length: Number = bytes_length(input)
+    let count_result: Result[Number, Text] = pg_read_u16_be(input, 0)
+    if not result_is_ok(count_result):
+        return err("postgres protocol: RowDescription is missing its field count")
+    let count: Number = result_unwrap(count_result)
+    if count > 1024:
+        return err("postgres protocol: RowDescription exceeds the 1024-column limit")
+    var cursor: Number = 2
+    var field: Number = 0
+    while field < count:
+        let name_result: Result[TextList, Text] = pg_read_cstring(input, cursor)
+        if not result_is_ok(name_result):
+            return err(result_unwrap_error(name_result))
+        set cursor = number_parse(list_get(result_unwrap(name_result), 1))
+        if cursor > total_length - 18:
+            return err("postgres protocol: RowDescription column metadata is truncated")
+        let table_oid: Result[Number, Text] = pg_read_u32_be(input, cursor)
+        let attribute: Result[Number, Text] = pg_read_i16_be(input, cursor + 4)
+        let type_oid: Result[Number, Text] = pg_read_u32_be(input, cursor + 6)
+        let type_size: Result[Number, Text] = pg_read_i16_be(input, cursor + 10)
+        let type_modifier: Result[Number, Text] = pg_read_i32_be(input, cursor + 12)
+        let format: Result[Number, Text] = pg_read_i16_be(input, cursor + 16)
+        if not result_is_ok(table_oid) or not result_is_ok(attribute) or not result_is_ok(type_oid) or not result_is_ok(type_size) or not result_is_ok(type_modifier) or not result_is_ok(format):
+            return err("postgres protocol: RowDescription has invalid column metadata")
+        let format_code: Number = result_unwrap(format)
+        if format_code < 0 or format_code > 1:
+            return err("postgres protocol: RowDescription format must be text or binary")
+        set cursor = cursor + 18
+        set field = field + 1
+    if cursor != total_length:
+        return err("postgres protocol: RowDescription contains trailing bytes")
+    return ok(count)
+
+fn pg_row_description_field_count(input: Bytes) -> Result[Number, Text]:
+    return pg_validate_row_description(input)
+
+fn pg_row_description_field(input: Bytes, index: Number) -> Result[PgColumnDescription, Text]:
+    let count_result: Result[Number, Text] = pg_validate_row_description(input)
+    if not result_is_ok(count_result):
+        return err(result_unwrap_error(count_result))
+    let count: Number = result_unwrap(count_result)
+    if index < 0 or index >= count:
+        return err("postgres protocol: RowDescription column index is out of range")
+    let total_length: Number = bytes_length(input)
+    var selected: Option[PgColumnDescription] = none
+    var cursor: Number = 2
+    var field: Number = 0
+    while field < count:
+        let name_result: Result[TextList, Text] = pg_read_cstring(input, cursor)
+        let name_info: TextList = result_unwrap(name_result)
+        let name: Text = list_get(name_info, 0)
+        set cursor = number_parse(list_get(name_info, 1))
+        let table_oid: Number = result_unwrap(pg_read_u32_be(input, cursor))
+        let attribute: Number = result_unwrap(pg_read_i16_be(input, cursor + 4))
+        let type_oid: Number = result_unwrap(pg_read_u32_be(input, cursor + 6))
+        let type_size: Number = result_unwrap(pg_read_i16_be(input, cursor + 10))
+        let type_modifier: Number = result_unwrap(pg_read_i32_be(input, cursor + 12))
+        let format_code: Number = result_unwrap(pg_read_i16_be(input, cursor + 16))
+        if field == index:
+            set selected = some(PgColumnDescription(name, table_oid, attribute, type_oid, type_size, type_modifier, format_code))
+        set cursor = cursor + 18
+        set field = field + 1
+    if cursor != total_length:
+        return err("postgres protocol: RowDescription contains trailing bytes")
+    return ok(option_unwrap(selected))
+
+fn pg_valid_sqlstate(value: Text) -> Boolean:
+    if text_length(value) != 5:
+        return false
+    var index: Number = 0
+    while index < 5:
+        let byte: Number = text_byte(value, index)
+        let digit: Boolean = byte >= 48 and byte <= 57
+        let uppercase: Boolean = byte >= 65 and byte <= 90
+        if not digit and not uppercase:
+            return false
+        set index = index + 1
+    return true
+
+fn pg_parse_error_response(frame: PgBackendFrame) -> Result[PgServerError, Text]:
+    if frame.tag != 69:
+        return err("postgres protocol: expected ErrorResponse frame")
+    let payload_length: Number = bytes_length(frame.payload)
+    if payload_length == 0 or payload_length > 65536:
+        return err("postgres protocol: ErrorResponse size is invalid")
+    var cursor: Number = 0
+    var field_count: Number = 0
+    var complete: Boolean = false
+    var severity: Text = ""
+    var sqlstate: Text = ""
+    var message: Text = ""
+    var detail: Option[Text] = none
+    var hint: Option[Text] = none
+    var saw_severity: Boolean = false
+    var saw_localized_severity: Boolean = false
+    var saw_sqlstate: Boolean = false
+    var saw_message: Boolean = false
+    var saw_detail: Boolean = false
+    var saw_hint: Boolean = false
+    while cursor < payload_length and not complete:
+        let field_code: Number = bytes_get(frame.payload, cursor)
+        set cursor = cursor + 1
+        if field_code == 0:
+            set complete = true
+        else:
+            if field_code < 33 or field_code > 126:
+                return err("postgres protocol: ErrorResponse field code is not printable ASCII")
+            set field_count = field_count + 1
+            if field_count > 64:
+                return err("postgres protocol: ErrorResponse exceeds the 64-field limit")
+            let value_result: Result[TextList, Text] = pg_read_cstring(frame.payload, cursor)
+            if not result_is_ok(value_result):
+                return err(result_unwrap_error(value_result))
+            let value_parts: TextList = result_unwrap(value_result)
+            let value: Text = list_get(value_parts, 0)
+            set cursor = number_parse(list_get(value_parts, 1))
+            if field_code == 83:
+                if saw_localized_severity:
+                    return err("postgres protocol: duplicate localized severity field")
+                set saw_localized_severity = true
+                if not saw_severity:
+                    set severity = value
+            else:
+                if field_code == 86:
+                    if saw_severity:
+                        return err("postgres protocol: duplicate severity field")
+                    set saw_severity = true
+                    set severity = value
+                else:
+                    if field_code == 67:
+                        if saw_sqlstate:
+                            return err("postgres protocol: duplicate SQLSTATE field")
+                        if not pg_valid_sqlstate(value):
+                            return err("postgres protocol: SQLSTATE must contain five uppercase letters or digits")
+                        set saw_sqlstate = true
+                        set sqlstate = value
+                    else:
+                        if field_code == 77:
+                            if saw_message:
+                                return err("postgres protocol: duplicate message field")
+                            set saw_message = true
+                            set message = value
+                        else:
+                            if field_code == 68:
+                                if saw_detail:
+                                    return err("postgres protocol: duplicate detail field")
+                                set saw_detail = true
+                                set detail = some(value)
+                            else:
+                                if field_code == 72:
+                                    if saw_hint:
+                                        return err("postgres protocol: duplicate hint field")
+                                    set saw_hint = true
+                                    set hint = some(value)
+    if not complete or cursor != payload_length:
+        return err("postgres protocol: ErrorResponse is unterminated or has trailing bytes")
+    if not saw_severity and not saw_localized_severity:
+        return err("postgres protocol: ErrorResponse is missing severity")
+    if not saw_sqlstate or not saw_message:
+        return err("postgres protocol: ErrorResponse is missing SQLSTATE or message")
+    return ok(PgServerError(severity, sqlstate, message, detail, hint))
+
+fn pg_parse_ready_for_query(frame: PgBackendFrame) -> Result[PgTransactionStatus, Text]:
+    if frame.tag != 90 or bytes_length(frame.payload) != 1:
+        return err("postgres protocol: ReadyForQuery must contain one status byte")
+    let status: Number = bytes_get(frame.payload, 0)
+    if status == 73:
+        return ok(PgTransactionStatus::Idle)
+    if status == 84:
+        return ok(PgTransactionStatus::InTransaction)
+    if status == 69:
+        return ok(PgTransactionStatus::FailedTransaction)
+    return err("postgres protocol: ReadyForQuery status is unknown")
+
+fn pg_parse_command_complete(frame: PgBackendFrame) -> Result[Text, Text]:
+    if frame.tag != 67:
+        return err("postgres protocol: expected CommandComplete frame")
+    let command: Result[TextList, Text] = pg_read_cstring(frame.payload, 0)
+    if not result_is_ok(command):
+        return err(result_unwrap_error(command))
+    let parts: TextList = result_unwrap(command)
+    if number_parse(list_get(parts, 1)) != bytes_length(frame.payload):
+        return err("postgres protocol: CommandComplete contains trailing bytes")
+    return ok(list_get(parts, 0))
+
+fn pg_parse_backend_key_data(frame: PgBackendFrame) -> Result[PgBackendKeyData, Text]:
+    if frame.tag != 75 or bytes_length(frame.payload) != 8:
+        return err("postgres protocol: BackendKeyData must contain two uint32 values")
+    let process_id: Result[Number, Text] = pg_read_u32_be(frame.payload, 0)
+    let secret_key: Result[Number, Text] = pg_read_u32_be(frame.payload, 4)
+    if not result_is_ok(process_id) or not result_is_ok(secret_key):
+        return err("postgres protocol: BackendKeyData is malformed")
+    return ok(PgBackendKeyData(result_unwrap(process_id), result_unwrap(secret_key)))
+
+fn pg_parse_parameter_status(frame: PgBackendFrame) -> Result[PgParameterStatus, Text]:
+    if frame.tag != 83:
+        return err("postgres protocol: expected ParameterStatus frame")
+    let name_result: Result[TextList, Text] = pg_read_cstring(frame.payload, 0)
+    if not result_is_ok(name_result):
+        return err(result_unwrap_error(name_result))
+    let name_parts: TextList = result_unwrap(name_result)
+    let value_offset: Number = number_parse(list_get(name_parts, 1))
+    let value_result: Result[TextList, Text] = pg_read_cstring(frame.payload, value_offset)
+    if not result_is_ok(value_result):
+        return err(result_unwrap_error(value_result))
+    let value_parts: TextList = result_unwrap(value_result)
+    if number_parse(list_get(value_parts, 1)) != bytes_length(frame.payload):
+        return err("postgres protocol: ParameterStatus contains trailing bytes")
+    return ok(PgParameterStatus(list_get(name_parts, 0), list_get(value_parts, 0)))
+
+fn pg_validate_data_row(input: Bytes) -> Result[Number, Text]:
+    let total_length: Number = bytes_length(input)
+    let count_result: Result[Number, Text] = pg_read_u16_be(input, 0)
+    if not result_is_ok(count_result):
+        return err("postgres protocol: DataRow is missing its field count")
+    let count: Number = result_unwrap(count_result)
+    if count > 1024:
+        return err("postgres protocol: DataRow exceeds the 1024-column limit")
+    var cursor: Number = 2
+    var field: Number = 0
+    while field < count:
+        let field_length_result: Result[Number, Text] = pg_read_i32_be(input, cursor)
+        if not result_is_ok(field_length_result):
+            return err("postgres protocol: DataRow field is missing its length")
+        let field_length: Number = result_unwrap(field_length_result)
+        set cursor = cursor + 4
+        if field_length < -1:
+            return err("postgres protocol: DataRow field length is invalid")
+        if field_length >= 0:
+            if field_length > 67108864 or cursor > total_length - field_length:
+                return err("postgres protocol: DataRow field exceeds the available bytes")
+            set cursor = cursor + field_length
+        set field = field + 1
+    if cursor != total_length:
+        return err("postgres protocol: DataRow contains trailing bytes")
+    return ok(count)
+
+fn pg_data_row_field_count(input: Bytes) -> Result[Number, Text]:
+    return pg_validate_data_row(input)
+
+fn pg_data_row_field(input: Bytes, index: Number) -> Result[Option[Bytes], Text]:
+    let count_result: Result[Number, Text] = pg_validate_data_row(input)
+    if not result_is_ok(count_result):
+        return err(result_unwrap_error(count_result))
+    let count: Number = result_unwrap(count_result)
+    if index < 0 or index >= count:
+        return err("postgres protocol: DataRow column index is out of range")
+    var selected: Option[Bytes] = none
+    var cursor: Number = 2
+    var field: Number = 0
+    while field < count:
+        let field_length: Number = result_unwrap(pg_read_i32_be(input, cursor))
+        set cursor = cursor + 4
+        if field == index:
+            if field_length >= 0:
+                set selected = some(bytes_slice(input, cursor, field_length))
+        if field_length >= 0:
+            set cursor = cursor + field_length
+        set field = field + 1
+    return ok(selected)
+
+fn pg_parse_int64_text(value: Text) -> Result[Number, Text]:
+    let input: Bytes = bytes_from_text(value)
+    let length: Number = bytes_length(input)
+    if length == 0 or length > 20:
+        return err("postgres protocol: integer text has an invalid length")
+    var negative: Boolean = false
+    var index: Number = 0
+    if bytes_get(input, 0) == 45:
+        set negative = true
+        set index = 1
+    else:
+        if bytes_get(input, 0) == 43:
+            set index = 1
+    if index == length:
+        return err("postgres protocol: integer text has no digits")
+    var limit: Number = -922337203685477580 * 10 - 7
+    if negative:
+        set limit = limit - 1
+    let multiply_limit: Number = limit / 10
+    var result: Number = 0
+    while index < length:
+        let byte: Number = bytes_get(input, index)
+        if byte < 48 or byte > 57:
+            return err("postgres protocol: integer text contains a non-digit")
+        let digit: Number = byte - 48
+        if result < multiply_limit:
+            return err("postgres protocol: integer text is out of int64 range")
+        set result = result * 10
+        if result < limit + digit:
+            return err("postgres protocol: integer text is out of int64 range")
+        set result = result - digit
+        set index = index + 1
+    if negative:
+        return ok(result)
+    return ok(-result)
+
+fn pg_hex_value(byte: Number) -> Number:
+    if byte >= 48 and byte <= 57:
+        return byte - 48
+    if byte >= 65 and byte <= 70:
+        return byte - 65 + 10
+    if byte >= 97 and byte <= 102:
+        return byte - 97 + 10
+    return -1
+
+fn pg_decode_bytea_hex(value: Text) -> Result[Bytes, Text]:
+    let input: Bytes = bytes_from_text(value)
+    let length: Number = bytes_length(input)
+    if length < 2 or length > 2097154 or bytes_get(input, 0) != 92 or bytes_get(input, 1) != 120:
+        return err("postgres protocol: bytea text must use the bounded hex format")
+    if (length - 2) % 2 != 0:
+        return err("postgres protocol: bytea hex text has an odd number of digits")
+    var output: Bytes = bytes_from_text("")
+    var index: Number = 2
+    while index < length:
+        let high: Number = pg_hex_value(bytes_get(input, index))
+        let low: Number = pg_hex_value(bytes_get(input, index + 1))
+        if high < 0 or low < 0:
+            return err("postgres protocol: bytea hex text contains an invalid digit")
+        set output = bytes_concat(output, bytes_from_number(high * 16 + low))
+        set index = index + 2
+    return ok(output)
+
+fn pg_decode_data_row_value(column: PgColumnDescription, input: Bytes, index: Number) -> Result[PgValue, Text]:
+    let field_result: Result[Option[Bytes], Text] = pg_data_row_field(input, index)
+    if not result_is_ok(field_result):
+        return err(result_unwrap_error(field_result))
+    let field: Option[Bytes] = result_unwrap(field_result)
+    if not option_is_some(field):
+        return ok(PgValue::Null)
+    let raw: Bytes = option_unwrap(field)
+    let decoded: Option[Text] = bytes_to_text_checked(raw)
+    if column.format_code == 1:
+        return ok(PgValue::BytesValue(raw))
+    if column.format_code != 0:
+        return err("postgres protocol: column format must be text or binary")
+    if column.type_oid == 17:
+        if not option_is_some(decoded):
+            return err("postgres protocol: bytea hex representation is not UTF-8")
+        let binary: Result[Bytes, Text] = pg_decode_bytea_hex(option_unwrap(decoded))
+        if not result_is_ok(binary):
+            return err(result_unwrap_error(binary))
+        return ok(PgValue::BytesValue(result_unwrap(binary)))
+    if not option_is_some(decoded):
+        return err("postgres protocol: text-format column is not valid non-NUL UTF-8")
+    let text: Text = option_unwrap(decoded)
+    if column.type_oid == 16:
+        if text == "t":
+            return ok(PgValue::BooleanValue(true))
+        if text == "f":
+            return ok(PgValue::BooleanValue(false))
+        return err("postgres protocol: boolean text must be t or f")
+    if column.type_oid == 20 or column.type_oid == 21 or column.type_oid == 23 or column.type_oid == 26:
+        let integer: Result[Number, Text] = pg_parse_int64_text(text)
+        if not result_is_ok(integer):
+            return err(result_unwrap_error(integer))
+        let number: Number = result_unwrap(integer)
+        if column.type_oid == 21 and (number < -32768 or number > 32767):
+            return err("postgres protocol: int2 value is out of range")
+        if column.type_oid == 23 and (number < -2147483648 or number > 2147483647):
+            return err("postgres protocol: int4 value is out of range")
+        if column.type_oid == 26 and (number < 0 or number > 4294967295):
+            return err("postgres protocol: oid value is out of range")
+        return ok(PgValue::NumberValue(number))
+    return ok(PgValue::TextValue(text))
+
+fn pg_validate_sasl_mechanisms(mechanisms: Bytes) -> Boolean:
+    let length: Number = bytes_length(mechanisms)
+    if length < 2 or length > 1024 or bytes_get(mechanisms, length - 1) != 0 or bytes_get(mechanisms, length - 2) != 0:
+        return false
+    var index: Number = 0
+    var mechanism_length: Number = 0
+    while index < length - 1:
+        let byte: Number = bytes_get(mechanisms, index)
+        if byte == 0:
+            if mechanism_length == 0:
+                return false
+            set mechanism_length = 0
+        else:
+            if byte < 33 or byte > 126:
+                return false
+            set mechanism_length = mechanism_length + 1
+        set index = index + 1
+    return mechanism_length == 0
+
+fn pg_parse_authentication(frame: PgBackendFrame) -> Result[PgAuthentication, Text]:
+    if frame.tag != 82:
+        return err("postgres protocol: expected AuthenticationRequest frame")
+    let payload_length: Number = bytes_length(frame.payload)
+    if payload_length < 4:
+        return err("postgres protocol: AuthenticationRequest is missing its method code")
+    let method_result: Result[Number, Text] = pg_read_u32_be(frame.payload, 0)
+    if not result_is_ok(method_result):
+        return err(result_unwrap_error(method_result))
+    let method: Number = result_unwrap(method_result)
+    if method == 0:
+        if payload_length != 4:
+            return err("postgres protocol: AuthenticationOk has unexpected trailing data")
+        return ok(PgAuthentication::Accepted)
+    if method == 3:
+        if payload_length != 4:
+            return err("postgres protocol: cleartext authentication has unexpected trailing data")
+        return ok(PgAuthentication::CleartextPassword)
+    if method == 5:
+        if payload_length != 8:
+            return err("postgres protocol: MD5 authentication must contain a four-byte salt")
+        return ok(PgAuthentication::Md5Password(bytes_slice(frame.payload, 4, 4)))
+    if method == 10:
+        if payload_length <= 4:
+            return err("postgres protocol: SASL authentication has no mechanisms")
+        let mechanisms: Bytes = bytes_slice(frame.payload, 4, payload_length - 4)
+        if not pg_validate_sasl_mechanisms(mechanisms):
+            return err("postgres protocol: malformed SASL mechanism list")
+        return ok(PgAuthentication::Sasl(mechanisms))
+    if method == 11:
+        if payload_length <= 4:
+            return err("postgres protocol: SASL continuation is empty")
+        return ok(PgAuthentication::SaslContinue(bytes_slice(frame.payload, 4, payload_length - 4)))
+    if method == 12:
+        if payload_length <= 4:
+            return err("postgres protocol: SASL final message is empty")
+        return ok(PgAuthentication::SaslFinal(bytes_slice(frame.payload, 4, payload_length - 4)))
+    return ok(PgAuthentication::Unsupported(method))

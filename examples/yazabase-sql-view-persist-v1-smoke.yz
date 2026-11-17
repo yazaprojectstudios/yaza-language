@@ -1,0 +1,108 @@
+use "../yazabase/catalog_init_v1"
+use "../yazabase/catalog_snapshot_v1"
+use "../yazabase/checkpoint_v1"
+use "../yazabase/sql_dispatch_v1"
+use "../yazabase/wal_v1"
+
+fn yazabase_sql_view_persist_close_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1) -> Boolean:
+    let wal_closed: Result[Boolean, Text] = yaza_db_wal_log_close_v1(wal)
+    let storage_closed: Result[Boolean, Text] = yaza_db_storage_close_v1(storage)
+    return result_is_ok(wal_closed) and result_is_ok(storage_closed) and result_unwrap(wal_closed) and result_unwrap(storage_closed)
+
+fn yazabase_sql_view_persist_v1(root_path: Text) -> Result[Boolean, Text]:
+    let root: Number = root_open(root_path)?
+    let created: YazaDbCatalogBootstrapV1 = yaza_db_catalog_create_v1(root, "view-persist-smoke.ydb")?
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+
+    let create_table: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(created.storage, created.wal, "CREATE TABLE people (id BIGINT PRIMARY KEY, name TEXT NOT NULL, age INT NOT NULL)", no_parameters)?
+    if create_table.statement_kind != yaza_db_sql_statement_kind_create_table_v1() or not option_is_some(create_table.write_commit): return err("YDBv1 view fixture could not create its physical dependency table")
+    let table_commit: YazaDbWriteCommitV1 = option_unwrap(create_table.write_commit)
+    let insert_people: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(table_commit.storage, table_commit.wal, "INSERT INTO people (id, name, age) VALUES (1, 'Ada', 18), (2, 'Ben', 17), (3, 'Cy', 42)", no_parameters)?
+    if insert_people.statement_kind != yaza_db_sql_statement_kind_insert_v1() or not option_is_some(insert_people.write_commit): return err("YDBv1 view fixture could not seed its physical dependency rows")
+    let inserted_commit: YazaDbWriteCommitV1 = option_unwrap(insert_people.write_commit)
+
+    let create_view: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(inserted_commit.storage, inserted_commit.wal, "CREATE VIEW adults AS SELECT id, name AS display_name FROM people WHERE age >= 18", no_parameters)?
+    if create_view.statement_kind != yaza_db_sql_statement_kind_create_view_v1() or not option_is_some(create_view.write_commit): return err("YDBv1 SQL dispatcher did not return the CREATE VIEW commit")
+    let view_commit: YazaDbWriteCommitV1 = option_unwrap(create_view.write_commit)
+    let after_create: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(view_commit.storage.file, view_commit.storage.header)?
+    if after_create.catalog.sys_views_root < 2 or list_count(after_create.views) != 1 or list_count(after_create.sql_snapshot.tables) != 5: return err("YDBv1 CREATE VIEW did not persist its private definition root and public view metadata")
+    let view: YazaDbCatalogViewV1 = list_get(after_create.views, 0)
+    if view.view_id < 13 or view.name != "adults" or view.definition != "SELECT id, name AS display_name FROM people WHERE age >= 18" or view.dependency_table_id != 13: return err("YDBv1 CREATE VIEW persisted the wrong definition or dependency")
+    if list_count(view.output_columns) != 2 or list_get(view.output_columns, 0).name != "id" or list_get(view.output_columns, 1).name != "display_name": return err("YDBv1 CREATE VIEW persisted the wrong output schema")
+    let idempotent_create_view: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(view_commit.storage, view_commit.wal, "CREATE VIEW IF NOT EXISTS adults AS SELECT id, name AS display_name FROM people WHERE age >= 18", no_parameters)?
+    if idempotent_create_view.statement_kind != yaza_db_sql_statement_kind_create_view_v1() or option_is_some(idempotent_create_view.write_commit) or idempotent_create_view.storage.header.next_commit_ts != view_commit.storage.header.next_commit_ts or idempotent_create_view.wal.next_lsn != view_commit.wal.next_lsn:
+        return err("YDBv1 CREATE VIEW IF NOT EXISTS mutated state for an existing view")
+    if result_is_ok(yaza_db_execute_statement_v1(view_commit.storage, view_commit.wal, "CREATE VIEW IF NOT EXISTS people AS SELECT id FROM people", no_parameters)):
+        return err("YDBv1 CREATE VIEW IF NOT EXISTS accepted a view name colliding with a physical table")
+
+    let selected_view: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(view_commit.storage, view_commit.wal, "SELECT id, display_name FROM adults ORDER BY id", no_parameters)?
+    if not option_is_some(selected_view.query_result): return err("YDBv1 SELECT did not materialize the persistent view")
+    let selected_view_rows: YazaSqlQueryResultV1 = option_unwrap(selected_view.query_result)
+    if list_count(selected_view_rows.rows) != 2 or list_get(list_get(selected_view_rows.rows, 0), 0).integer_value != 1 or list_get(list_get(selected_view_rows.rows, 0), 1).text_value != "Ada" or list_get(list_get(selected_view_rows.rows, 1), 0).integer_value != 3 or list_get(list_get(selected_view_rows.rows, 1), 1).text_value != "Cy":
+        return err("YDBv1 SELECT through a persistent view returned incorrect filtered rows")
+
+    let insert_through_view: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(view_commit.storage, view_commit.wal, "INSERT INTO adults (id, display_name) VALUES (4, 'Dee')", no_parameters)
+    if result_is_ok(insert_through_view) or result_unwrap_error(insert_through_view) != "YDBv1 views are read-only; INSERT through a view is not supported":
+        return err("YDBv1 INSERT through a view did not receive its read-only diagnostic")
+    let update_through_view: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(view_commit.storage, view_commit.wal, "UPDATE adults SET display_name = 'Dee' WHERE id = 1", no_parameters)
+    if result_is_ok(update_through_view) or result_unwrap_error(update_through_view) != "YDBv1 views are read-only; UPDATE through a view is not supported":
+        return err("YDBv1 UPDATE through a view did not receive its read-only diagnostic")
+    let delete_through_view: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(view_commit.storage, view_commit.wal, "DELETE FROM adults WHERE id = 1", no_parameters)
+    if result_is_ok(delete_through_view) or result_unwrap_error(delete_through_view) != "YDBv1 views are read-only; DELETE through a view is not supported":
+        return err("YDBv1 DELETE through a view did not receive its read-only diagnostic")
+
+    let joined_view: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(view_commit.storage, view_commit.wal, "SELECT a.id, p.name FROM adults AS a INNER JOIN people AS p ON a.id = p.id ORDER BY a.id", no_parameters)?
+    if not option_is_some(joined_view.query_result) or list_count(option_unwrap(joined_view.query_result).rows) != 2:
+        return err("YDBv1 JOIN did not accept a persistent view as one relation")
+    if list_get(list_get(option_unwrap(joined_view.query_result).rows, 1), 1).text_value != "Cy": return err("YDBv1 JOIN against a persistent view returned incorrect values")
+
+    let explain_view: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(view_commit.storage, view_commit.wal, "EXPLAIN SELECT id FROM adults WHERE id >= 3", no_parameters)?
+    if not option_is_some(explain_view.explain_text) or text_find(option_unwrap(explain_view.explain_text), "View expansion: adults") < 0 or text_find(option_unwrap(explain_view.explain_text), view.definition) < 0 or text_find(option_unwrap(explain_view.explain_text), "Scan(table_id=") < 0:
+        return err("YDBv1 EXPLAIN did not show the expanded view definition and virtual scan")
+    let explain_cte_view: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(view_commit.storage, view_commit.wal, "EXPLAIN WITH adult_ids AS (SELECT id FROM adults) SELECT id FROM adult_ids", no_parameters)?
+    if not option_is_some(explain_cte_view.explain_text) or text_find(option_unwrap(explain_cte_view.explain_text), "View expansion: adults") < 0:
+        return err("YDBv1 EXPLAIN WITH did not expand a persistent view inside its CTE")
+
+    let cte_shadow: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(view_commit.storage, view_commit.wal, "WITH adults AS (SELECT id FROM people WHERE id = 2) SELECT id FROM adults", no_parameters)?
+    if not option_is_some(cte_shadow.query_result) or list_count(option_unwrap(cte_shadow.query_result).rows) != 1 or list_get(list_get(option_unwrap(cte_shadow.query_result).rows, 0), 0).integer_value != 2:
+        return err("YDBv1 CTE name did not shadow a persistent view")
+
+    let stale_snapshot: Result[YazaSqlQueryResultV1, Text] = yaza_db_execute_select_at_snapshot_v1(view_commit.storage, view_commit.wal, "SELECT id FROM adults", no_parameters, inserted_commit.commit_ts, 0, List[YazaDbTxnStatusV1]())
+    if result_is_ok(stale_snapshot) or result_unwrap_error(stale_snapshot) != "YDBv1 historical SELECT through a persistent view is not supported until view metadata is loaded at the requested catalog snapshot":
+        return err("YDBv1 historical SELECT through a view did not fail closed with its documented diagnostic")
+
+    if not yazabase_sql_view_persist_close_v1(view_commit.storage, view_commit.wal): return err("YDBv1 view fixture could not close before its persistent-view reopen check")
+    let reopened_view: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "view-persist-smoke.ydb")?
+    let reopened_view_select: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(reopened_view.storage, reopened_view.wal, "SELECT id, display_name FROM adults ORDER BY id", no_parameters)?
+    if not option_is_some(reopened_view_select.query_result) or list_count(option_unwrap(reopened_view_select.query_result).rows) != 2:
+        return err("YDBv1 persistent view could not be queried after close/reopen")
+
+    let blocked_drop: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(reopened_view.storage, reopened_view.wal, "DROP TABLE people", no_parameters)
+    if result_is_ok(blocked_drop): return err("YDBv1 DROP TABLE removed a table with a dependent view")
+    if result_unwrap_error(blocked_drop) != "YDBv1 DROP TABLE is blocked by a dependent view; DROP VIEW first": return err("YDBv1 DROP TABLE dependency rejection did not identify the dependent view")
+
+    let drop_view: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(reopened_view.storage, reopened_view.wal, "DROP VIEW adults", no_parameters)?
+    if drop_view.statement_kind != yaza_db_sql_statement_kind_drop_view_v1() or not option_is_some(drop_view.write_commit): return err("YDBv1 SQL dispatcher did not return the DROP VIEW commit")
+    let dropped_commit: YazaDbWriteCommitV1 = option_unwrap(drop_view.write_commit)
+    let after_drop: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(dropped_commit.storage.file, dropped_commit.storage.header)?
+    if list_count(after_drop.views) != 0 or yaza_db_catalog_snapshot_table_index_v1(after_drop.sql_snapshot.tables, 13) < 0: return err("YDBv1 DROP VIEW removed unrelated physical catalog state or left the view visible")
+    if not yazabase_sql_view_persist_close_v1(dropped_commit.storage, dropped_commit.wal): return err("YDBv1 view fixture could not close after DROP VIEW")
+
+    let reopened_after_drop: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "view-persist-smoke.ydb")?
+    let after_reopen: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(reopened_after_drop.storage.file, reopened_after_drop.storage.header)?
+    if list_count(after_reopen.views) != 0 or yaza_db_catalog_snapshot_table_index_v1(after_reopen.sql_snapshot.tables, 13) < 0: return err("YDBv1 view tombstone or physical table did not survive reopen")
+    let drop_missing: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(reopened_after_drop.storage, reopened_after_drop.wal, "DROP VIEW IF EXISTS adults", no_parameters)?
+    if drop_missing.statement_kind != yaza_db_sql_statement_kind_drop_view_v1() or option_is_some(drop_missing.write_commit): return err("YDBv1 DROP VIEW IF EXISTS changed state for a missing view")
+    if not yazabase_sql_view_persist_close_v1(drop_missing.storage, drop_missing.wal): return err("YDBv1 view fixture could not close after idempotent DROP VIEW")
+    let root_closed: Boolean = close(root)?
+    if not root_closed: return err("YDBv1 view fixture root did not close")
+    return ok(true)
+
+start:
+    let outcome: Result[Boolean, Text] = yazabase_sql_view_persist_v1(arg(1))
+    if result_is_ok(outcome) and result_unwrap(outcome):
+        say "yazabase-sql-view-persist-v1-ok"
+    else:
+        if result_is_ok(outcome): say "YDBv1 view fixture returned false"
+        else: say result_unwrap_error(outcome)
+        exit(1)

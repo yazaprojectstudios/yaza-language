@@ -1,0 +1,127 @@
+# End-to-end nonblocking PostgreSQL connection: DNS/TCP, SSLRequest, verified
+# TLS, startup packet, SCRAM-SHA-256, BackendKeyData, and ReadyForQuery.
+use "async_connect"
+use "async_startup"
+use "std/security/secret"
+
+shape PgAsyncConnectionState:
+    phase: Number
+    deadline_ms: Number
+    connect_state: Option[PgTlsConnectState]
+    startup_state: Option[PgAsyncStartupState]
+    username: Text
+    database: Text
+    password: SecretText
+    timeout_ms: Number
+
+variant PgAsyncConnectionStep:
+    Progress(state: PgAsyncConnectionState)
+    WaitConnect(state: PgAsyncConnectionState)
+    WaitRead(state: PgAsyncConnectionState)
+    WaitWrite(state: PgAsyncConnectionState)
+    Complete(handle: Number)
+
+fn pg_async_connection_state(phase: Number, deadline_ms: Number, connect_state: Option[PgTlsConnectState], startup_state: Option[PgAsyncStartupState], username: Text, database: Text, password: SecretText, timeout_ms: Number) -> PgAsyncConnectionState:
+    return PgAsyncConnectionState(phase, deadline_ms, connect_state, startup_state, username, database, password, timeout_ms)
+
+fn pg_connect_async_begin(host: Text, port: Number, username: Text, database: Text, password: SecretText, timeout_ms: Number) -> Result[PgAsyncConnectionState, Text]:
+    if timeout_ms < 1 or timeout_ms > 3600000:
+        let wiped: Boolean = secret_zeroize(password)
+        return err("postgres async connect: timeout must be between 1 and 3600000 milliseconds")
+    if not secret_is_valid(password):
+        return err("postgres async connect: password secret is invalid")
+    if not secret_at_most(password, 1024):
+        let wiped: Boolean = secret_zeroize(password)
+        return err("postgres async connect: password exceeds the 1024-character limit")
+    let startup_packet: Result[Bytes, Text] = pg_startup_packet(username, database)
+    if not result_is_ok(startup_packet):
+        let wiped: Boolean = secret_zeroize(password)
+        return err(result_unwrap_error(startup_packet))
+    let connected: Result[PgTlsConnectState, Text] = pg_tls_connect_async_begin(host, port, timeout_ms)
+    if not result_is_ok(connected):
+        let wiped: Boolean = secret_zeroize(password)
+        return err(result_unwrap_error(connected))
+    let connect_state: PgTlsConnectState = result_unwrap(connected)
+    return ok(pg_async_connection_state(0, connect_state.deadline_ms, some(connect_state), none, username, database, password, timeout_ms))
+
+fn pg_connect_async_after_tcp(state: PgAsyncConnectionState, step: PgTlsConnectStep) -> Result[PgAsyncConnectionStep, Text]:
+    match step:
+        Progress(connect_state):
+            return ok(PgAsyncConnectionStep::Progress(pg_async_connection_state(0, state.deadline_ms, some(connect_state), none, state.username, state.database, state.password, state.timeout_ms)))
+        WaitConnect(connect_state):
+            return ok(PgAsyncConnectionStep::WaitConnect(pg_async_connection_state(0, state.deadline_ms, some(connect_state), none, state.username, state.database, state.password, state.timeout_ms)))
+        WaitRead(connect_state):
+            return ok(PgAsyncConnectionStep::WaitRead(pg_async_connection_state(0, state.deadline_ms, some(connect_state), none, state.username, state.database, state.password, state.timeout_ms)))
+        WaitWrite(connect_state):
+            return ok(PgAsyncConnectionStep::WaitWrite(pg_async_connection_state(0, state.deadline_ms, some(connect_state), none, state.username, state.database, state.password, state.timeout_ms)))
+        Complete(handle):
+            let started: Result[PgAsyncStartupState, Text] = pg_startup_async_begin_at(handle, state.username, state.database, state.password, state.deadline_ms)
+            if not result_is_ok(started):
+                let closed: Number = net_close(handle)
+                let wiped: Boolean = secret_zeroize(state.password)
+                return err(result_unwrap_error(started))
+            return ok(PgAsyncConnectionStep::Progress(pg_async_connection_state(1, state.deadline_ms, none, some(result_unwrap(started)), state.username, state.database, state.password, state.timeout_ms)))
+
+fn pg_connect_async_after_startup(state: PgAsyncConnectionState, step: PgAsyncStartupStep) -> Result[PgAsyncConnectionStep, Text]:
+    match step:
+        Progress(startup_state):
+            return ok(PgAsyncConnectionStep::Progress(pg_async_connection_state(1, state.deadline_ms, none, some(startup_state), state.username, state.database, state.password, state.timeout_ms)))
+        WaitRead(startup_state):
+            return ok(PgAsyncConnectionStep::WaitRead(pg_async_connection_state(1, state.deadline_ms, none, some(startup_state), state.username, state.database, state.password, state.timeout_ms)))
+        WaitWrite(startup_state):
+            return ok(PgAsyncConnectionStep::WaitWrite(pg_async_connection_state(1, state.deadline_ms, none, some(startup_state), state.username, state.database, state.password, state.timeout_ms)))
+        Complete(handle):
+            return ok(PgAsyncConnectionStep::Complete(handle))
+
+fn pg_connect_async_step(state: PgAsyncConnectionState) -> Result[PgAsyncConnectionStep, Text]:
+    if state.timeout_ms < 1 or state.timeout_ms > 3600000 or state.deadline_ms <= 0 or not secret_is_valid(state.password):
+        let wiped: Boolean = secret_zeroize(state.password)
+        return err("postgres async connect: continuation state is malformed")
+    if state.phase == 0:
+        if not option_is_some(state.connect_state) or option_is_some(state.startup_state):
+            let cancelled: Boolean = pg_connect_async_cancel(state)
+            let wiped: Boolean = secret_zeroize(state.password)
+            return err("postgres async connect: TCP/TLS continuation state is malformed")
+        let stepped: Result[PgTlsConnectStep, Text] = pg_tls_connect_async_step(option_unwrap(state.connect_state))
+        if not result_is_ok(stepped):
+            let wiped: Boolean = secret_zeroize(state.password)
+            return err(result_unwrap_error(stepped))
+        let advanced: Result[PgAsyncConnectionStep, Text] = pg_connect_async_after_tcp(state, result_unwrap(stepped))
+        if not result_is_ok(advanced):
+            let wiped: Boolean = secret_zeroize(state.password)
+        return advanced
+    if state.phase == 1:
+        if option_is_some(state.connect_state) or not option_is_some(state.startup_state):
+            let wiped: Boolean = secret_zeroize(state.password)
+            return err("postgres async connect: startup continuation state is malformed")
+        let stepped: Result[PgAsyncStartupStep, Text] = pg_startup_async_step(option_unwrap(state.startup_state))
+        if not result_is_ok(stepped):
+            let wiped: Boolean = secret_zeroize(state.password)
+            return err(result_unwrap_error(stepped))
+        let advanced: Result[PgAsyncConnectionStep, Text] = pg_connect_async_after_startup(state, result_unwrap(stepped))
+        if not result_is_ok(advanced):
+            let wiped: Boolean = secret_zeroize(state.password)
+        return advanced
+    let wiped: Boolean = secret_zeroize(state.password)
+    return err("postgres async connect: continuation phase is unknown")
+
+fn pg_connect_async_wait(state: PgAsyncConnectionState, writable: Boolean) -> Result[Boolean, Text]:
+    if state.phase == 0 and option_is_some(state.connect_state) and not option_is_some(state.startup_state):
+        let waiting: Result[Boolean, Text] = pg_tls_connect_async_wait(option_unwrap(state.connect_state), writable)
+        if not result_is_ok(waiting):
+            let cancelled: Boolean = pg_connect_async_cancel(state)
+        return waiting
+    if state.phase == 1 and not option_is_some(state.connect_state) and option_is_some(state.startup_state):
+        return pg_startup_async_wait(option_unwrap(state.startup_state), writable)
+    let wiped: Boolean = secret_zeroize(state.password)
+    return err("postgres async connect: readiness wait does not match a suspended continuation")
+
+fn pg_connect_async_cancel(state: PgAsyncConnectionState) -> Boolean:
+    if state.phase == 0 and option_is_some(state.connect_state) and not option_is_some(state.startup_state):
+        let cancelled: Boolean = pg_tls_connect_async_cancel(option_unwrap(state.connect_state))
+        let wiped: Boolean = secret_zeroize(state.password)
+        return cancelled
+    if state.phase == 1 and not option_is_some(state.connect_state) and option_is_some(state.startup_state):
+        return pg_startup_async_cancel(option_unwrap(state.startup_state))
+    let wiped: Boolean = secret_zeroize(state.password)
+    return false

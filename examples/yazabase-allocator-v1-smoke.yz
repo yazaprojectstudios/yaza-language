@@ -1,0 +1,165 @@
+use "std/fs"
+use "../yazabase/allocator_v1"
+use "../yazabase/page_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/wal_v1"
+
+fn yaza_base_allocator_v1_check(root_path: Text) -> Result[Number, Text]:
+    let root: Number = root_open(root_path)?
+    let uuid: Bytes = bytes_from_text("alloc-smoke-uuid")
+    let initial: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(uuid, 0, 1, 1, 0, 2, 1)
+    let created: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, "allocator-smoke.ydb", initial)?
+    if created.header.page_count != yaza_db_storage_preallocated_page_count_v1(): return err("YDBv1 allocator fixture did not receive its preallocated logical range")
+
+    let log: YazaDbWalLogV1 = yaza_db_wal_log_open_for_v1(root, uuid)?
+    let seed: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(log, YazaDbWalRecordV1(0, 0, 1, yaza_db_wal_type_mtr_end_v1(), 0, bytes_from_text("")))?
+    let first: YazaDbPageSpaceChangeV1 = yaza_db_allocator_allocate_existing_v1(created, seed.log, 1, seed.record.lsn)?
+    if first.page_id != 3 or first.bitmap_page_id != 2 or first.bit_index != 1: return err("YDBv1 allocator did not choose the first free existing page")
+    if first.record.lsn != 40 or first.record.prev_lsn != seed.record.lsn: return err("YDBv1 first allocation was not linked into the durable WAL chain")
+    let first_decoded: YazaDbPageSpaceRecordV1 = yaza_db_page_space_payload_decode_v1(first.record)?
+    if first_decoded.operation != 1 or first_decoded.page_id != first.page_id or first_decoded.bitmap_page_id != first.bitmap_page_id or first_decoded.bit_index != first.bit_index: return err("YDBv1 first PAGE_ALLOC payload did not round-trip")
+    let first_page: Bytes = yaza_db_page_new_v1(first.page_id, first.record.lsn, 1, 0)?
+    let first_slot: Number = yaza_db_page_add_slot_v1(first_page, bytes_from_text("a"), bytes_from_text("row-a"))?
+    if first_slot != 0: return err("YDBv1 allocator first leaf slot index is wrong")
+    let first_finalized: Bytes = yaza_db_page_finalize_v1(first_page)?
+    let first_page_write: Number = yaza_db_storage_write_page_v1(first.storage.file, first.storage.header, first_finalized)?
+    if first_page_write != yaza_db_page_size_v1(): return err("YDBv1 allocator could not write its first allocated page")
+
+    let second: YazaDbPageSpaceChangeV1 = yaza_db_allocator_allocate_existing_v1(first.storage, first.wal, 1, first.record.lsn)?
+    if second.page_id != 4 or second.bitmap_page_id != 2 or second.bit_index != 2: return err("YDBv1 allocator did not advance to the next free page")
+    if second.record.prev_lsn != first.record.lsn or second.record.lsn != 104: return err("YDBv1 second allocation broke its transaction WAL chain")
+    let second_decoded: YazaDbPageSpaceRecordV1 = yaza_db_page_space_payload_decode_v1(second.record)?
+    if second_decoded.operation != 1 or second_decoded.page_id != second.page_id or second_decoded.bitmap_page_id != second.bitmap_page_id or second_decoded.bit_index != second.bit_index: return err("YDBv1 second PAGE_ALLOC payload did not round-trip")
+    let second_page: Bytes = yaza_db_page_new_v1(second.page_id, second.record.lsn, 1, 0)?
+    let second_slot: Number = yaza_db_page_add_slot_v1(second_page, bytes_from_text("b"), bytes_from_text("row-b"))?
+    if second_slot != 0: return err("YDBv1 allocator second leaf slot index is wrong")
+    let second_finalized: Bytes = yaza_db_page_finalize_v1(second_page)?
+    let second_page_write: Number = yaza_db_storage_write_page_v1(second.storage.file, second.storage.header, second_finalized)?
+    if second_page_write != yaza_db_page_size_v1(): return err("YDBv1 allocator could not write its second allocated page")
+
+    let bitmap_free_rejected: Result[YazaDbPageSpaceChangeV1, Text] = yaza_db_allocator_free_existing_v1(second.storage, second.wal, 1, second.record.lsn, 2)
+    if result_is_ok(bitmap_free_rejected): return err("YDBv1 allocator allowed release of a BITMAP metadata page")
+    let corrupt_first_page: Bytes = bytes_try_slice(first_finalized, 0, yaza_db_page_size_v1())?
+    let original_byte: Number = bytes_get(corrupt_first_page, 100)
+    if not bytes_try_set(corrupt_first_page, 100, original_byte + 1): return err("YDBv1 allocator corruption fixture could not change the page")
+    let corrupt_offset: Number = first.page_id * yaza_db_page_size_v1()
+    let corrupt_write: Number = write_exact(second.storage.file, corrupt_offset, corrupt_first_page)?
+    let corrupt_sync: Boolean = sync(second.storage.file)?
+    if corrupt_write != yaza_db_page_size_v1() or not corrupt_sync: return err("YDBv1 allocator corruption fixture could not persist the page")
+    let corrupt_page_free_rejected: Result[YazaDbPageSpaceChangeV1, Text] = yaza_db_allocator_free_existing_v1(second.storage, second.wal, 1, second.record.lsn, first.page_id)
+    if result_is_ok(corrupt_page_free_rejected): return err("YDBv1 allocator freed a page with an invalid checksum")
+    let restore_write: Number = write_exact(second.storage.file, corrupt_offset, first_finalized)?
+    let restore_sync: Boolean = sync(second.storage.file)?
+    if restore_write != yaza_db_page_size_v1() or not restore_sync: return err("YDBv1 allocator corruption fixture could not restore the page")
+    let freed: YazaDbPageSpaceChangeV1 = yaza_db_allocator_free_existing_v1(second.storage, second.wal, 1, second.record.lsn, 3)?
+    if freed.record.rec_type != yaza_db_wal_type_page_free_v1() or freed.record.lsn != 168 or freed.record.prev_lsn != second.record.lsn: return err("YDBv1 PAGE_FREE was not durable and transaction-linked")
+    let free_decoded: YazaDbPageSpaceRecordV1 = yaza_db_page_space_payload_decode_v1(freed.record)?
+    if free_decoded.operation != 2 or free_decoded.page_id != 3 or free_decoded.bitmap_page_id != 2 or free_decoded.bit_index != 1: return err("YDBv1 PAGE_FREE payload did not round-trip")
+    let repeated_free: Result[YazaDbPageSpaceChangeV1, Text] = yaza_db_allocator_free_existing_v1(freed.storage, freed.wal, 1, freed.record.lsn, 3)
+    if result_is_ok(repeated_free): return err("YDBv1 allocator logged a repeated free for an already-free page")
+    let freed_page_read: Result[Bytes, Text] = yaza_db_storage_read_page_v1(freed.storage.file, freed.storage.header, 3)
+    if result_is_ok(freed_page_read): return err("YDBv1 storage returned a page after its allocation bit was cleared")
+    let reallocated: YazaDbPageSpaceChangeV1 = yaza_db_allocator_allocate_existing_v1(freed.storage, freed.wal, 1, freed.record.lsn)?
+    if reallocated.page_id != 3 or reallocated.bit_index != 1 or reallocated.record.lsn != 232 or reallocated.record.prev_lsn != freed.record.lsn: return err("YDBv1 allocator did not reuse the released page through WAL")
+    let recycled_page: Bytes = yaza_db_page_new_v1(reallocated.page_id, reallocated.record.lsn, 1, 0)?
+    let recycled_slot: Number = yaza_db_page_add_slot_v1(recycled_page, bytes_from_text("c"), bytes_from_text("row-c"))?
+    if recycled_slot != 0: return err("YDBv1 recycled leaf slot index is wrong")
+    let recycled_finalized: Bytes = yaza_db_page_finalize_v1(recycled_page)?
+    let recycled_write: Number = yaza_db_storage_write_page_v1(reallocated.storage.file, reallocated.storage.header, recycled_finalized)?
+    if recycled_write != yaza_db_page_size_v1(): return err("YDBv1 allocator could not write its recycled page")
+    let persisted_bitmap: Bytes = yaza_db_storage_read_page_v1(reallocated.storage.file, reallocated.storage.header, 2)?
+    let first_allocated: Boolean = yaza_db_bitmap_page_bit_for_page_v1(persisted_bitmap, 3, 2)?
+    let second_allocated: Boolean = yaza_db_bitmap_page_bit_for_page_v1(persisted_bitmap, 4, 2)?
+    if not first_allocated or not second_allocated: return err("YDBv1 allocator bitmap did not persist allocation and reuse")
+    let closed_log: Boolean = yaza_db_wal_log_close_v1(reallocated.wal)?
+    if not closed_log: return err("YDBv1 allocator WAL close failed")
+    let reopened_log: YazaDbWalLogV1 = yaza_db_wal_log_open_for_v1(root, uuid)?
+    if reopened_log.next_lsn != 296: return err("YDBv1 allocator WAL end did not recover after reopen")
+    let reopened_seed: YazaDbWalRecordV1 = yaza_db_wal_read_segment_record_v1(reopened_log.file, 0, 0)?
+    let reopened_first: YazaDbWalRecordV1 = yaza_db_wal_read_segment_record_v1(reopened_log.file, 40, 40)?
+    let reopened_second: YazaDbWalRecordV1 = yaza_db_wal_read_segment_record_v1(reopened_log.file, 104, 104)?
+    let reopened_free: YazaDbWalRecordV1 = yaza_db_wal_read_segment_record_v1(reopened_log.file, 168, 168)?
+    let reopened_reallocation: YazaDbWalRecordV1 = yaza_db_wal_read_segment_record_v1(reopened_log.file, 232, 232)?
+    if reopened_seed.rec_type != yaza_db_wal_type_mtr_end_v1() or reopened_first.rec_type != yaza_db_wal_type_page_alloc_v1() or reopened_second.rec_type != yaza_db_wal_type_page_alloc_v1() or reopened_free.rec_type != yaza_db_wal_type_page_free_v1() or reopened_reallocation.rec_type != yaza_db_wal_type_page_alloc_v1(): return err("YDBv1 allocator WAL records did not survive reopen")
+    let recovered_first_payload: YazaDbPageSpaceRecordV1 = yaza_db_page_space_payload_decode_v1(reopened_first)?
+    let recovered_second_payload: YazaDbPageSpaceRecordV1 = yaza_db_page_space_payload_decode_v1(reopened_second)?
+    let recovered_free_payload: YazaDbPageSpaceRecordV1 = yaza_db_page_space_payload_decode_v1(reopened_free)?
+    let recovered_reallocation_payload: YazaDbPageSpaceRecordV1 = yaza_db_page_space_payload_decode_v1(reopened_reallocation)?
+    if recovered_first_payload.page_id != 3 or recovered_second_payload.page_id != 4 or recovered_free_payload.page_id != 3 or recovered_reallocation_payload.page_id != 3: return err("YDBv1 recovered PAGE_ALLOC/PAGE_FREE records refer to the wrong pages")
+    let closed_reopened_log: Boolean = yaza_db_wal_log_close_v1(reopened_log)?
+    if not closed_reopened_log: return err("YDBv1 reopened allocator WAL close failed")
+    let closed_storage: Boolean = yaza_db_storage_close_v1(reallocated.storage)?
+    if not closed_storage: return err("YDBv1 allocator storage close failed")
+    let removed_database: Boolean = remove(root, "allocator-smoke.ydb")?
+    let wal_segment_name: Text = yaza_db_wal_segment_name_for_v1(0, uuid)?
+    let removed_wal: Boolean = remove(root, wal_segment_name)?
+    if not removed_database or not removed_wal: return err("YDBv1 allocator fixture cleanup failed")
+    let synced_directory: Boolean = sync_directory(root)?
+    if not synced_directory: return err("YDBv1 allocator fixture failed to sync cleanup")
+
+    let redo_uuid: Bytes = bytes_from_text("alloc-redo-uuid1")
+    let redo_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(redo_uuid, 0, 1, 1, 0, 2, 1)
+    let redo_storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, "allocator-redo-smoke.ydb", redo_header)?
+    let redo_log: YazaDbWalLogV1 = yaza_db_wal_log_open_for_v1(root, redo_uuid)?
+    let redo_seed: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(redo_log, YazaDbWalRecordV1(0, 0, 1, yaza_db_wal_type_mtr_end_v1(), 0, bytes_from_text("")))?
+    let redo_alloc_payload: Bytes = yaza_db_page_space_payload_encode_v1(1, 3, 2, 1)?
+    let redo_alloc: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(redo_seed.log, YazaDbWalRecordV1(0, redo_seed.record.lsn, 1, yaza_db_wal_type_page_alloc_v1(), 0, redo_alloc_payload))?
+    let before_redo: Bytes = yaza_db_storage_read_page_v1(redo_storage.file, redo_storage.header, 2)?
+    let before_redo_allocated: Boolean = yaza_db_bitmap_page_bit_for_page_v1(before_redo, 3, 2)?
+    if before_redo_allocated or redo_alloc.record.lsn == 0: return err("YDBv1 page-space redo fixture did not create an unapplied PAGE_ALLOC")
+    let applied_alloc: Boolean = yaza_db_allocator_redo_page_space_v1(redo_storage, redo_alloc.record, redo_alloc.log.next_lsn)?
+    if not applied_alloc: return err("YDBv1 PAGE_ALLOC redo did not report success")
+    let after_alloc_redo: Bytes = yaza_db_storage_read_page_v1(redo_storage.file, redo_storage.header, 2)?
+    let alloc_redo_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(after_alloc_redo, 2)?
+    let after_allocated: Boolean = yaza_db_bitmap_page_bit_for_page_v1(after_alloc_redo, 3, 2)?
+    if not after_allocated or alloc_redo_header.page_lsn != redo_alloc.record.lsn: return err("YDBv1 PAGE_ALLOC redo did not durably set the bit and page LSN")
+    let repeated_alloc_redo: Boolean = yaza_db_allocator_redo_page_space_v1(redo_storage, redo_alloc.record, redo_alloc.log.next_lsn)?
+    if not repeated_alloc_redo: return err("YDBv1 PAGE_ALLOC redo was not idempotent")
+
+    let redo_free_payload: Bytes = yaza_db_page_space_payload_encode_v1(2, 3, 2, 1)?
+    let redo_free: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(redo_alloc.log, YazaDbWalRecordV1(0, redo_alloc.record.lsn, 1, yaza_db_wal_type_page_free_v1(), 0, redo_free_payload))?
+    let applied_free: Boolean = yaza_db_allocator_redo_page_space_v1(redo_storage, redo_free.record, redo_free.log.next_lsn)?
+    if not applied_free: return err("YDBv1 PAGE_FREE redo did not report success")
+    let after_free_redo: Bytes = yaza_db_storage_read_page_v1(redo_storage.file, redo_storage.header, 2)?
+    let free_redo_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(after_free_redo, 2)?
+    let after_free_allocated: Boolean = yaza_db_bitmap_page_bit_for_page_v1(after_free_redo, 3, 2)?
+    if after_free_allocated or free_redo_header.page_lsn != redo_free.record.lsn: return err("YDBv1 PAGE_FREE redo did not durably clear the bit and advance the page LSN")
+    let stale_alloc_redo: Boolean = yaza_db_allocator_redo_page_space_v1(redo_storage, redo_alloc.record, redo_free.log.next_lsn)?
+    if not stale_alloc_redo: return err("YDBv1 stale PAGE_ALLOC redo was not ignored")
+    let after_stale_redo: Bytes = yaza_db_storage_read_page_v1(redo_storage.file, redo_storage.header, 2)?
+    let stale_redo_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(after_stale_redo, 2)?
+    let after_stale_allocated: Boolean = yaza_db_bitmap_page_bit_for_page_v1(after_stale_redo, 3, 2)?
+    if after_stale_allocated or stale_redo_header.page_lsn != redo_free.record.lsn: return err("YDBv1 older PAGE_ALLOC redo overwrote a later PAGE_FREE")
+
+    let compensation_payload: Bytes = yaza_db_compensation_payload_encode_v1(1, 3, 2, 1, redo_alloc.record.lsn, redo_free.record.lsn)?
+    let compensation_input: YazaDbWalRecordV1 = YazaDbWalRecordV1(0, redo_free.record.lsn, 1, yaza_db_wal_type_compensation_v1(), 0, compensation_payload)
+    let compensation: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(redo_free.log, compensation_input)?
+    let decoded_compensation: YazaDbCompensationPayloadV1 = yaza_db_compensation_payload_decode_v1(compensation.record)?
+    if decoded_compensation.operation != 1 or decoded_compensation.page_id != 3 or decoded_compensation.bitmap_page_id != 2 or decoded_compensation.bit_index != 1 or decoded_compensation.undo_next_lsn != redo_alloc.record.lsn or decoded_compensation.compensated_lsn != redo_free.record.lsn: return err("YDBv1 compensation payload did not round-trip")
+    let redone_compensation: Boolean = yaza_db_allocator_redo_compensation_v1(redo_storage, compensation.record, compensation.log.next_lsn)?
+    if not redone_compensation: return err("YDBv1 COMPENSATION redo did not report success")
+    let after_compensation: Bytes = yaza_db_storage_read_page_v1(redo_storage.file, redo_storage.header, 2)?
+    let compensation_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(after_compensation, 2)?
+    let after_compensation_allocated: Boolean = yaza_db_bitmap_page_bit_for_page_v1(after_compensation, 3, 2)?
+    if not after_compensation_allocated or compensation_header.page_lsn != compensation.record.lsn: return err("YDBv1 COMPENSATION redo did not apply the inverse state with its own page LSN")
+    let repeated_compensation: Boolean = yaza_db_allocator_redo_compensation_v1(redo_storage, compensation.record, compensation.log.next_lsn)?
+    if not repeated_compensation: return err("YDBv1 COMPENSATION redo was not idempotent")
+    let invalid_compensation_payload: Result[Bytes, Text] = yaza_db_compensation_payload_encode_v1(1, 3, 2, 1, redo_free.record.lsn, redo_free.record.lsn)
+    if result_is_ok(invalid_compensation_payload): return err("YDBv1 COMPENSATION encoder accepted an undo cursor at the compensated record")
+
+    let closed_redo_log: Boolean = yaza_db_wal_log_close_v1(compensation.log)?
+    let closed_redo_storage: Boolean = yaza_db_storage_close_v1(redo_storage)?
+    let removed_redo_db: Boolean = remove(root, "allocator-redo-smoke.ydb")?
+    let redo_segment_name: Text = yaza_db_wal_segment_name_for_v1(0, redo_uuid)?
+    let removed_redo_wal: Boolean = remove(root, redo_segment_name)?
+    let cleanup_redo_sync: Boolean = sync_directory(root)?
+    let closed_root: Boolean = close(root)?
+    if not closed_redo_log or not closed_redo_storage or not removed_redo_db or not removed_redo_wal or not cleanup_redo_sync or not closed_root: return err("YDBv1 allocator fixture failed to close or clean up its redo case")
+    return ok(reallocated.record.lsn + yaza_db_page_size_v1())
+
+start:
+    let outcome: Result[Number, Text] = yaza_base_allocator_v1_check(arg(1))
+    if result_is_ok(outcome):
+        say "yazabase-allocator-v1-ok bytes=" + number_text(result_unwrap(outcome))
+    else:
+        say result_unwrap_error(outcome)

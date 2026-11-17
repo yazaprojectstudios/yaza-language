@@ -1,0 +1,501 @@
+# MySQL wire protocol v10 client codec and frame framing.
+# Pure YAZA implementation of MySQL packet structure, Handshake, Response, and Resultset.
+
+shape MysqlPacketHeader:
+    payload_length: Number
+    sequence_id: Number
+
+shape MysqlLenencInt:
+    value: Number
+    is_null: Boolean
+    bytes_consumed: Number
+
+shape MysqlCString:
+    value: Text
+    bytes_consumed: Number
+
+shape MysqlHandshakeV10:
+    protocol_version: Number
+    server_version: Text
+    connection_id: Number
+    auth_plugin_data: Bytes
+    capability_flags: Number
+    character_set: Number
+    status_flags: Number
+    auth_plugin_name: Text
+
+shape MysqlColumnDefinition:
+    catalog: Text
+    schema: Text
+    table: Text
+    org_table: Text
+    name: Text
+    org_name: Text
+    charset: Number
+    column_length: Number
+    column_type: Number
+    flags: Number
+    decimals: Number
+
+shape MysqlOkPacket:
+    affected_rows: Number
+    last_insert_id: Number
+    status_flags: Number
+    warnings: Number
+    info: Text
+
+shape MysqlErrPacket:
+    error_code: Number
+    sql_state: Text
+    error_message: Text
+
+shape MysqlEofPacket:
+    warnings: Number
+    status_flags: Number
+
+shape MysqlRow:
+    cell_values: TextList
+    cell_is_null: TextList
+
+variant MysqlPacketKind:
+    PacketOk
+    PacketErr
+    PacketEof
+    PacketData
+
+# Capability constants (Protocol 41 and common client flags)
+fn mysql_client_long_password() -> Number:
+    return 1
+
+fn mysql_client_found_rows() -> Number:
+    return 2
+
+fn mysql_client_connect_with_db() -> Number:
+    return 8
+
+fn mysql_client_protocol_41() -> Number:
+    return 512
+
+fn mysql_client_secure_connection() -> Number:
+    return 32768
+
+fn mysql_client_plugin_auth() -> Number:
+    return 524288
+
+fn mysql_client_plugin_auth_lenenc() -> Number:
+    return 2097152
+
+fn mysql_u16_le(value: Number) -> Result[Bytes, Text]:
+    if value < 0 or value > 65535:
+        return err("MySQL integer outside 16-bit unsigned range")
+    let b0: Number = value % 256
+    let b1: Number = (value / 256) % 256
+    return ok(bytes_concat(bytes_from_number(b0), bytes_from_number(b1)))
+
+fn mysql_read_u16_le(payload: Bytes, offset: Number) -> Result[Number, Text]:
+    if offset < 0 or offset + 2 > bytes_length(payload):
+        return err("MySQL buffer underflow reading u16_le")
+    let b0: Number = bytes_get(payload, offset)
+    let b1: Number = bytes_get(payload, offset + 1)
+    return ok(b0 + b1 * 256)
+
+fn mysql_u24_le(value: Number) -> Result[Bytes, Text]:
+    if value < 0 or value > 16777215:
+        return err("MySQL integer outside 24-bit unsigned range")
+    let b0: Number = value % 256
+    let b1: Number = (value / 256) % 256
+    let b2: Number = (value / 65536) % 256
+    let p0: Bytes = bytes_concat(bytes_from_number(b0), bytes_from_number(b1))
+    return ok(bytes_concat(p0, bytes_from_number(b2)))
+
+fn mysql_read_u24_le(payload: Bytes, offset: Number) -> Result[Number, Text]:
+    if offset < 0 or offset + 3 > bytes_length(payload):
+        return err("MySQL buffer underflow reading u24_le")
+    let b0: Number = bytes_get(payload, offset)
+    let b1: Number = bytes_get(payload, offset + 1)
+    let b2: Number = bytes_get(payload, offset + 2)
+    return ok(b0 + b1 * 256 + b2 * 65536)
+
+fn mysql_u32_le(value: Number) -> Result[Bytes, Text]:
+    if value < 0 or value > 4294967295:
+        return err("MySQL integer outside 32-bit unsigned range")
+    let b0: Number = value % 256
+    let b1: Number = (value / 256) % 256
+    let b2: Number = (value / 65536) % 256
+    let b3: Number = (value / 16777216) % 256
+    let p0: Bytes = bytes_concat(bytes_from_number(b0), bytes_from_number(b1))
+    let p1: Bytes = bytes_concat(bytes_from_number(b2), bytes_from_number(b3))
+    return ok(bytes_concat(p0, p1))
+
+fn mysql_read_u32_le(payload: Bytes, offset: Number) -> Result[Number, Text]:
+    if offset < 0 or offset + 4 > bytes_length(payload):
+        return err("MySQL buffer underflow reading u32_le")
+    let b0: Number = bytes_get(payload, offset)
+    let b1: Number = bytes_get(payload, offset + 1)
+    let b2: Number = bytes_get(payload, offset + 2)
+    let b3: Number = bytes_get(payload, offset + 3)
+    return ok(b0 + b1 * 256 + b2 * 65536 + b3 * 16777216)
+
+fn mysql_cstring(text: Text) -> Bytes:
+    return bytes_concat(bytes_from_text(text), bytes_from_number(0))
+
+fn mysql_read_cstring(payload: Bytes, offset: Number) -> Result[MysqlCString, Text]:
+    let total: Number = bytes_length(payload)
+    if offset < 0 or offset >= total:
+        return err("MySQL cstring offset out of bounds")
+    var end_pos: Number = offset
+    while end_pos < total and bytes_get(payload, end_pos) != 0:
+        set end_pos = end_pos + 1
+    if end_pos >= total:
+        return err("MySQL cstring missing null terminator")
+    let str_bytes: Bytes = bytes_slice(payload, offset, end_pos - offset)
+    let str_opt: Option[Text] = bytes_to_text_checked(str_bytes)
+    if not option_is_some(str_opt):
+        return err("MySQL cstring invalid UTF-8")
+    let consumed: Number = end_pos - offset + 1
+    return ok(MysqlCString(option_unwrap(str_opt), consumed))
+
+fn mysql_encode_lenenc_int(value: Number) -> Result[Bytes, Text]:
+    if value < 0:
+        return err("MySQL lenenc integer cannot be negative")
+    if value < 251:
+        return ok(bytes_from_number(value))
+    if value <= 65535:
+        let u16_res: Result[Bytes, Text] = mysql_u16_le(value)
+        if not result_is_ok(u16_res):
+            return err(result_unwrap_error(u16_res))
+        return ok(bytes_concat(bytes_from_number(252), result_unwrap(u16_res)))
+    if value <= 16777215:
+        let u24_res: Result[Bytes, Text] = mysql_u24_le(value)
+        if not result_is_ok(u24_res):
+            return err(result_unwrap_error(u24_res))
+        return ok(bytes_concat(bytes_from_number(253), result_unwrap(u24_res)))
+    let u32_res: Result[Bytes, Text] = mysql_u32_le(value)
+    if not result_is_ok(u32_res):
+        return err(result_unwrap_error(u32_res))
+    let high_zero: Bytes = bytes_concat(bytes_concat(bytes_from_number(0), bytes_from_number(0)), bytes_concat(bytes_from_number(0), bytes_from_number(0)))
+    return ok(bytes_concat(bytes_concat(bytes_from_number(254), result_unwrap(u32_res)), high_zero))
+
+fn mysql_read_lenenc_int(payload: Bytes, offset: Number) -> Result[MysqlLenencInt, Text]:
+    let total: Number = bytes_length(payload)
+    if offset < 0 or offset >= total:
+        return err("MySQL buffer underflow reading lenenc int")
+    let first: Number = bytes_get(payload, offset)
+    if first == 251:
+        return ok(MysqlLenencInt(0, true, 1))
+    if first < 251:
+        return ok(MysqlLenencInt(first, false, 1))
+    if first == 252:
+        let u16_val: Result[Number, Text] = mysql_read_u16_le(payload, offset + 1)
+        if not result_is_ok(u16_val):
+            return err(result_unwrap_error(u16_val))
+        return ok(MysqlLenencInt(result_unwrap(u16_val), false, 3))
+    if first == 253:
+        let u24_val: Result[Number, Text] = mysql_read_u24_le(payload, offset + 1)
+        if not result_is_ok(u24_val):
+            return err(result_unwrap_error(u24_val))
+        return ok(MysqlLenencInt(result_unwrap(u24_val), false, 4))
+    if first == 254:
+        let u32_val: Result[Number, Text] = mysql_read_u32_le(payload, offset + 1)
+        if not result_is_ok(u32_val):
+            return err(result_unwrap_error(u32_val))
+        return ok(MysqlLenencInt(result_unwrap(u32_val), false, 9))
+    return err("MySQL invalid lenenc integer prefix 0xFF")
+
+fn mysql_encode_lenenc_string(text: Text) -> Result[Bytes, Text]:
+    let raw: Bytes = bytes_from_text(text)
+    let len_res: Result[Bytes, Text] = mysql_encode_lenenc_int(bytes_length(raw))
+    if not result_is_ok(len_res):
+        return err(result_unwrap_error(len_res))
+    return ok(bytes_concat(result_unwrap(len_res), raw))
+
+fn mysql_packet(sequence_id: Number, payload: Bytes) -> Result[Bytes, Text]:
+    let len: Number = bytes_length(payload)
+    if len > 16777215:
+        return err("MySQL payload exceeds maximum single packet size of 16MiB")
+    let len_bytes_res: Result[Bytes, Text] = mysql_u24_le(len)
+    if not result_is_ok(len_bytes_res):
+        return err(result_unwrap_error(len_bytes_res))
+    let seq_byte: Bytes = bytes_from_number(sequence_id % 256)
+    let header: Bytes = bytes_concat(result_unwrap(len_bytes_res), seq_byte)
+    return ok(bytes_concat(header, payload))
+
+fn mysql_parse_packet_header(packet: Bytes, offset: Number) -> Result[MysqlPacketHeader, Text]:
+    if offset < 0 or offset + 4 > bytes_length(packet):
+        return err("MySQL packet underflow reading header")
+    let len_res: Result[Number, Text] = mysql_read_u24_le(packet, offset)
+    if not result_is_ok(len_res):
+        return err(result_unwrap_error(len_res))
+    let seq_id: Number = bytes_get(packet, offset + 3)
+    return ok(MysqlPacketHeader(result_unwrap(len_res), seq_id))
+
+fn mysql_parse_handshake_v10(payload: Bytes) -> Result[MysqlHandshakeV10, Text]:
+    let total: Number = bytes_length(payload)
+    if total < 30:
+        return err("MySQL handshake packet too short")
+    let proto_ver: Number = bytes_get(payload, 0)
+    if proto_ver != 10:
+        return err("Unsupported MySQL protocol version; expected 10")
+    let server_ver_res: Result[MysqlCString, Text] = mysql_read_cstring(payload, 1)
+    if not result_is_ok(server_ver_res):
+        return err(result_unwrap_error(server_ver_res))
+    let server_ver_item: MysqlCString = result_unwrap(server_ver_res)
+    var cursor: Number = 1 + server_ver_item.bytes_consumed
+    let conn_id_res: Result[Number, Text] = mysql_read_u32_le(payload, cursor)
+    if not result_is_ok(conn_id_res):
+        return err(result_unwrap_error(conn_id_res))
+    let conn_id: Number = result_unwrap(conn_id_res)
+    set cursor = cursor + 4
+    if cursor + 8 > total:
+        return err("MySQL handshake underflow reading auth plugin data part 1")
+    let auth_data_1: Bytes = bytes_slice(payload, cursor, 8)
+    set cursor = cursor + 8
+    set cursor = cursor + 1
+    let cap_low_res: Result[Number, Text] = mysql_read_u16_le(payload, cursor)
+    if not result_is_ok(cap_low_res):
+        return err(result_unwrap_error(cap_low_res))
+    let cap_low: Number = result_unwrap(cap_low_res)
+    set cursor = cursor + 2
+    let charset: Number = bytes_get(payload, cursor)
+    set cursor = cursor + 1
+    let status_res: Result[Number, Text] = mysql_read_u16_le(payload, cursor)
+    if not result_is_ok(status_res):
+        return err(result_unwrap_error(status_res))
+    let status_val: Number = result_unwrap(status_res)
+    set cursor = cursor + 2
+    let cap_high_res: Result[Number, Text] = mysql_read_u16_le(payload, cursor)
+    if not result_is_ok(cap_high_res):
+        return err(result_unwrap_error(cap_high_res))
+    let cap_high: Number = result_unwrap(cap_high_res)
+    set cursor = cursor + 2
+    let full_cap: Number = cap_low + cap_high * 65536
+    let auth_plugin_data_len: Number = bytes_get(payload, cursor)
+    set cursor = cursor + 1
+    set cursor = cursor + 10
+    var salt_bytes: Bytes = auth_data_1
+    if cursor < total:
+        var part2_len: Number = 12
+        if auth_plugin_data_len > 8:
+            set part2_len = auth_plugin_data_len - 8
+            if part2_len < 12:
+                set part2_len = 12
+        if cursor + part2_len <= total:
+            let auth_data_2: Bytes = bytes_slice(payload, cursor, part2_len)
+            set salt_bytes = bytes_concat(auth_data_1, auth_data_2)
+            set cursor = cursor + part2_len
+    var plugin_name: Text = "caching_sha2_password"
+    if cursor < total:
+        let plugin_str_res: Result[MysqlCString, Text] = mysql_read_cstring(payload, cursor)
+        if result_is_ok(plugin_str_res):
+            set plugin_name = result_unwrap(plugin_str_res).value
+    return ok(MysqlHandshakeV10(proto_ver, server_ver_item.value, conn_id, salt_bytes, full_cap, charset, status_val, plugin_name))
+
+fn mysql_handshake_response_41(username: Text, auth_data: Bytes, database: Option[Text], plugin_name: Text, sequence_id: Number) -> Result[Bytes, Text]:
+    var client_flags: Number = 512 + 1 + 2 + 32768 + 524288
+    if option_is_some(database):
+        set client_flags = client_flags + 8
+    let cap_res: Result[Bytes, Text] = mysql_u32_le(client_flags)
+    if not result_is_ok(cap_res):
+        return err(result_unwrap_error(cap_res))
+    let max_pkt_res: Result[Bytes, Text] = mysql_u32_le(16777216)
+    if not result_is_ok(max_pkt_res):
+        return err(result_unwrap_error(max_pkt_res))
+    let charset_byte: Bytes = bytes_from_number(45)
+    var reserved: Bytes = bytes_empty()
+    var r_idx: Number = 0
+    while r_idx < 23:
+        set reserved = bytes_concat(reserved, bytes_from_number(0))
+        set r_idx = r_idx + 1
+    let user_cstring: Bytes = mysql_cstring(username)
+    let auth_len: Number = bytes_length(auth_data)
+    let auth_with_len: Bytes = bytes_concat(bytes_from_number(auth_len), auth_data)
+    var payload: Bytes = bytes_concat(result_unwrap(cap_res), result_unwrap(max_pkt_res))
+    set payload = bytes_concat(payload, charset_byte)
+    set payload = bytes_concat(payload, reserved)
+    set payload = bytes_concat(payload, user_cstring)
+    set payload = bytes_concat(payload, auth_with_len)
+    if option_is_some(database):
+        set payload = bytes_concat(payload, mysql_cstring(option_unwrap(database)))
+    set payload = bytes_concat(payload, mysql_cstring(plugin_name))
+    return mysql_packet(sequence_id, payload)
+
+fn mysql_com_query(query: Text, sequence_id: Number) -> Result[Bytes, Text]:
+    let payload: Bytes = bytes_concat(bytes_from_number(3), bytes_from_text(query))
+    return mysql_packet(sequence_id, payload)
+
+fn mysql_com_ping(sequence_id: Number) -> Result[Bytes, Text]:
+    return mysql_packet(sequence_id, bytes_from_number(14))
+
+fn mysql_com_quit(sequence_id: Number) -> Result[Bytes, Text]:
+    return mysql_packet(sequence_id, bytes_from_number(1))
+
+fn mysql_com_init_db(db_name: Text, sequence_id: Number) -> Result[Bytes, Text]:
+    let payload: Bytes = bytes_concat(bytes_from_number(2), bytes_from_text(db_name))
+    return mysql_packet(sequence_id, payload)
+
+fn mysql_response_packet_kind(payload: Bytes) -> MysqlPacketKind:
+    if bytes_length(payload) == 0:
+        return MysqlPacketKind::PacketData
+    let first: Number = bytes_get(payload, 0)
+    if first == 0:
+        return MysqlPacketKind::PacketOk
+    if first == 255:
+        return MysqlPacketKind::PacketErr
+    if first == 254 and bytes_length(payload) < 9:
+        return MysqlPacketKind::PacketEof
+    return MysqlPacketKind::PacketData
+
+fn mysql_parse_ok_packet(payload: Bytes) -> Result[MysqlOkPacket, Text]:
+    let total: Number = bytes_length(payload)
+    if total < 5 or bytes_get(payload, 0) != 0:
+        return err("Invalid MySQL OK packet")
+    var cursor: Number = 1
+    let rows_res: Result[MysqlLenencInt, Text] = mysql_read_lenenc_int(payload, cursor)
+    if not result_is_ok(rows_res):
+        return err(result_unwrap_error(rows_res))
+    let affected_rows: Number = result_unwrap(rows_res).value
+    set cursor = cursor + result_unwrap(rows_res).bytes_consumed
+    let id_res: Result[MysqlLenencInt, Text] = mysql_read_lenenc_int(payload, cursor)
+    if not result_is_ok(id_res):
+        return err(result_unwrap_error(id_res))
+    let last_id: Number = result_unwrap(id_res).value
+    set cursor = cursor + result_unwrap(id_res).bytes_consumed
+    var status_flags: Number = 0
+    var warnings: Number = 0
+    if cursor + 2 <= total:
+        let s_res: Result[Number, Text] = mysql_read_u16_le(payload, cursor)
+        if result_is_ok(s_res):
+            set status_flags = result_unwrap(s_res)
+        set cursor = cursor + 2
+    if cursor + 2 <= total:
+        let w_res: Result[Number, Text] = mysql_read_u16_le(payload, cursor)
+        if result_is_ok(w_res):
+            set warnings = result_unwrap(w_res)
+        set cursor = cursor + 2
+    var info_text: Text = ""
+    if cursor < total:
+        let info_opt: Option[Text] = bytes_to_text_checked(bytes_slice(payload, cursor, total - cursor))
+        if option_is_some(info_opt):
+            set info_text = option_unwrap(info_opt)
+    return ok(MysqlOkPacket(affected_rows, last_id, status_flags, warnings, info_text))
+
+fn mysql_parse_err_packet(payload: Bytes) -> Result[MysqlErrPacket, Text]:
+    let total: Number = bytes_length(payload)
+    if total < 3 or bytes_get(payload, 0) != 255:
+        return err("Invalid MySQL ERR packet")
+    let err_code_res: Result[Number, Text] = mysql_read_u16_le(payload, 1)
+    if not result_is_ok(err_code_res):
+        return err(result_unwrap_error(err_code_res))
+    let err_code: Number = result_unwrap(err_code_res)
+    var cursor: Number = 3
+    var sql_state: Text = "HY000"
+    if cursor < total and bytes_get(payload, cursor) == 35:
+        set cursor = cursor + 1
+        if cursor + 5 <= total:
+            let state_opt: Option[Text] = bytes_to_text_checked(bytes_slice(payload, cursor, 5))
+            if option_is_some(state_opt):
+                set sql_state = option_unwrap(state_opt)
+            set cursor = cursor + 5
+    var err_msg: Text = ""
+    if cursor < total:
+        let msg_opt: Option[Text] = bytes_to_text_checked(bytes_slice(payload, cursor, total - cursor))
+        if option_is_some(msg_opt):
+            set err_msg = option_unwrap(msg_opt)
+    return ok(MysqlErrPacket(err_code, sql_state, err_msg))
+
+fn mysql_parse_eof_packet(payload: Bytes) -> Result[MysqlEofPacket, Text]:
+    let total: Number = bytes_length(payload)
+    if total < 5 or bytes_get(payload, 0) != 254:
+        return err("Invalid MySQL EOF packet")
+    let warn_res: Result[Number, Text] = mysql_read_u16_le(payload, 1)
+    if not result_is_ok(warn_res):
+        return err(result_unwrap_error(warn_res))
+    let status_res: Result[Number, Text] = mysql_read_u16_le(payload, 3)
+    if not result_is_ok(status_res):
+        return err(result_unwrap_error(status_res))
+    return ok(MysqlEofPacket(result_unwrap(warn_res), result_unwrap(status_res)))
+
+fn mysql_read_lenenc_string(payload: Bytes, offset: Number) -> Result[MysqlCString, Text]:
+    let len_res: Result[MysqlLenencInt, Text] = mysql_read_lenenc_int(payload, offset)
+    if not result_is_ok(len_res):
+        return err(result_unwrap_error(len_res))
+    let item: MysqlLenencInt = result_unwrap(len_res)
+    let cursor: Number = offset + item.bytes_consumed
+    if cursor + item.value > bytes_length(payload):
+        return err("MySQL buffer underflow reading lenenc string")
+    let raw: Bytes = bytes_slice(payload, cursor, item.value)
+    let str_opt: Option[Text] = bytes_to_text_checked(raw)
+    if not option_is_some(str_opt):
+        return err("MySQL lenenc string invalid UTF-8")
+    return ok(MysqlCString(option_unwrap(str_opt), item.bytes_consumed + item.value))
+
+fn mysql_parse_column_definition(payload: Bytes) -> Result[MysqlColumnDefinition, Text]:
+    var cursor: Number = 0
+    let cat_res: Result[MysqlCString, Text] = mysql_read_lenenc_string(payload, cursor)
+    if not result_is_ok(cat_res): return err(result_unwrap_error(cat_res))
+    let catalog: Text = result_unwrap(cat_res).value
+    set cursor = cursor + result_unwrap(cat_res).bytes_consumed
+    let sch_res: Result[MysqlCString, Text] = mysql_read_lenenc_string(payload, cursor)
+    if not result_is_ok(sch_res): return err(result_unwrap_error(sch_res))
+    let schema: Text = result_unwrap(sch_res).value
+    set cursor = cursor + result_unwrap(sch_res).bytes_consumed
+    let tbl_res: Result[MysqlCString, Text] = mysql_read_lenenc_string(payload, cursor)
+    if not result_is_ok(tbl_res): return err(result_unwrap_error(tbl_res))
+    let table: Text = result_unwrap(tbl_res).value
+    set cursor = cursor + result_unwrap(tbl_res).bytes_consumed
+    let otbl_res: Result[MysqlCString, Text] = mysql_read_lenenc_string(payload, cursor)
+    if not result_is_ok(otbl_res): return err(result_unwrap_error(otbl_res))
+    let org_table: Text = result_unwrap(otbl_res).value
+    set cursor = cursor + result_unwrap(otbl_res).bytes_consumed
+    let name_res: Result[MysqlCString, Text] = mysql_read_lenenc_string(payload, cursor)
+    if not result_is_ok(name_res): return err(result_unwrap_error(name_res))
+    let name: Text = result_unwrap(name_res).value
+    set cursor = cursor + result_unwrap(name_res).bytes_consumed
+    let oname_res: Result[MysqlCString, Text] = mysql_read_lenenc_string(payload, cursor)
+    if not result_is_ok(oname_res): return err(result_unwrap_error(oname_res))
+    let org_name: Text = result_unwrap(oname_res).value
+    set cursor = cursor + result_unwrap(oname_res).bytes_consumed
+    let fixed_len_res: Result[MysqlLenencInt, Text] = mysql_read_lenenc_int(payload, cursor)
+    if not result_is_ok(fixed_len_res): return err(result_unwrap_error(fixed_len_res))
+    set cursor = cursor + result_unwrap(fixed_len_res).bytes_consumed
+    let cs_res: Result[Number, Text] = mysql_read_u16_le(payload, cursor)
+    if not result_is_ok(cs_res): return err(result_unwrap_error(cs_res))
+    let charset: Number = result_unwrap(cs_res)
+    set cursor = cursor + 2
+    let col_len_res: Result[Number, Text] = mysql_read_u32_le(payload, cursor)
+    if not result_is_ok(col_len_res): return err(result_unwrap_error(col_len_res))
+    let col_len: Number = result_unwrap(col_len_res)
+    set cursor = cursor + 4
+    let col_type: Number = bytes_get(payload, cursor)
+    set cursor = cursor + 1
+    let flags_res: Result[Number, Text] = mysql_read_u16_le(payload, cursor)
+    if not result_is_ok(flags_res): return err(result_unwrap_error(flags_res))
+    let flags: Number = result_unwrap(flags_res)
+    set cursor = cursor + 2
+    let decimals: Number = bytes_get(payload, cursor)
+    return ok(MysqlColumnDefinition(catalog, schema, table, org_table, name, org_name, charset, col_len, col_type, flags, decimals))
+
+fn mysql_parse_text_row(payload: Bytes, column_count: Number) -> Result[MysqlRow, Text]:
+    let values: TextList = text_list()
+    let nulls: TextList = text_list()
+    var cursor: Number = 0
+    let total: Number = bytes_length(payload)
+    var col_idx: Number = 0
+    while col_idx < column_count:
+        if cursor >= total:
+            return err("MySQL row underflow: not enough columns in payload")
+        let first: Number = bytes_get(payload, cursor)
+        if first == 251:
+            list_push(values, "")
+            list_push(nulls, "true")
+            set cursor = cursor + 1
+        else:
+            let str_res: Result[MysqlCString, Text] = mysql_read_lenenc_string(payload, cursor)
+            if not result_is_ok(str_res):
+                return err(result_unwrap_error(str_res))
+            let item: MysqlCString = result_unwrap(str_res)
+            list_push(values, item.value)
+            list_push(nulls, "false")
+            set cursor = cursor + item.bytes_consumed
+        set col_idx = col_idx + 1
+    return ok(MysqlRow(values, nulls))

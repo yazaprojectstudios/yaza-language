@@ -1,0 +1,124 @@
+# Bounded parser boundary for non-recursive SELECT CTEs. Execution is supplied
+# by the query layer; this module only preserves definitions and source spans.
+use "sql_lexer_v1"
+use "sql_parser_v2"
+
+shape YazaSqlCteDefinitionV1:
+    name_token: YazaSqlTokenV1
+    column_names: List[YazaSqlTokenV1]
+    query: Text
+    query_start_byte: Number
+    query_end_byte: Number
+
+shape YazaSqlCteQueryV1:
+    recursive: Boolean
+    definitions: List[YazaSqlCteDefinitionV1]
+    main_query: Text
+    main_start_byte: Number
+
+fn yaza_sql_cte_max_definitions_v1() -> Number:
+    return 16
+
+fn yaza_sql_cte_max_columns_v1() -> Number:
+    return 1024
+
+fn yaza_sql_cte_identifier_token_v1(tokens: List[YazaSqlTokenV1], index: Number) -> Boolean:
+    if index < 0 or index >= list_count(tokens): return false
+    let token: YazaSqlTokenV1 = list_get(tokens, index)
+    return token.kind == 1 or token.kind == 2
+
+fn yaza_sql_cte_parse_v1(source: Text) -> Result[YazaSqlCteQueryV1, Text]:
+    let lexed: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(source)
+    if not result_is_ok(lexed): return err(result_unwrap_error(lexed))
+    let tokens: List[YazaSqlTokenV1] = result_unwrap(lexed)
+    if not yaza_sql_v2_is_keyword(source, tokens, 0, "WITH"):
+        return err("SQL CTE parser expected WITH at the start of the statement")
+
+    var cursor: Number = 1
+    var recursive: Boolean = false
+    if yaza_sql_v2_is_keyword(source, tokens, cursor, "RECURSIVE"):
+        set recursive = true
+        set cursor = cursor + 1
+
+    let definitions_created: Result[List[YazaSqlCteDefinitionV1], Text] = list_try_new()
+    if not result_is_ok(definitions_created): return err("SQL CTE parser could not allocate definition metadata")
+    let definitions: List[YazaSqlCteDefinitionV1] = result_unwrap(definitions_created)
+    if not list_try_reserve(definitions, yaza_sql_cte_max_definitions_v1()):
+        return err("SQL CTE parser could not reserve its bounded definition list")
+
+    var more_definitions: Boolean = true
+    while more_definitions:
+        if list_count(definitions) >= yaza_sql_cte_max_definitions_v1():
+            return err("SQL CTE parser exceeds the 16-definition limit")
+        if not yaza_sql_cte_identifier_token_v1(tokens, cursor):
+            return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CTE parser expected a CTE name at byte "))
+        let name_token: YazaSqlTokenV1 = list_get(tokens, cursor)
+        set cursor = cursor + 1
+
+        let columns_created: Result[List[YazaSqlTokenV1], Text] = list_try_new()
+        if not result_is_ok(columns_created): return err("SQL CTE parser could not allocate column aliases")
+        let column_names: List[YazaSqlTokenV1] = result_unwrap(columns_created)
+        if not list_try_reserve(column_names, 16):
+            return err("SQL CTE parser could not reserve column aliases")
+
+        if yaza_sql_v2_is_symbol(source, tokens, cursor, 40):
+            set cursor = cursor + 1
+            var more_columns: Boolean = true
+            while more_columns:
+                if list_count(column_names) >= yaza_sql_cte_max_columns_v1():
+                    return err("SQL CTE parser exceeds the 1024-column alias limit")
+                if not yaza_sql_cte_identifier_token_v1(tokens, cursor):
+                    return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CTE parser expected a column alias at byte "))
+                if not list_try_push(column_names, list_get(tokens, cursor)):
+                    return err("SQL CTE parser could not append a column alias")
+                set cursor = cursor + 1
+                if yaza_sql_v2_is_symbol(source, tokens, cursor, 44):
+                    set cursor = cursor + 1
+                else:
+                    set more_columns = false
+            if not yaza_sql_v2_is_symbol(source, tokens, cursor, 41):
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CTE parser expected ')' after column aliases at byte "))
+            set cursor = cursor + 1
+
+        if not yaza_sql_v2_is_keyword(source, tokens, cursor, "AS"):
+            return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CTE parser expected AS at byte "))
+        set cursor = cursor + 1
+        if not yaza_sql_v2_is_symbol(source, tokens, cursor, 40):
+            return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CTE parser expected '(' before the CTE query at byte "))
+        let open_index: Number = cursor
+        set cursor = cursor + 1
+        if not yaza_sql_v2_is_keyword(source, tokens, cursor, "SELECT"):
+            return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CTE parser supports SELECT queries in each definition at byte "))
+
+        var depth: Number = 1
+        while cursor < list_count(tokens) and depth > 0:
+            if yaza_sql_v2_is_symbol(source, tokens, cursor, 40):
+                set depth = depth + 1
+            elif yaza_sql_v2_is_symbol(source, tokens, cursor, 41):
+                set depth = depth - 1
+            if depth > 0: set cursor = cursor + 1
+        if depth != 0:
+            return err(yaza_sql_v2_parse_error(source, tokens, open_index, "SQL CTE parser found an unterminated query beginning at byte "))
+
+        let close_index: Number = cursor
+        let open_token: YazaSqlTokenV1 = list_get(tokens, open_index)
+        let close_token: YazaSqlTokenV1 = list_get(tokens, close_index)
+        let query_start: Number = open_token.end_byte
+        let query_end: Number = close_token.start_byte
+        if query_end <= query_start:
+            return err(yaza_sql_v2_parse_error(source, tokens, open_index, "SQL CTE parser found an empty query at byte "))
+        let query: Text = text_slice(source, query_start, query_end - query_start)
+        if not list_try_push(definitions, YazaSqlCteDefinitionV1(name_token, column_names, query, query_start, query_end)):
+            return err("SQL CTE parser could not append a definition")
+        set cursor = close_index + 1
+
+        if yaza_sql_v2_is_symbol(source, tokens, cursor, 44):
+            set cursor = cursor + 1
+        else:
+            set more_definitions = false
+
+    if not yaza_sql_v2_is_keyword(source, tokens, cursor, "SELECT"):
+        return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CTE parser expected the final SELECT at byte "))
+    let main_token: YazaSqlTokenV1 = list_get(tokens, cursor)
+    let main_query: Text = text_slice(source, main_token.start_byte, text_length(source) - main_token.start_byte)
+    return ok(YazaSqlCteQueryV1(recursive, definitions, main_query, main_token.start_byte))

@@ -1,0 +1,389 @@
+# Nonblocking PostgreSQL simple-query exchange.
+# Call begin once, then step again after Progress or the requested readiness.
+# Every socket operation shares one absolute deadline. Errors from a claimed
+# operation close the connection; a rejected stale/forged copy cannot disturb
+# the live continuation that owns that connection.
+use "std/task"
+use "protocol"
+use "transport"
+use "async_transport"
+
+shape PgAsyncQueryAccumulator:
+    column_metadata: TextList
+    cell_values: TextList
+    cell_is_null: TextList
+    command_tag: Text
+    command_count: Number
+    row_count: Number
+    column_count: Number
+    total_cells: Number
+    saw_row_description: Boolean
+    client_error: Text
+    server_error: Text
+    transaction_status: PgTransactionStatus
+
+shape PgAsyncQueryState:
+    handle: Number
+    token: Number
+    transition: Number
+    deadline_ms: Number
+    allow_multiple: Boolean
+    phase: Number
+    write_state: Option[PgWriteState]
+    frame_state: Option[PgFrameReadState]
+    accumulator: PgAsyncQueryAccumulator
+    frame_count: Number
+    total_wire_bytes: Number
+
+fn pg_async_state_register(handle: Number, deadline_ms: Number) -> Result[Number, Text]:
+    return pg_async_state_register_native(handle, deadline_ms)
+
+fn pg_async_state_claim(state: PgAsyncQueryState) -> Result[Boolean, Text]:
+    return pg_async_state_claim_native(state.handle, state.token, state.transition, state.deadline_ms)
+
+# Register the suspended query's socket with the active scheduler task. Call
+# this after a WaitRead/WaitWrite step; the scheduler task must already carry
+# a deadline no later than the query's absolute deadline.
+fn pg_query_async_wait(state: PgAsyncQueryState, writable: Boolean) -> Result[Boolean, Text]:
+    return pg_async_state_wait_native(state.handle, state.token, state.transition, state.deadline_ms, writable)
+
+fn pg_async_state_advance(state: PgAsyncQueryState) -> Result[Number, Text]:
+    return pg_async_state_advance_native(state.token, state.transition)
+
+fn pg_async_state_release(state: PgAsyncQueryState) -> Boolean:
+    return pg_async_state_release_native(state.token)
+
+fn pg_async_state_with_transition(state: PgAsyncQueryState, transition: Number) -> PgAsyncQueryState:
+    return PgAsyncQueryState(state.handle, state.token, transition, state.deadline_ms, state.allow_multiple, state.phase, state.write_state, state.frame_state, state.accumulator, state.frame_count, state.total_wire_bytes)
+
+variant PgAsyncQueryFrameOutcome:
+    Continue(accumulator: PgAsyncQueryAccumulator)
+    Complete(result: PgQueryResult)
+
+variant PgAsyncQueryStep:
+    Progress(state: PgAsyncQueryState)
+    WaitRead(state: PgAsyncQueryState)
+    WaitWrite(state: PgAsyncQueryState)
+    Complete(result: PgQueryResult)
+
+fn pg_query_async_begin(handle: Number, sql: Text, timeout_ms: Number) -> Result[PgAsyncQueryState, Text]:
+    let message: Result[Bytes, Text] = pg_simple_query_message(sql)
+    if not result_is_ok(message):
+        return err(result_unwrap_error(message))
+    return pg_query_async_begin_message(handle, result_unwrap(message), timeout_ms, false)
+
+fn pg_query_async_params_begin(handle: Number, sql: Text, parameters: TextList, null_flags: TextList, timeout_ms: Number) -> Result[PgAsyncQueryState, Text]:
+    let message: Result[Bytes, Text] = pg_extended_query_message(sql, parameters, null_flags)
+    if not result_is_ok(message):
+        return err(result_unwrap_error(message))
+    return pg_query_async_begin_message(handle, result_unwrap(message), timeout_ms, false)
+
+fn pg_query_async_params_typed_begin(handle: Number, sql: Text, parameters: TextList, null_flags: TextList, parameter_type_oids: TextList, timeout_ms: Number) -> Result[PgAsyncQueryState, Text]:
+    let message: Result[Bytes, Text] = pg_extended_query_message_with_oids(sql, parameters, null_flags, parameter_type_oids)
+    if not result_is_ok(message):
+        return err(result_unwrap_error(message))
+    return pg_query_async_begin_message(handle, result_unwrap(message), timeout_ms, false)
+
+fn pg_query_async_with_parameters_begin(handle: Number, sql: Text, parameters: PgParameters, timeout_ms: Number) -> Result[PgAsyncQueryState, Text]:
+    let message: Result[Bytes, Text] = pg_parameters_message(sql, parameters)
+    if not result_is_ok(message):
+        return err(result_unwrap_error(message))
+    return pg_query_async_begin_message(handle, result_unwrap(message), timeout_ms, false)
+
+fn pg_query_async_script_begin(handle: Number, sql: Text, timeout_ms: Number) -> Result[PgAsyncQueryState, Text]:
+    let message: Result[Bytes, Text] = pg_simple_query_message(sql)
+    if not result_is_ok(message):
+        return err(result_unwrap_error(message))
+    return pg_query_async_begin_message(handle, result_unwrap(message), timeout_ms, true)
+
+fn pg_query_async_begin_message(handle: Number, message: Bytes, timeout_ms: Number, allow_multiple: Boolean) -> Result[PgAsyncQueryState, Text]:
+    if not pg_transport_connection_allowed(handle):
+        return err("postgres async query: verified TLS or explicitly configured loopback plaintext is required")
+    if bytes_length(message) < 1 or bytes_length(message) > 67108864:
+        return err("postgres async query: frontend message is empty or exceeds the 64 MiB limit")
+    if timeout_ms < 1 or timeout_ms > 3600000:
+        return err("postgres async query: timeout must be between 1 and 3600000 milliseconds")
+    let started: Number = monotonic_ms()
+    if started < 0:
+        return err("postgres async query: monotonic clock is unavailable")
+    let max_int64: Number = 9223372036854775 * 1000 + 807
+    if started > max_int64 - timeout_ms:
+        return err("postgres async query: deadline is outside the monotonic clock range")
+    let deadline: Number = started + timeout_ms
+    # Use the exact same absolute deadline for the scheduler timer and query;
+    # separate relative clock samples can otherwise differ by a fraction of a ms.
+    let capped: Boolean = task_deadline_cap_until(deadline)
+    let write_state: Result[PgWriteState, Text] = pg_transport_write_begin_at(handle, message, deadline)
+    if not result_is_ok(write_state):
+        return err(result_unwrap_error(write_state))
+    let registered: Result[Number, Text] = pg_async_state_register(handle, deadline)
+    if not result_is_ok(registered):
+        let closed: Number = net_close(handle)
+        return err(result_unwrap_error(registered))
+    let accumulator: PgAsyncQueryAccumulator = PgAsyncQueryAccumulator(text_list(), text_list(), text_list(), "", 0, 0, 0, 0, false, "", "", PgTransactionStatus::Idle)
+    return ok(PgAsyncQueryState(handle, result_unwrap(registered), 1, deadline, allow_multiple, 0, some(result_unwrap(write_state)), none, accumulator, 0, 0))
+
+fn pg_query_async_accumulate_frame(state: PgAsyncQueryState, frame: PgBackendFrame) -> Result[PgAsyncQueryFrameOutcome, Text]:
+    var accumulator: PgAsyncQueryAccumulator = state.accumulator
+    if frame.tag == 84:
+        if accumulator.saw_row_description:
+            if accumulator.client_error == "":
+                set accumulator.client_error = "postgres async query: multiple result sets are not supported"
+        else:
+            let parsed_count: Result[Number, Text] = pg_row_description_field_count(frame.payload)
+            if not result_is_ok(parsed_count):
+                if accumulator.client_error == "":
+                    set accumulator.client_error = result_unwrap_error(parsed_count)
+            else:
+                set accumulator.column_count = result_unwrap(parsed_count)
+                set accumulator.saw_row_description = true
+                var description_index: Number = 0
+                while description_index < accumulator.column_count:
+                    let column_result: Result[PgColumnDescription, Text] = pg_row_description_field(frame.payload, description_index)
+                    if not result_is_ok(column_result):
+                        if accumulator.client_error == "":
+                            set accumulator.client_error = result_unwrap_error(column_result)
+                    else:
+                        let column: PgColumnDescription = result_unwrap(column_result)
+                        if column.format_code != 0 and accumulator.client_error == "":
+                            set accumulator.client_error = "postgres async query: only text-format result columns are supported"
+                        if not list_try_push(accumulator.column_metadata, column.name):
+                            return err("postgres async query: column metadata exceeded the active memory budget")
+                        if not list_try_push(accumulator.column_metadata, number_text(column.table_oid)):
+                            return err("postgres async query: column metadata exceeded the active memory budget")
+                        if not list_try_push(accumulator.column_metadata, number_text(column.attribute_number)):
+                            return err("postgres async query: column metadata exceeded the active memory budget")
+                        if not list_try_push(accumulator.column_metadata, number_text(column.type_oid)):
+                            return err("postgres async query: column metadata exceeded the active memory budget")
+                        if not list_try_push(accumulator.column_metadata, number_text(column.type_size)):
+                            return err("postgres async query: column metadata exceeded the active memory budget")
+                        if not list_try_push(accumulator.column_metadata, number_text(column.type_modifier)):
+                            return err("postgres async query: column metadata exceeded the active memory budget")
+                        if not list_try_push(accumulator.column_metadata, number_text(column.format_code)):
+                            return err("postgres async query: column metadata exceeded the active memory budget")
+                    set description_index = description_index + 1
+    else:
+        if frame.tag == 68:
+            let parsed_row_count: Result[Number, Text] = pg_data_row_field_count(frame.payload)
+            if not accumulator.saw_row_description:
+                if accumulator.client_error == "":
+                    set accumulator.client_error = "postgres async query: DataRow arrived without RowDescription"
+            else:
+                if not result_is_ok(parsed_row_count):
+                    if accumulator.client_error == "":
+                        set accumulator.client_error = result_unwrap_error(parsed_row_count)
+                else:
+                    if result_unwrap(parsed_row_count) != accumulator.column_count:
+                        if accumulator.client_error == "":
+                            set accumulator.client_error = "postgres async query: DataRow column count does not match RowDescription"
+                    else:
+                        if accumulator.client_error != "":
+                            set accumulator.row_count = accumulator.row_count + 1
+                        else:
+                            if accumulator.row_count >= 10000 or accumulator.total_cells > 10000 - accumulator.column_count:
+                                set accumulator.client_error = "postgres async query: result exceeds the 10000-cell limit"
+                                set accumulator.row_count = accumulator.row_count + 1
+                            else:
+                                var data_index: Number = 0
+                                while data_index < accumulator.column_count:
+                                    let field_result: Result[Option[Bytes], Text] = pg_data_row_field(frame.payload, data_index)
+                                    if not result_is_ok(field_result):
+                                        if accumulator.client_error == "":
+                                            set accumulator.client_error = result_unwrap_error(field_result)
+                                    else:
+                                        let field: Option[Bytes] = result_unwrap(field_result)
+                                        if option_is_some(field):
+                                            let decoded: Option[Text] = bytes_to_text_checked(option_unwrap(field))
+                                            if not option_is_some(decoded):
+                                                if accumulator.client_error == "":
+                                                    set accumulator.client_error = "postgres async query: text-format field is not valid non-NUL UTF-8"
+                                                if not list_try_push(accumulator.cell_values, "") or not list_try_push(accumulator.cell_is_null, "1"):
+                                                    return err("postgres async query: result exceeded the active memory budget")
+                                            else:
+                                                if not list_try_push(accumulator.cell_values, option_unwrap(decoded)) or not list_try_push(accumulator.cell_is_null, "0"):
+                                                    return err("postgres async query: result exceeded the active memory budget")
+                                        else:
+                                            if not list_try_push(accumulator.cell_values, "") or not list_try_push(accumulator.cell_is_null, "1"):
+                                                return err("postgres async query: result exceeded the active memory budget")
+                                    set data_index = data_index + 1
+                                set accumulator.row_count = accumulator.row_count + 1
+                                set accumulator.total_cells = accumulator.total_cells + accumulator.column_count
+        else:
+            if frame.tag == 67:
+                let parsed_command: Result[Text, Text] = pg_parse_command_complete(frame)
+                if not result_is_ok(parsed_command):
+                    if accumulator.client_error == "":
+                        set accumulator.client_error = result_unwrap_error(parsed_command)
+                else:
+                    set accumulator.command_count = accumulator.command_count + 1
+                    if not pg_query_command_count_allowed(accumulator.command_count, state.allow_multiple) and accumulator.client_error == "":
+                        set accumulator.client_error = "postgres async query: command count exceeds this query mode's allowed limit"
+                    if accumulator.command_count == 1:
+                        set accumulator.command_tag = result_unwrap(parsed_command)
+            else:
+                if frame.tag == 69:
+                    let parsed_error: Result[PgServerError, Text] = pg_parse_error_response(frame)
+                    if result_is_ok(parsed_error):
+                        let details: PgServerError = result_unwrap(parsed_error)
+                        set accumulator.server_error = details.sqlstate + ": " + details.message
+                    else:
+                        set accumulator.server_error = result_unwrap_error(parsed_error)
+                else:
+                    if frame.tag == 90:
+                        let ready: Result[PgTransactionStatus, Text] = pg_parse_ready_for_query(frame)
+                        if not result_is_ok(ready):
+                            return err(result_unwrap_error(ready))
+                        set accumulator.transaction_status = result_unwrap(ready)
+                        if accumulator.server_error != "":
+                            return err("postgres server error: " + accumulator.server_error)
+                        if accumulator.client_error != "":
+                            return err(accumulator.client_error)
+                        if list_count(accumulator.cell_values) != list_count(accumulator.cell_is_null) or list_count(accumulator.cell_values) != accumulator.total_cells:
+                            return err("postgres async query: internal result cell count is inconsistent")
+                        return ok(PgAsyncQueryFrameOutcome::Complete(PgQueryResult(accumulator.column_metadata, accumulator.cell_values, accumulator.cell_is_null, accumulator.command_tag, accumulator.command_count, accumulator.row_count, accumulator.transaction_status)))
+                    else:
+                        if frame.tag == 83:
+                            let parameter: Result[PgParameterStatus, Text] = pg_parse_parameter_status(frame)
+                            if not result_is_ok(parameter) and accumulator.client_error == "":
+                                set accumulator.client_error = result_unwrap_error(parameter)
+                        else:
+                            if frame.tag == 75:
+                                let key_data: Result[PgBackendKeyData, Text] = pg_parse_backend_key_data(frame)
+                                if not result_is_ok(key_data):
+                                    if accumulator.client_error == "":
+                                        set accumulator.client_error = result_unwrap_error(key_data)
+                                else:
+                                    if not pg_transport_register_cancel_key(state.handle, result_unwrap(key_data)) and accumulator.client_error == "":
+                                        set accumulator.client_error = "postgres async query: backend cancellation key could not be registered"
+                            else:
+                                if frame.tag == 78:
+                                    let notice: Result[PgServerError, Text] = pg_parse_error_response(PgBackendFrame(69, frame.payload))
+                                    if not result_is_ok(notice) and accumulator.client_error == "":
+                                        set accumulator.client_error = result_unwrap_error(notice)
+                                else:
+                                    if frame.tag == 73 or frame.tag == 49 or frame.tag == 50 or frame.tag == 110:
+                                        if bytes_length(frame.payload) != 0 and accumulator.client_error == "":
+                                            set accumulator.client_error = "postgres async query: completion frame contains unexpected data"
+                                    else:
+                                        return err("postgres async query: unexpected backend frame")
+    return ok(PgAsyncQueryFrameOutcome::Continue(accumulator))
+
+fn pg_query_async_after_write_step(state: PgAsyncQueryState, stepped: PgWriteStep) -> Result[PgAsyncQueryStep, Text]:
+    match stepped:
+        Progress(write_progress_state):
+            return ok(PgAsyncQueryStep::Progress(PgAsyncQueryState(state.handle, state.token, state.transition, state.deadline_ms, state.allow_multiple, 0, some(write_progress_state), none, state.accumulator, state.frame_count, state.total_wire_bytes)))
+        WaitRead(write_read_wait_state):
+            return ok(PgAsyncQueryStep::WaitRead(PgAsyncQueryState(state.handle, state.token, state.transition, state.deadline_ms, state.allow_multiple, 0, some(write_read_wait_state), none, state.accumulator, state.frame_count, state.total_wire_bytes)))
+        WaitWrite(write_write_wait_state):
+            return ok(PgAsyncQueryStep::WaitWrite(PgAsyncQueryState(state.handle, state.token, state.transition, state.deadline_ms, state.allow_multiple, 0, some(write_write_wait_state), none, state.accumulator, state.frame_count, state.total_wire_bytes)))
+        Complete:
+            let read_frame: Result[PgFrameReadState, Text] = pg_transport_read_frame_begin_at(state.handle, state.deadline_ms)
+            if not result_is_ok(read_frame):
+                let closed: Number = net_close(state.handle)
+                return err(result_unwrap_error(read_frame))
+            return ok(PgAsyncQueryStep::Progress(PgAsyncQueryState(state.handle, state.token, state.transition, state.deadline_ms, state.allow_multiple, 1, none, some(result_unwrap(read_frame)), state.accumulator, 0, 0)))
+
+fn pg_query_async_after_frame_step(state: PgAsyncQueryState, stepped: PgFrameReadStep) -> Result[PgAsyncQueryStep, Text]:
+    match stepped:
+        Progress(read_progress_state):
+            return ok(PgAsyncQueryStep::Progress(PgAsyncQueryState(state.handle, state.token, state.transition, state.deadline_ms, state.allow_multiple, 1, none, some(read_progress_state), state.accumulator, state.frame_count, state.total_wire_bytes)))
+        WaitRead(read_read_wait_state):
+            return ok(PgAsyncQueryStep::WaitRead(PgAsyncQueryState(state.handle, state.token, state.transition, state.deadline_ms, state.allow_multiple, 1, none, some(read_read_wait_state), state.accumulator, state.frame_count, state.total_wire_bytes)))
+        WaitWrite(read_write_wait_state):
+            return ok(PgAsyncQueryStep::WaitWrite(PgAsyncQueryState(state.handle, state.token, state.transition, state.deadline_ms, state.allow_multiple, 1, none, some(read_write_wait_state), state.accumulator, state.frame_count, state.total_wire_bytes)))
+        Complete(backend_frame):
+            let next_frame_count: Number = state.frame_count + 1
+            let frame_wire_bytes: Number = bytes_length(backend_frame.payload) + 5
+            let next_wire_bytes: Number = state.total_wire_bytes + frame_wire_bytes
+            if next_wire_bytes > 16777216:
+                let closed: Number = net_close(state.handle)
+                return err("postgres async query: result exceeds the 16 MiB response limit")
+            var accumulator: PgAsyncQueryAccumulator = state.accumulator
+            let accumulated: Result[PgAsyncQueryFrameOutcome, Text] = pg_query_async_accumulate_frame(PgAsyncQueryState(state.handle, state.token, state.transition, state.deadline_ms, state.allow_multiple, 1, none, none, accumulator, next_frame_count, next_wire_bytes), backend_frame)
+            if not result_is_ok(accumulated):
+                let closed: Number = net_close(state.handle)
+                return err(result_unwrap_error(accumulated))
+            match result_unwrap(accumulated):
+                Complete(query_result):
+                    return ok(PgAsyncQueryStep::Complete(query_result))
+                Continue(next_accumulator):
+                    let next_read: Result[PgFrameReadState, Text] = pg_transport_read_frame_begin_at(state.handle, state.deadline_ms)
+                    if not result_is_ok(next_read):
+                        let closed: Number = net_close(state.handle)
+                        return err(result_unwrap_error(next_read))
+                    return ok(PgAsyncQueryStep::Progress(PgAsyncQueryState(state.handle, state.token, state.transition, state.deadline_ms, state.allow_multiple, 1, none, some(result_unwrap(next_read)), next_accumulator, next_frame_count, next_wire_bytes)))
+
+fn pg_query_async_step_apply(state: PgAsyncQueryState) -> Result[PgAsyncQueryStep, Text]:
+    let now: Number = monotonic_ms()
+    if now < 0:
+        let closed: Number = net_close(state.handle)
+        return err("postgres async query: monotonic clock is unavailable")
+    let accumulator: PgAsyncQueryAccumulator = state.accumulator
+    let metadata_count: Number = list_count(accumulator.column_metadata)
+    let cell_count: Number = list_count(accumulator.cell_values)
+    if state.handle <= 0 or state.token <= 0 or state.transition <= 0 or state.deadline_ms <= now or state.deadline_ms - now > 3600000 or state.frame_count < 0 or state.frame_count >= 100000 or state.total_wire_bytes < 0 or state.total_wire_bytes > 1700000000000 or state.phase < 0 or state.phase > 1:
+        let closed: Number = net_close(state.handle)
+        return err("postgres async query: state is invalid or its absolute deadline expired")
+    if accumulator.command_count < 0 or accumulator.command_count > 10000 or accumulator.row_count < 0 or accumulator.row_count > 10000 or accumulator.column_count < 0 or accumulator.column_count > 1024 or accumulator.total_cells < 0 or accumulator.total_cells > 10000 or cell_count != accumulator.total_cells or cell_count != list_count(accumulator.cell_is_null) or metadata_count > 7168 or (accumulator.saw_row_description and metadata_count != accumulator.column_count * 7) or (not accumulator.saw_row_description and (metadata_count != 0 or accumulator.column_count != 0)):
+        let closed: Number = net_close(state.handle)
+        return err("postgres async query: result accumulator state is malformed")
+    if task_or_request_cancelled():
+        let closed: Number = net_close(state.handle)
+        return err("postgres async query: operation was cancelled")
+    if state.phase == 0:
+        if not option_is_some(state.write_state) or option_is_some(state.frame_state):
+            let closed: Number = net_close(state.handle)
+            return err("postgres async query: write continuation state is malformed")
+        let stepped: Result[PgWriteStep, Text] = pg_transport_write_step(option_unwrap(state.write_state))
+        if not result_is_ok(stepped):
+            let closed: Number = net_close(state.handle)
+            return err(result_unwrap_error(stepped))
+        return pg_query_async_after_write_step(state, result_unwrap(stepped))
+    if not option_is_some(state.frame_state) or option_is_some(state.write_state):
+        let closed: Number = net_close(state.handle)
+        return err("postgres async query: read continuation state is malformed")
+    let stepped_frame: Result[PgFrameReadStep, Text] = pg_transport_read_frame_step(option_unwrap(state.frame_state))
+    if not result_is_ok(stepped_frame):
+        let closed: Number = net_close(state.handle)
+        return err(result_unwrap_error(stepped_frame))
+    return pg_query_async_after_frame_step(state, result_unwrap(stepped_frame))
+
+fn pg_query_async_commit_state(original: PgAsyncQueryState, next_state: PgAsyncQueryState) -> Result[PgAsyncQueryState, Text]:
+    let advanced: Result[Number, Text] = pg_async_state_advance(original)
+    if not result_is_ok(advanced):
+        let closed: Number = net_close(original.handle)
+        let released: Boolean = pg_async_state_release(original)
+        return err(result_unwrap_error(advanced))
+    return ok(pg_async_state_with_transition(next_state, result_unwrap(advanced)))
+
+fn pg_query_async_step(state: PgAsyncQueryState) -> Result[PgAsyncQueryStep, Text]:
+    let claimed: Result[Boolean, Text] = pg_async_state_claim(state)
+    if not result_is_ok(claimed):
+        let claim_error: Text = result_unwrap_error(claimed)
+        if claim_error == "postgres async query: continuation expired":
+            let closed: Number = net_close(state.handle)
+        return err(claim_error)
+    let stepped: Result[PgAsyncQueryStep, Text] = pg_query_async_step_apply(state)
+    if not result_is_ok(stepped):
+        let released: Boolean = pg_async_state_release(state)
+        return err(result_unwrap_error(stepped))
+    match result_unwrap(stepped):
+        Progress(next_state):
+            let committed: Result[PgAsyncQueryState, Text] = pg_query_async_commit_state(state, next_state)
+            if not result_is_ok(committed):
+                return err(result_unwrap_error(committed))
+            return ok(PgAsyncQueryStep::Progress(result_unwrap(committed)))
+        WaitRead(next_state):
+            let committed: Result[PgAsyncQueryState, Text] = pg_query_async_commit_state(state, next_state)
+            if not result_is_ok(committed):
+                return err(result_unwrap_error(committed))
+            return ok(PgAsyncQueryStep::WaitRead(result_unwrap(committed)))
+        WaitWrite(next_state):
+            let committed: Result[PgAsyncQueryState, Text] = pg_query_async_commit_state(state, next_state)
+            if not result_is_ok(committed):
+                return err(result_unwrap_error(committed))
+            return ok(PgAsyncQueryStep::WaitWrite(result_unwrap(committed)))
+        Complete(result):
+            if not pg_async_state_release(state):
+                return err("postgres async query: completed continuation could not be released")
+            return ok(PgAsyncQueryStep::Complete(result))

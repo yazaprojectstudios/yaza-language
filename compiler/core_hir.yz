@@ -1,0 +1,1888 @@
+# Typed-source-independent HIR for YAZA's core language.
+# Lexing and parsing live in this backend; only shared language/runtime services are external.
+use "core_lexer"
+
+shape HirExpr:
+    kind: Text
+    value: Text
+    children: List[HirExpr]
+    source_line: Number
+    source_column: Number
+    source_end_column: Number
+    source_file: Text
+
+shape HirSourceOrigin:
+    source_file: Text
+    source_line: Number
+    source_column_offset: Number
+    synthetic_from_method: Boolean
+
+shape HirImportOrigin:
+    source_file: Text
+    source_line: Number
+    source_column: Number
+    source_end_column: Number
+
+shape CoreExpandedSource:
+    lines: TextList
+    origins: List[HirSourceOrigin]
+
+shape HirParameter:
+    name: Text
+    value_type: Text
+    source_line: Number
+    source_column: Number
+    name_end_column: Number
+    type_column: Number
+    type_end_column: Number
+
+shape HirField:
+    name: Text
+    value_type: Text
+    source_line: Number
+    source_file: Text
+    source_column: Number
+    name_end_column: Number
+    type_column: Number
+    type_end_column: Number
+
+shape HirShape:
+    name: Text
+    fields: List[HirField]
+    source_line: Number
+    source_file: Text
+    source_column: Number
+    name_end_column: Number
+    header_source_column: Number
+    header_source_end_column: Number
+
+shape HirVariantCase:
+    name: Text
+    fields: List[HirField]
+    source_line: Number
+    source_file: Text
+    source_column: Number
+    name_end_column: Number
+    header_source_column: Number
+    header_source_end_column: Number
+
+shape HirVariant:
+    name: Text
+    cases: List[HirVariantCase]
+    source_line: Number
+    source_file: Text
+    source_column: Number
+    name_end_column: Number
+    header_source_column: Number
+    header_source_end_column: Number
+
+shape HirBranch:
+    condition: HirExpr
+    body: List[HirStatement]
+    source_line: Number
+    source_file: Text
+    source_column: Number
+    source_end_column: Number
+
+shape HirMatchArm:
+    case_name: Text
+    bindings: TextList
+    body: List[HirStatement]
+    source_line: Number
+    pattern_operator: Text
+    pattern_value: HirExpr
+    result_expression: HirExpr
+    binding_columns: TextList
+    source_file: Text
+    source_column: Number
+    source_end_column: Number
+
+shape HirStatement:
+    kind: Text
+    name: Text
+    value_type: Text
+    expression: HirExpr
+    body: List[HirStatement]
+    alternate: List[HirStatement]
+    branches: List[HirBranch]
+    match_arms: List[HirMatchArm]
+    source_line: Number
+    source_file: Text
+    source_column: Number
+    source_end_column: Number
+    field_path: List[Text]
+    field_path_columns: TextList
+    header_source_line: Number
+    header_source_file: Text
+    header_source_column: Number
+    header_source_end_column: Number
+    else_source_line: Number
+    else_source_file: Text
+    else_source_column: Number
+    else_source_end_column: Number
+    has_else: Boolean
+
+shape HirFunction:
+    name: Text
+    parameters: List[HirParameter]
+    return_type: Text
+    body: List[HirStatement]
+    source_line: Number
+    source_file: Text
+    source_column: Number
+    name_end_column: Number
+    return_type_column: Number
+    return_type_end_column: Number
+    header_source_column: Number
+    header_source_end_column: Number
+    is_async: Boolean
+
+shape HirProgram:
+    functions: List[HirFunction]
+    shapes: List[HirShape]
+    variants: List[HirVariant]
+    body: List[HirStatement]
+    start_source_line: Number
+    start_source_file: Text
+    start_source_column: Number
+    start_source_end_column: Number
+
+fn core_empty_expr(source_line: Number) -> HirExpr:
+    return HirExpr("unit", "", List[HirExpr](), source_line, 1, 1, "")
+
+fn core_token_value(token: Text) -> Text:
+    if token == "P:double_colon":
+        return "::"
+    if text_length(token) >= 2:
+        return text_slice(token, 2, text_length(token) - 2)
+    return token
+
+fn core_join_type_tokens(tokens: TextList, start: Number, stop: Number) -> Text:
+    var result: Text = ""
+    var index: Number = start
+    while index < stop:
+        let token: Text = list_get(tokens, index)
+        let val: Text = core_token_value(token)
+        if result != "" and text_starts_with(token, "I:"):
+            let last_char: Text = text_slice(result, text_length(result) - 1, 1)
+            if last_char != "[" and last_char != "," and last_char != "&":
+                set result = result + " "
+        set result = result + val
+        set index = index + 1
+    return result
+
+fn core_expression_precedence(token: Text) -> Number:
+    if token == "I:or": return 1
+    if token == "I:and": return 2
+    if token == "O:==" or token == "O:!=" or token == "O:<" or token == "O:>" or token == "O:<=" or token == "O:>=": return 3
+    if token == "O:+" or token == "O:-": return 4
+    if token == "O:*" or token == "O:/" or token == "O:%": return 5
+    return 0
+
+fn core_token_columns(raw_line: Text, tokens: TextList) -> TextList:
+    let columns: TextList = text_list()
+    var search_from: Number = 0
+    var index: Number = 0
+    while index < list_count(tokens):
+        let spelling: Text = core_token_value(list_get(tokens, index))
+        let remaining: Text = text_slice(raw_line, search_from, text_length(raw_line) - search_from)
+        let relative: Number = text_find(remaining, spelling)
+        var column: Number = search_from + 1
+        if relative >= 0:
+            set column = search_from + relative + 1
+            set search_from = column - 1 + text_length(spelling)
+        list_push(columns, number_text(column))
+        set index = index + 1
+    return columns
+
+fn core_expression_node(kind: Text, value: Text, children: List[HirExpr], source_line: Number, source_column: Number) -> HirExpr:
+    return HirExpr(kind, value, children, source_line, source_column, source_column, "")
+
+fn core_parse_expression(tokens: TextList, columns: TextList, cursor: TextList, minimum: Number, source_line: Number, source: CoreExpandedSource) -> HirExpr:
+    let count: Number = list_count(tokens)
+    let token_index: Number = number_parse(list_get(cursor, 0))
+    if token_index >= count:
+        fail("LLVM Core parser: expected an expression (" + core_parser_cursor_location(source, source_line, tokens, columns, token_index) + ")")
+        return core_empty_expr(source_line)
+
+    let token: Text = list_get(tokens, token_index)
+    let token_column: Number = number_parse(list_get(columns, token_index))
+    list_set(cursor, 0, number_text(token_index + 1))
+    var left: HirExpr = core_empty_expr(source_line)
+
+    if text_starts_with(token, "N:"):
+        set left = core_expression_node("number", core_token_value(token), List[HirExpr](), source_line, token_column)
+    else:
+        if text_starts_with(token, "F:"):
+            set left = core_expression_node("float", core_token_value(token), List[HirExpr](), source_line, token_column)
+        else:
+            if text_starts_with(token, "S:"):
+                let literal: Text = core_token_value(token)
+                set left = core_expression_node("text", text_slice(literal, 1, text_length(literal) - 2), List[HirExpr](), source_line, token_column)
+            else:
+                if token == "O:-" or token == "O:!" or token == "I:not" or token == "I:move" or token == "O:&" or token == "I:edit" or token == "I:await" or token == "I:spawn":
+                    var is_mut: Boolean = false
+                    if token == "O:&":
+                        let next_index: Number = number_parse(list_get(cursor, 0))
+                        if next_index < count and list_get(tokens, next_index) == "I:mut":
+                            set is_mut = true
+                            list_set(cursor, 0, number_text(next_index + 1))
+                    let nested: HirExpr = core_parse_expression(tokens, columns, cursor, 6, source_line, source)
+                    let unary_children: List[HirExpr] = List[HirExpr]()
+                    list_push(unary_children, nested)
+                    if token == "I:move":
+                        set left = core_expression_node("move", "move", unary_children, source_line, token_column)
+                    else:
+                        if token == "I:await":
+                            set left = core_expression_node("await", "await", unary_children, source_line, token_column)
+                        else:
+                            if token == "I:spawn":
+                                set left = core_expression_node("spawn", "spawn", unary_children, source_line, token_column)
+                            else:
+                                if token == "O:&":
+                                    if is_mut:
+                                        set left = core_expression_node("borrow_mut", "&mut", unary_children, source_line, token_column)
+                                    else:
+                                        set left = core_expression_node("borrow", "&", unary_children, source_line, token_column)
+                                else:
+                                    if token == "I:edit":
+                                        set left = core_expression_node("borrow_mut", "edit", unary_children, source_line, token_column)
+                                    else:
+                                        var unary: Text = core_token_value(token)
+                                        if token == "I:not": set unary = "not"
+                                        set left = core_expression_node("unary", unary, unary_children, source_line, token_column)
+                else:
+                    if token == "P:(":
+                        set left = core_parse_expression(tokens, columns, cursor, 1, source_line, source)
+                        let close_index: Number = number_parse(list_get(cursor, 0))
+                        if close_index >= count or list_get(tokens, close_index) != "P:)":
+                            fail("LLVM Core parser: expected ')' (" + core_parser_cursor_location(source, source_line, tokens, columns, close_index) + ")")
+                        else:
+                            list_set(cursor, 0, number_text(close_index + 1))
+                    else:
+                        if token == "P:[":
+                            let items: List[HirExpr] = List[HirExpr]()
+                            let first_item: Number = number_parse(list_get(cursor, 0))
+                            var parsing_items: Boolean = first_item < count and list_get(tokens, first_item) != "P:]"
+                            while parsing_items:
+                                list_push(items, core_parse_expression(tokens, columns, cursor, 1, source_line, source))
+                                let after_item: Number = number_parse(list_get(cursor, 0))
+                                if after_item < count and list_get(tokens, after_item) == "P:,":
+                                    list_set(cursor, 0, number_text(after_item + 1))
+                                else:
+                                    set parsing_items = false
+                            let close_index: Number = number_parse(list_get(cursor, 0))
+                            if close_index >= count or list_get(tokens, close_index) != "P:]":
+                                fail("LLVM Core parser: expected ']' (" + core_parser_cursor_location(source, source_line, tokens, columns, close_index) + ")")
+                            else:
+                                list_set(cursor, 0, number_text(close_index + 1))
+                            set left = core_expression_node("list", "", items, source_line, token_column)
+                        else:
+                            if text_starts_with(token, "I:"):
+                                let identifier: Text = core_token_value(token)
+                                if identifier == "true" or identifier == "false":
+                                    set left = core_expression_node("boolean", identifier, List[HirExpr](), source_line, token_column)
+                                else:
+                                    if identifier == "none":
+                                        set left = core_expression_node("none", "none", List[HirExpr](), source_line, token_column)
+                                    else:
+                                        var call_name: Text = identifier
+                                        var next_index: Number = number_parse(list_get(cursor, 0))
+                                        if next_index < count and list_get(tokens, next_index) == "P:[":
+                                            var type_end: Number = next_index + 1
+                                            var type_depth: Number = 1
+                                            while type_end < count and type_depth > 0:
+                                                if list_get(tokens, type_end) == "P:[": set type_depth = type_depth + 1
+                                                if list_get(tokens, type_end) == "P:]": set type_depth = type_depth - 1
+                                                set type_end = type_end + 1
+                                            if type_depth == 0 and type_end < count and list_get(tokens, type_end) == "P:(":
+                                                set call_name = call_name + "[" + core_join_type_tokens(tokens, next_index + 1, type_end - 1) + "]"
+                                                list_set(cursor, 0, number_text(type_end))
+                                                set next_index = type_end
+                                        if next_index + 1 < count and list_get(tokens, next_index) == "P:double_colon":
+                                            if text_starts_with(list_get(tokens, next_index + 1), "I:"):
+                                                set call_name = call_name + "::" + core_token_value(list_get(tokens, next_index + 1))
+                                                list_set(cursor, 0, number_text(next_index + 2))
+                                                set next_index = next_index + 2
+                                        let open_index: Number = number_parse(list_get(cursor, 0))
+                                        if open_index < count and list_get(tokens, open_index) == "P:(":
+                                            list_set(cursor, 0, number_text(open_index + 1))
+                                            let arguments: List[HirExpr] = List[HirExpr]()
+                                            let first_argument: Number = number_parse(list_get(cursor, 0))
+                                            var parsing_arguments: Boolean = first_argument < count and list_get(tokens, first_argument) != "P:)"
+                                            while parsing_arguments:
+                                                list_push(arguments, core_parse_expression(tokens, columns, cursor, 1, source_line, source))
+                                                let after_argument: Number = number_parse(list_get(cursor, 0))
+                                                if after_argument < count and list_get(tokens, after_argument) == "P:,":
+                                                    list_set(cursor, 0, number_text(after_argument + 1))
+                                                else:
+                                                    set parsing_arguments = false
+                                            let close_index: Number = number_parse(list_get(cursor, 0))
+                                            if close_index >= count or list_get(tokens, close_index) != "P:)":
+                                                fail("LLVM Core parser: expected ')' after arguments (" + core_parser_cursor_location(source, source_line, tokens, columns, close_index) + ")")
+                                            else:
+                                                list_set(cursor, 0, number_text(close_index + 1))
+                                            if call_name == "text_try_interpolate" and list_count(arguments) == 1:
+                                                let template: HirExpr = list_get(arguments, 0)
+                                                if template.kind == "text" and (text_find(template.value, "{") >= 0 or text_find(template.value, "}") >= 0):
+                                                    if text_find(template.value, "\\") >= 0: fail("LLVM Core parser: escaped Text templates are not supported by text_try_interpolate (" + core_parser_span_location(source, source_line, template.source_column, template.source_column + text_length(template.value) + 1) + ")")
+                                                    list_set(arguments, 0, core_parse_text_template(template.value, source_line, template.source_column, source))
+                                            set left = core_expression_node("call", call_name, arguments, source_line, token_column)
+                                        else:
+                                            set left = core_expression_node("variable", call_name, List[HirExpr](), source_line, token_column)
+                            else:
+                                fail("LLVM Core parser: unsupported expression token '" + token + "' (" + core_parser_token_span_location(source, source_line, tokens, columns, token_index) + ")")
+
+    var parsing_suffix: Boolean = true
+    while parsing_suffix:
+        let suffix_index: Number = number_parse(list_get(cursor, 0))
+        if suffix_index >= count:
+            set parsing_suffix = false
+        else:
+            let suffix: Text = list_get(tokens, suffix_index)
+            if suffix == "P:." and suffix_index + 1 < count and text_starts_with(list_get(tokens, suffix_index + 1), "I:"):
+                let member_name: Text = core_token_value(list_get(tokens, suffix_index + 1))
+                if member_name == "await":
+                    let await_children: List[HirExpr] = List[HirExpr]()
+                    list_push(await_children, left)
+                    set left = core_expression_node("await", "await", await_children, source_line, number_parse(list_get(columns, suffix_index + 1)))
+                    list_set(cursor, 0, number_text(suffix_index + 2))
+                else:
+                    let field_children: List[HirExpr] = List[HirExpr]()
+                    list_push(field_children, left)
+                    set left = core_expression_node("field", member_name, field_children, source_line, number_parse(list_get(columns, suffix_index + 1)))
+                    list_set(cursor, 0, number_text(suffix_index + 2))
+            else:
+                if suffix == "P:[":
+                    list_set(cursor, 0, number_text(suffix_index + 1))
+                    let subscript: HirExpr = core_parse_expression(tokens, columns, cursor, 1, source_line, source)
+                    let close_index: Number = number_parse(list_get(cursor, 0))
+                    if close_index >= count or list_get(tokens, close_index) != "P:]":
+                        fail("LLVM Core parser: expected ']' after index (" + core_parser_cursor_location(source, source_line, tokens, columns, close_index) + ")")
+                    else:
+                        list_set(cursor, 0, number_text(close_index + 1))
+                    let index_children: List[HirExpr] = List[HirExpr]()
+                    list_push(index_children, left)
+                    list_push(index_children, subscript)
+                    set left = core_expression_node("index", "", index_children, source_line, number_parse(list_get(columns, suffix_index)))
+                else:
+                    if suffix == "O:?":
+                        let try_children: List[HirExpr] = List[HirExpr]()
+                        list_push(try_children, left)
+                        set left = core_expression_node("try", "?", try_children, source_line, number_parse(list_get(columns, suffix_index)))
+                        list_set(cursor, 0, number_text(suffix_index + 1))
+                    else:
+                        let precedence: Number = core_expression_precedence(suffix)
+                        if precedence < minimum:
+                            set parsing_suffix = false
+                        else:
+                            list_set(cursor, 0, number_text(suffix_index + 1))
+                            let right: HirExpr = core_parse_expression(tokens, columns, cursor, precedence + 1, source_line, source)
+                            let binary_children: List[HirExpr] = List[HirExpr]()
+                            list_push(binary_children, left)
+                            list_push(binary_children, right)
+                            set left = core_expression_node("binary", core_token_value(suffix), binary_children, source_line, number_parse(list_get(columns, suffix_index)))
+    let consumed_index: Number = number_parse(list_get(cursor, 0))
+    if consumed_index > 0:
+        let final_token_index: Number = consumed_index - 1
+        let final_token: Text = core_token_value(list_get(tokens, final_token_index))
+        set left.source_end_column = number_parse(list_get(columns, final_token_index)) + text_length(final_token) - 1
+    return left
+
+fn core_parse_full_expression(tokens: TextList, columns: TextList, start: Number, stop: Number, source_line: Number, source: CoreExpandedSource) -> HirExpr:
+    let selected: TextList = text_list()
+    let selected_columns: TextList = text_list()
+    var index: Number = start
+    while index < stop:
+        list_push(selected, list_get(tokens, index))
+        list_push(selected_columns, list_get(columns, index))
+        set index = index + 1
+    let cursor: TextList = text_list()
+    list_push(cursor, "0")
+    let result: HirExpr = core_parse_expression(selected, selected_columns, cursor, 1, source_line, source)
+    let consumed: Number = number_parse(list_get(cursor, 0))
+    if consumed != list_count(selected):
+        fail("LLVM Core parser: unexpected token after expression (" + core_parser_token_span_location(source, source_line, selected, selected_columns, consumed) + ")")
+    return result
+
+fn core_find_top_level_token(tokens: TextList, start: Number, sought: Text) -> Number:
+    var depth: Number = 0
+    var index: Number = start
+    var result: Number = -1
+    while index < list_count(tokens) and result < 0:
+        let token: Text = list_get(tokens, index)
+        if depth == 0 and token == sought:
+            set result = index
+        else:
+            if token == "P:(" or token == "P:[": set depth = depth + 1
+            if token == "P:)" or token == "P:]": set depth = depth - 1
+        set index = index + 1
+    return result
+
+fn core_statement(kind: Text, name: Text, value_type: Text, expression: HirExpr, line: Number) -> HirStatement:
+    return HirStatement(kind, name, value_type, expression, List[HirStatement](), List[HirStatement](), List[HirBranch](), List[HirMatchArm](), line, "", 1, 1, List[Text](), text_list(), 0, "", 1, 1, 0, "", 1, 1, false)
+
+fn core_statement_token_span(statement: HirStatement, tokens: TextList, columns: TextList, token_index: Number) -> HirStatement:
+    var result: HirStatement = statement
+    if token_index >= 0 and token_index < list_count(tokens):
+        let spelling: Text = core_token_value(list_get(tokens, token_index))
+        let column: Number = number_parse(list_get(columns, token_index))
+        set result.source_column = column
+        set result.source_end_column = column + text_length(spelling) - 1
+    return result
+
+fn core_statement_header_span(statement: HirStatement, tokens: TextList, columns: TextList, first_index: Number, last_index: Number) -> HirStatement:
+    var result: HirStatement = statement
+    if first_index >= 0 and last_index >= first_index and last_index < list_count(tokens):
+        let last_spelling: Text = core_token_value(list_get(tokens, last_index))
+        set result.header_source_line = statement.source_line
+        set result.header_source_column = number_parse(list_get(columns, first_index))
+        set result.header_source_end_column = number_parse(list_get(columns, last_index)) + text_length(last_spelling) - 1
+    return result
+
+fn core_statement_token_range_span(statement: HirStatement, tokens: TextList, columns: TextList, first_index: Number, last_index: Number) -> HirStatement:
+    var result: HirStatement = statement
+    if first_index >= 0 and last_index >= first_index and last_index < list_count(tokens):
+        let first_column: Number = number_parse(list_get(columns, first_index))
+        let last_spelling: Text = core_token_value(list_get(tokens, last_index))
+        set result.source_column = first_column
+        set result.source_end_column = number_parse(list_get(columns, last_index)) + text_length(last_spelling) - 1
+    return result
+
+fn core_parse_match_arms(records: TextList, source_lines: TextList, cursor: TextList, indent_level: Number, match_line: Number, source: CoreExpandedSource) -> List[HirMatchArm]:
+    let arms: List[HirMatchArm] = List[HirMatchArm]()
+    var reading: Boolean = true
+    while reading:
+        let record_index: Number = number_parse(list_get(cursor, 0))
+        if record_index >= list_count(records):
+            set reading = false
+        else:
+            let record: TextList = text_split(list_get(records, record_index), "|")
+            let indent: Number = number_parse(list_get(record, 0))
+            if indent < indent_level + 4:
+                set reading = false
+            else:
+                let line_number: Number = number_parse(list_get(record, 1))
+                if indent != indent_level + 4:
+                    fail("LLVM Core parser: match arms must be indented one level (" + core_parser_location_at(source, line_number, indent_level + 5) + ")")
+                let raw_line: Text = list_get(source_lines, line_number - 1)
+                let tokens: TextList = core_lex_trimmed_line(raw_line, source, line_number)
+                let columns: TextList = core_token_columns(raw_line, tokens)
+                let colon_index: Number = core_find_top_level_token(tokens, 0, "P::")
+                if colon_index != list_count(tokens) - 1 or colon_index < 1:
+                    var error_location: Text = core_parser_end_location(source, line_number)
+                    if colon_index >= 0 and colon_index + 1 < list_count(tokens): set error_location = core_parser_token_span_location(source, line_number, tokens, columns, colon_index + 1)
+                    else:
+                        if colon_index == 0: set error_location = core_parser_token_span_location(source, line_number, tokens, columns, colon_index)
+                    fail("LLVM Core parser: malformed match arm (" + error_location + ")")
+                if not text_starts_with(list_get(tokens, 0), "I:"):
+                    fail("LLVM Core parser: match arm requires a case name (" + core_parser_token_span_location(source, line_number, tokens, columns, 0) + ")")
+                let case_name: Text = core_token_value(list_get(tokens, 0))
+                let bindings: TextList = text_list()
+                let binding_columns: TextList = text_list()
+                if colon_index == 1:
+                    if list_count(tokens) != 2: fail("LLVM Core parser: malformed unit match arm (" + core_parser_token_span_location(source, line_number, tokens, columns, 2) + ")")
+                else:
+                    if list_get(tokens, 1) != "P:(" or list_get(tokens, colon_index - 1) != "P:)":
+                        var error_index: Number = 1
+                        if list_get(tokens, 1) == "P:(" and colon_index > 1 and list_get(tokens, colon_index - 1) != "P:)": set error_index = colon_index
+                        fail("LLVM Core parser: malformed match payload binding list (" + core_parser_token_span_location(source, line_number, tokens, columns, error_index) + ")")
+                    var binding_index: Number = 2
+                    while binding_index < colon_index - 1:
+                        let binding: Text = list_get(tokens, binding_index)
+                        if not text_starts_with(binding, "I:"):
+                            fail("LLVM Core parser: expected a match binding name or '_' (" + core_parser_token_span_location(source, line_number, tokens, columns, binding_index) + ")")
+                        list_push(bindings, core_token_value(binding))
+                        list_push(binding_columns, list_get(columns, binding_index))
+                        set binding_index = binding_index + 1
+                        if binding_index < colon_index - 1:
+                            if list_get(tokens, binding_index) != "P:,":
+                                fail("LLVM Core parser: expected ',' between match bindings (" + core_parser_token_span_location(source, line_number, tokens, columns, binding_index) + ")")
+                            set binding_index = binding_index + 1
+                    if list_count(bindings) == 0 and colon_index != 3:
+                        fail("LLVM Core parser: malformed empty match payload binding list (" + core_parser_token_span_location(source, line_number, tokens, columns, 2) + ")")
+                list_set(cursor, 0, number_text(record_index + 1))
+                let body: List[HirStatement] = core_parse_block(records, source_lines, cursor, indent_level + 8, source)
+                if list_count(body) == 0:
+                    let underindent_location: Text = core_parser_underindent_location(records, cursor, indent_level + 8, 0, source)
+                    if underindent_location != "":
+                        fail("LLVM Core parser: match arm body cannot be empty (" + underindent_location + ")")
+                    fail("LLVM Core parser: match arm body cannot be empty (" + core_parser_token_span_location(source, line_number, tokens, columns, 0) + ")")
+                let arm_column: Number = number_parse(list_get(columns, 0))
+                list_push(arms, HirMatchArm(case_name, bindings, body, line_number, "", core_empty_expr(line_number), core_empty_expr(line_number), binding_columns, "", arm_column, arm_column + text_length(case_name) - 1))
+    if list_count(arms) == 0:
+        let header_text: Text = list_get(source_lines, match_line - 1)
+        let header_tokens: TextList = core_lex_trimmed_line(header_text, source, match_line)
+        let header_columns: TextList = core_token_columns(header_text, header_tokens)
+        let underindent_location: Text = core_parser_underindent_location(records, cursor, indent_level + 4, indent_level, source)
+        if underindent_location != "":
+            fail("LLVM Core parser: match requires at least one arm (" + underindent_location + ")")
+        fail("LLVM Core parser: match requires at least one arm (" + core_parser_token_span_location(source, match_line, header_tokens, header_columns, 0) + ")")
+    return arms
+
+fn core_parse_match_expr_arms(records: TextList, source_lines: TextList, cursor: TextList, indent_level: Number, match_line: Number, match_column: Number, source: CoreExpandedSource) -> List[HirMatchArm]:
+    let arms: List[HirMatchArm] = List[HirMatchArm]()
+    var reading: Boolean = true
+    while reading:
+        let record_index: Number = number_parse(list_get(cursor, 0))
+        if record_index >= list_count(records):
+            set reading = false
+        else:
+            let record: TextList = text_split(list_get(records, record_index), "|")
+            let indent: Number = number_parse(list_get(record, 0))
+            if indent < indent_level + 4:
+                set reading = false
+            else:
+                let line_number: Number = number_parse(list_get(record, 1))
+                if indent != indent_level + 4: fail("LLVM Core parser: match-expression arms must be indented one level (" + core_parser_location_at(source, line_number, indent_level + 5) + ")")
+                let raw_line: Text = list_get(source_lines, line_number - 1)
+                let tokens: TextList = core_lex_trimmed_line(raw_line, source, line_number)
+                let columns: TextList = core_token_columns(raw_line, tokens)
+                let arrow_index: Number = core_find_top_level_token(tokens, 0, "O:->")
+                if arrow_index < 1:
+                    fail("LLVM Core parser: match-expression arm requires 'pattern -> expression' (" + core_parser_end_location(source, line_number) + ")")
+                if arrow_index + 1 >= list_count(tokens):
+                    fail("LLVM Core parser: match-expression arm requires 'pattern -> expression' (" + core_parser_end_location(source, line_number) + ")")
+                let first: Text = list_get(tokens, 0)
+                var case_name: Text = ""
+                var pattern_operator: Text = ""
+                var pattern_value: HirExpr = core_empty_expr(line_number)
+                let bindings: TextList = text_list()
+                let binding_columns: TextList = text_list()
+                if first == "O:<" or first == "O:>" or first == "O:<=" or first == "O:>=" or first == "O:==" or first == "O:!=":
+                    set pattern_operator = core_token_value(first)
+                    set pattern_value = core_parse_full_expression(tokens, columns, 1, arrow_index, line_number, source)
+                else:
+                    if first == "I:else":
+                        if arrow_index != 1: fail("LLVM Core parser: malformed else match-expression arm (" + core_parser_token_span_location(source, line_number, tokens, columns, 1) + ")")
+                        set case_name = "else"
+                    else:
+                        if not text_starts_with(first, "I:"): fail("LLVM Core parser: match-expression pattern must be a numeric guard, case, or else (" + core_parser_token_span_location(source, line_number, tokens, columns, 0) + ")")
+                        set case_name = core_token_value(first)
+                        if arrow_index > 1:
+                            if list_get(tokens, 1) != "P:(" or list_get(tokens, arrow_index - 1) != "P:)":
+                                var error_index: Number = 1
+                                if list_get(tokens, 1) == "P:(" and arrow_index > 1 and list_get(tokens, arrow_index - 1) != "P:)": set error_index = arrow_index
+                                fail("LLVM Core parser: malformed match-expression payload bindings (" + core_parser_token_span_location(source, line_number, tokens, columns, error_index) + ")")
+                            var binding_index: Number = 2
+                            while binding_index < arrow_index - 1:
+                                let binding: Text = list_get(tokens, binding_index)
+                                if not text_starts_with(binding, "I:"): fail("LLVM Core parser: expected a match binding name or '_' (" + core_parser_token_span_location(source, line_number, tokens, columns, binding_index) + ")")
+                                list_push(bindings, core_token_value(binding))
+                                list_push(binding_columns, list_get(columns, binding_index))
+                                set binding_index = binding_index + 1
+                                if binding_index < arrow_index - 1:
+                                    if list_get(tokens, binding_index) != "P:,": fail("LLVM Core parser: expected ',' between match bindings (" + core_parser_token_span_location(source, line_number, tokens, columns, binding_index) + ")")
+                                    set binding_index = binding_index + 1
+                            if list_count(bindings) == 0 and arrow_index != 3: fail("LLVM Core parser: malformed empty match-expression binding list (" + core_parser_token_span_location(source, line_number, tokens, columns, 2) + ")")
+                let result_expression: HirExpr = core_parse_full_expression(tokens, columns, arrow_index + 1, list_count(tokens), line_number, source)
+                let arm_spelling: Text = core_token_value(first)
+                let arm_column: Number = number_parse(list_get(columns, 0))
+                list_push(arms, HirMatchArm(case_name, bindings, List[HirStatement](), line_number, pattern_operator, pattern_value, result_expression, binding_columns, "", arm_column, arm_column + text_length(arm_spelling) - 1))
+                list_set(cursor, 0, number_text(record_index + 1))
+    if list_count(arms) == 0:
+        let underindent_location: Text = core_parser_underindent_location(records, cursor, indent_level + 4, indent_level, source)
+        if underindent_location != "":
+            fail("LLVM Core parser: match expression requires at least one arm (" + underindent_location + ")")
+        fail("LLVM Core parser: match expression requires at least one arm (" + core_parser_span_location(source, match_line, match_column, match_column + 4) + ")")
+    return arms
+
+fn core_parse_match_expr_statement(records: TextList, source_lines: TextList, cursor: TextList, indent_level: Number, tokens: TextList, columns: TextList, source_line: Number, kind: Text, name: Text, value_type: Text, subject_start: Number, source: CoreExpandedSource) -> HirStatement:
+    let colon_index: Number = core_find_top_level_token(tokens, subject_start, "P::")
+    var header_error_index: Number = -1
+    if colon_index < 0: set header_error_index = list_count(tokens)
+    if colon_index >= 0 and colon_index <= subject_start: set header_error_index = colon_index
+    if colon_index > subject_start and colon_index != list_count(tokens) - 1: set header_error_index = colon_index + 1
+    if header_error_index >= 0: fail("LLVM Core parser: malformed match-expression header (" + core_parser_cursor_location(source, source_line, tokens, columns, header_error_index) + ")")
+    let subject: HirExpr = core_parse_full_expression(tokens, columns, subject_start, colon_index, source_line, source)
+    var result: HirStatement = core_statement(kind, name, value_type, subject, source_line)
+    var statement_token_index: Number = 1
+    if kind == "match_expr_return": set statement_token_index = 0
+    set result = core_statement_token_span(result, tokens, columns, statement_token_index)
+    set result = core_statement_header_span(result, tokens, columns, 0, colon_index)
+    let match_column: Number = number_parse(list_get(columns, subject_start - 1))
+    set result.match_arms = core_parse_match_expr_arms(records, source_lines, cursor, indent_level, source_line, match_column, source)
+    return result
+
+fn core_parse_text_template(literal: Text, source_line: Number, source_column: Number, source: CoreExpandedSource) -> HirExpr:
+    let children: List[HirExpr] = List[HirExpr]()
+    var cursor: Number = 0
+    var parsing: Boolean = true
+    while parsing:
+        let remaining: Text = text_slice(literal, cursor, text_length(literal) - cursor)
+        let open_brace: Number = text_find(remaining, "{")
+        let close_brace: Number = text_find(remaining, "}")
+        if open_brace < 0:
+            if close_brace >= 0: fail("LLVM Core parser: unmatched closing brace in Text template (" + core_parser_span_location(source, source_line, source_column + cursor + close_brace + 1, source_column + cursor + close_brace + 1) + ")")
+            set parsing = false
+        else:
+            if close_brace >= 0 and close_brace < open_brace:
+                fail("LLVM Core parser: unmatched closing brace in Text template (" + core_parser_span_location(source, source_line, source_column + cursor + close_brace + 1, source_column + cursor + close_brace + 1) + ")")
+                set parsing = false
+            else:
+                if close_brace < 0:
+                    fail("LLVM Core parser: missing closing brace in Text template (" + core_parser_span_location(source, source_line, source_column + cursor + open_brace + 1, source_column + cursor + open_brace + 1) + ")")
+                    set parsing = false
+                else:
+                    let name: Text = text_slice(remaining, open_brace + 1, close_brace - open_brace - 1)
+                    let name_tokens: TextList = core_lex_text(name, source, source_line, source_column + cursor + open_brace + 2)
+                    if name == "" or list_count(name_tokens) != 1 or not text_starts_with(list_get(name_tokens, 0), "I:"):
+                        fail("LLVM Core parser: Text templates currently accept one local variable per placeholder (" + core_parser_span_location(source, source_line, source_column + cursor + open_brace + 1, source_column + cursor + close_brace + 1) + ")")
+                    else:
+                        list_push(children, core_expression_node("variable", core_token_value(list_get(name_tokens, 0)), List[HirExpr](), source_line, source_column + cursor + open_brace + 2))
+                    set cursor = cursor + close_brace + 1
+    return core_expression_node("interpolate", literal, children, source_line, source_column)
+
+fn core_assert_source_text(tokens: TextList, columns: TextList, source_line: Number, source: CoreExpandedSource) -> Text:
+    if list_count(tokens) < 2 or source_line < 1 or source_line > list_count(source.lines): return ""
+    let first_column: Number = number_parse(list_get(columns, 1))
+    let raw_line: Text = list_get(source.lines, source_line - 1)
+    if first_column < 1 or first_column > text_length(raw_line): return ""
+    return text_trim(text_slice(raw_line, first_column - 1, text_length(raw_line) - first_column + 1))
+
+fn core_parse_simple_statement(tokens: TextList, columns: TextList, source_line: Number, source: CoreExpandedSource) -> HirStatement:
+    let count: Number = list_count(tokens)
+    if count == 0:
+        fail("LLVM Core parser: empty statement (" + core_parser_location(source, source_line) + ")")
+        return core_statement("invalid", "", "", core_empty_expr(source_line), source_line)
+    let first: Text = list_get(tokens, 0)
+    if first == "I:defer":
+        if count < 2: fail("LLVM Core parser: defer requires a function call (" + core_parser_end_location(source, source_line) + ")")
+        let deferred_call: HirExpr = core_parse_full_expression(tokens, columns, 1, count, source_line, source)
+        if deferred_call.kind != "call": fail("LLVM Core parser: defer requires a direct function call (" + core_parser_token_span_location(source, source_line, tokens, columns, 1) + ")")
+        return core_statement_token_span(core_statement("defer", "", "", deferred_call, source_line), tokens, columns, 0)
+    if first == "I:say" and count == 2 and text_starts_with(list_get(tokens, 1), "S:"):
+        let quoted: Text = core_token_value(list_get(tokens, 1))
+        let literal: Text = text_slice(quoted, 1, text_length(quoted) - 2)
+        if text_find(literal, "\\") >= 0: fail("LLVM Core parser: escaped Text literals in say are not supported by the current compiler (" + core_parser_token_span_location(source, source_line, tokens, columns, 1) + ")")
+        if text_find(literal, "{") >= 0 or text_find(literal, "}") >= 0:
+            return core_statement_token_span(core_statement("say", "", "", core_parse_text_template(literal, source_line, number_parse(list_get(columns, 1)), source), source_line), tokens, columns, 0)
+    if first == "I:assert":
+        var assertion: HirStatement = core_statement_token_span(core_statement("assert", "", "", core_parse_full_expression(tokens, columns, 1, count, source_line, source), source_line), tokens, columns, 0)
+        set assertion.name = core_assert_source_text(tokens, columns, source_line, source)
+        return assertion
+    if first == "I:say":
+        return core_statement_token_span(core_statement(core_token_value(first), "", "", core_parse_full_expression(tokens, columns, 1, count, source_line, source), source_line), tokens, columns, 0)
+    if first == "I:return":
+        if count == 1:
+            return core_statement_token_span(core_statement("return", "", "Unit", core_empty_expr(source_line), source_line), tokens, columns, 0)
+        return core_statement_token_span(core_statement("return", "", "", core_parse_full_expression(tokens, columns, 1, count, source_line, source), source_line), tokens, columns, 0)
+    if first == "I:break" or first == "I:continue":
+        if count != 1: fail("LLVM Core parser: " + core_token_value(first) + " takes no value (" + core_parser_token_span_location(source, source_line, tokens, columns, 1) + ")")
+        return core_statement_token_span(core_statement(core_token_value(first), "", "", core_empty_expr(source_line), source_line), tokens, columns, 0)
+    if first == "I:elif":
+        fail("LLVM Core parser: elif has no matching if (" + core_parser_token_span_location(source, source_line, tokens, columns, 0) + ")")
+    if first == "I:else":
+        fail("LLVM Core parser: else has no matching if (" + core_parser_token_span_location(source, source_line, tokens, columns, 0) + ")")
+    if (first == "I:let" or first == "I:var") and count >= 3 and text_starts_with(list_get(tokens, 1), "I:") and list_get(tokens, 2) == "P::":
+        let equal_index: Number = core_find_top_level_token(tokens, 3, "O:=")
+        let name: Text = core_token_value(list_get(tokens, 1))
+        var type_stop: Number = count
+        if equal_index >= 0: set type_stop = equal_index
+        let value_type: Text = core_join_type_tokens(tokens, 3, type_stop)
+        if value_type == "":
+            if equal_index >= 0:
+                fail("LLVM Core parser: local type is missing (" + core_parser_token_span_location(source, source_line, tokens, columns, equal_index) + ")")
+            else:
+                fail("LLVM Core parser: local type is missing (" + core_parser_end_location(source, source_line) + ")")
+        if equal_index < 0: fail("LLVM Core parser: typed local is missing '=' (" + core_parser_end_location(source, source_line) + ")")
+        if equal_index + 1 >= count: fail("LLVM Core parser: typed local is missing an initializer (" + core_parser_end_location(source, source_line) + ")")
+        var local_statement: HirStatement = core_statement_token_span(core_statement(core_token_value(first), name, value_type, core_parse_full_expression(tokens, columns, equal_index + 1, count, source_line, source), source_line), tokens, columns, 1)
+        set local_statement = core_statement_header_span(local_statement, tokens, columns, 3, type_stop - 1)
+        return local_statement
+    if first == "I:set" and count >= 4 and text_starts_with(list_get(tokens, 1), "I:") and list_get(tokens, 2) == "P:.":
+        let equal_index: Number = core_find_top_level_token(tokens, 2, "O:=")
+        if equal_index < 0:
+            var error_index: Number = count
+            if count > 4: set error_index = count - 1
+            fail("LLVM Core parser: shape field update is missing '=' (" + core_parser_cursor_location(source, source_line, tokens, columns, error_index) + ")")
+        let field_path: List[Text] = List[Text]()
+        let field_path_columns: TextList = text_list()
+        var path_cursor: Number = 2
+        while path_cursor < equal_index:
+            if list_get(tokens, path_cursor) != "P:." or path_cursor + 1 >= equal_index or not text_starts_with(list_get(tokens, path_cursor + 1), "I:"):
+                fail("LLVM Core parser: malformed shape field update path (" + core_parser_token_span_location(source, source_line, tokens, columns, path_cursor) + ")")
+            else:
+                list_push(field_path, core_token_value(list_get(tokens, path_cursor + 1)))
+                list_push(field_path_columns, list_get(columns, path_cursor + 1))
+                set path_cursor = path_cursor + 2
+        if list_count(field_path) == 0: fail("LLVM Core parser: shape field update requires a field path (" + core_parser_token_span_location(source, source_line, tokens, columns, 1) + ")")
+        if equal_index + 1 >= count: fail("LLVM Core parser: shape field update requires a value (" + core_parser_end_location(source, source_line) + ")")
+        let field_name: Text = list_get(field_path, list_count(field_path) - 1)
+        var update: HirStatement = core_statement("set_field", core_token_value(list_get(tokens, 1)), field_name, core_parse_full_expression(tokens, columns, equal_index + 1, count, source_line, source), source_line)
+        set update.field_path = field_path
+        set update.field_path_columns = field_path_columns
+        return core_statement_token_span(update, tokens, columns, 1)
+    if first == "I:set" and count > 3 and text_starts_with(list_get(tokens, 1), "I:") and list_get(tokens, 2) == "O:=":
+        return core_statement_token_span(core_statement("set", core_token_value(list_get(tokens, 1)), "", core_parse_full_expression(tokens, columns, 3, count, source_line, source), source_line), tokens, columns, 1)
+    return core_statement_token_range_span(core_statement("expression", "", "", core_parse_full_expression(tokens, columns, 0, count, source_line, source), source_line), tokens, columns, 0, count - 1)
+
+fn core_parse_block(records: TextList, source_lines: TextList, cursor: TextList, indent_level: Number, source: CoreExpandedSource) -> List[HirStatement]:
+    let statements: List[HirStatement] = List[HirStatement]()
+    var parsing: Boolean = true
+    while parsing:
+        let record_index: Number = number_parse(list_get(cursor, 0))
+        if record_index >= list_count(records):
+            set parsing = false
+        else:
+            let fields: TextList = text_split(list_get(records, record_index), "|")
+            let indent: Number = number_parse(list_get(fields, 0))
+            if indent < indent_level:
+                set parsing = false
+            else:
+                if indent > indent_level:
+                    fail("LLVM Core parser: unexpected indentation at " + core_parser_location_at(source, number_parse(list_get(fields, 1)), indent_level + 1))
+                    set parsing = false
+                else:
+                    let line_number: Number = number_parse(list_get(fields, 1))
+                    let raw_line: Text = list_get(source_lines, line_number - 1)
+                    let tokens: TextList = core_lex_trimmed_line(raw_line, source, line_number)
+                    let statement: HirStatement = core_parse_statement(records, source_lines, cursor, indent_level, tokens, line_number, source)
+                    list_push(statements, statement)
+    return statements
+
+fn core_append_statement_block(destination: List[HirStatement], source_block: List[HirStatement]) -> List[HirStatement]:
+    var statement_index: Number = 0
+    while statement_index < list_count(source_block):
+        list_push(destination, list_get(source_block, statement_index))
+        set statement_index = statement_index + 1
+    return destination
+
+fn core_parse_statement(records: TextList, source_lines: TextList, cursor: TextList, indent_level: Number, tokens: TextList, source_line: Number, source: CoreExpandedSource) -> HirStatement:
+    let count: Number = list_count(tokens)
+    let columns: TextList = core_token_columns(list_get(source_lines, source_line - 1), tokens)
+    let first: Text = list_get(tokens, 0)
+    let record_index: Number = number_parse(list_get(cursor, 0))
+    list_set(cursor, 0, number_text(record_index + 1))
+    if first == "I:return" and count > 2 and list_get(tokens, 1) == "I:match":
+        return core_parse_match_expr_statement(records, source_lines, cursor, indent_level, tokens, columns, source_line, "match_expr_return", "", "", 2, source)
+    if (first == "I:let" or first == "I:var") and count > 5 and text_starts_with(list_get(tokens, 1), "I:") and list_get(tokens, 2) == "P::":
+        let match_declaration_equal: Number = core_find_top_level_token(tokens, 3, "O:=")
+        if match_declaration_equal > 0 and match_declaration_equal + 1 < count and list_get(tokens, match_declaration_equal + 1) == "I:match":
+            let declared_name: Text = core_token_value(list_get(tokens, 1))
+            let declared_type: Text = core_join_type_tokens(tokens, 3, match_declaration_equal)
+            if declared_type == "": fail("LLVM Core parser: match declaration type is missing (" + core_parser_cursor_location(source, source_line, tokens, columns, match_declaration_equal) + ")")
+            var match_kind: Text = "match_expr_let"
+            if first == "I:var": set match_kind = "match_expr_var"
+            return core_parse_match_expr_statement(records, source_lines, cursor, indent_level, tokens, columns, source_line, match_kind, declared_name, declared_type, match_declaration_equal + 2, source)
+    if first == "I:set" and count > 4 and text_starts_with(list_get(tokens, 1), "I:") and list_get(tokens, 2) == "O:=" and list_get(tokens, 3) == "I:match":
+        return core_parse_match_expr_statement(records, source_lines, cursor, indent_level, tokens, columns, source_line, "match_expr_set", core_token_value(list_get(tokens, 1)), "", 4, source)
+    if first == "I:defer":
+        if count < 2: fail("LLVM Core parser: defer requires a function call (" + core_parser_end_location(source, source_line) + ")")
+        let deferred_call: HirExpr = core_parse_full_expression(tokens, columns, 1, count, source_line, source)
+        if deferred_call.kind != "call": fail("LLVM Core parser: defer requires a direct function call (" + core_parser_token_span_location(source, source_line, tokens, columns, 1) + ")")
+        return core_statement_token_span(core_statement("defer", "", "", deferred_call, source_line), tokens, columns, 0)
+    if first == "I:if":
+        var result: HirStatement = core_statement_token_span(core_statement("if", "", "", core_empty_expr(source_line), source_line), tokens, columns, 0)
+        let branch_list: List[HirBranch] = List[HirBranch]()
+        var header: TextList = tokens
+        var header_columns: TextList = columns
+        var header_line: Number = source_line
+        var reading_chain: Boolean = true
+        while reading_chain:
+            let header_count: Number = list_count(header)
+            let colon_index: Number = core_find_top_level_token(header, 1, "P::")
+            if colon_index < 0: fail("LLVM Core parser: expected ':' after condition (" + core_parser_end_location(source, header_line) + ")")
+            let condition: HirExpr = core_parse_full_expression(header, header_columns, 1, colon_index, header_line, source)
+            var arm_body: List[HirStatement] = List[HirStatement]()
+            if colon_index + 1 < header_count:
+                let inline_tokens: TextList = text_list()
+                let inline_columns: TextList = text_list()
+                var inline_index: Number = colon_index + 1
+                while inline_index < header_count:
+                    list_push(inline_tokens, list_get(header, inline_index))
+                    list_push(inline_columns, list_get(header_columns, inline_index))
+                    set inline_index = inline_index + 1
+                list_push(arm_body, core_parse_simple_statement(inline_tokens, inline_columns, header_line, source))
+                let continuation: List[HirStatement] = core_parse_block(records, source_lines, cursor, indent_level + 4, source)
+                set arm_body = core_append_statement_block(arm_body, continuation)
+            else:
+                set arm_body = core_parse_block(records, source_lines, cursor, indent_level + 4, source)
+            if list_count(arm_body) == 0: fail("LLVM Core parser: block cannot be empty (" + core_parser_empty_block_location(records, cursor, indent_level + 4, source, header_line, header, header_columns) + ")")
+            let branch_source_column: Number = number_parse(list_get(header_columns, 0))
+            let branch_colon: Number = colon_index
+            let branch_colon_spelling: Text = core_token_value(list_get(header, branch_colon))
+            let branch_source_end_column: Number = number_parse(list_get(header_columns, branch_colon)) + text_length(branch_colon_spelling) - 1
+            list_push(branch_list, HirBranch(condition, arm_body, header_line, "", branch_source_column, branch_source_end_column))
+            let next_index: Number = number_parse(list_get(cursor, 0))
+            if next_index < list_count(records):
+                let next_fields: TextList = text_split(list_get(records, next_index), "|")
+                let next_indent: Number = number_parse(list_get(next_fields, 0))
+                if next_indent == indent_level:
+                    let next_line: Number = number_parse(list_get(next_fields, 1))
+                    let next_raw_line: Text = list_get(source_lines, next_line - 1)
+                    let next_tokens: TextList = core_lex_trimmed_line(next_raw_line, source, next_line)
+                    let next_columns: TextList = core_token_columns(next_raw_line, next_tokens)
+                    if list_get(next_tokens, 0) == "I:elif":
+                        set header = next_tokens
+                        set header_columns = next_columns
+                        set header_line = next_line
+                        list_set(cursor, 0, number_text(next_index + 1))
+                    else:
+                        if list_get(next_tokens, 0) == "I:else":
+                            list_set(cursor, 0, number_text(next_index + 1))
+                            let else_colon: Number = core_find_top_level_token(next_tokens, 1, "P::")
+                            if else_colon < 0: fail("LLVM Core parser: expected ':' after else (" + core_parser_end_location(source, next_line) + ")")
+                            let else_colon_spelling: Text = core_token_value(list_get(next_tokens, else_colon))
+                            set result.else_source_line = next_line
+                            set result.else_source_column = number_parse(list_get(next_columns, 0))
+                            set result.else_source_end_column = number_parse(list_get(next_columns, else_colon)) + text_length(else_colon_spelling) - 1
+                            set result.has_else = true
+                            if else_colon + 1 < list_count(next_tokens):
+                                let inline_tokens: TextList = text_list()
+                                let inline_columns: TextList = text_list()
+                                var inline_index: Number = else_colon + 1
+                                while inline_index < list_count(next_tokens):
+                                    list_push(inline_tokens, list_get(next_tokens, inline_index))
+                                    list_push(inline_columns, list_get(next_columns, inline_index))
+                                    set inline_index = inline_index + 1
+                                set result.alternate = List[HirStatement]()
+                                list_push(result.alternate, core_parse_simple_statement(inline_tokens, inline_columns, next_line, source))
+                                let continuation: List[HirStatement] = core_parse_block(records, source_lines, cursor, indent_level + 4, source)
+                                set result.alternate = core_append_statement_block(result.alternate, continuation)
+                            else:
+                                set result.alternate = core_parse_block(records, source_lines, cursor, indent_level + 4, source)
+                            if list_count(result.alternate) == 0: fail("LLVM Core parser: block cannot be empty (" + core_parser_empty_block_location(records, cursor, indent_level + 4, source, next_line, next_tokens, next_columns) + ")")
+                            set reading_chain = false
+                        else:
+                            set reading_chain = false
+                else:
+                    set reading_chain = false
+            else:
+                set reading_chain = false
+        set result.branches = branch_list
+        return result
+    if first == "I:match":
+        let colon_index: Number = core_find_top_level_token(tokens, 1, "P::")
+        if colon_index < 0: fail("LLVM Core parser: expected ':' after match value (" + core_parser_end_location(source, source_line) + ")")
+        if colon_index + 1 < count: fail("LLVM Core parser: inline match arms are not supported (" + core_parser_token_span_location(source, source_line, tokens, columns, colon_index + 1) + ")")
+        let value: HirExpr = core_parse_full_expression(tokens, columns, 1, colon_index, source_line, source)
+        var result: HirStatement = core_statement_token_span(core_statement("match", "", "", value, source_line), tokens, columns, 0)
+        set result = core_statement_header_span(result, tokens, columns, 0, colon_index)
+        set result.match_arms = core_parse_match_arms(records, source_lines, cursor, indent_level, source_line, source)
+        return result
+    if first == "I:arena_scope":
+        let colon_index: Number = core_find_top_level_token(tokens, 1, "P::")
+        if colon_index < 0: fail("LLVM Core parser: expected ':' after arena_scope limit (" + core_parser_end_location(source, source_line) + ")")
+        if colon_index + 1 < count: fail("LLVM Core parser: arena_scope requires an indented block (" + core_parser_token_span_location(source, source_line, tokens, columns, colon_index + 1) + ")")
+        if colon_index == 1: fail("LLVM Core parser: arena_scope requires a Number byte limit (" + core_parser_cursor_location(source, source_line, tokens, columns, colon_index) + ")")
+        let limit: HirExpr = core_parse_full_expression(tokens, columns, 1, colon_index, source_line, source)
+        var scope: HirStatement = core_statement_token_span(core_statement("arena_scope", "", "", limit, source_line), tokens, columns, 0)
+        set scope = core_statement_header_span(scope, tokens, columns, 0, colon_index)
+        set scope.body = core_parse_block(records, source_lines, cursor, indent_level + 4, source)
+        if list_count(scope.body) == 0: fail("LLVM Core parser: arena_scope block cannot be empty (" + core_parser_empty_block_location(records, cursor, indent_level + 4, source, source_line, tokens, columns) + ")")
+        return scope
+    if first == "I:while" or first == "I:for":
+        let colon_index: Number = core_find_top_level_token(tokens, 1, "P::")
+        if colon_index < 0: fail("LLVM Core parser: expected ':' after loop header (" + core_parser_end_location(source, source_line) + ")")
+        let end_index: Number = colon_index
+        if colon_index + 1 < count: fail("LLVM Core parser: inline loop bodies are not supported yet (" + core_parser_token_span_location(source, source_line, tokens, columns, colon_index + 1) + ")")
+        let body: List[HirStatement] = core_parse_block(records, source_lines, cursor, indent_level + 4, source)
+        if list_count(body) == 0: fail("LLVM Core parser: block cannot be empty (" + core_parser_empty_block_location(records, cursor, indent_level + 4, source, source_line, tokens, columns) + ")")
+        if first == "I:while":
+            var loop: HirStatement = core_statement_token_span(core_statement("while", "", "", core_parse_full_expression(tokens, columns, 1, end_index, source_line, source), source_line), tokens, columns, 0)
+            set loop = core_statement_header_span(loop, tokens, columns, 0, colon_index)
+            set loop.body = body
+            return loop
+        var loop_header_error_index: Number = -1
+        if count < 2: set loop_header_error_index = count
+        else:
+            if not text_starts_with(list_get(tokens, 1), "I:"): set loop_header_error_index = 1
+            else:
+                if count < 3: set loop_header_error_index = count
+                else:
+                    if list_get(tokens, 2) != "I:in": set loop_header_error_index = 2
+                    else:
+                        if count < 5: set loop_header_error_index = colon_index
+        if loop_header_error_index >= 0: fail("LLVM Core parser: expected 'for name in range-or-collection:' (" + core_parser_cursor_location(source, source_line, tokens, columns, loop_header_error_index) + ")")
+        let binder: Text = core_token_value(list_get(tokens, 1))
+        var range_separator: Number = -1
+        var scan: Number = 3
+        while scan + 1 < end_index and range_separator < 0:
+            if list_get(tokens, scan) == "P:." and list_get(tokens, scan + 1) == "P:.": set range_separator = scan
+            set scan = scan + 1
+        if range_separator >= 0:
+            let range_values: List[HirExpr] = List[HirExpr]()
+            list_push(range_values, core_parse_full_expression(tokens, columns, 3, range_separator, source_line, source))
+            list_push(range_values, core_parse_full_expression(tokens, columns, range_separator + 2, end_index, source_line, source))
+            var loop: HirStatement = core_statement("for_range", binder, "Number", core_empty_expr(source_line), source_line)
+            set loop.body = body
+            set loop.alternate = List[HirStatement]()
+            let bound_text: Text = number_text(list_count(range_values))
+            list_push(loop.alternate, core_statement("range_start", "", bound_text, list_get(range_values, 0), source_line))
+            list_push(loop.alternate, core_statement("range_end", "", "", list_get(range_values, 1), source_line))
+            set loop = core_statement_token_span(loop, tokens, columns, 1)
+            return core_statement_header_span(loop, tokens, columns, 0, colon_index)
+        let iterable: HirExpr = core_parse_full_expression(tokens, columns, 3, end_index, source_line, source)
+        var loop: HirStatement = core_statement("for_each", binder, "", iterable, source_line)
+        set loop.body = body
+        set loop = core_statement_token_span(loop, tokens, columns, 1)
+        return core_statement_header_span(loop, tokens, columns, 0, colon_index)
+    return core_parse_simple_statement(tokens, columns, source_line, source)
+
+fn core_function_header_error_index(tokens: TextList) -> Number:
+    let count: Number = list_count(tokens)
+    if count == 0: return 0
+    if list_get(tokens, 0) != "I:fn": return 0
+    if count < 2: return count
+    if not text_starts_with(list_get(tokens, 1), "I:"): return 1
+    if count < 3: return count
+    if list_get(tokens, 2) != "P:(": return 2
+    var nesting: Number = 0
+    var close_index: Number = -1
+    var scan: Number = 2
+    while scan < count and close_index < 0:
+        if list_get(tokens, scan) == "P:(": set nesting = nesting + 1
+        if list_get(tokens, scan) == "P:)":
+            set nesting = nesting - 1
+            if nesting == 0: set close_index = scan
+        set scan = scan + 1
+    if close_index < 0:
+        set scan = 3
+        while scan < count:
+            if list_get(tokens, scan) == "O:->": return scan
+            set scan = scan + 1
+        return count
+    if close_index + 1 >= count: return count
+    if list_get(tokens, close_index + 1) != "O:->": return close_index + 1
+    if close_index + 2 >= count: return count
+    if list_get(tokens, count - 1) != "P::": return count
+    return -1
+
+fn core_named_declaration_header_error_index(tokens: TextList, keyword: Text) -> Number:
+    let count: Number = list_count(tokens)
+    if count == 0: return 0
+    if list_get(tokens, 0) != "I:" + keyword: return 0
+    if count < 2: return count
+    if not text_starts_with(list_get(tokens, 1), "I:"): return 1
+    if count < 3: return count
+    if list_get(tokens, 2) != "P::": return 2
+    if count > 3: return 3
+    return -1
+
+fn core_function_parameter_error_index(tokens: TextList, cursor: Number, close_index: Number) -> Number:
+    var colon: Number = core_find_top_level_token(tokens, cursor, "P::")
+    if colon >= close_index: set colon = -1
+    let comma: Number = core_find_top_level_token(tokens, cursor, "P:,")
+    if colon < 0 or (comma >= 0 and comma < colon):
+        if comma >= 0:
+            if cursor + 1 < comma: return cursor + 1
+            return comma
+        if cursor + 1 < close_index: return cursor + 1
+        return cursor
+    if colon + 1 >= close_index: return close_index
+    if list_get(tokens, colon + 1) == "P:,": return colon + 1
+    return -1
+
+fn core_field_header_error_index(tokens: TextList, field_index: Number, stop_index: Number) -> Number:
+    if field_index >= stop_index: return stop_index
+    if not text_starts_with(list_get(tokens, field_index), "I:"): return field_index
+    if field_index + 1 >= stop_index: return stop_index
+    if list_get(tokens, field_index + 1) != "P::": return field_index + 1
+    if field_index + 2 >= stop_index: return stop_index
+    if list_get(tokens, field_index + 2) == "P:,": return field_index + 2
+    return -1
+
+fn core_variant_case_header_candidate(tokens: TextList) -> Boolean:
+    if list_count(tokens) < 2 or not text_starts_with(list_get(tokens, 0), "I:") or list_get(tokens, list_count(tokens) - 1) != "P::": return false
+    let name: Text = core_token_value(list_get(tokens, 0))
+    if name == "fn" or name == "shape" or name == "variant" or name == "start" or name == "use" or name == "impl": return false
+    return true
+
+fn core_parse_function_header(tokens: TextList, columns: TextList, source_line: Number, source: CoreExpandedSource) -> HirFunction:
+    let count: Number = list_count(tokens)
+    let header_error_index: Number = core_function_header_error_index(tokens)
+    if count < 7 or header_error_index >= 0:
+        fail("LLVM Core parser: malformed function declaration (" + core_parser_cursor_location(source, source_line, tokens, columns, header_error_index) + ")")
+    let close_index: Number = core_find_top_level_token(tokens, 2, "O:->")
+    let arrow_index: Number = close_index
+    if arrow_index < 0: fail("LLVM Core parser: function is missing '-> ReturnType' (" + core_parser_end_location(source, source_line) + ")")
+    if list_get(tokens, arrow_index - 1) != "P:)":
+        fail("LLVM Core parser: malformed function signature (" + core_parser_token_span_location(source, source_line, tokens, columns, arrow_index) + ")")
+    if list_get(tokens, count - 1) != "P::":
+        fail("LLVM Core parser: malformed function signature (" + core_parser_cursor_location(source, source_line, tokens, columns, count) + ")")
+    let parameters: List[HirParameter] = List[HirParameter]()
+    var cursor: Number = 3
+    while cursor < arrow_index - 1:
+        let parameter_error_index: Number = core_function_parameter_error_index(tokens, cursor, arrow_index - 1)
+        if parameter_error_index >= 0:
+            fail("LLVM Core parser: malformed function parameter (" + core_parser_cursor_location(source, source_line, tokens, columns, parameter_error_index) + ")")
+            set cursor = arrow_index - 1
+        else:
+            let colon: Number = core_find_top_level_token(tokens, cursor, "P::")
+            var type_stop: Number = arrow_index - 1
+            var next_parameter: Number = arrow_index - 1
+            var depth: Number = 0
+            var scan: Number = colon + 1
+            while scan < arrow_index - 1:
+                let part: Text = list_get(tokens, scan)
+                if part == "P:[": set depth = depth + 1
+                if part == "P:]": set depth = depth - 1
+                if depth == 0 and part == "P:,":
+                    set type_stop = scan
+                    set next_parameter = scan + 1
+                    set scan = arrow_index
+                else:
+                    set scan = scan + 1
+            if not text_starts_with(list_get(tokens, cursor), "I:"):
+                fail("LLVM Core parser: parameter name must be an identifier (" + core_parser_location_at(source, source_line, number_parse(list_get(columns, cursor))) + ")")
+            let type_last: Number = type_stop - 1
+            let type_end_column: Number = number_parse(list_get(columns, type_last)) + text_length(core_token_value(list_get(tokens, type_last))) - 1
+            let name_token: Text = core_token_value(list_get(tokens, cursor))
+            let name_column: Number = number_parse(list_get(columns, cursor))
+            list_push(parameters, HirParameter(name_token, core_join_type_tokens(tokens, colon + 1, type_stop), source_line, name_column, name_column + text_length(name_token) - 1, number_parse(list_get(columns, colon + 1)), type_end_column))
+            set cursor = next_parameter
+    let return_type: Text = core_join_type_tokens(tokens, arrow_index + 1, count - 1)
+    if return_type == "": fail("LLVM Core parser: function return type is missing (" + core_parser_token_span_location(source, source_line, tokens, columns, count - 1) + ")")
+    let return_type_last: Number = count - 2
+    let return_type_end_column: Number = number_parse(list_get(columns, return_type_last)) + text_length(core_token_value(list_get(tokens, return_type_last))) - 1
+    let function_name: Text = core_token_value(list_get(tokens, 1))
+    let function_name_column: Number = number_parse(list_get(columns, 1))
+    let header_end_index: Number = count - 1
+    let header_end_column: Number = number_parse(list_get(columns, header_end_index)) + text_length(core_token_value(list_get(tokens, header_end_index))) - 1
+    return HirFunction(function_name, parameters, return_type, List[HirStatement](), source_line, "", function_name_column, function_name_column + text_length(function_name) - 1, number_parse(list_get(columns, arrow_index + 1)), return_type_end_column, number_parse(list_get(columns, 0)), header_end_column, false)
+
+fn core_parse_shape_fields(records: TextList, source_lines: TextList, cursor: TextList, source: CoreExpandedSource, declaration_line: Number) -> List[HirField]:
+    let fields: List[HirField] = List[HirField]()
+    var reading: Boolean = true
+    while reading:
+        let record_index: Number = number_parse(list_get(cursor, 0))
+        if record_index >= list_count(records):
+            set reading = false
+        else:
+            let record: TextList = text_split(list_get(records, record_index), "|")
+            let indent: Number = number_parse(list_get(record, 0))
+            if indent < 4:
+                let source_line: Number = number_parse(list_get(record, 1))
+                let raw_line: Text = list_get(source_lines, source_line - 1)
+                let tokens: TextList = core_lex_trimmed_line(raw_line, source, source_line)
+                if core_field_header_error_index(tokens, 0, list_count(tokens)) < 0:
+                    fail("LLVM Core parser: shape fields must be indented one level (" + core_parser_location_at(source, source_line, core_parser_indentation_error_column(indent, 4)) + ")")
+                set reading = false
+            else:
+                let source_line: Number = number_parse(list_get(record, 1))
+                if indent != 4:
+                    fail("LLVM Core parser: shape fields must be indented one level (" + core_parser_location_at(source, source_line, 5) + ")")
+                let raw_line: Text = list_get(source_lines, source_line - 1)
+                let tokens: TextList = core_lex_trimmed_line(raw_line, source, source_line)
+                let columns: TextList = core_token_columns(raw_line, tokens)
+                let field_error_index: Number = core_field_header_error_index(tokens, 0, list_count(tokens))
+                if field_error_index >= 0:
+                    fail("LLVM Core parser: expected 'field: Type' in shape (" + core_parser_cursor_location(source, source_line, tokens, columns, field_error_index) + ")")
+                let field_type: Text = core_join_type_tokens(tokens, 2, list_count(tokens))
+                if field_type == "": fail("LLVM Core parser: shape field type is missing (" + core_parser_end_location(source, source_line) + ")")
+                let type_last: Number = list_count(tokens) - 1
+                let type_end_column: Number = number_parse(list_get(columns, type_last)) + text_length(core_token_value(list_get(tokens, type_last))) - 1
+                let field_name: Text = core_token_value(list_get(tokens, 0))
+                let field_name_column: Number = number_parse(list_get(columns, 0))
+                list_push(fields, HirField(field_name, field_type, source_line, "", field_name_column, field_name_column + text_length(field_name) - 1, number_parse(list_get(columns, 2)), type_end_column))
+                list_set(cursor, 0, number_text(record_index + 1))
+    if list_count(fields) == 0: fail("LLVM Core parser: a shape must declare at least one field (" + core_parser_span_location(source, declaration_line, 1, 5) + ")")
+    return fields
+
+fn core_parse_variant_case_fields(tokens: TextList, columns: TextList, source_line: Number, case_name: Text, source: CoreExpandedSource) -> List[HirField]:
+    let fields: List[HirField] = List[HirField]()
+    let close_index: Number = list_count(tokens) - 1
+    if close_index == 2 and list_get(tokens, 1) == "P:(" and list_get(tokens, 2) == "P:)": return fields
+    if list_count(tokens) < 2 or list_get(tokens, 1) != "P:(":
+        fail("LLVM Core parser: malformed payload declaration for variant case '" + case_name + "' (" + core_parser_cursor_location(source, source_line, tokens, columns, 1) + ")")
+        return fields
+    if close_index < 2 or list_get(tokens, close_index) != "P:)":
+        fail("LLVM Core parser: expected ')' in variant payload (" + core_parser_end_location(source, source_line) + ")")
+        return fields
+    if close_index == 2: return fields
+    if close_index < 3:
+        fail("LLVM Core parser: malformed payload declaration for variant case '" + case_name + "' (" + core_parser_token_span_location(source, source_line, tokens, columns, 1) + ")")
+        return fields
+    var field_start: Number = 2
+    var reading: Boolean = field_start < close_index
+    while reading:
+        let field_error_index: Number = core_field_header_error_index(tokens, field_start, close_index)
+        if field_error_index >= 0:
+            fail("LLVM Core parser: expected 'field: Type' in variant case '" + case_name + "' (" + core_parser_cursor_location(source, source_line, tokens, columns, field_error_index) + ")")
+        let comma_index: Number = core_find_top_level_token(tokens, field_start + 2, "P:,")
+        var field_stop: Number = close_index
+        if comma_index >= 0 and comma_index < close_index: set field_stop = comma_index
+        let field_type: Text = core_join_type_tokens(tokens, field_start + 2, field_stop)
+        if field_type == "": fail("LLVM Core parser: variant payload field type is missing (" + core_parser_cursor_location(source, source_line, tokens, columns, field_start + 2) + ")")
+        let type_last: Number = field_stop - 1
+        let type_end_column: Number = number_parse(list_get(columns, type_last)) + text_length(core_token_value(list_get(tokens, type_last))) - 1
+        let field_name: Text = core_token_value(list_get(tokens, field_start))
+        let field_name_column: Number = number_parse(list_get(columns, field_start))
+        list_push(fields, HirField(field_name, field_type, source_line, "", field_name_column, field_name_column + text_length(field_name) - 1, number_parse(list_get(columns, field_start + 2)), type_end_column))
+        if field_stop == close_index:
+            set reading = false
+        else:
+            set field_start = field_stop + 1
+            if field_start >= close_index: set reading = false
+    return fields
+
+fn core_parse_variant_cases(records: TextList, source_lines: TextList, cursor: TextList, variant_line: Number, source: CoreExpandedSource) -> List[HirVariantCase]:
+    let cases: List[HirVariantCase] = List[HirVariantCase]()
+    var reading: Boolean = true
+    while reading:
+        let record_index: Number = number_parse(list_get(cursor, 0))
+        if record_index >= list_count(records):
+            set reading = false
+        else:
+            let record: TextList = text_split(list_get(records, record_index), "|")
+            let indent: Number = number_parse(list_get(record, 0))
+            if indent < 4:
+                let source_line: Number = number_parse(list_get(record, 1))
+                let raw_line: Text = list_get(source_lines, source_line - 1)
+                let tokens: TextList = core_lex_trimmed_line(raw_line, source, source_line)
+                if core_variant_case_header_candidate(tokens):
+                    fail("LLVM Core parser: variant cases must be indented one level (" + core_parser_location_at(source, source_line, core_parser_indentation_error_column(indent, 4)) + ")")
+                set reading = false
+            else:
+                let source_line: Number = number_parse(list_get(record, 1))
+                if indent != 4: fail("LLVM Core parser: variant cases must be indented one level (" + core_parser_location_at(source, source_line, 5) + ")")
+                let raw_line: Text = list_get(source_lines, source_line - 1)
+                let tokens: TextList = core_lex_trimmed_line(raw_line, source, source_line)
+                let columns: TextList = core_token_columns(raw_line, tokens)
+                if list_count(tokens) == 0 or not text_starts_with(list_get(tokens, 0), "I:"):
+                    fail("LLVM Core parser: expected a variant case name (" + core_parser_cursor_location(source, source_line, tokens, columns, 0) + ")")
+                let case_name: Text = core_token_value(list_get(tokens, 0))
+                var fields: List[HirField] = List[HirField]()
+                if list_count(tokens) > 1:
+                    set fields = core_parse_variant_case_fields(tokens, columns, source_line, case_name, source)
+                let case_name_column: Number = number_parse(list_get(columns, 0))
+                let case_header_end_index: Number = list_count(tokens) - 1
+                let case_header_end_column: Number = number_parse(list_get(columns, case_header_end_index)) + text_length(core_token_value(list_get(tokens, case_header_end_index))) - 1
+                list_push(cases, HirVariantCase(case_name, fields, source_line, "", case_name_column, case_name_column + text_length(case_name) - 1, case_name_column, case_header_end_column))
+                list_set(cursor, 0, number_text(record_index + 1))
+    if list_count(cases) == 0: fail("LLVM Core parser: a variant must declare at least one case (" + core_parser_span_location(source, variant_line, 1, 7) + ")")
+    return cases
+
+fn core_contains_path(paths: TextList, sought: Text) -> Boolean:
+    var index: Number = 0
+    while index < list_count(paths):
+        if list_get(paths, index) == sought: return true
+        set index = index + 1
+    return false
+
+fn core_directory_of(path: Text) -> Text:
+    var last_slash: Number = -1
+    var index: Number = 0
+    while index < text_length(path):
+        if text_byte(path, index) == 47: set last_slash = index
+        set index = index + 1
+    if last_slash == 0: return "/"
+    if last_slash > 0: return text_slice(path, 0, last_slash)
+    return "."
+
+fn core_normalize_lexical_path(path: Text) -> Text:
+    let absolute: Boolean = text_starts_with(path, "/")
+    let parts: TextList = text_split(path, "/")
+    let normalized: TextList = text_list()
+    var active_count: Number = 0
+    var part_index: Number = 0
+    while part_index < list_count(parts):
+        let part: Text = list_get(parts, part_index)
+        if part != "" and part != ".":
+            if part == "..":
+                if active_count > 0 and list_get(normalized, active_count - 1) != "..":
+                    set active_count = active_count - 1
+                else:
+                    if not absolute:
+                        if active_count < list_count(normalized): list_set(normalized, active_count, part)
+                        else: list_push(normalized, part)
+                        set active_count = active_count + 1
+            else:
+                if active_count < list_count(normalized): list_set(normalized, active_count, part)
+                else: list_push(normalized, part)
+                set active_count = active_count + 1
+        set part_index = part_index + 1
+    var result: Text = ""
+    if absolute: set result = "/"
+    var segment_index: Number = 0
+    while segment_index < active_count:
+        if segment_index > 0: set result = result + "/"
+        set result = result + list_get(normalized, segment_index)
+        set segment_index = segment_index + 1
+    if result == "": set result = "."
+    return result
+
+fn core_standard_module_name_valid(module_name: Text) -> Boolean:
+    if not text_starts_with(module_name, "std/"): return false
+    var relative_name: Text = text_slice(module_name, 4, text_length(module_name) - 4)
+    if text_ends_with(relative_name, ".yz"):
+        set relative_name = text_slice(relative_name, 0, text_length(relative_name) - 3)
+    if relative_name == "": return false
+    let segments: TextList = text_split(relative_name, "/")
+    if list_count(segments) == 0: return false
+    var segment_index: Number = 0
+    while segment_index < list_count(segments):
+        let segment: Text = list_get(segments, segment_index)
+        if segment == "" or segment == "." or segment == "..": return false
+        var byte_index: Number = 0
+        while byte_index < text_length(segment):
+            let byte: Number = text_byte(segment, byte_index)
+            let valid: Boolean = (byte >= 48 and byte <= 57) or (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122) or byte == 45 or byte == 95
+            if not valid: return false
+            set byte_index = byte_index + 1
+        set segment_index = segment_index + 1
+    return true
+
+fn core_join_path(directory: Text, child: Text) -> Text:
+    if directory == "": return child
+    if child == "": return directory
+    if text_ends_with(directory, "/"): return directory + child
+    return directory + "/" + child
+
+fn core_resolve_module_path(importer_path: Text, module_name: Text, import_origin: HirImportOrigin) -> Text:
+    var module_file: Text = module_name
+    if not text_ends_with(module_file, ".yz"): set module_file = module_file + ".yz"
+    if text_starts_with(module_name, "std/"):
+        if not core_standard_module_name_valid(module_name): fail("LLVM Core parser: invalid standard module path '" + module_name + "'" + core_import_origin_context(import_origin))
+        if file_exists(module_file): return core_normalize_lexical_path(module_file)
+        let configured_root: Text = env_get("YAZA_STDLIB_DIR")
+        if configured_root != "":
+            let configured_path: Text = core_normalize_lexical_path(core_join_path(configured_root, module_file))
+            if file_exists(configured_path): return configured_path
+        let executable: Text = arg(0)
+        var separator: Number = text_length(executable)
+        while separator > 0 and text_byte(executable, separator - 1) != 47:
+            set separator = separator - 1
+        if separator > 0:
+            let executable_dir: Text = text_slice(executable, 0, separator - 1)
+            let relative_std: Text = core_normalize_lexical_path(core_join_path(executable_dir + "/..", module_file))
+            if file_exists(relative_std): return relative_std
+            let relative_share_std: Text = core_normalize_lexical_path(core_join_path(executable_dir + "/../share/yaza", module_file))
+            if file_exists(relative_share_std): return relative_share_std
+            let relative_direct_std: Text = core_normalize_lexical_path(core_join_path(executable_dir, module_file))
+            if file_exists(relative_direct_std): return relative_direct_std
+        let local_install_path: Text = core_join_path("/usr/local/share/yaza", module_file)
+        if file_exists(local_install_path): return local_install_path
+        let homebrew_install_path: Text = core_join_path("/opt/homebrew/share/yaza", module_file)
+        if file_exists(homebrew_install_path): return homebrew_install_path
+        fail("LLVM Core parser: standard module not found; install YAZA's standard library or set YAZA_STDLIB_DIR" + core_import_origin_context(import_origin))
+    if module_name == "" or text_starts_with(module_name, "/"):
+        fail("LLVM Core parser: module path must be non-empty and relative" + core_import_origin_context(import_origin))
+    return core_normalize_lexical_path(core_join_path(core_directory_of(importer_path), module_file))
+
+fn core_expanded_source() -> CoreExpandedSource:
+    return CoreExpandedSource(text_list(), List[HirSourceOrigin]())
+
+fn core_expanded_push(source: CoreExpandedSource, raw_line: Text, source_file: Text, source_line: Number) -> Number:
+    return core_expanded_push_with_offset(source, raw_line, source_file, source_line, 0)
+
+fn core_expanded_push_with_offset(source: CoreExpandedSource, raw_line: Text, source_file: Text, source_line: Number, source_column_offset: Number) -> Number:
+    list_push(source.lines, raw_line)
+    list_push(source.origins, HirSourceOrigin(source_file, source_line, source_column_offset, false))
+    return list_count(source.lines)
+
+fn core_expanded_push_from_method(source: CoreExpandedSource, raw_line: Text, origin: HirSourceOrigin) -> Number:
+    list_push(source.lines, raw_line)
+    list_push(source.origins, HirSourceOrigin(origin.source_file, origin.source_line, origin.source_column_offset, true))
+    return list_count(source.lines)
+
+fn core_expanded_append(destination: CoreExpandedSource, source: CoreExpandedSource) -> Number:
+    var line_index: Number = 0
+    while line_index < list_count(source.lines):
+        list_push(destination.lines, list_get(source.lines, line_index))
+        list_push(destination.origins, list_get(source.origins, line_index))
+        set line_index = line_index + 1
+    return list_count(destination.lines)
+
+fn core_expanded_text(source: CoreExpandedSource) -> Text:
+    return text_join(source.lines, "\n")
+
+fn core_expanded_origin(source: CoreExpandedSource, expanded_line: Number) -> HirSourceOrigin:
+    if expanded_line >= 1 and expanded_line <= list_count(source.origins):
+        return list_get(source.origins, expanded_line - 1)
+    return HirSourceOrigin("", expanded_line, 0, false)
+
+fn core_lex_text(value: Text, source: CoreExpandedSource, expanded_line: Number, source_column: Number) -> TextList:
+    let origin: HirSourceOrigin = core_expanded_origin(source, expanded_line)
+    return lex_with_source(value, origin.source_file, origin.source_line, source_column + origin.source_column_offset)
+
+fn core_lex_trimmed_line(raw_line: Text, source: CoreExpandedSource, expanded_line: Number) -> TextList:
+    var first_column: Number = 1
+    while first_column <= text_length(raw_line) and text_byte(raw_line, first_column - 1) == 32:
+        set first_column = first_column + 1
+    return core_lex_text(text_trim(raw_line), source, expanded_line, first_column)
+
+fn core_parser_location(source: CoreExpandedSource, expanded_line: Number) -> Text:
+    var source_column: Number = 1
+    if expanded_line >= 1 and expanded_line <= list_count(source.lines):
+        let raw_line: Text = list_get(source.lines, expanded_line - 1)
+        while source_column <= text_length(raw_line) and text_byte(raw_line, source_column - 1) == 32:
+            set source_column = source_column + 1
+    return core_parser_location_at(source, expanded_line, source_column)
+
+fn core_parser_indentation_error_column(actual_indent: Number, expected_indent: Number) -> Number:
+    if actual_indent < expected_indent: return actual_indent + 1
+    return expected_indent + 1
+
+fn core_parser_underindent_location(records: TextList, cursor: TextList, expected_indent: Number, minimum_indent: Number, source: CoreExpandedSource) -> Text:
+    let next_index: Number = number_parse(list_get(cursor, 0))
+    if next_index < list_count(records):
+        let next_record: TextList = text_split(list_get(records, next_index), "|")
+        let actual_indent: Number = number_parse(list_get(next_record, 0))
+        if actual_indent < expected_indent and actual_indent >= minimum_indent:
+            let next_line: Number = number_parse(list_get(next_record, 1))
+            return core_parser_location_at(source, next_line, core_parser_indentation_error_column(actual_indent, expected_indent))
+    return ""
+
+fn core_parser_empty_block_location(records: TextList, cursor: TextList, expected_indent: Number, source: CoreExpandedSource, header_line: Number, header_tokens: TextList, header_columns: TextList) -> Text:
+    let header_indent: Number = number_parse(list_get(header_columns, 0)) - 1
+    let underindent_location: Text = core_parser_underindent_location(records, cursor, expected_indent, header_indent, source)
+    if underindent_location != "": return underindent_location
+    return core_parser_token_span_location(source, header_line, header_tokens, header_columns, 0)
+
+fn core_parser_location_at(source: CoreExpandedSource, expanded_line: Number, source_column: Number) -> Text:
+    let origin: HirSourceOrigin = core_expanded_origin(source, expanded_line)
+    let mapped_column: Number = source_column + origin.source_column_offset
+    if origin.source_file == "": return "line " + number_text(expanded_line) + ", column " + number_text(mapped_column)
+    return origin.source_file + ":" + number_text(origin.source_line) + ":" + number_text(mapped_column)
+
+fn core_parser_span_location(source: CoreExpandedSource, expanded_line: Number, source_column: Number, source_end_column: Number) -> Text:
+    let origin: HirSourceOrigin = core_expanded_origin(source, expanded_line)
+    let mapped_column: Number = source_column + origin.source_column_offset
+    var mapped_end_column: Number = source_end_column + origin.source_column_offset
+    if mapped_end_column < mapped_column: set mapped_end_column = mapped_column
+    if origin.source_file == "": return "line " + number_text(expanded_line) + ", column " + number_text(mapped_column) + " (through " + number_text(mapped_end_column) + ")"
+    return origin.source_file + ":" + number_text(origin.source_line) + ":" + number_text(mapped_column) + "-" + number_text(mapped_end_column)
+
+fn core_parser_token_span_location(source: CoreExpandedSource, expanded_line: Number, tokens: TextList, columns: TextList, token_index: Number) -> Text:
+    if token_index < 0 or token_index >= list_count(tokens): return core_parser_end_location(source, expanded_line)
+    let token_spelling: Text = core_token_value(list_get(tokens, token_index))
+    let token_column: Number = number_parse(list_get(columns, token_index))
+    return core_parser_span_location(source, expanded_line, token_column, token_column + text_length(token_spelling) - 1)
+
+fn core_parser_cursor_location(source: CoreExpandedSource, expanded_line: Number, tokens: TextList, columns: TextList, token_index: Number) -> Text:
+    if token_index >= list_count(tokens): return core_parser_end_location(source, expanded_line)
+    return core_parser_token_span_location(source, expanded_line, tokens, columns, token_index)
+
+fn core_parser_end_location(source: CoreExpandedSource, expanded_line: Number) -> Text:
+    if expanded_line < 1 or expanded_line > list_count(source.lines): return core_parser_location(source, expanded_line)
+    let raw_line: Text = list_get(source.lines, expanded_line - 1)
+    let end_column: Number = text_length(raw_line) + 1
+    return core_parser_span_location(source, expanded_line, end_column, end_column)
+
+fn core_import_origin_context(origin: HirImportOrigin) -> Text:
+    if origin.source_file == "": return " (line " + number_text(origin.source_line) + ", column " + number_text(origin.source_column) + " (through " + number_text(origin.source_end_column) + "))"
+    return " (" + origin.source_file + ":" + number_text(origin.source_line) + ":" + number_text(origin.source_column) + "-" + number_text(origin.source_end_column) + ")"
+
+fn core_import_origin_at(source_file: Text, source_line: Number, raw_line: Text, tokens: TextList, columns: TextList, token_index: Number) -> HirImportOrigin:
+    if token_index >= list_count(tokens):
+        let end_column: Number = text_length(raw_line) + 1
+        return HirImportOrigin(source_file, source_line, end_column, end_column)
+    let token: Text = core_token_value(list_get(tokens, token_index))
+    let column: Number = number_parse(list_get(columns, token_index))
+    return HirImportOrigin(source_file, source_line, column, column + text_length(token) - 1)
+
+fn core_identity_expanded_source(source: Text) -> CoreExpandedSource:
+    let result: CoreExpandedSource = core_expanded_source()
+    let lines: TextList = text_lines(source)
+    var line_index: Number = 0
+    while line_index < list_count(lines):
+        core_expanded_push(result, list_get(lines, line_index), "", line_index + 1)
+        set line_index = line_index + 1
+    return result
+
+fn core_expand_modules(path: Text, source: Text, visited: TextList, stack: TextList, depth: Number, is_root: Boolean, import_origin: HirImportOrigin) -> CoreExpandedSource:
+    if depth > 64: fail("LLVM Core parser: module import depth exceeds 64" + core_import_origin_context(import_origin))
+    let normalized_path: Text = core_normalize_lexical_path(path)
+    var source_origin_path: Text = normalized_path
+    if is_root: set source_origin_path = ""
+    if core_contains_path(stack, normalized_path): fail("LLVM Core parser: module import cycle at '" + normalized_path + "'" + core_import_origin_context(import_origin))
+    if core_contains_path(visited, normalized_path): return core_expanded_source()
+    list_push(visited, normalized_path)
+    let next_stack: TextList = text_list()
+    var stack_index: Number = 0
+    while stack_index < list_count(stack):
+        list_push(next_stack, list_get(stack, stack_index))
+        set stack_index = stack_index + 1
+    list_push(next_stack, normalized_path)
+    let lines: TextList = text_lines(source)
+    let local_source: CoreExpandedSource = core_expanded_source()
+    let dependencies: TextList = text_list()
+    let dependency_origins: List[HirImportOrigin] = List[HirImportOrigin]()
+    var saw_start: Boolean = false
+    var line_index: Number = 0
+    while line_index < list_count(lines):
+        let raw_line: Text = list_get(lines, line_index)
+        let trimmed: Text = text_trim(raw_line)
+        var indent: Number = 0
+        while indent < text_length(raw_line) and text_byte(raw_line, indent) == 32:
+            set indent = indent + 1
+        let tab_column: Number = text_find(raw_line, "\t") + 1
+        if tab_column > 0:
+            if source_origin_path == "":
+                fail("YAZA indentation cannot contain tabs (line " + number_text(line_index + 1) + ", column " + number_text(tab_column) + ")")
+            else:
+                fail("YAZA indentation cannot contain tabs (" + source_origin_path + ":" + number_text(line_index + 1) + ":" + number_text(tab_column) + ")")
+        if trimmed != "" and not text_starts_with(trimmed, "#") and indent % 4 != 0:
+            let invalid_indent_column: Number = (indent / 4) * 4 + 1
+            if source_origin_path == "":
+                fail("YAZA indentation must use multiples of four spaces (line " + number_text(line_index + 1) + ", column " + number_text(invalid_indent_column) + ")")
+            else:
+                fail("YAZA indentation must use multiples of four spaces (" + source_origin_path + ":" + number_text(line_index + 1) + ":" + number_text(invalid_indent_column) + ")")
+        if trimmed == "" or text_starts_with(trimmed, "#"):
+            core_expanded_push(local_source, raw_line, source_origin_path, line_index + 1)
+        else:
+            if indent == 0 and trimmed == "start:": set saw_start = true
+            if text_starts_with(trimmed, "use "):
+                let import_tokens: TextList = lex_with_source(trimmed, source_origin_path, line_index + 1, indent + 1)
+                let import_columns: TextList = core_token_columns(raw_line, import_tokens)
+                if indent != 0 or saw_start:
+                    let misplaced_import_origin: HirImportOrigin = core_import_origin_at(source_origin_path, line_index + 1, raw_line, import_tokens, import_columns, 0)
+                    fail("LLVM Core parser: imports must be top-level and before start:" + core_import_origin_context(misplaced_import_origin))
+                var syntax_error_index: Number = list_count(import_tokens)
+                if list_count(import_tokens) > 2: set syntax_error_index = 2
+                if list_count(import_tokens) == 2 and not text_starts_with(list_get(import_tokens, 1), "S:"): set syntax_error_index = 1
+                if list_count(import_tokens) != 2 or not text_starts_with(list_get(import_tokens, 1), "S:"):
+                    let malformed_import_origin: HirImportOrigin = core_import_origin_at(source_origin_path, line_index + 1, raw_line, import_tokens, import_columns, syntax_error_index)
+                    fail("LLVM Core parser: expected use \"relative/path\"" + core_import_origin_context(malformed_import_origin))
+                let literal: Text = list_get(import_tokens, 1)
+                let module_name: Text = text_slice(literal, 3, text_length(literal) - 4)
+                let resolved_import_origin: HirImportOrigin = core_import_origin_at(source_origin_path, line_index + 1, raw_line, import_tokens, import_columns, 1)
+                let dependency_path: Text = core_resolve_module_path(normalized_path, module_name, resolved_import_origin)
+                if core_contains_path(next_stack, dependency_path):
+                    fail("LLVM Core parser: module import cycle at '" + dependency_path + "'" + core_import_origin_context(resolved_import_origin))
+                if not file_exists(dependency_path): fail("LLVM Core parser: imported module not found at '" + dependency_path + "'" + core_import_origin_context(resolved_import_origin))
+                if is_directory(dependency_path): fail("LLVM Core parser: imported module path is a directory at '" + dependency_path + "'" + core_import_origin_context(resolved_import_origin))
+                list_push(dependencies, dependency_path)
+                list_push(dependency_origins, resolved_import_origin)
+            else:
+                if not is_root and indent == 0 and not text_starts_with(trimmed, "fn ") and not text_starts_with(trimmed, "async fn ") and not text_starts_with(trimmed, "shape ") and not text_starts_with(trimmed, "variant ") and not text_starts_with(trimmed, "impl From["):
+                    let declaration_origin: HirImportOrigin = HirImportOrigin(source_origin_path, line_index + 1, indent + 1, indent + text_length(trimmed))
+                    fail("LLVM Core parser: imported modules may contain function and type declarations only" + core_import_origin_context(declaration_origin))
+                core_expanded_push(local_source, raw_line, source_origin_path, line_index + 1)
+        set line_index = line_index + 1
+    let expanded_source: CoreExpandedSource = core_expanded_source()
+    var dependency_index: Number = 0
+    while dependency_index < list_count(dependencies):
+        let dependency_path: Text = list_get(dependencies, dependency_index)
+        let dependency_origin: HirImportOrigin = list_get(dependency_origins, dependency_index)
+        let dependency_source: Text = file_read(dependency_path)
+        let dependency_expansion: CoreExpandedSource = core_expand_modules(dependency_path, dependency_source, visited, next_stack, depth + 1, false, dependency_origin)
+        core_expanded_append(expanded_source, dependency_expansion)
+        set dependency_index = dependency_index + 1
+    core_expanded_append(expanded_source, local_source)
+    return expanded_source
+
+fn core_from_header_error_index(tokens: TextList) -> Number:
+    let count: Number = list_count(tokens)
+    if count < 8: return count
+    if count > 8: return 8
+    if list_get(tokens, 0) != "I:impl": return 0
+    if list_get(tokens, 1) != "I:From": return 1
+    if list_get(tokens, 2) != "P:[": return 2
+    if not text_starts_with(list_get(tokens, 3), "I:"): return 3
+    if list_get(tokens, 4) != "P:]": return 4
+    if list_get(tokens, 5) != "I:for": return 5
+    if not text_starts_with(list_get(tokens, 6), "I:"): return 6
+    if list_get(tokens, 7) != "P::": return 7
+    return -1
+
+fn core_from_method_error_index(tokens: TextList, source_type: Text, target_type: Text) -> Number:
+    let count: Number = list_count(tokens)
+    if count < 10: return count
+    if count > 10: return 10
+    if list_get(tokens, 0) != "I:fn": return 0
+    if list_get(tokens, 1) != "I:from": return 1
+    if list_get(tokens, 2) != "P:(": return 2
+    if not text_starts_with(list_get(tokens, 3), "I:"): return 3
+    if list_get(tokens, 4) != "P::": return 4
+    if list_get(tokens, 5) != "I:" + source_type: return 5
+    if list_get(tokens, 6) != "P:)": return 6
+    if list_get(tokens, 7) != "O:->": return 7
+    if list_get(tokens, 8) != "I:" + target_type: return 8
+    if list_get(tokens, 9) != "P::": return 9
+    return -1
+
+fn core_expand_from_implementations(source: CoreExpandedSource) -> CoreExpandedSource:
+    let source_lines: TextList = source.lines
+    let output_source: CoreExpandedSource = core_expanded_source()
+    let conversions: TextList = text_list()
+    var line_index: Number = 0
+    while line_index < list_count(source_lines):
+        let raw_line: Text = list_get(source_lines, line_index)
+        let trimmed: Text = text_trim(raw_line)
+        var indent: Number = 0
+        while indent < text_length(raw_line) and text_byte(raw_line, indent) == 32:
+            set indent = indent + 1
+        if indent == 0 and text_starts_with(trimmed, "impl From["):
+            let header: TextList = core_lex_trimmed_line(raw_line, source, line_index + 1)
+            let header_columns: TextList = core_token_columns(raw_line, header)
+            let header_error_index: Number = core_from_header_error_index(header)
+            if header_error_index >= 0:
+                fail("LLVM Core parser: expected 'impl From[Source] for Target:' (" + core_parser_cursor_location(source, line_index + 1, header, header_columns, header_error_index) + ")")
+            let source_type: Text = core_token_value(list_get(header, 3))
+            let target_type: Text = core_token_value(list_get(header, 6))
+            if source_type == target_type: fail("LLVM Core parser: identity From implementations are unnecessary (" + core_parser_token_span_location(source, line_index + 1, header, header_columns, 6) + ")")
+            var conversion_index: Number = 0
+            while conversion_index < list_count(conversions):
+                if list_get(conversions, conversion_index) == source_type + "|" + target_type:
+                    fail("LLVM Core parser: duplicate From[" + source_type + "] implementation for " + target_type + " (" + core_parser_token_span_location(source, line_index + 1, header, header_columns, 3) + ")")
+                set conversion_index = conversion_index + 1
+            list_push(conversions, source_type + "|" + target_type)
+            var method_index: Number = line_index + 1
+            var looking_for_method: Boolean = true
+            while method_index < list_count(source_lines) and looking_for_method:
+                let candidate_raw: Text = list_get(source_lines, method_index)
+                let candidate: Text = text_trim(candidate_raw)
+                if candidate == "" or text_starts_with(candidate, "#"):
+                    let candidate_origin: HirSourceOrigin = core_expanded_origin(source, method_index + 1)
+                    core_expanded_push(output_source, candidate_raw, candidate_origin.source_file, candidate_origin.source_line)
+                    set method_index = method_index + 1
+                else:
+                    set looking_for_method = false
+            if method_index >= list_count(source_lines): fail("LLVM Core parser: From implementation is missing its from method (" + core_parser_end_location(source, list_count(source_lines)) + ")")
+            let method_raw: Text = list_get(source_lines, method_index)
+            let method_line: Text = text_trim(method_raw)
+            let method_origin: HirSourceOrigin = core_expanded_origin(source, method_index + 1)
+            var method_indent: Number = 0
+            while method_indent < text_length(method_raw) and text_byte(method_raw, method_indent) == 32:
+                set method_indent = method_indent + 1
+            let method_tokens: TextList = core_lex_trimmed_line(method_raw, source, method_index + 1)
+            let method_columns: TextList = core_token_columns(method_raw, method_tokens)
+            let method_error_index: Number = core_from_method_error_index(method_tokens, source_type, target_type)
+            if method_indent != 4:
+                fail("LLVM Core parser: From method must be indented one level (" + core_parser_location_at(source, method_index + 1, core_parser_indentation_error_column(method_indent, 4)) + ")")
+            if method_error_index >= 0:
+                fail("LLVM Core parser: From method must be 'fn from(value: Source) -> Target:' with the declared types (" + core_parser_cursor_location(source, method_index + 1, method_tokens, method_columns, method_error_index) + ")")
+            let open_paren: Number = text_find(method_line, "(")
+            let function_name: Text = "yaza_impl_from_" + source_type + "_to_" + target_type
+            core_expanded_push_from_method(output_source, "fn " + function_name + text_slice(method_line, open_paren, text_length(method_line) - open_paren), method_origin)
+            var body_index: Number = method_index + 1
+            var scanning_body: Boolean = true
+            var body_seen: Boolean = false
+            while body_index < list_count(source_lines) and scanning_body:
+                let body_raw: Text = list_get(source_lines, body_index)
+                let body_trimmed: Text = text_trim(body_raw)
+                var body_indent: Number = 0
+                while body_indent < text_length(body_raw) and text_byte(body_raw, body_indent) == 32:
+                    set body_indent = body_indent + 1
+                if body_trimmed == "" or text_starts_with(body_trimmed, "#"):
+                    let body_origin: HirSourceOrigin = core_expanded_origin(source, body_index + 1)
+                    if body_indent >= 4:
+                        core_expanded_push_with_offset(output_source, text_slice(body_raw, 4, text_length(body_raw) - 4), body_origin.source_file, body_origin.source_line, body_origin.source_column_offset + 4)
+                    else:
+                        core_expanded_push(output_source, body_raw, body_origin.source_file, body_origin.source_line)
+                    set body_index = body_index + 1
+                else:
+                    if body_indent < 8:
+                        if body_indent >= 4:
+                            fail("LLVM Core parser: From method body statements must be indented eight spaces (" + core_parser_location_at(source, body_index + 1, core_parser_indentation_error_column(body_indent, 8)) + ")")
+                        set scanning_body = false
+                    else:
+                        set body_seen = true
+                        let body_origin: HirSourceOrigin = core_expanded_origin(source, body_index + 1)
+                        core_expanded_push_with_offset(output_source, text_slice(body_raw, 4, text_length(body_raw) - 4), body_origin.source_file, body_origin.source_line, body_origin.source_column_offset + 4)
+                        set body_index = body_index + 1
+            if not body_seen: fail("LLVM Core parser: From method body cannot be empty (" + core_parser_end_location(source, method_index + 1) + ")")
+            set line_index = body_index
+        else:
+            let line_origin: HirSourceOrigin = core_expanded_origin(source, line_index + 1)
+            core_expanded_push(output_source, raw_line, line_origin.source_file, line_origin.source_line)
+            set line_index = line_index + 1
+    return output_source
+
+fn core_remap_expr_source(source: CoreExpandedSource, value: HirExpr) -> HirExpr:
+    let origin: HirSourceOrigin = core_expanded_origin(source, value.source_line)
+    var result: HirExpr = value
+    set result.source_line = origin.source_line
+    set result.source_column = result.source_column + origin.source_column_offset
+    set result.source_end_column = result.source_end_column + origin.source_column_offset
+    set result.source_file = origin.source_file
+    var child_index: Number = 0
+    while child_index < list_count(result.children):
+        list_set(result.children, child_index, core_remap_expr_source(source, list_get(result.children, child_index)))
+        set child_index = child_index + 1
+    return result
+
+fn core_remap_statement_sources(source: CoreExpandedSource, statements: List[HirStatement]) -> List[HirStatement]:
+    var statement_index: Number = 0
+    while statement_index < list_count(statements):
+        var statement: HirStatement = list_get(statements, statement_index)
+        let statement_origin: HirSourceOrigin = core_expanded_origin(source, statement.source_line)
+        set statement.source_line = statement_origin.source_line
+        set statement.source_file = statement_origin.source_file
+        set statement.source_column = statement.source_column + statement_origin.source_column_offset
+        set statement.source_end_column = statement.source_end_column + statement_origin.source_column_offset
+        set statement.expression = core_remap_expr_source(source, statement.expression)
+        if statement.header_source_line > 0:
+            let header_origin: HirSourceOrigin = core_expanded_origin(source, statement.header_source_line)
+            set statement.header_source_line = header_origin.source_line
+            set statement.header_source_file = header_origin.source_file
+            set statement.header_source_column = statement.header_source_column + header_origin.source_column_offset
+            set statement.header_source_end_column = statement.header_source_end_column + header_origin.source_column_offset
+        if statement.has_else:
+            let else_origin: HirSourceOrigin = core_expanded_origin(source, statement.else_source_line)
+            set statement.else_source_line = else_origin.source_line
+            set statement.else_source_file = else_origin.source_file
+            set statement.else_source_column = statement.else_source_column + else_origin.source_column_offset
+            set statement.else_source_end_column = statement.else_source_end_column + else_origin.source_column_offset
+        var field_path_index: Number = 0
+        while field_path_index < list_count(statement.field_path_columns):
+            list_set(statement.field_path_columns, field_path_index, number_text(number_parse(list_get(statement.field_path_columns, field_path_index)) + statement_origin.source_column_offset))
+            set field_path_index = field_path_index + 1
+        set statement.body = core_remap_statement_sources(source, statement.body)
+        set statement.alternate = core_remap_statement_sources(source, statement.alternate)
+        var branch_index: Number = 0
+        while branch_index < list_count(statement.branches):
+            var branch: HirBranch = list_get(statement.branches, branch_index)
+            let branch_origin: HirSourceOrigin = core_expanded_origin(source, branch.source_line)
+            set branch.source_line = branch_origin.source_line
+            set branch.source_file = branch_origin.source_file
+            set branch.source_column = branch.source_column + branch_origin.source_column_offset
+            set branch.source_end_column = branch.source_end_column + branch_origin.source_column_offset
+            set branch.condition = core_remap_expr_source(source, branch.condition)
+            set branch.body = core_remap_statement_sources(source, branch.body)
+            list_set(statement.branches, branch_index, branch)
+            set branch_index = branch_index + 1
+        var arm_index: Number = 0
+        while arm_index < list_count(statement.match_arms):
+            var arm: HirMatchArm = list_get(statement.match_arms, arm_index)
+            let arm_origin: HirSourceOrigin = core_expanded_origin(source, arm.source_line)
+            set arm.source_line = arm_origin.source_line
+            set arm.source_file = arm_origin.source_file
+            set arm.source_column = arm.source_column + arm_origin.source_column_offset
+            set arm.source_end_column = arm.source_end_column + arm_origin.source_column_offset
+            var binding_column_index: Number = 0
+            while binding_column_index < list_count(arm.binding_columns):
+                list_set(arm.binding_columns, binding_column_index, number_text(number_parse(list_get(arm.binding_columns, binding_column_index)) + arm_origin.source_column_offset))
+                set binding_column_index = binding_column_index + 1
+            set arm.pattern_value = core_remap_expr_source(source, arm.pattern_value)
+            set arm.result_expression = core_remap_expr_source(source, arm.result_expression)
+            set arm.body = core_remap_statement_sources(source, arm.body)
+            list_set(statement.match_arms, arm_index, arm)
+            set arm_index = arm_index + 1
+        list_set(statements, statement_index, statement)
+        set statement_index = statement_index + 1
+    return statements
+
+fn core_remap_hir_fields(source: CoreExpandedSource, fields: List[HirField]) -> List[HirField]:
+    var field_index: Number = 0
+    while field_index < list_count(fields):
+        var field: HirField = list_get(fields, field_index)
+        let origin: HirSourceOrigin = core_expanded_origin(source, field.source_line)
+        set field.source_line = origin.source_line
+        set field.source_file = origin.source_file
+        set field.source_column = field.source_column + origin.source_column_offset
+        set field.name_end_column = field.name_end_column + origin.source_column_offset
+        set field.type_column = field.type_column + origin.source_column_offset
+        set field.type_end_column = field.type_end_column + origin.source_column_offset
+        list_set(fields, field_index, field)
+        set field_index = field_index + 1
+    return fields
+
+fn core_remap_hir_parameters(source: CoreExpandedSource, parameters: List[HirParameter], column_offset: Number) -> List[HirParameter]:
+    var parameter_index: Number = 0
+    while parameter_index < list_count(parameters):
+        var parameter: HirParameter = list_get(parameters, parameter_index)
+        let origin: HirSourceOrigin = core_expanded_origin(source, parameter.source_line)
+        set parameter.source_line = origin.source_line
+        set parameter.source_column = parameter.source_column + column_offset
+        set parameter.name_end_column = parameter.name_end_column + column_offset
+        set parameter.type_column = parameter.type_column + column_offset
+        set parameter.type_end_column = parameter.type_end_column + column_offset
+        list_set(parameters, parameter_index, parameter)
+        set parameter_index = parameter_index + 1
+    return parameters
+
+fn core_remap_hir_sources(source: CoreExpandedSource, program: HirProgram) -> HirProgram:
+    var result: HirProgram = program
+    let start_origin: HirSourceOrigin = core_expanded_origin(source, result.start_source_line)
+    set result.start_source_line = start_origin.source_line
+    set result.start_source_file = start_origin.source_file
+    set result.start_source_column = result.start_source_column + start_origin.source_column_offset
+    set result.start_source_end_column = result.start_source_end_column + start_origin.source_column_offset
+    var function_index: Number = 0
+    while function_index < list_count(result.functions):
+        var function: HirFunction = list_get(result.functions, function_index)
+        let function_origin: HirSourceOrigin = core_expanded_origin(source, function.source_line)
+        var signature_column_offset: Number = function_origin.source_column_offset
+        set function.source_line = function_origin.source_line
+        set function.source_file = function_origin.source_file
+        if function_origin.synthetic_from_method:
+            set signature_column_offset = function_origin.source_column_offset + 8 - text_length(function.name)
+            set function.source_column = function_origin.source_column_offset + 8
+            set function.name_end_column = function.source_column + 3
+            set function.return_type_column = function.return_type_column + signature_column_offset
+            set function.return_type_end_column = function.return_type_end_column + signature_column_offset
+            set function.header_source_column = function_origin.source_column_offset + 5
+            set function.header_source_end_column = function.header_source_end_column + signature_column_offset
+        else:
+            set function.source_column = function.source_column + function_origin.source_column_offset
+            set function.name_end_column = function.name_end_column + function_origin.source_column_offset
+            set function.return_type_column = function.return_type_column + function_origin.source_column_offset
+            set function.return_type_end_column = function.return_type_end_column + function_origin.source_column_offset
+            set function.header_source_column = function.header_source_column + function_origin.source_column_offset
+            set function.header_source_end_column = function.header_source_end_column + function_origin.source_column_offset
+        set function.parameters = core_remap_hir_parameters(source, function.parameters, signature_column_offset)
+        set function.body = core_remap_statement_sources(source, function.body)
+        list_set(result.functions, function_index, function)
+        set function_index = function_index + 1
+    set result.body = core_remap_statement_sources(source, result.body)
+    var shape_index: Number = 0
+    while shape_index < list_count(result.shapes):
+        var shape: HirShape = list_get(result.shapes, shape_index)
+        let shape_origin: HirSourceOrigin = core_expanded_origin(source, shape.source_line)
+        set shape.source_line = shape_origin.source_line
+        set shape.source_file = shape_origin.source_file
+        set shape.source_column = shape.source_column + shape_origin.source_column_offset
+        set shape.name_end_column = shape.name_end_column + shape_origin.source_column_offset
+        set shape.header_source_column = shape.header_source_column + shape_origin.source_column_offset
+        set shape.header_source_end_column = shape.header_source_end_column + shape_origin.source_column_offset
+        set shape.fields = core_remap_hir_fields(source, shape.fields)
+        list_set(result.shapes, shape_index, shape)
+        set shape_index = shape_index + 1
+    var variant_index: Number = 0
+    while variant_index < list_count(result.variants):
+        var variant: HirVariant = list_get(result.variants, variant_index)
+        let variant_origin: HirSourceOrigin = core_expanded_origin(source, variant.source_line)
+        set variant.source_line = variant_origin.source_line
+        set variant.source_file = variant_origin.source_file
+        set variant.source_column = variant.source_column + variant_origin.source_column_offset
+        set variant.name_end_column = variant.name_end_column + variant_origin.source_column_offset
+        set variant.header_source_column = variant.header_source_column + variant_origin.source_column_offset
+        set variant.header_source_end_column = variant.header_source_end_column + variant_origin.source_column_offset
+        var case_index: Number = 0
+        while case_index < list_count(variant.cases):
+            var variant_case: HirVariantCase = list_get(variant.cases, case_index)
+            let case_origin: HirSourceOrigin = core_expanded_origin(source, variant_case.source_line)
+            set variant_case.source_line = case_origin.source_line
+            set variant_case.source_file = case_origin.source_file
+            set variant_case.source_column = variant_case.source_column + case_origin.source_column_offset
+            set variant_case.name_end_column = variant_case.name_end_column + case_origin.source_column_offset
+            set variant_case.header_source_column = variant_case.header_source_column + case_origin.source_column_offset
+            set variant_case.header_source_end_column = variant_case.header_source_end_column + case_origin.source_column_offset
+            set variant_case.fields = core_remap_hir_fields(source, variant_case.fields)
+            list_set(variant.cases, case_index, variant_case)
+            set case_index = case_index + 1
+        list_set(result.variants, variant_index, variant)
+        set variant_index = variant_index + 1
+    return result
+
+fn core_parse_indented_records(source: CoreExpandedSource) -> TextList:
+    let records: TextList = text_list()
+    var line_index: Number = 0
+    while line_index < list_count(source.lines):
+        let raw_line: Text = list_get(source.lines, line_index)
+        let line_length: Number = text_length(raw_line)
+        var indent: Number = 0
+        let tab_column: Number = text_find(raw_line, "\t") + 1
+        if tab_column > 0:
+            fail("YAZA indentation cannot contain tabs (" + core_parser_location_at(source, line_index + 1, tab_column) + ")")
+        while indent < line_length and text_byte(raw_line, indent) == 32:
+            set indent = indent + 1
+        let normalized_line: Text = text_trim(raw_line)
+        if normalized_line != "" and not text_starts_with(normalized_line, "#"):
+            if indent % 4 != 0:
+                let invalid_indent_column: Number = (indent / 4) * 4 + 1
+                fail("YAZA indentation must use multiples of four spaces (" + core_parser_location_at(source, line_index + 1, invalid_indent_column) + ")")
+            let tokens: TextList = core_lex_text(normalized_line, source, line_index + 1, indent + 1)
+            let token_text: Text = text_join(tokens, " ")
+            list_push(records, number_text(indent) + "|" + number_text(line_index + 1) + "|" + token_text)
+        set line_index = line_index + 1
+    return records
+
+fn core_parse_expanded_hir(source: CoreExpandedSource) -> HirProgram:
+    let mapped_source: CoreExpandedSource = core_expand_from_implementations(source)
+    let expanded_text: Text = core_expanded_text(mapped_source)
+    let records: TextList = core_parse_indented_records(mapped_source)
+    let source_lines: TextList = text_lines(expanded_text)
+    let functions: List[HirFunction] = List[HirFunction]()
+    let shapes: List[HirShape] = List[HirShape]()
+    let variants: List[HirVariant] = List[HirVariant]()
+    var main_body: List[HirStatement] = List[HirStatement]()
+    var start_source_line: Number = 0
+    var start_source_column: Number = 0
+    var start_source_end_column: Number = 0
+    let cursor: TextList = text_list()
+    list_push(cursor, "0")
+    var saw_start: Boolean = false
+    while number_parse(list_get(cursor, 0)) < list_count(records):
+        let record_index: Number = number_parse(list_get(cursor, 0))
+        let fields: TextList = text_split(list_get(records, record_index), "|")
+        let indent: Number = number_parse(list_get(fields, 0))
+        let source_line: Number = number_parse(list_get(fields, 1))
+        let raw_line: Text = list_get(source_lines, source_line - 1)
+        let tokens: TextList = core_lex_trimmed_line(raw_line, mapped_source, source_line)
+        let token_columns: TextList = core_token_columns(raw_line, tokens)
+        if indent != 0:
+            fail("LLVM Core parser: top-level declaration must start at column zero (" + core_parser_location_at(mapped_source, source_line, 1) + ")")
+            list_set(cursor, 0, number_text(record_index + 1))
+        else:
+            var is_async_func: Boolean = false
+            var fn_tokens: TextList = tokens
+            var fn_columns: TextList = token_columns
+            if list_get(tokens, 0) == "I:async":
+                if list_count(tokens) > 1 and list_get(tokens, 1) == "I:fn":
+                    set is_async_func = true
+                    let sliced_tokens: TextList = text_list()
+                    let sliced_columns: TextList = text_list()
+                    var s_i: Number = 1
+                    while s_i < list_count(tokens):
+                        list_push(sliced_tokens, list_get(tokens, s_i))
+                        list_push(sliced_columns, list_get(token_columns, s_i))
+                        set s_i = s_i + 1
+                    set fn_tokens = sliced_tokens
+                    set fn_columns = sliced_columns
+                else:
+                    fail("LLVM Core parser: expected 'fn' after 'async' (" + core_parser_token_span_location(mapped_source, source_line, tokens, token_columns, 0) + ")")
+            if list_get(fn_tokens, 0) == "I:fn":
+                var function: HirFunction = core_parse_function_header(fn_tokens, fn_columns, source_line, mapped_source)
+                set function.is_async = is_async_func
+                list_set(cursor, 0, number_text(record_index + 1))
+                set function.body = core_parse_block(records, source_lines, cursor, 4, mapped_source)
+                if list_count(function.body) == 0: fail("LLVM Core parser: function body cannot be empty (" + core_parser_token_span_location(mapped_source, source_line, tokens, token_columns, 0) + ")")
+                list_push(functions, function)
+            else:
+                if list_get(tokens, 0) == "I:start" and list_count(tokens) == 2 and list_get(tokens, 1) == "P::":
+                    if saw_start: fail("LLVM Core parser: duplicate start block (" + core_parser_token_span_location(mapped_source, source_line, tokens, token_columns, 0) + ")")
+                    set saw_start = true
+                    set start_source_line = source_line
+                    set start_source_column = number_parse(list_get(token_columns, 0))
+                    set start_source_end_column = number_parse(list_get(token_columns, 1)) + text_length(core_token_value(list_get(tokens, 1))) - 1
+                    list_set(cursor, 0, number_text(record_index + 1))
+                    set main_body = core_parse_block(records, source_lines, cursor, 4, mapped_source)
+                    if list_count(main_body) == 0: fail("LLVM Core parser: start block must contain at least one statement (" + core_parser_empty_block_location(records, cursor, 4, mapped_source, source_line, tokens, token_columns) + ")")
+                else:
+                    if list_get(tokens, 0) == "I:shape":
+                        let shape_header_error_index: Number = core_named_declaration_header_error_index(tokens, "shape")
+                        if shape_header_error_index >= 0:
+                            fail("LLVM Core parser: malformed shape declaration (" + core_parser_cursor_location(mapped_source, source_line, tokens, token_columns, shape_header_error_index) + ")")
+                        let shape_name: Text = core_token_value(list_get(tokens, 1))
+                        let shape_name_column: Number = number_parse(list_get(token_columns, 1))
+                        let shape_header_end_index: Number = list_count(tokens) - 1
+                        let shape_header_end_column: Number = number_parse(list_get(token_columns, shape_header_end_index)) + text_length(core_token_value(list_get(tokens, shape_header_end_index))) - 1
+                        list_set(cursor, 0, number_text(record_index + 1))
+                        let shape_fields: List[HirField] = core_parse_shape_fields(records, source_lines, cursor, mapped_source, source_line)
+                        list_push(shapes, HirShape(shape_name, shape_fields, source_line, "", shape_name_column, shape_name_column + text_length(shape_name) - 1, number_parse(list_get(token_columns, 0)), shape_header_end_column))
+                    else:
+                        if list_get(tokens, 0) == "I:use":
+                            fail("LLVM Core parser: relative modules are not connected yet (" + core_parser_token_span_location(mapped_source, source_line, tokens, token_columns, 0) + ")")
+                            list_set(cursor, 0, number_text(record_index + 1))
+                        else:
+                            if list_get(tokens, 0) == "I:variant":
+                                let variant_header_error_index: Number = core_named_declaration_header_error_index(tokens, "variant")
+                                if variant_header_error_index >= 0:
+                                    fail("LLVM Core parser: malformed variant declaration (" + core_parser_cursor_location(mapped_source, source_line, tokens, token_columns, variant_header_error_index) + ")")
+                                let variant_name: Text = core_token_value(list_get(tokens, 1))
+                                let variant_name_column: Number = number_parse(list_get(token_columns, 1))
+                                let variant_header_end_index: Number = list_count(tokens) - 1
+                                let variant_header_end_column: Number = number_parse(list_get(token_columns, variant_header_end_index)) + text_length(core_token_value(list_get(tokens, variant_header_end_index))) - 1
+                                list_set(cursor, 0, number_text(record_index + 1))
+                                let variant_cases: List[HirVariantCase] = core_parse_variant_cases(records, source_lines, cursor, source_line, mapped_source)
+                                list_push(variants, HirVariant(variant_name, variant_cases, source_line, "", variant_name_column, variant_name_column + text_length(variant_name) - 1, number_parse(list_get(token_columns, 0)), variant_header_end_column))
+                            else:
+                                fail("LLVM Core parser: expected a function, type declaration, module import, or start block (" + core_parser_token_span_location(mapped_source, source_line, tokens, token_columns, 0) + ")")
+                                list_set(cursor, 0, number_text(record_index + 1))
+    if not saw_start: fail("LLVM Core parser: expected a start block (" + core_parser_end_location(mapped_source, list_count(mapped_source.lines)) + ")")
+    return core_remap_hir_sources(mapped_source, HirProgram(functions, shapes, variants, main_body, start_source_line, "", start_source_column, start_source_end_column))
+
+fn parse_core_hir(source: Text) -> HirProgram:
+    return core_parse_expanded_hir(core_identity_expanded_source(source))
+
+fn parse_core_hir_file(source_path: Text, source: Text) -> HirProgram:
+    let visited: TextList = text_list()
+    let stack: TextList = text_list()
+    let normalized_path: Text = core_normalize_lexical_path(source_path)
+    let expanded: CoreExpandedSource = core_expand_modules(normalized_path, source, visited, stack, 0, true, HirImportOrigin("", 0, 0, 0))
+    return core_parse_expanded_hir(expanded)

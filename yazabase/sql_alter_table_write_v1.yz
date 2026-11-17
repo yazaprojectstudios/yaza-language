@@ -1,0 +1,225 @@
+# Atomic, bounded ALTER TABLE ADD COLUMN and CHECK catalog updates.
+use "./catalog_snapshot_v1"
+use "./catalog_schema_v1"
+use "./catalog_storage_v1"
+use "./btree_scan_v1"
+use "./key_codec_v1"
+use "./mvcc_history_v1"
+use "./page_v1"
+use "./query_v1"
+use "./sql_alter_table_v1"
+use "./sql_check_v1"
+use "./sql_create_table_write_v1"
+use "./sql_insert_write_v1"
+use "./storage_v1"
+use "./transaction_v1"
+use "./wal_v1"
+
+shape YazaDbSqlAlterTableTargetV1:
+    key: Bytes
+    page_id: Number
+    row_payload: Bytes
+
+fn yaza_db_sql_alter_table_close_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1) -> Unit:
+    let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(wal)
+    let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(storage)
+    return
+
+fn yaza_db_sql_alter_table_sys_column_row_v1(table_id: Number, column: YazaSqlColumnSchemaV1) -> Result[YazaSqlInsertMaterializedRowV1, Text]:
+    let values: List[YazaSqlValueV1] = yaza_db_sql_create_table_values_v1()?
+    let type_flags: Number = yaza_db_catalog_column_type_flags_encode_v1(column.type_id, column.precision, column.scale)?
+    if not yaza_db_sql_create_table_push_integer_v1(values, 4, table_id) or not yaza_db_sql_create_table_push_integer_v1(values, 3, column.ordinal) or not yaza_db_sql_create_table_push_text_v1(values, column.name) or not yaza_db_sql_create_table_push_integer_v1(values, 2, column.type_id) or not yaza_db_sql_create_table_push_boolean_v1(values, column.nullable) or not yaza_db_sql_create_table_push_null_v1(values, 2) or not yaza_db_sql_create_table_push_integer_v1(values, 3, type_flags): return err("YDBv1 ALTER TABLE sys_columns row could not be built")
+    var default_is_null: Boolean = true
+    if text_length(column.default_expression) > 0:
+        if not yaza_db_sql_create_table_push_text_v1(values, column.default_expression): return err("YDBv1 ALTER TABLE DEFAULT metadata could not be built")
+        set default_is_null = false
+    elif not yaza_db_sql_create_table_push_null_v1(values, 9):
+        return err("YDBv1 ALTER TABLE sys_columns DEFAULT field could not be built")
+    return yaza_db_sql_create_table_row_v1(values, [false, false, false, false, false, true, false, default_is_null])
+
+fn yaza_db_sql_alter_table_sys_table_target_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, table_id: Number, schema_version: Number, commit_ts: Number, columns: List[YazaSqlColumnSchemaV1]) -> Result[YazaDbSqlAlterTableTargetV1, Text]:
+    let key_ordinals: List[Number] = [0]
+    let rows: List[YazaDbRowV1] = yaza_db_catalog_snapshot_read_tree_v1(file, file_header, root_page_id, columns, key_ordinals, file_header.next_commit_ts - 1, yaza_db_catalog_max_table_records_v1())?
+    var matched: Boolean = false
+    var prior: YazaDbRowV1 = YazaDbRowV1(0, 0, false, List[YazaSqlValueV1](), List[Boolean](), 1, 1, 0, 0, 0, List[YazaDbOverflowRefV1]())
+    var index: Number = 0
+    while index < list_count(rows):
+        let row: YazaDbRowV1 = list_get(rows, index)
+        if list_count(row.values) != 7 or list_count(row.nulls) != 7: return err("YDBv1 ALTER TABLE sys_tables row width is invalid")
+        if list_get(row.values, 0).integer_value == table_id:
+            if matched: return err("YDBv1 ALTER TABLE found duplicate sys_tables rows")
+            set prior = row
+            set matched = true
+        set index = index + 1
+    if not matched or prior.deleted or prior.version_ts < 1 or prior.version_ts >= commit_ts: return err("YDBv1 ALTER TABLE target has no current committed sys_tables row")
+    if list_get(prior.values, 6).integer_value != schema_version: return err("YDBv1 ALTER TABLE schema version changed after binding")
+    let values_result: Result[List[YazaSqlValueV1], Text] = list_try_new()
+    let nulls_result: Result[List[Boolean], Text] = list_try_new()
+    if not result_is_ok(values_result) or not result_is_ok(nulls_result): return err("YDBv1 ALTER TABLE could not allocate sys_tables update values")
+    let values: List[YazaSqlValueV1] = result_unwrap(values_result)
+    let nulls: List[Boolean] = result_unwrap(nulls_result)
+    if not list_try_reserve(values, 7) or not list_try_reserve(nulls, 7): return err("YDBv1 ALTER TABLE could not reserve sys_tables update values")
+    set index = 0
+    while index < 7:
+        if not list_try_push(values, list_get(prior.values, index)) or not list_try_push(nulls, list_get(prior.nulls, index)): return err("YDBv1 ALTER TABLE could not copy sys_tables update values")
+        set index = index + 1
+    let next_version: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, schema_version + 1)?
+    if not list_try_set(values, 6, next_version) or not list_try_set(nulls, 6, false): return err("YDBv1 ALTER TABLE could not increment sys_tables schema version")
+    let encoded: Bytes = yaza_db_row_encode_v1(values, nulls, columns, commit_ts)?
+    let key: Bytes = yaza_db_key_encode_composite_v1(prior.values, prior.nulls, columns, key_ordinals)?
+    let seek: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(file, file_header, root_page_id, key)?
+    let page: Bytes = yaza_db_storage_read_page_v1(file, file_header, seek.leaf_page_id)?
+    let page_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, seek.leaf_page_id)?
+    let slot_index: Number = yaza_db_page_lower_bound_v1(page, key, seek.leaf_page_id)?
+    if slot_index >= page_header.count: return err("YDBv1 ALTER TABLE sys_tables row disappeared during preflight")
+    let stored_key: Bytes = yaza_db_page_slot_key_v1(page, slot_index, seek.leaf_page_id)?
+    if not bytes_equal(stored_key, key): return err("YDBv1 ALTER TABLE sys_tables key changed during preflight")
+    let slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(page, slot_index, seek.leaf_page_id)?
+    let decoded: YazaDbRowV1 = yaza_db_row_decode_v1(slot.payload, columns)?
+    let canonical: Bytes = yaza_db_mvcc_row_encode_exact_v1(decoded, columns)?
+    if not bytes_equal(canonical, slot.payload): return err("YDBv1 ALTER TABLE sys_tables row is not canonical")
+    return ok(YazaDbSqlAlterTableTargetV1(key, seek.leaf_page_id, encoded))
+
+fn yaza_db_sql_alter_table_add_check_write_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, plan: YazaSqlAlterTablePlanV1) -> Result[YazaDbWriteCommitV1, Text]:
+    if storage.root != wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid): return err("YDBv1 ALTER TABLE CHECK storage and WAL handles belong to different databases")
+    if plan.action_kind != 2 or plan.catalog_version < 1 or plan.table_id <= yaza_db_catalog_system_table_id_max_v1() or plan.schema_version < 1 or list_count(plan.check_constraints) < 1 or list_count(plan.check_constraints) > 64: return err("YDBv1 ALTER TABLE CHECK plan is invalid")
+    let loaded: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(storage.file, storage.header)?
+    if loaded.sql_snapshot.version != plan.catalog_version: return err("YDBv1 ALTER TABLE CHECK plan was bound against a stale catalog snapshot")
+    let table_index: Number = yaza_db_catalog_snapshot_table_index_v1(loaded.sql_snapshot.tables, plan.table_id)
+    if table_index < 0 or table_index >= list_count(loaded.table_schema_versions) or table_index >= list_count(loaded.root_page_ids): return err("YDBv1 ALTER TABLE CHECK target is absent from the catalog snapshot")
+    let table: YazaSqlTableSchemaV1 = list_get(loaded.sql_snapshot.tables, table_index)
+    let schema_version: Number = list_get(loaded.table_schema_versions, table_index)
+    if table.name != plan.table_name or schema_version != plan.schema_version or schema_version > list_count(table.columns): return err("YDBv1 ALTER TABLE CHECK schema changed after binding")
+    var check_index: Number = 0
+    while check_index < list_count(plan.check_constraints):
+        let check: YazaSqlCreateCheckPlanV1 = list_get(plan.check_constraints, check_index)
+        if check.column_ordinal < 0 or check.column_ordinal >= list_count(table.columns) or check.comparison_operator < 1 or check.comparison_operator > 6 or text_length(check.literal) < 1 or text_length(check.literal) > 4096: return err("YDBv1 ALTER TABLE CHECK clause is outside its bound")
+        set check_index = check_index + 1
+
+    let root_page_id: Number = list_get(loaded.root_page_ids, table_index)
+    let catalog: YazaDbCatalogRootV1 = yaza_db_catalog_storage_read_root_v1(storage.file, storage.header)?
+    let key_ordinals: List[Number] = yaza_db_query_clustered_key_ordinals_v1(storage.file, storage.header, catalog, table.table_id, root_page_id, loaded.sql_snapshot.version, list_count(table.columns))?
+    let current_rows: List[YazaDbRowV1] = yaza_db_btree_read_rows_for_schema_v1(storage.file, storage.header, root_page_id, table.columns, schema_version, key_ordinals, loaded.sql_snapshot.version, 65536)?
+    let existing_rows_valid: Boolean = yaza_db_sql_check_validate_candidate_rows_v1(loaded, plan.table_id, current_rows, plan.check_constraints)?
+    if not existing_rows_valid: return err("YDBv1 ALTER TABLE CHECK rejected an existing row")
+    if catalog.next_object_id < 1 or catalog.next_object_id > yaza_db_catalog_max_object_id_v1() - (list_count(plan.check_constraints) - 1) or catalog.generation >= yaza_db_catalog_max_page_id_v1(): return err("YDBv1 ALTER TABLE CHECK catalog object-ID or generation space is exhausted")
+    if catalog.sys_constraints_root < 2: return err("YDBv1 ALTER TABLE CHECK constraints catalog root is missing")
+    let constraints_schema: List[YazaSqlColumnSchemaV1] = yaza_db_catalog_table_schema_v1(4)?
+    let constraint_rows_created: Result[List[YazaSqlInsertMaterializedRowV1], Text] = list_try_new()
+    if not result_is_ok(constraint_rows_created): return err(result_unwrap_error(constraint_rows_created))
+    let constraint_rows: List[YazaSqlInsertMaterializedRowV1] = result_unwrap(constraint_rows_created)
+    if not list_try_reserve(constraint_rows, list_count(plan.check_constraints)): return err("YDBv1 ALTER TABLE CHECK could not reserve constraint rows")
+    set check_index = 0
+    while check_index < list_count(plan.check_constraints):
+        let constraint_id: Number = catalog.next_object_id + check_index
+        let constraint_row: YazaSqlInsertMaterializedRowV1 = yaza_db_sql_create_table_sys_check_constraint_row_v1(plan.table_id, constraint_id, list_get(plan.check_constraints, check_index))?
+        if not list_try_push(constraint_rows, constraint_row): return err("YDBv1 ALTER TABLE CHECK could not stage its catalog row")
+        set check_index = check_index + 1
+    let constraint_batch: YazaSqlInsertMaterializedV1 = yaza_db_sql_create_table_batch_v1(4, loaded.sql_snapshot.version, constraints_schema, constraint_rows)?
+    let constraint_key_ordinals: List[Number] = [0]
+    let capacity: YazaDbWriteCapacityV1 = yaza_db_write_transaction_prepare_capacity_v1(storage, wal, yaza_db_write_transaction_default_free_page_reserve_v1())?
+    let constraint_preflight: Boolean = yaza_db_sql_insert_preflight_v1(capacity.storage, catalog.sys_constraints_root, constraint_key_ordinals, constraint_batch)?
+    if not constraint_preflight: return err("YDBv1 ALTER TABLE CHECK catalog preflight did not complete")
+    let commit_ts: Number = capacity.storage.header.next_commit_ts
+    if commit_ts != storage.header.next_commit_ts: return err("YDBv1 ALTER TABLE CHECK commit timestamp changed during capacity preparation")
+    let begun: YazaDbWriteTransactionV1 = yaza_db_write_transaction_begin_prepared_v1(capacity.storage, capacity.wal)?
+    if begun.commit_ts != commit_ts:
+        yaza_db_sql_alter_table_close_v1(begun.storage, begun.wal)
+        return err("YDBv1 ALTER TABLE CHECK commit timestamp changed after preflight")
+    if not yaza_db_write_transaction_tail_fits_v1(begun, list_count(plan.check_constraints) + 1):
+        yaza_db_sql_alter_table_close_v1(begun.storage, begun.wal)
+        return err("YDBv1 ALTER TABLE CHECK exceeds the bounded WAL recovery-tail budget")
+    let next_catalog: YazaDbCatalogRootV1 = YazaDbCatalogRootV1(catalog.sys_tables_root, catalog.sys_columns_root, catalog.sys_indexes_root, catalog.sys_constraints_root, catalog.next_object_id + list_count(plan.check_constraints), catalog.generation + 1, catalog.sys_views_root)
+    let descriptor_result: Result[YazaDbWalAppendV1, Text] = yaza_db_sql_create_table_append_catalog_root_v1(begun.storage, begun.wal, begun.storage.header.catalog_root, next_catalog)
+    if not result_is_ok(descriptor_result):
+        let message: Text = result_unwrap_error(descriptor_result)
+        yaza_db_sql_alter_table_close_v1(begun.storage, begun.wal)
+        return err("YDBv1 ALTER TABLE CHECK catalog reservation failed; reopen through recovery: " + message)
+    let descriptor: YazaDbWalAppendV1 = result_unwrap(descriptor_result)
+    var current: YazaDbWriteTransactionV1 = YazaDbWriteTransactionV1(begun.storage, descriptor.log, begun.txn_id, begun.commit_ts, begun.last_lsn, begun.pending_pages, begun.pending_keys_hex, begun.pending_rows_hex, begun.active)
+    set check_index = 0
+    while check_index < list_count(constraint_rows):
+        let row: YazaSqlInsertMaterializedRowV1 = list_get(constraint_rows, check_index)
+        let inserted: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_insert_committed_row_v1(current, catalog.sys_constraints_root, row.values, row.nulls, constraints_schema, constraint_key_ordinals)
+        if not result_is_ok(inserted):
+            let message: Text = result_unwrap_error(inserted)
+            yaza_db_sql_alter_table_close_v1(current.storage, current.wal)
+            return err("YDBv1 ALTER TABLE CHECK catalog write failed; reopen through recovery: " + message)
+        set current = result_unwrap(inserted)
+        set check_index = check_index + 1
+    let committed: Result[YazaDbWriteCommitV1, Text] = yaza_db_write_transaction_commit_v1(current)
+    if not result_is_ok(committed):
+        let message: Text = result_unwrap_error(committed)
+        yaza_db_sql_alter_table_close_v1(current.storage, current.wal)
+        return err("YDBv1 ALTER TABLE CHECK commit failed; reopen through recovery: " + message)
+    return ok(result_unwrap(committed))
+
+fn yaza_db_sql_alter_table_write_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, plan: YazaSqlAlterTablePlanV1) -> Result[YazaDbWriteCommitV1, Text]:
+    if storage.root != wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid): return err("YDBv1 ALTER TABLE storage and WAL handles belong to different databases")
+    if plan.action_kind == 2: return yaza_db_sql_alter_table_add_check_write_v1(storage, wal, plan)
+    if plan.action_kind != 1 or list_count(plan.check_constraints) != 0 or plan.catalog_version < 1 or plan.table_id <= yaza_db_catalog_system_table_id_max_v1() or plan.schema_version < 1 or plan.column.ordinal < 1 or (not plan.column.nullable and text_length(plan.column.default_expression) == 0) or text_length(plan.column.default_expression) > 4096: return err("YDBv1 ALTER TABLE plan is invalid")
+    if text_length(plan.column.default_expression) > 0:
+        let default_value: YazaSqlValueV1 = yaza_sql_insert_materialize_column_default_v1(plan.column.default_expression, plan.column)?
+        if default_value.is_null and not plan.column.nullable: return err("YDBv1 ALTER TABLE NOT NULL DEFAULT cannot be NULL")
+    let loaded: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(storage.file, storage.header)?
+    if loaded.sql_snapshot.version != plan.catalog_version: return err("YDBv1 ALTER TABLE plan was bound against a stale catalog snapshot")
+    let table_index: Number = yaza_db_catalog_snapshot_table_index_v1(loaded.sql_snapshot.tables, plan.table_id)
+    if table_index < 0 or table_index >= list_count(loaded.table_schema_versions) or table_index >= list_count(loaded.root_page_ids): return err("YDBv1 ALTER TABLE target is absent from the catalog snapshot")
+    let table: YazaSqlTableSchemaV1 = list_get(loaded.sql_snapshot.tables, table_index)
+    let current_schema_version: Number = list_get(loaded.table_schema_versions, table_index)
+    if table.name != plan.table_name or current_schema_version != plan.schema_version or plan.column.ordinal != list_count(table.columns): return err("YDBv1 ALTER TABLE bound schema no longer matches the catalog")
+    if plan.column.ordinal >= 1024 or current_schema_version >= yaza_db_row_max_schema_epoch_v1(): return err("YDBv1 ALTER TABLE schema reached its column or epoch bound")
+    var column_index: Number = 0
+    while column_index < list_count(table.columns):
+        if list_get(table.columns, column_index).name == plan.column.name: return err("YDBv1 ALTER TABLE column already exists")
+        set column_index = column_index + 1
+
+    let catalog: YazaDbCatalogRootV1 = yaza_db_catalog_storage_read_root_v1(storage.file, storage.header)?
+    if catalog.generation >= yaza_db_catalog_max_page_id_v1(): return err("YDBv1 ALTER TABLE catalog generation is exhausted")
+    let sys_tables_index: Number = yaza_db_catalog_snapshot_table_index_v1(loaded.sql_snapshot.tables, 1)
+    let sys_columns_index: Number = yaza_db_catalog_snapshot_table_index_v1(loaded.sql_snapshot.tables, 2)
+    if sys_tables_index < 0 or sys_columns_index < 0 or sys_tables_index >= list_count(loaded.root_page_ids) or sys_columns_index >= list_count(loaded.root_page_ids): return err("YDBv1 ALTER TABLE system catalog roots are missing")
+    let tables_root: Number = list_get(loaded.root_page_ids, sys_tables_index)
+    let columns_root: Number = list_get(loaded.root_page_ids, sys_columns_index)
+    let tables_schema: List[YazaSqlColumnSchemaV1] = yaza_db_catalog_table_schema_v1(1)?
+    let columns_schema: List[YazaSqlColumnSchemaV1] = yaza_db_catalog_table_schema_v1(2)?
+    let table_target: YazaDbSqlAlterTableTargetV1 = yaza_db_sql_alter_table_sys_table_target_v1(storage.file, storage.header, tables_root, plan.table_id, current_schema_version, storage.header.next_commit_ts, tables_schema)?
+    let column_row: YazaSqlInsertMaterializedRowV1 = yaza_db_sql_alter_table_sys_column_row_v1(plan.table_id, plan.column)?
+    let column_rows: List[YazaSqlInsertMaterializedRowV1] = [column_row]
+    let column_batch: YazaSqlInsertMaterializedV1 = YazaSqlInsertMaterializedV1(2, loaded.sql_snapshot.version, columns_schema, column_rows)
+    let column_key_ordinals: List[Number] = [0, 1]
+    let capacity: YazaDbWriteCapacityV1 = yaza_db_write_transaction_prepare_capacity_v1(storage, wal, yaza_db_write_transaction_default_free_page_reserve_v1())?
+    let column_preflight: Boolean = yaza_db_sql_insert_preflight_v1(capacity.storage, columns_root, column_key_ordinals, column_batch)?
+    if not column_preflight: return err("YDBv1 ALTER TABLE sys_columns preflight did not complete")
+    let commit_ts: Number = capacity.storage.header.next_commit_ts
+    if commit_ts != storage.header.next_commit_ts: return err("YDBv1 ALTER TABLE commit timestamp changed during capacity preparation")
+    let begun: YazaDbWriteTransactionV1 = yaza_db_write_transaction_begin_prepared_v1(capacity.storage, capacity.wal)?
+    if begun.commit_ts != commit_ts:
+        yaza_db_sql_alter_table_close_v1(begun.storage, begun.wal)
+        return err("YDBv1 ALTER TABLE commit timestamp changed after preflight")
+    if not yaza_db_write_transaction_tail_fits_v1(begun, 3):
+        yaza_db_sql_alter_table_close_v1(begun.storage, begun.wal)
+        return err("YDBv1 ALTER TABLE exceeds the bounded WAL recovery-tail budget")
+    let next_catalog: YazaDbCatalogRootV1 = YazaDbCatalogRootV1(catalog.sys_tables_root, catalog.sys_columns_root, catalog.sys_indexes_root, catalog.sys_constraints_root, catalog.next_object_id, catalog.generation + 1, catalog.sys_views_root)
+    let descriptor_result: Result[YazaDbWalAppendV1, Text] = yaza_db_sql_create_table_append_catalog_root_v1(begun.storage, begun.wal, begun.storage.header.catalog_root, next_catalog)
+    if not result_is_ok(descriptor_result):
+        let message: Text = result_unwrap_error(descriptor_result)
+        yaza_db_sql_alter_table_close_v1(begun.storage, begun.wal)
+        return err("YDBv1 ALTER TABLE catalog generation update failed; reopen through recovery: " + message)
+    let descriptor: YazaDbWalAppendV1 = result_unwrap(descriptor_result)
+    var current: YazaDbWriteTransactionV1 = YazaDbWriteTransactionV1(begun.storage, descriptor.log, begun.txn_id, begun.commit_ts, begun.last_lsn, begun.pending_pages, begun.pending_keys_hex, begun.pending_rows_hex, begun.active)
+    let updated_table: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_mutate_leaf_v1(current, yaza_db_wal_type_leaf_update_v1(), table_target.page_id, table_target.key, table_target.row_payload)
+    if not result_is_ok(updated_table): return err("YDBv1 ALTER TABLE sys_tables update failed; reopen through recovery: " + result_unwrap_error(updated_table))
+    set current = result_unwrap(updated_table)
+    let inserted_column: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_insert_committed_row_v1(current, columns_root, column_row.values, column_row.nulls, columns_schema, column_key_ordinals)
+    if not result_is_ok(inserted_column):
+        let message: Text = result_unwrap_error(inserted_column)
+        yaza_db_sql_alter_table_close_v1(current.storage, current.wal)
+        return err("YDBv1 ALTER TABLE sys_columns insert failed; reopen through recovery: " + message)
+    set current = result_unwrap(inserted_column)
+    let committed: Result[YazaDbWriteCommitV1, Text] = yaza_db_write_transaction_commit_v1(current)
+    if not result_is_ok(committed):
+        let message: Text = result_unwrap_error(committed)
+        yaza_db_sql_alter_table_close_v1(current.storage, current.wal)
+        return err("YDBv1 ALTER TABLE commit failed; reopen through recovery: " + message)
+    return ok(result_unwrap(committed))

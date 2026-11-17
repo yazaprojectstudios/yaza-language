@@ -1,0 +1,70 @@
+use "../yazabase/meta_free_v1"
+
+fn yaza_base_meta_free_v1_check() -> Result[Number, Text]:
+    let payload: Bytes = bytes_from_text("sys_tables-schema-v1")
+    let encoded: Bytes = yaza_db_meta_page_encode_v1(77, 120, 2, 1, payload)?
+    let metadata: YazaDbMetaPageV1 = yaza_db_meta_page_decode_v1(encoded, 77)?
+    if metadata.header.page_type != 4 or metadata.header.page_lsn != 120: return err("YDBv1 META page header did not round-trip")
+    if metadata.kind != 2 or metadata.payload_version != 1 or not bytes_equal(metadata.payload, payload): return err("YDBv1 META envelope did not round-trip")
+
+    let empty_payload: Bytes = bytes_try_new_zeroed(0)?
+    let empty_page: Bytes = yaza_db_meta_page_encode_v1(78, 121, 65535, 1, empty_payload)?
+    let empty_metadata: YazaDbMetaPageV1 = yaza_db_meta_page_decode_v1(empty_page, 78)?
+    if empty_metadata.kind != 65535 or bytes_length(empty_metadata.payload) != 0: return err("YDBv1 META empty-payload boundary failed")
+    let maximum_payload: Bytes = bytes_try_new_zeroed(yaza_db_meta_page_max_payload_v1())?
+    if not bytes_try_set(maximum_payload, 0, 255): return err("YDBv1 META maximum-payload fixture could not be filled")
+    let maximum_page: Bytes = yaza_db_meta_page_encode_v1(79, 122, 2, 1, maximum_payload)?
+    let maximum_metadata: YazaDbMetaPageV1 = yaza_db_meta_page_decode_v1(maximum_page, 79)?
+    if bytes_length(maximum_metadata.payload) != yaza_db_meta_page_max_payload_v1() or bytes_get(maximum_metadata.payload, 0) != 255: return err("YDBv1 META maximum-payload boundary failed")
+    let too_large_payload: Bytes = bytes_try_new_zeroed(yaza_db_meta_page_max_payload_v1() + 1)?
+    if result_is_ok(yaza_db_meta_page_encode_v1(80, 123, 1, 1, too_large_payload)): return err("YDBv1 META encoder accepted an oversized payload")
+    if result_is_ok(yaza_db_meta_page_encode_v1(79, 122, 0, 1, payload)): return err("YDBv1 META encoder accepted the reserved zero kind")
+    if result_is_ok(yaza_db_meta_page_encode_v1(79, 122, 65536, 1, payload)): return err("YDBv1 META encoder accepted a kind outside u16")
+    if result_is_ok(yaza_db_meta_page_encode_v1(79, 122, 1, 2, payload)): return err("YDBv1 META encoder accepted an unsupported payload version")
+    if result_is_ok(yaza_db_meta_page_decode_v1(encoded, 76)): return err("YDBv1 META decoder accepted the wrong page ID")
+
+    let bad_magic: Bytes = bytes_try_slice(encoded, 0, bytes_length(encoded))?
+    let meta_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(encoded, 77)?
+    if not bytes_try_set(bad_magic, meta_header.data_start, 0): return err("YDBv1 META magic corruption fixture could not be changed")
+    if not yaza_db_write_uint_le_v1(bad_magic, 8, bytes_ydbv1_checksum_zeroed_range(bad_magic, 8, 4), 4): return err("YDBv1 META magic corruption checksum could not be written")
+    if result_is_ok(yaza_db_meta_page_decode_v1(bad_magic, 77)): return err("YDBv1 META decoder accepted a bad envelope magic")
+
+    let bad_version: Bytes = bytes_try_slice(encoded, 0, bytes_length(encoded))?
+    if not yaza_db_write_uint_le_v1(bad_version, meta_header.data_start + 6, 2, 2): return err("YDBv1 META version corruption fixture could not be changed")
+    if not yaza_db_write_uint_le_v1(bad_version, 8, bytes_ydbv1_checksum_zeroed_range(bad_version, 8, 4), 4): return err("YDBv1 META version corruption checksum could not be written")
+    if result_is_ok(yaza_db_meta_page_decode_v1(bad_version, 77)): return err("YDBv1 META decoder accepted an unsupported payload version")
+
+    let bad_length: Bytes = bytes_try_slice(encoded, 0, bytes_length(encoded))?
+    if not yaza_db_write_uint_le_v1(bad_length, meta_header.data_start + 8, bytes_length(payload) + 1, 4): return err("YDBv1 META length corruption fixture could not be changed at " + number_text(meta_header.data_start + 8) + " of " + number_text(bytes_length(bad_length)))
+    if not yaza_db_write_uint_le_v1(bad_length, 8, bytes_ydbv1_checksum_zeroed_range(bad_length, 8, 4), 4): return err("YDBv1 META length corruption checksum could not be written")
+    if result_is_ok(yaza_db_meta_page_decode_v1(bad_length, 77)): return err("YDBv1 META decoder accepted a mismatched payload length")
+
+    let bad_reserved: Bytes = bytes_try_slice(encoded, 0, bytes_length(encoded))?
+    if not yaza_db_write_uint_le_v1(bad_reserved, meta_header.data_start + 12, 4, 1): return err("YDBv1 META reserved-field fixture could not be changed")
+    if not yaza_db_write_uint_le_v1(bad_reserved, 8, bytes_ydbv1_checksum_zeroed_range(bad_reserved, 8, 4), 4): return err("YDBv1 META reserved-field checksum could not be written")
+    if result_is_ok(yaza_db_meta_page_decode_v1(bad_reserved, 77)): return err("YDBv1 META decoder accepted non-zero reserved bytes")
+
+    let bad_padding: Bytes = bytes_try_slice(encoded, 0, bytes_length(encoded))?
+    if not bytes_try_set(bad_padding, yaza_db_page_header_size_v1(), 1): return err("YDBv1 META padding fixture could not be changed")
+    if not yaza_db_write_uint_le_v1(bad_padding, 8, bytes_ydbv1_checksum_zeroed_range(bad_padding, 8, 4), 4): return err("YDBv1 META padding checksum could not be written")
+    if result_is_ok(yaza_db_meta_page_decode_v1(bad_padding, 77)): return err("YDBv1 META decoder accepted non-zero envelope padding")
+
+    let free_page: Bytes = yaza_db_free_page_encode_v1(88, 123)?
+    let free_header: YazaDbPageHeaderV1 = yaza_db_free_page_validate_v1(free_page, 88)?
+    if free_header.page_type != 6 or free_header.page_lsn != 123 or free_header.space_used != 0: return err("YDBv1 FREE page header did not round-trip")
+    if result_is_ok(yaza_db_free_page_validate_v1(free_page, 89)): return err("YDBv1 FREE decoder accepted the wrong page ID")
+    if result_is_ok(yaza_db_free_page_validate_v1(encoded, 77)): return err("YDBv1 FREE decoder accepted a META page")
+
+    let bad_free_body: Bytes = bytes_try_slice(free_page, 0, bytes_length(free_page))?
+    if not bytes_try_set(bad_free_body, yaza_db_page_header_size_v1(), 1): return err("YDBv1 FREE body fixture could not be changed")
+    if not yaza_db_write_uint_le_v1(bad_free_body, 8, bytes_ydbv1_checksum_zeroed_range(bad_free_body, 8, 4), 4): return err("YDBv1 FREE body checksum could not be written")
+    if result_is_ok(yaza_db_free_page_validate_v1(bad_free_body, 88)): return err("YDBv1 FREE decoder accepted a non-zero page body")
+    if result_is_ok(yaza_db_page_new_v1(89, 124, 7, 0)): return err("YDBv1 page constructor accepted an unknown type")
+    return ok(bytes_length(metadata.payload) + bytes_length(payload))
+
+start:
+    let outcome: Result[Number, Text] = yaza_base_meta_free_v1_check()
+    if result_is_ok(outcome):
+        say "yazabase-meta-free-v1-ok bytes=" + number_text(result_unwrap(outcome))
+    else:
+        say result_unwrap_error(outcome)

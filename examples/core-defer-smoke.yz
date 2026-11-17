@@ -1,0 +1,158 @@
+use "core-from-errors"
+
+shape DeferredValue:
+    name: Text
+    count: Number
+
+fn deferred_append(events: TextList, value: Text) -> Number:
+    list_push(events, value)
+    return 0
+
+fn deferred_argument(events: TextList, value: Text) -> Text:
+    list_push(events, "evaluate:" + value)
+    return value
+
+fn deferred_pair(events: TextList, first: Text, second: Text) -> Number:
+    list_push(events, first + second)
+    return 0
+
+fn deferred_shape(events: TextList, value: DeferredValue) -> Number:
+    list_push(events, value.name + number_text(value.count))
+    return 0
+
+fn deferred_failure() -> Result[Number, StorageError]:
+    return err(StorageError::Unavailable("storage unavailable"))
+
+fn deferred_same_failure() -> Result[Number, Text]:
+    return err("same-type failure")
+
+fn deferred_return(events: TextList, early: Boolean) -> Number:
+    var name: Text = "captured"
+    defer deferred_append(events, name)
+    set name = "changed"
+    if early:
+        defer deferred_append(events, "inner")
+        return list_count(events)
+    defer deferred_pair(events, deferred_argument(events, "a"), deferred_argument(events, "b"))
+    var value: DeferredValue = DeferredValue("shape", 1)
+    defer deferred_shape(events, value)
+    set value.count = 2
+    return list_count(events)
+
+fn deferred_propagation(events: TextList) -> Result[Number, ApplicationError]:
+    defer deferred_append(events, "propagated")
+    let value: Number = deferred_failure()?
+    return ok(value)
+
+fn deferred_same_propagation(events: TextList) -> Result[Number, Text]:
+    defer deferred_append(events, "same-type-propagated")
+    let value: Number = deferred_same_failure()?
+    return ok(value)
+
+fn deferred_same_direct_return(events: TextList) -> Result[Number, Text]:
+    defer deferred_append(events, "same-type-direct-return")
+    return deferred_same_failure()?
+
+fn deferred_conversion_direct_return(events: TextList) -> Result[Number, ApplicationError]:
+    defer deferred_append(events, "conversion-direct-return")
+    return deferred_failure()?
+
+fn deferred_main_cleanup() -> Number:
+    say "defer-main-exit"
+    return 0
+
+start:
+    let early_events: TextList = text_list()
+    assert deferred_return(early_events, true) == 0
+    assert list_count(early_events) == 2
+    assert list_get(early_events, 0) == "inner"
+    assert list_get(early_events, 1) == "captured"
+
+    let normal_events: TextList = text_list()
+    assert deferred_return(normal_events, false) == 2
+    assert list_count(normal_events) == 5
+    assert list_get(normal_events, 0) == "evaluate:a"
+    assert list_get(normal_events, 1) == "evaluate:b"
+    assert list_get(normal_events, 2) == "shape1"
+    assert list_get(normal_events, 3) == "ab"
+    assert list_get(normal_events, 4) == "captured"
+
+    let propagated_events: TextList = text_list()
+    let propagated: Result[Number, ApplicationError] = deferred_propagation(propagated_events)
+    assert not result_is_ok(propagated)
+    match result_unwrap_error(propagated):
+        Storage(message):
+            assert message == "storage unavailable"
+        MissingRecord:
+            assert false
+    assert list_count(propagated_events) == 1
+    assert list_get(propagated_events, 0) == "propagated"
+    let same_type_propagated: Result[Number, Text] = deferred_same_propagation(propagated_events)
+    assert not result_is_ok(same_type_propagated)
+    assert list_count(propagated_events) == 2
+    assert list_get(propagated_events, 1) == "same-type-propagated"
+
+    let direct_return_events: TextList = text_list()
+    let direct_same_return: Result[Number, Text] = deferred_same_direct_return(direct_return_events)
+    assert not result_is_ok(direct_same_return)
+    assert list_count(direct_return_events) == 1
+    assert list_get(direct_return_events, 0) == "same-type-direct-return"
+    let direct_converted_return: Result[Number, ApplicationError] = deferred_conversion_direct_return(direct_return_events)
+    assert not result_is_ok(direct_converted_return)
+    match result_unwrap_error(direct_converted_return):
+        Storage(message):
+            assert message == "storage unavailable"
+        MissingRecord:
+            assert false
+    assert list_count(direct_return_events) == 2
+    assert list_get(direct_return_events, 1) == "conversion-direct-return"
+
+    let loop_events: TextList = text_list()
+    for index in 0..4:
+        defer deferred_append(loop_events, number_text(index))
+        if index == 0:
+            defer deferred_append(loop_events, "continue")
+            continue
+        if index == 2:
+            defer deferred_append(loop_events, "break")
+            break
+    assert list_count(loop_events) == 5
+    assert list_get(loop_events, 0) == "continue"
+    assert list_get(loop_events, 1) == "0"
+    assert list_get(loop_events, 2) == "1"
+    assert list_get(loop_events, 3) == "break"
+    assert list_get(loop_events, 4) == "2"
+
+    var counter: Number = 0
+    while counter < 2:
+        defer deferred_append(loop_events, "while" + number_text(counter))
+        set counter = counter + 1
+    if false:
+        defer deferred_append(loop_events, "unreachable-if")
+    elif true:
+        defer deferred_append(loop_events, "elif")
+    else:
+        defer deferred_append(loop_events, "unreachable-else")
+    if false:
+        defer deferred_append(loop_events, "unreachable-elif-if")
+    elif false:
+        defer deferred_append(loop_events, "unreachable-elif")
+    else:
+        defer deferred_append(loop_events, "else")
+    if true:
+        defer deferred_append(loop_events, "if")
+    let optional: Option[Text] = some("match")
+    match optional:
+        some(value):
+            defer deferred_append(loop_events, value)
+        none:
+            defer deferred_append(loop_events, "none")
+    assert list_count(loop_events) == 11
+    assert list_get(loop_events, 5) == "while0"
+    assert list_get(loop_events, 6) == "while1"
+    assert list_get(loop_events, 7) == "elif"
+    assert list_get(loop_events, 8) == "else"
+    assert list_get(loop_events, 9) == "if"
+    assert list_get(loop_events, 10) == "match"
+    defer deferred_main_cleanup()
+    say "core-defer-ok"

@@ -1,0 +1,74 @@
+use "std/fs"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/catalog_snapshot_v1"
+use "../yazabase/catalog_storage_v1"
+use "../yazabase/page_v1"
+use "../yazabase/sql_dispatch_v1"
+
+fn yazabase_catalog_tree_growth_v1(root_path: Text) -> Result[Number, Text]:
+    let root: Number = root_open(root_path)?
+    let db_name: Text = "catalog-tree-growth-smoke.ydb"
+    let header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_from_text("ct-persist-uuid1"), 0, 1, 1, 0, 2, 1)
+    let empty_storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, db_name, header)?
+    let empty_closed: Boolean = yaza_db_storage_close_v1(empty_storage)?
+    if not empty_closed: return err("YDBv1 catalog-growth fixture could not close its empty database")
+
+    let initialized: YazaDbCatalogBootstrapV1 = yaza_db_catalog_initialize_v1(root, db_name)?
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let parts_result: Result[TextList, Text] = text_list_try_new()
+    if not result_is_ok(parts_result): return err("YDBv1 catalog-growth fixture could not allocate SQL fragments")
+    let parts: TextList = result_unwrap(parts_result)
+    if not list_try_reserve(parts, 604) or not list_try_push(parts, "CREATE TABLE wide_catalog (id BIGINT PRIMARY KEY"): return err("YDBv1 catalog-growth fixture could not reserve SQL fragments")
+    var column_index: Number = 1
+    while column_index <= 600:
+        if not list_try_push(parts, ", c" + number_text(column_index) + " INT"): return err("YDBv1 catalog-growth fixture could not append a column")
+        set column_index = column_index + 1
+    if not list_try_push(parts, ")"): return err("YDBv1 catalog-growth fixture could not finish CREATE TABLE")
+    let source: Text = text_try_join(parts, "")?
+    let first_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(initialized.storage, initialized.wal, source, no_parameters)?
+    if first_result.statement_kind != yaza_db_sql_statement_kind_create_table_v1() or not option_is_some(first_result.write_commit): return err("YDBv1 catalog-growth fixture did not commit its wide table")
+    let first_commit: YazaDbWriteCommitV1 = option_unwrap(first_result.write_commit)
+    let first_snapshot: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(first_commit.storage.file, first_commit.storage.header)?
+    let columns_root_id: Number = list_get(first_snapshot.root_page_ids, 1)
+    let columns_root_page: Bytes = yaza_db_storage_read_page_v1(first_commit.storage.file, first_commit.storage.header, columns_root_id)?
+    let columns_root_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(columns_root_page, columns_root_id)?
+    if columns_root_header.page_type != 2 or columns_root_header.level < 1 or columns_root_header.count < 1: return err("YDBv1 sys_columns did not grow from a leaf into a B+Tree")
+
+    let second_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(first_commit.storage, first_commit.wal, "CREATE TABLE after_growth (id BIGINT PRIMARY KEY)", no_parameters)?
+    if second_result.statement_kind != yaza_db_sql_statement_kind_create_table_v1() or not option_is_some(second_result.write_commit): return err("YDBv1 CREATE TABLE could not write through the grown catalog tree")
+    let second_commit: YazaDbWriteCommitV1 = option_unwrap(second_result.write_commit)
+    let wal_closed: Boolean = yaza_db_wal_log_close_v1(second_commit.wal)?
+    let storage_closed: Boolean = yaza_db_storage_close_v1(second_commit.storage)?
+    if not wal_closed or not storage_closed: return err("YDBv1 catalog-growth fixture could not close committed handles")
+
+    let recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, db_name)?
+    let after: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(recovered.storage.file, recovered.storage.header)?
+    if list_count(after.sql_snapshot.tables) != 6: return err("YDBv1 catalog-growth recovery lost a user table")
+    let wide_index: Number = yaza_db_catalog_snapshot_table_index_v1(after.sql_snapshot.tables, 13)
+    let later_index: Number = yaza_db_catalog_snapshot_table_index_v1(after.sql_snapshot.tables, 16)
+    if wide_index < 0 or later_index < 0: return err("YDBv1 catalog-growth recovery lost table identities")
+    if list_count(list_get(after.sql_snapshot.tables, wide_index).columns) != 601: return err("YDBv1 catalog-growth recovery lost wide-table columns")
+    if list_get(after.sql_snapshot.tables, later_index).name != "after_growth": return err("YDBv1 catalog-growth recovery decoded the later table incorrectly")
+    let recovered_columns_root_id: Number = list_get(after.root_page_ids, 1)
+    if recovered_columns_root_id != columns_root_id: return err("YDBv1 catalog descriptor changed the stable sys_columns root identity")
+    let select_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(recovered.storage, recovered.wal, "SELECT id FROM wide_catalog", no_parameters)?
+    if not option_is_some(select_result.query_result): return err("YDBv1 SQL binder did not return a SELECT result for the recovered wide catalog schema")
+    let selected: YazaSqlQueryResultV1 = option_unwrap(select_result.query_result)
+    if list_count(selected.rows) != 0: return err("YDBv1 empty wide table unexpectedly returned rows")
+    let final_wal_closed: Boolean = yaza_db_wal_log_close_v1(select_result.wal)?
+    let final_storage_closed: Boolean = yaza_db_storage_close_v1(select_result.storage)?
+    if not final_wal_closed or not final_storage_closed: return err("YDBv1 catalog-growth recovered handles did not close")
+    let removed: Boolean = remove(root, db_name)?
+    if not removed: return err("YDBv1 catalog-growth fixture could not remove its database")
+    let synced: Boolean = sync_directory(root)?
+    if not synced: return err("YDBv1 catalog-growth fixture cleanup sync failed")
+    let root_closed: Boolean = close(root)?
+    if not root_closed: return err("YDBv1 catalog-growth fixture root did not close")
+    return ok(list_count(list_get(after.sql_snapshot.tables, wide_index).columns))
+
+start:
+    let outcome: Result[Number, Text] = yazabase_catalog_tree_growth_v1(arg(1))
+    if result_is_ok(outcome):
+        say "yazabase-catalog-tree-growth-v1-ok columns=" + number_text(result_unwrap(outcome)) + " arena-peak-bytes=" + number_text(arena_peak_used())
+    else:
+        say result_unwrap_error(outcome)

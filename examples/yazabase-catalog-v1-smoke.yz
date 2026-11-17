@@ -1,0 +1,90 @@
+use "../yazabase/catalog_v1"
+use "../yazabase/catalog_schema_v1"
+
+fn yaza_base_catalog_v1_check() -> Result[Number, Text]:
+    if yaza_db_catalog_max_table_records_v1() != 1024 or yaza_db_catalog_max_object_id_v1() != 3072 or yaza_db_catalog_max_column_rows_v1() != 65536: return err("YDBv1 catalog growth bounds are inconsistent with the seeded ID profile")
+    let root: YazaDbCatalogRootV1 = YazaDbCatalogRootV1(7, 8, 9, 10, 5, 1, 0)
+    let encoded: Bytes = yaza_db_catalog_root_page_encode_v1(11, 20, root)?
+    let decoded: YazaDbCatalogRootV1 = yaza_db_catalog_root_page_decode_v1(encoded, 11)?
+    if decoded.sys_tables_root != 7 or decoded.sys_columns_root != 8 or decoded.sys_indexes_root != 9 or decoded.sys_constraints_root != 10: return err("YDBv1 system-catalog roots did not round-trip")
+    if decoded.next_object_id != 5 or decoded.generation != 1 or decoded.sys_views_root != 0: return err("YDBv1 catalog counters or absent optional view root did not round-trip")
+
+    let view_root: YazaDbCatalogRootV1 = YazaDbCatalogRootV1(7, 8, 9, 10, 15, 2, 12)
+    let view_root_encoded: Bytes = yaza_db_catalog_root_page_encode_v1(11, 20, view_root)?
+    let view_root_decoded: YazaDbCatalogRootV1 = yaza_db_catalog_root_page_decode_v1(view_root_encoded, 11)?
+    if yaza_db_catalog_root_payload_size_v2() != 64 or view_root_decoded.sys_views_root != 12 or view_root_decoded.next_object_id != 15 or view_root_decoded.generation != 2:
+        return err("YDBv1 catalog-root v2 did not round-trip its optional sys_views root and shifted counters")
+
+    let uuid: Bytes = bytes_from_text("0123456789abcdef")
+    let header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(uuid, 20, 1, 1, 11, 20, 1)
+    let checked: YazaDbCatalogRootV1 = yaza_db_catalog_root_validate_header_v1(encoded, 11, header)?
+    if checked.generation != 1: return err("YDBv1 catalog-root/header validation changed the descriptor")
+    let checked_view_root: YazaDbCatalogRootV1 = yaza_db_catalog_root_validate_header_v1(view_root_encoded, 11, header)?
+    if checked_view_root.sys_views_root != 12: return err("YDBv1 catalog-root/header validation lost the optional v2 root")
+    let wrong_header_root: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(uuid, 20, 1, 1, 10, 12, 1)
+    if result_is_ok(yaza_db_catalog_root_validate_header_v1(encoded, 11, wrong_header_root)): return err("YDBv1 catalog-root validator accepted a header-root mismatch")
+    let short_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(uuid, 20, 1, 1, 11, 11, 1)
+    if result_is_ok(yaza_db_catalog_root_validate_header_v1(encoded, 11, short_header)): return err("YDBv1 catalog-root validator accepted a root outside the logical page range")
+
+    let duplicate_roots: YazaDbCatalogRootV1 = YazaDbCatalogRootV1(7, 7, 9, 10, 5, 1, 0)
+    if result_is_ok(yaza_db_catalog_root_page_encode_v1(11, 20, duplicate_roots)): return err("YDBv1 catalog-root encoder accepted duplicate system roots")
+    let root_alias: YazaDbCatalogRootV1 = YazaDbCatalogRootV1(7, 8, 9, 11, 5, 1, 0)
+    if result_is_ok(yaza_db_catalog_root_page_encode_v1(11, 20, root_alias)): return err("YDBv1 catalog-root encoder accepted a system root aliasing its META page")
+    let no_object_id: YazaDbCatalogRootV1 = YazaDbCatalogRootV1(7, 8, 9, 10, 0, 1, 0)
+    if result_is_ok(yaza_db_catalog_root_page_encode_v1(11, 20, no_object_id)): return err("YDBv1 catalog-root encoder accepted next_object_id zero")
+    let no_generation: YazaDbCatalogRootV1 = YazaDbCatalogRootV1(7, 8, 9, 10, 5, 0, 0)
+    if result_is_ok(yaza_db_catalog_root_page_encode_v1(11, 20, no_generation)): return err("YDBv1 catalog-root encoder accepted generation zero")
+    let duplicate_view_root: YazaDbCatalogRootV1 = YazaDbCatalogRootV1(7, 8, 9, 10, 15, 2, 10)
+    if result_is_ok(yaza_db_catalog_root_page_encode_v1(11, 20, duplicate_view_root)): return err("YDBv2 catalog-root encoder accepted a view root aliasing another catalog root")
+    let alias_view_meta_root: YazaDbCatalogRootV1 = YazaDbCatalogRootV1(7, 8, 9, 10, 15, 2, 11)
+    if result_is_ok(yaza_db_catalog_root_page_encode_v1(11, 20, alias_view_meta_root)): return err("YDBv2 catalog-root encoder accepted a view root aliasing its descriptor page")
+
+    let bitmap_root: YazaDbCatalogRootV1 = YazaDbCatalogRootV1(2, 7, 8, 9, 5, 1, 0)
+    let bitmap_root_page: Bytes = yaza_db_catalog_root_page_encode_v1(11, 20, bitmap_root)?
+    if result_is_ok(yaza_db_catalog_root_validate_header_v1(bitmap_root_page, 11, header)): return err("YDBv1 catalog-root validator accepted a BITMAP page as a system catalog")
+    let out_of_range_root: YazaDbCatalogRootV1 = YazaDbCatalogRootV1(20, 7, 8, 9, 5, 1, 0)
+    let out_of_range_page: Bytes = yaza_db_catalog_root_page_encode_v1(11, 20, out_of_range_root)?
+    if result_is_ok(yaza_db_catalog_root_validate_header_v1(out_of_range_page, 11, header)): return err("YDBv1 catalog-root validator accepted a system root beyond page_count")
+
+    let unknown_kind_page: Bytes = yaza_db_meta_page_encode_v1(11, 20, 2, 1, bytes_from_text("not-a-root"))?
+    if result_is_ok(yaza_db_catalog_root_page_decode_v1(unknown_kind_page, 11)): return err("YDBv1 catalog-root decoder accepted an unknown META kind")
+    let short_payload: Bytes = bytes_try_new_zeroed(yaza_db_catalog_root_payload_size_v1() - 1)?
+    let short_payload_page: Bytes = yaza_db_meta_page_encode_v1(11, 20, yaza_db_catalog_meta_kind_root_v1(), 1, short_payload)?
+    if result_is_ok(yaza_db_catalog_root_page_decode_v1(short_payload_page, 11)): return err("YDBv1 catalog-root decoder accepted a truncated payload")
+
+    let metadata: YazaDbMetaPageV1 = yaza_db_meta_page_decode_v1(encoded, 11)?
+    let bad_version: Bytes = bytes_try_slice(encoded, 0, bytes_length(encoded))?
+    if not yaza_db_write_uint_le_v1(bad_version, metadata.header.data_start + yaza_db_meta_page_envelope_size_v1() + 4, 2, 2): return err("YDBv1 catalog format-version fixture could not be changed")
+    let resealed_version: Bytes = yaza_db_page_finalize_v1(bad_version)?
+    if result_is_ok(yaza_db_catalog_root_page_decode_v1(resealed_version, 11)): return err("YDBv1 catalog-root decoder accepted an unknown format version")
+
+    let bad_count: Bytes = bytes_try_slice(encoded, 0, bytes_length(encoded))?
+    if not yaza_db_write_uint_le_v1(bad_count, metadata.header.data_start + yaza_db_meta_page_envelope_size_v1() + 6, 3, 2): return err("YDBv1 catalog-count fixture could not be changed")
+    let resealed_count: Bytes = yaza_db_page_finalize_v1(bad_count)?
+    if result_is_ok(yaza_db_catalog_root_page_decode_v1(resealed_count, 11)): return err("YDBv1 catalog-root decoder accepted the wrong system-catalog count")
+
+    let view_metadata: YazaDbMetaPageV1 = yaza_db_meta_page_decode_v1(view_root_encoded, 11)?
+    let bad_view_count: Bytes = bytes_try_slice(view_root_encoded, 0, bytes_length(view_root_encoded))?
+    if not yaza_db_write_uint_le_v1(bad_view_count, view_metadata.header.data_start + yaza_db_meta_page_envelope_size_v1() + 6, 4, 2): return err("YDBv2 catalog-count fixture could not be changed")
+    let resealed_view_count: Bytes = yaza_db_page_finalize_v1(bad_view_count)?
+    if result_is_ok(yaza_db_catalog_root_page_decode_v1(resealed_view_count, 11)): return err("YDBv2 catalog-root decoder accepted the wrong system-catalog count")
+
+    let short_view_payload: Bytes = bytes_try_new_zeroed(yaza_db_catalog_root_payload_size_v2() - 1)?
+    if not yaza_db_write_bytes_v1(short_view_payload, 0, bytes_from_text("YCRT")) or not yaza_db_write_uint_le_v1(short_view_payload, 4, 2, 2) or not yaza_db_write_uint_le_v1(short_view_payload, 6, 5, 2): return err("YDBv2 truncated-payload fixture could not be constructed")
+    let short_view_payload_page: Bytes = yaza_db_meta_page_encode_v1(11, 20, yaza_db_catalog_meta_kind_root_v1(), 1, short_view_payload)?
+    if result_is_ok(yaza_db_catalog_root_page_decode_v1(short_view_payload_page, 11)): return err("YDBv2 catalog-root decoder accepted a truncated v2 payload")
+
+    let bad_root_magic: Bytes = bytes_try_slice(encoded, 0, bytes_length(encoded))?
+    if not bytes_try_set(bad_root_magic, metadata.header.data_start + yaza_db_meta_page_envelope_size_v1(), 0): return err("YDBv1 catalog magic fixture could not be changed")
+    let resealed_magic: Bytes = yaza_db_page_finalize_v1(bad_root_magic)?
+    if result_is_ok(yaza_db_catalog_root_page_decode_v1(resealed_magic, 11)): return err("YDBv1 catalog-root decoder accepted a bad payload magic")
+
+    if result_is_ok(yaza_db_catalog_root_page_decode_v1(encoded, 12)): return err("YDBv1 catalog-root decoder accepted the wrong page identity")
+    return ok(decoded.next_object_id + decoded.generation)
+
+start:
+    let outcome: Result[Number, Text] = yaza_base_catalog_v1_check()
+    if result_is_ok(outcome):
+        say "yazabase-catalog-v1-ok generation=" + number_text(result_unwrap(outcome))
+    else:
+        say result_unwrap_error(outcome)

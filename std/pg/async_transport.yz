@@ -1,0 +1,336 @@
+# Nonblocking PostgreSQL transport state machines for cooperative tasks.
+use "std/net/io"
+use "std/task"
+use "protocol"
+
+shape PgReadState:
+    handle: Number
+    expected_bytes: Number
+    received_bytes: Number
+    deadline_ms: Number
+    chunks: List[Bytes]
+
+shape PgWriteState:
+    handle: Number
+    data: Bytes
+    offset: Number
+    deadline_ms: Number
+
+shape PgTlsUpgradeState:
+    handle: Number
+    hostname: Text
+    root_cert_file: Text
+    timeout_ms: Number
+
+variant PgTlsUpgradeStep:
+    Ready
+    WaitRead
+    WaitWrite
+
+variant PgReadStep:
+    Progress(state: PgReadState)
+    WaitRead(state: PgReadState)
+    WaitWrite(state: PgReadState)
+    Complete(data: Bytes)
+
+variant PgWriteStep:
+    Progress(state: PgWriteState)
+    WaitRead(state: PgWriteState)
+    WaitWrite(state: PgWriteState)
+    Complete
+
+fn pg_tls_upgrade_begin(handle: Number, hostname: Text, root_cert_file: Text, timeout_ms: Number) -> Result[PgTlsUpgradeState, Text]:
+    if handle <= 0:
+        return err("postgres transport: TLS upgrade socket handle is invalid")
+    if hostname == "" or text_length(hostname) > 253:
+        return err("postgres transport: TLS upgrade hostname must contain 1 to 253 characters")
+    if text_length(root_cert_file) > 4096:
+        return err("postgres transport: TLS trust path exceeds 4096 characters")
+    if timeout_ms < 1 or timeout_ms > 3600000:
+        return err("postgres transport: TLS timeout must be between 1 and 3600000 milliseconds")
+    return ok(PgTlsUpgradeState(handle, hostname, root_cert_file, timeout_ms))
+
+fn pg_tls_upgrade_step(state: PgTlsUpgradeState) -> Result[PgTlsUpgradeStep, Text]:
+    if task_or_request_cancelled():
+        return err("postgres transport: TLS upgrade was cancelled")
+    if state.handle <= 0 or state.hostname == "" or text_length(state.hostname) > 253 or text_length(state.root_cert_file) > 4096 or state.timeout_ms < 1 or state.timeout_ms > 3600000:
+        return err("postgres transport: asynchronous TLS upgrade state is invalid")
+    let polled: Result[NetTlsPoll, Text] = net_tls_client_poll(state.handle, state.hostname, state.root_cert_file, state.timeout_ms)
+    if not result_is_ok(polled):
+        return err(result_unwrap_error(polled))
+    match result_unwrap(polled):
+        Ready:
+            return ok(PgTlsUpgradeStep::Ready)
+        PendingRead:
+            return ok(PgTlsUpgradeStep::WaitRead)
+        PendingWrite:
+            return ok(PgTlsUpgradeStep::WaitWrite)
+
+fn pg_tls_upgrade_wait(state: PgTlsUpgradeState, writable: Boolean) -> Result[Boolean, Text]:
+    return net_wait_current_task(state.handle, writable)
+
+shape PgFrameReadState:
+    handle: Number
+    deadline_ms: Number
+    phase: Number
+    tag: Number
+    payload_bytes: Number
+    read_state: Option[PgReadState]
+
+variant PgFrameReadStep:
+    Progress(state: PgFrameReadState)
+    WaitRead(state: PgFrameReadState)
+    WaitWrite(state: PgFrameReadState)
+    Complete(frame: PgBackendFrame)
+
+fn pg_transport_read_exact_begin(handle: Number, expected_bytes: Number, timeout_ms: Number) -> Result[PgReadState, Text]:
+    if handle <= 0:
+        return err("postgres transport: socket handle is invalid")
+    if expected_bytes < 0 or expected_bytes > 67108864:
+        return err("postgres transport: exact read size is outside the 64 MiB limit")
+    if timeout_ms < 1 or timeout_ms > 3600000:
+        return err("postgres transport: timeout must be between 1 and 3600000 milliseconds")
+    let started: Number = monotonic_ms()
+    if started < 0:
+        return err("postgres transport: monotonic clock is unavailable")
+    let max_int64: Number = 9223372036854775 * 1000 + 807
+    if started > max_int64 - timeout_ms:
+        return err("postgres transport: read deadline is outside the monotonic clock range")
+    return pg_transport_read_exact_begin_at(handle, expected_bytes, started + timeout_ms)
+
+fn pg_transport_read_exact_begin_at(handle: Number, expected_bytes: Number, deadline_ms: Number) -> Result[PgReadState, Text]:
+    if handle <= 0:
+        return err("postgres transport: socket handle is invalid")
+    if expected_bytes < 0 or expected_bytes > 67108864:
+        return err("postgres transport: exact read size is outside the 64 MiB limit")
+    let now: Number = monotonic_ms()
+    if now < 0:
+        return err("postgres transport: monotonic clock is unavailable")
+    if deadline_ms <= now:
+        return err("postgres transport: read deadline has expired")
+    if deadline_ms - now > 3600000:
+        return err("postgres transport: read deadline exceeds the one-hour limit")
+    let chunks: List[Bytes] = List[Bytes]()
+    return ok(PgReadState(handle, expected_bytes, 0, deadline_ms, chunks))
+
+fn pg_transport_read_state_validate(state: PgReadState) -> Result[Boolean, Text]:
+    if state.handle <= 0 or state.expected_bytes < 0 or state.expected_bytes > 67108864 or state.received_bytes < 0 or state.received_bytes > state.expected_bytes or state.deadline_ms < 0:
+        return err("postgres transport: asynchronous read state is invalid")
+    let now: Number = monotonic_ms()
+    if now < 0:
+        return err("postgres transport: monotonic clock is unavailable")
+    if state.deadline_ms <= now:
+        return err("postgres transport: read timed out")
+    if state.deadline_ms - now > 3600000:
+        return err("postgres transport: read deadline exceeds the one-hour limit")
+    let chunk_count: Number = list_count(state.chunks)
+    if chunk_count < 0 or chunk_count > 65536:
+        return err("postgres transport: asynchronous read state exceeds the chunk metadata limit")
+    var measured_bytes: Number = 0
+    var index: Number = 0
+    while index < chunk_count:
+        let chunk: Bytes = list_get(state.chunks, index)
+        let chunk_bytes: Number = bytes_length(chunk)
+        if chunk_bytes < 1 or chunk_bytes > 1048576 or chunk_bytes > state.expected_bytes - measured_bytes:
+            return err("postgres transport: asynchronous read state contains an invalid chunk")
+        set measured_bytes = measured_bytes + chunk_bytes
+        set index = index + 1
+    if measured_bytes != state.received_bytes:
+        return err("postgres transport: asynchronous read state byte count does not match its chunks")
+    return ok(true)
+
+fn pg_transport_read_exact_step(state: PgReadState) -> Result[PgReadStep, Text]:
+    if task_or_request_cancelled():
+        return err("postgres transport: asynchronous read was cancelled")
+    let valid_state: Result[Boolean, Text] = pg_transport_read_state_validate(state)
+    if not result_is_ok(valid_state):
+        return err(result_unwrap_error(valid_state))
+    if state.received_bytes == state.expected_bytes:
+        let joined: Result[Bytes, Text] = bytes_join(state.chunks)
+        if not result_is_ok(joined):
+            return err(result_unwrap_error(joined))
+        return ok(PgReadStep::Complete(result_unwrap(joined)))
+    let now: Number = monotonic_ms()
+    if now < 0:
+        return err("postgres transport: monotonic clock is unavailable")
+    if now >= state.deadline_ms:
+        return err("postgres transport: read timed out")
+    let remaining_bytes: Number = state.expected_bytes - state.received_bytes
+    var request_size: Number = remaining_bytes
+    if request_size > 1048576:
+        set request_size = 1048576
+    let polled: Result[NetIoPoll, Text] = net_read_poll(state.handle, request_size)
+    if not result_is_ok(polled):
+        return err(result_unwrap_error(polled))
+    match result_unwrap(polled):
+        Read(data):
+            let count: Number = bytes_length(data)
+            if count < 1 or count > remaining_bytes:
+                return err("postgres transport: asynchronous read returned an invalid chunk")
+            let stored: Boolean = list_try_push(state.chunks, data)
+            if not stored:
+                return err("postgres transport: read buffer capacity or memory limit reached")
+            let next_received: Number = state.received_bytes + count
+            let next_state: PgReadState = PgReadState(state.handle, state.expected_bytes, next_received, state.deadline_ms, state.chunks)
+            if next_received == state.expected_bytes:
+                let joined: Result[Bytes, Text] = bytes_join(next_state.chunks)
+                if not result_is_ok(joined):
+                    return err(result_unwrap_error(joined))
+                return ok(PgReadStep::Complete(result_unwrap(joined)))
+            return ok(PgReadStep::Progress(next_state))
+        Wrote(count):
+            return err("postgres transport: read poll unexpectedly reported written bytes")
+        PendingRead:
+            return ok(PgReadStep::WaitRead(state))
+        PendingWrite:
+            return ok(PgReadStep::WaitWrite(state))
+        Closed:
+            return err("postgres transport: server closed the connection during an asynchronous read")
+
+fn pg_transport_write_begin(handle: Number, data: Bytes, timeout_ms: Number) -> Result[PgWriteState, Text]:
+    if handle <= 0:
+        return err("postgres transport: socket handle is invalid")
+    if bytes_length(data) > 67108864:
+        return err("postgres transport: asynchronous write exceeds the 64 MiB limit")
+    if timeout_ms < 1 or timeout_ms > 3600000:
+        return err("postgres transport: timeout must be between 1 and 3600000 milliseconds")
+    let started: Number = monotonic_ms()
+    if started < 0:
+        return err("postgres transport: monotonic clock is unavailable")
+    let max_int64: Number = 9223372036854775 * 1000 + 807
+    if started > max_int64 - timeout_ms:
+        return err("postgres transport: write deadline is outside the monotonic clock range")
+    return pg_transport_write_begin_at(handle, data, started + timeout_ms)
+
+fn pg_transport_write_begin_at(handle: Number, data: Bytes, deadline_ms: Number) -> Result[PgWriteState, Text]:
+    if handle <= 0:
+        return err("postgres transport: socket handle is invalid")
+    if bytes_length(data) > 67108864:
+        return err("postgres transport: asynchronous write exceeds the 64 MiB limit")
+    let now: Number = monotonic_ms()
+    if now < 0:
+        return err("postgres transport: monotonic clock is unavailable")
+    if deadline_ms <= now:
+        return err("postgres transport: write deadline has expired")
+    if deadline_ms - now > 3600000:
+        return err("postgres transport: write deadline exceeds the one-hour limit")
+    return ok(PgWriteState(handle, data, 0, deadline_ms))
+
+fn pg_transport_write_step(state: PgWriteState) -> Result[PgWriteStep, Text]:
+    if task_or_request_cancelled():
+        return err("postgres transport: asynchronous write was cancelled")
+    let data_length: Number = bytes_length(state.data)
+    if state.handle <= 0 or state.offset < 0 or state.offset > data_length or data_length > 67108864 or state.deadline_ms < 0:
+        return err("postgres transport: asynchronous write state is invalid")
+    let now: Number = monotonic_ms()
+    if now < 0:
+        return err("postgres transport: monotonic clock is unavailable")
+    if now >= state.deadline_ms:
+        return err("postgres transport: write timed out")
+    if state.deadline_ms - now > 3600000:
+        return err("postgres transport: write deadline exceeds the one-hour limit")
+    if state.offset == data_length:
+        return ok(PgWriteStep::Complete)
+    let remaining_bytes: Number = data_length - state.offset
+    var request_size: Number = remaining_bytes
+    if request_size > 1048576:
+        set request_size = 1048576
+    let polled: Result[NetIoPoll, Text] = net_write_poll_range(state.handle, state.data, state.offset, request_size)
+    if not result_is_ok(polled):
+        return err(result_unwrap_error(polled))
+    match result_unwrap(polled):
+        Wrote(count):
+            if count < 1 or count > request_size:
+                return err("postgres transport: asynchronous write returned an invalid byte count")
+            let next_state: PgWriteState = PgWriteState(state.handle, state.data, state.offset + count, state.deadline_ms)
+            if next_state.offset == data_length:
+                return ok(PgWriteStep::Complete)
+            return ok(PgWriteStep::Progress(next_state))
+        Read(data):
+            return err("postgres transport: write poll unexpectedly returned bytes")
+        PendingRead:
+            return ok(PgWriteStep::WaitRead(state))
+        PendingWrite:
+            return ok(PgWriteStep::WaitWrite(state))
+        Closed:
+            return err("postgres transport: server closed the connection during an asynchronous write")
+
+fn pg_transport_read_frame_begin(handle: Number, timeout_ms: Number) -> Result[PgFrameReadState, Text]:
+    if timeout_ms < 1 or timeout_ms > 3600000:
+        return err("postgres transport: frame timeout must be between 1 and 3600000 milliseconds")
+    let started: Number = monotonic_ms()
+    if started < 0:
+        return err("postgres transport: monotonic clock is unavailable")
+    let max_int64: Number = 9223372036854775 * 1000 + 807
+    if started > max_int64 - timeout_ms:
+        return err("postgres transport: frame deadline is outside the monotonic clock range")
+    return pg_transport_read_frame_begin_at(handle, started + timeout_ms)
+
+fn pg_transport_read_frame_begin_at(handle: Number, deadline_ms: Number) -> Result[PgFrameReadState, Text]:
+    if handle <= 0:
+        return err("postgres transport: socket handle is invalid")
+    let now: Number = monotonic_ms()
+    if now < 0:
+        return err("postgres transport: monotonic clock is unavailable")
+    if deadline_ms <= now:
+        return err("postgres transport: frame deadline has expired")
+    if deadline_ms - now > 3600000:
+        return err("postgres transport: frame deadline exceeds the one-hour limit")
+    let header: Result[PgReadState, Text] = pg_transport_read_exact_begin_at(handle, 5, deadline_ms)
+    if not result_is_ok(header):
+        return err(result_unwrap_error(header))
+    let read_state: PgReadState = result_unwrap(header)
+    return ok(PgFrameReadState(handle, deadline_ms, 0, 0, 0, some(read_state)))
+
+fn pg_transport_read_frame_step(state: PgFrameReadState) -> Result[PgFrameReadStep, Text]:
+    if task_or_request_cancelled():
+        return err("postgres transport: asynchronous frame read was cancelled")
+    if state.handle <= 0 or state.deadline_ms < 0 or (state.phase != 0 and state.phase != 1) or not option_is_some(state.read_state):
+        return err("postgres transport: asynchronous frame state is invalid")
+    let read_state: PgReadState = option_unwrap(state.read_state)
+    if read_state.handle != state.handle or read_state.deadline_ms > state.deadline_ms:
+        return err("postgres transport: asynchronous frame state has inconsistent transport metadata")
+    if state.phase == 0 and (read_state.expected_bytes != 5 or state.tag != 0 or state.payload_bytes != 0):
+        return err("postgres transport: asynchronous frame header state is malformed")
+    if state.phase == 1 and (read_state.expected_bytes != state.payload_bytes or state.payload_bytes < 0 or state.payload_bytes > 16777212 or state.tag < 33 or state.tag > 126):
+        return err("postgres transport: asynchronous frame payload state is malformed")
+    let now: Number = monotonic_ms()
+    if now < 0:
+        return err("postgres transport: monotonic clock is unavailable")
+    if now >= state.deadline_ms:
+        return err("postgres transport: frame read timed out")
+    if state.deadline_ms - now > 3600000:
+        return err("postgres transport: frame deadline exceeds the one-hour limit")
+    let stepped: Result[PgReadStep, Text] = pg_transport_read_exact_step(read_state)
+    if not result_is_ok(stepped):
+        return err(result_unwrap_error(stepped))
+    match result_unwrap(stepped):
+        Progress(next_read):
+            let next_state: PgFrameReadState = PgFrameReadState(state.handle, state.deadline_ms, state.phase, state.tag, state.payload_bytes, some(next_read))
+            return ok(PgFrameReadStep::Progress(next_state))
+        WaitRead(wait_read):
+            let next_state: PgFrameReadState = PgFrameReadState(state.handle, state.deadline_ms, state.phase, state.tag, state.payload_bytes, some(wait_read))
+            return ok(PgFrameReadStep::WaitRead(next_state))
+        WaitWrite(wait_write):
+            let next_state: PgFrameReadState = PgFrameReadState(state.handle, state.deadline_ms, state.phase, state.tag, state.payload_bytes, some(wait_write))
+            return ok(PgFrameReadStep::WaitWrite(next_state))
+        Complete(data):
+            if state.phase == 1:
+                return ok(PgFrameReadStep::Complete(PgBackendFrame(state.tag, data)))
+            let tag: Number = bytes_get(data, 0)
+            if tag < 33 or tag > 126:
+                return err("postgres transport: backend frame tag is not printable ASCII")
+            let length_result: Result[Number, Text] = pg_read_u32_be(data, 1)
+            if not result_is_ok(length_result):
+                return err(result_unwrap_error(length_result))
+            let message_length: Number = result_unwrap(length_result)
+            if message_length < 4 or message_length > 16777216:
+                return err("postgres transport: backend frame length is outside the 16 MiB limit")
+            let payload_bytes: Number = message_length - 4
+            if payload_bytes == 0:
+                return ok(PgFrameReadStep::Complete(PgBackendFrame(tag, bytes_from_text(""))))
+            let payload: Result[PgReadState, Text] = pg_transport_read_exact_begin_at(state.handle, payload_bytes, state.deadline_ms)
+            if not result_is_ok(payload):
+                return err(result_unwrap_error(payload))
+            let next_state: PgFrameReadState = PgFrameReadState(state.handle, state.deadline_ms, 1, tag, payload_bytes, some(result_unwrap(payload)))
+            return ok(PgFrameReadStep::Progress(next_state))

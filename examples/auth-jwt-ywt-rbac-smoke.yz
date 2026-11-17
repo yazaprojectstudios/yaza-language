@@ -1,0 +1,75 @@
+# Focused smoke test for YWT, JWT HS256, Middleware, Controller RBAC, and YazaBase Auth/Config.
+
+use "std/ywt"
+use "std/jwt"
+use "std/middleware"
+use "std/http"
+use "std/time"
+use "std/db/yazabase"
+use "std/config/api_config"
+
+start:
+    let now_s: Number = time_now_unix_ms() / 1000
+    let exp_s: Number = now_s + 3600
+    let secret: Text = "smoke-auth-secret-1234567890-rotation-ready"
+
+    # 1. YWT with role
+    let ywt_tok: Text = ywt_create_with_role("usr-admin", "yaza-api", "admin", exp_s, secret)
+    let ywt_claims: YwtClaims = result_unwrap(ywt_verify_claims(ywt_tok, "yaza-api", now_s, secret))
+    assert(ywt_claims.subject == "usr-admin")
+    assert(ywt_claims.role == "admin")
+    let ywt_at_expiry: Result[YwtClaims, Text] = ywt_verify_claims(ywt_tok, "yaza-api", exp_s, secret)
+    assert(not result_is_ok(ywt_at_expiry))
+    let ywt_weak_secret: Result[YwtClaims, Text] = ywt_verify_claims(ywt_tok, "yaza-api", now_s, "short-secret")
+    assert(not result_is_ok(ywt_weak_secret))
+
+    # 2. JWT HS256 with role
+    let jwt_tok: Text = jwt_create_hs256("usr-viewer", "yaza-api", "yaza-clients", "viewer", exp_s, secret)
+    let jwt_claims: JwtClaims = result_unwrap(jwt_verify_hs256(jwt_tok, "yaza-api", "yaza-clients", now_s, secret))
+    assert(jwt_claims.subject == "usr-viewer")
+    assert(jwt_claims.role == "viewer")
+    let jwt_at_expiry: Result[JwtClaims, Text] = jwt_verify_hs256(jwt_tok, "yaza-api", "yaza-clients", exp_s, secret)
+    assert(not result_is_ok(jwt_at_expiry))
+    let jwt_weak_secret: Result[JwtClaims, Text] = jwt_verify_hs256(jwt_tok, "yaza-api", "yaza-clients", now_s, "short-secret")
+    assert(not result_is_ok(jwt_weak_secret))
+
+    # 3. Middleware + RBAC enforcement
+    let viewer_req: HttpRequest = HttpRequest("POST", "/api/products", "", "application/json", "application/json", "Bearer " + jwt_tok, "req-1", 0, bytes_empty(), "")
+    var v_ctx: MiddlewareContext = middleware_begin(viewer_req)
+    set v_ctx = middleware_auth_jwt(v_ctx, "yaza-api", "yaza-clients", secret)
+    assert(not v_ctx.rejected)
+    assert(v_ctx.authenticated)
+    set v_ctx = middleware_require_any_role(v_ctx, "admin,editor")
+    assert(v_ctx.rejected)
+    assert(v_ctx.reject_response.status_code == 403)
+
+    let admin_req: HttpRequest = HttpRequest("DELETE", "/api/products/sku-001", "", "application/json", "application/json", "Bearer " + ywt_tok, "req-2", 0, bytes_empty(), "")
+    var a_ctx: MiddlewareContext = middleware_begin(admin_req)
+    set a_ctx = middleware_auth_ywt(a_ctx, "yaza-api", secret)
+    set a_ctx = middleware_require_role(a_ctx, "admin")
+    assert(not a_ctx.rejected)
+    assert(a_ctx.role == "admin")
+
+    # 4. YazaBase default connect + credential rotation verification
+    let db_dir: Text = "/tmp/yaza_auth_smoke_" + number_text(time_now_monotonic_ms())
+    assert(not yazabase_verify_credentials(db_dir, "yaza", "yaza_dev_password"))
+    let no_default_cred: Result[YazaBaseConnection, Text] = yazabase_connect_default(db_dir, "smoke")
+    assert(not result_is_ok(no_default_cred))
+    let set_res: Result[Boolean, Text] = yazabase_set_credentials(db_dir, "custom_admin", "Strong-Passphrase-99-For-Yaza")
+    assert(result_is_ok(set_res))
+    let def_conn: YazaBaseConnection = result_unwrap(yazabase_connect(db_dir, "smoke", "custom_admin", "Strong-Passphrase-99-For-Yaza"))
+    assert(def_conn.connected)
+    assert(def_conn.username == "custom_admin")
+
+    assert(not yazabase_verify_credentials(db_dir, "yaza", "yaza_dev_password"))
+    assert(yazabase_verify_credentials(db_dir, "custom_admin", "Strong-Passphrase-99-For-Yaza"))
+    assert(not yazabase_verify_credentials(db_dir, "custom_admin", "Wrong-Passphrase-99-For-Yaza"))
+
+    # 5. API config default verification (balanced + adaptive + yazabase)
+    let parsed_cfg: ApiServiceConfig = result_unwrap(api_config_parse("[project]\nname = \"demo\"\n"))
+    assert(parsed_cfg.database_kind == "yazabase")
+    assert(parsed_cfg.database_username == "")
+    assert(parsed_cfg.resources.profile == "balanced")
+    assert(parsed_cfg.resources.arena_mode == "adaptive")
+
+    say "auth-jwt-ywt-rbac-smoke: PASS"

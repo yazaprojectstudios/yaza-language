@@ -1,0 +1,57 @@
+# Snapshot visibility primitives for the YDBv1 transaction table.
+# This module does not resolve undo chains or persist transaction state yet.
+use "./row_v1"
+
+shape YazaDbTxnStatusV1:
+    txn_id: Number
+    state: Number
+    commit_ts: Number
+
+fn yaza_db_mvcc_txn_state_active_v1() -> Number:
+    return 0
+
+fn yaza_db_mvcc_txn_state_committed_v1() -> Number:
+    return 1
+
+fn yaza_db_mvcc_txn_state_aborted_v1() -> Number:
+    return 2
+
+fn yaza_db_mvcc_max_transaction_statuses_v1() -> Number:
+    return 65536
+
+fn yaza_db_mvcc_status_validate_v1(status: YazaDbTxnStatusV1) -> Boolean:
+    if status.txn_id < 1: return false
+    if status.state == yaza_db_mvcc_txn_state_active_v1(): return status.commit_ts == 0
+    if status.state == yaza_db_mvcc_txn_state_committed_v1(): return status.commit_ts > 0
+    if status.state == yaza_db_mvcc_txn_state_aborted_v1(): return status.commit_ts == 0
+    return false
+
+fn yaza_db_mvcc_find_transaction_v1(transactions: List[YazaDbTxnStatusV1], txn_id: Number) -> Result[YazaDbTxnStatusV1, Text]:
+    let count: Number = list_count(transactions)
+    if txn_id < 1 or count > yaza_db_mvcc_max_transaction_statuses_v1(): return err("YDBv1 MVCC transaction lookup is outside its bound")
+    var found: Boolean = false
+    var selected: YazaDbTxnStatusV1 = YazaDbTxnStatusV1(0, 0, 0)
+    var index: Number = 0
+    while index < count:
+        let candidate: YazaDbTxnStatusV1 = list_get(transactions, index)
+        if not yaza_db_mvcc_status_validate_v1(candidate): return err("YDBv1 MVCC transaction table contains an invalid status")
+        if candidate.txn_id == txn_id:
+            if found: return err("YDBv1 MVCC transaction table contains a duplicate transaction ID")
+            set selected = candidate
+            set found = true
+        set index = index + 1
+    if not found: return err("YDBv1 MVCC version references a transaction missing from the transaction table")
+    return ok(selected)
+
+fn yaza_db_mvcc_version_visible_v1(version_ts: Number, snapshot_ts: Number, own_txn_id: Number, transactions: List[YazaDbTxnStatusV1]) -> Result[Boolean, Text]:
+    if snapshot_ts < 1 or own_txn_id < 0: return err("YDBv1 MVCC snapshot or transaction identity is invalid")
+    if version_ts == 0: return err("YDBv1 MVCC row version timestamp zero is invalid")
+    if version_ts > 0: return ok(version_ts <= snapshot_ts)
+
+    let writer_txn_id: Number = yaza_db_row_version_txn_decode_v1(version_ts)?
+    let status: YazaDbTxnStatusV1 = yaza_db_mvcc_find_transaction_v1(transactions, writer_txn_id)?
+    if writer_txn_id == own_txn_id:
+        if status.state != yaza_db_mvcc_txn_state_active_v1(): return err("YDBv1 MVCC current transaction is not active")
+        return ok(true)
+    if status.state != yaza_db_mvcc_txn_state_committed_v1(): return ok(false)
+    return ok(status.commit_ts <= snapshot_ts)

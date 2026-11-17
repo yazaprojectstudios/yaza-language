@@ -1,0 +1,39 @@
+use "../yazabase/catalog_init_v1"
+use "../yazabase/catalog_migration_v1"
+use "../yazabase/catalog_storage_v1"
+use "../yazabase/checkpoint_v1"
+
+fn yazabase_catalog_migration_close_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1) -> Boolean:
+    let wal_closed: Result[Boolean, Text] = yaza_db_wal_log_close_v1(wal)
+    let storage_closed: Result[Boolean, Text] = yaza_db_storage_close_v1(storage)
+    return result_is_ok(wal_closed) and result_is_ok(storage_closed) and result_unwrap(wal_closed) and result_unwrap(storage_closed)
+
+fn yazabase_catalog_migration_v1_check(root_path: Text) -> Result[Number, Text]:
+    let root: Number = root_open(root_path)?
+    let created: YazaDbCatalogBootstrapV1 = yaza_db_catalog_create_v1(root, "catalog-migration-smoke.ydb")?
+    let old_root: Number = created.storage.header.catalog_root
+    let old_generation: Number = created.catalog.generation
+    if created.catalog.sys_views_root != 0: return err("YDBv1 migration fixture did not start from a legacy catalog")
+
+    let migrated: YazaDbCatalogMigrationV1 = yaza_db_catalog_migrate_views_opened_v1(created.storage, created.wal)?
+    if not migrated.migrated or migrated.storage.header.catalog_root == old_root: return err("YDBv1 migration did not publish a new catalog descriptor")
+    if migrated.catalog.sys_views_root < 2 or migrated.catalog.generation != old_generation + 1: return err("YDBv1 migration did not install its root and generation")
+    if not yazabase_catalog_migration_close_v1(migrated.storage, migrated.wal): return err("YDBv1 migration fixture could not close the committed database")
+
+    let recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "catalog-migration-smoke.ydb")?
+    let reopened_catalog: YazaDbCatalogRootV1 = yaza_db_catalog_storage_read_root_v1(recovered.storage.file, recovered.storage.header)?
+    if reopened_catalog.sys_views_root != migrated.catalog.sys_views_root or recovered.storage.header.catalog_root != migrated.storage.header.catalog_root: return err("YDBv1 migration did not survive close and recovery")
+    let repeated: YazaDbCatalogMigrationV1 = yaza_db_catalog_migrate_views_opened_v1(recovered.storage, recovered.wal)?
+    if repeated.migrated or repeated.catalog.sys_views_root != reopened_catalog.sys_views_root: return err("YDBv1 catalog migration is not idempotent")
+    if not yazabase_catalog_migration_close_v1(repeated.storage, repeated.wal): return err("YDBv1 idempotency fixture could not close the database")
+    let root_closed: Boolean = close(root)?
+    if not root_closed: return err("YDBv1 migration fixture root did not close")
+    return ok(reopened_catalog.generation)
+
+start:
+    let outcome: Result[Number, Text] = yazabase_catalog_migration_v1_check(arg(1))
+    if result_is_ok(outcome):
+        say "yazabase-catalog-migration-v1-ok generation=" + number_text(result_unwrap(outcome))
+    else:
+        say result_unwrap_error(outcome)
+        exit(1)

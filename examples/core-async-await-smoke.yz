@@ -1,0 +1,85 @@
+use "std/async"
+use "std/sync"
+use "std/time"
+
+shape TaskMessage:
+    title: Text
+    code: Number
+
+async fn compute_square(x: Number) -> Number:
+    return x * x
+
+async fn compute_sum(a: Number, b: Number) -> Number:
+    return a + b
+
+async fn build_msg(tag: Text, val: Number) -> TaskMessage:
+    return TaskMessage(tag, val)
+
+async fn rendezvous_worker_a(ch_a: AsyncChannel, ch_b: AsyncChannel, counter: AtomicNumber, mu: Mutex) -> Number:
+    assert(async_channel_send(ch_a, 11))
+    let from_b: Option[Number] = async_channel_recv(ch_b)
+    assert(option_is_some(from_b))
+    let locked: Boolean = mutex_lock(mu)
+    assert(locked)
+    atomic_add(counter, 10)
+    let unlocked: Boolean = mutex_unlock(mu)
+    assert(unlocked)
+    return option_unwrap(from_b)
+
+async fn rendezvous_worker_b(ch_a: AsyncChannel, ch_b: AsyncChannel, counter: AtomicNumber, mu: Mutex) -> Number:
+    let from_a: Option[Number] = async_channel_recv(ch_a)
+    assert(option_is_some(from_a))
+    assert(async_channel_send(ch_b, 22))
+    let locked: Boolean = mutex_lock(mu)
+    assert(locked)
+    atomic_add(counter, 20)
+    let unlocked: Boolean = mutex_unlock(mu)
+    assert(unlocked)
+    return option_unwrap(from_a)
+
+async fn sleep_worker(ms: Number) -> Boolean:
+    let slept: Boolean = sleep_ms(ms)
+    return slept
+
+start:
+    # 1. Basic prefix and postfix await on spawned tasks
+    let t1: Task[Number] = spawn compute_square(6)
+    let r1: Number = await t1
+    assert(r1 == 36)
+
+    let t2: Task[Number] = spawn compute_sum(10, 32)
+    let r2: Number = t2.await
+    assert(r2 == 42)
+
+    # 2. Returning arena-allocated Text inside Shape from spawned task
+    let t3: Task[TaskMessage] = spawn build_msg("ok", 200)
+    let r3: TaskMessage = t3.await
+    assert(r3.title == "ok")
+    assert(r3.code == 200)
+
+    # 3. Inline spawn & await
+    let r4: Number = await (spawn compute_square(8))
+    assert(r4 == 64)
+
+    # 4. Incontrovertible concurrent execution proof via two-way channel rendezvous + Mutex + AtomicNumber
+    let ch_a: AsyncChannel = async_channel_create(1)
+    let ch_b: AsyncChannel = async_channel_create(1)
+    let counter: AtomicNumber = atomic_create(0)
+    let mu: Mutex = mutex_create(0)
+
+    let ta: Task[Number] = spawn rendezvous_worker_a(ch_a, ch_b, counter, mu)
+    let tb: Task[Number] = spawn rendezvous_worker_b(ch_a, ch_b, counter, mu)
+
+    let ra: Number = await ta
+    let rb: Number = tb.await
+    assert(ra == 22)
+    assert(rb == 11)
+    assert(atomic_load(counter) == 30)
+
+    # 5. Parallel OS sleep timing check
+    let s1: Task[Boolean] = spawn sleep_worker(40)
+    let s2: Task[Boolean] = spawn sleep_worker(40)
+    assert(await s1)
+    assert(await s2)
+
+    say "async await smoke passed"

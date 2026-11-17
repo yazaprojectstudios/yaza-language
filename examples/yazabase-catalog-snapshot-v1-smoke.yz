@@ -1,0 +1,76 @@
+use "std/fs"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/catalog_snapshot_v1"
+use "../yazabase/sql_parser_v3"
+use "../yazabase/sql_binder_v1"
+use "../yazabase/query_v1"
+
+fn yaza_base_catalog_snapshot_v1_check(root_path: Text) -> Result[Number, Text]:
+    let root: Number = root_open(root_path)?
+    let header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_from_text("cat-snapshot-id1"), 0, 1, 1, 0, 2, 1)
+    let empty_storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, "catalog-snapshot-smoke.ydb", header)?
+    let empty_closed: Boolean = yaza_db_storage_close_v1(empty_storage)?
+    if not empty_closed: return err("YDBv1 catalog snapshot fixture could not close its empty database")
+
+    let initialized: YazaDbCatalogBootstrapV1 = yaza_db_catalog_initialize_v1(root, "catalog-snapshot-smoke.ydb")?
+    let snapshot: YazaSqlCatalogSnapshotV1 = yaza_db_catalog_snapshot_load_v1(initialized.storage.file, initialized.storage.header)?
+    if snapshot.version != 1 or list_count(snapshot.tables) != 4: return err("YDBv1 persisted catalog did not load the expected table snapshot")
+    let unpublished_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(initialized.storage.header.db_uuid, initialized.storage.header.checkpoint_lsn, initialized.storage.header.next_txn_id, 1, initialized.storage.header.catalog_root, initialized.storage.header.page_count, initialized.storage.header.flags)
+    if result_is_ok(yaza_db_catalog_snapshot_load_v1(initialized.storage.file, unpublished_header)): return err("YDBv1 catalog snapshot accepted rows without a published commit timestamp")
+
+    let tables_index: Number = yaza_db_catalog_snapshot_table_index_v1(snapshot.tables, 1)
+    if tables_index != 0: return err("YDBv1 persisted catalog did not retain primary-key table order")
+    let tables_schema: YazaSqlTableSchemaV1 = list_get(snapshot.tables, tables_index)
+    if tables_schema.name != "sys_tables" or list_count(tables_schema.columns) != 7: return err("YDBv1 persisted catalog did not load sys_tables columns")
+    if list_get(tables_schema.columns, 0).name != "table_id" or list_get(tables_schema.columns, 1).name != "schema_name" or list_get(tables_schema.columns, 2).name != "table_name": return err("YDBv1 persisted catalog column order is incorrect")
+
+    let source: Text = "SELECT table_name FROM sys_tables WHERE table_id = 1"
+    let parsed: YazaSqlSelectAstV3 = yaza_sql_parse_select_v3(source)?
+    let bound: YazaSqlBoundPlanV1 = yaza_sql_bind_select_v1(source, parsed, snapshot)?
+    if bound.table_id != 1 or bound.catalog_version != 1 or list_count(bound.projections) != 1 or list_get(bound.projections, 0).type_id != 9: return err("YDBv1 persisted catalog did not bind a query using loaded metadata")
+
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let selected: YazaSqlQueryResultV1 = yaza_db_execute_select_v1(initialized.storage.file, initialized.storage.header, source, no_parameters)?
+    if list_count(selected.rows) != 1 or list_count(list_get(selected.rows, 0)) != 1: return err("YDBv1 persistent SELECT returned the wrong row shape")
+    if list_get(list_get(selected.rows, 0), 0).text_value != "sys_tables": return err("YDBv1 persistent SELECT returned the wrong stored value")
+    let table_id_parameter: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 1)?
+    let typed_parameters: List[YazaSqlValueV1] = [table_id_parameter]
+    let parameterized: YazaSqlQueryResultV1 = yaza_db_execute_select_v1(initialized.storage.file, initialized.storage.header, "SELECT table_name FROM sys_tables WHERE table_id = $1", typed_parameters)?
+    if list_count(parameterized.rows) != 1 or list_get(list_get(parameterized.rows, 0), 0).text_value != "sys_tables": return err("YDBv1 persistent SELECT did not execute its typed bind parameter")
+    let missing: YazaSqlQueryResultV1 = yaza_db_execute_select_v1(initialized.storage.file, initialized.storage.header, "SELECT table_name FROM sys_tables WHERE table_id = 999", no_parameters)?
+    if list_count(missing.rows) != 0: return err("YDBv1 persistent SELECT did not apply its WHERE predicate")
+    let table_count: YazaSqlQueryResultV1 = yaza_db_execute_select_v1(initialized.storage.file, initialized.storage.header, "SELECT COUNT(*) AS total FROM sys_tables", no_parameters)?
+    if list_count(table_count.columns) != 1 or list_get(table_count.columns, 0).type_id != 4 or list_get(table_count.columns, 0).output_name != "total": return err("YDBv1 persistent COUNT(*) returned incorrect result metadata")
+    if list_count(table_count.rows) != 1 or list_get(list_get(table_count.rows, 0), 0).integer_value != 4: return err("YDBv1 persistent COUNT(*) did not count committed catalog rows")
+    let filtered_count: YazaSqlQueryResultV1 = yaza_db_execute_select_v1(initialized.storage.file, initialized.storage.header, "SELECT COUNT(*) FROM sys_tables WHERE table_id = 1", no_parameters)?
+    if list_count(filtered_count.rows) != 1 or list_get(list_get(filtered_count.rows, 0), 0).integer_value != 1: return err("YDBv1 persistent COUNT(*) did not count rows after its predicate")
+    let nullable_rows: YazaSqlQueryResultV1 = yaza_db_execute_select_v1(initialized.storage.file, initialized.storage.header, "SELECT column_name FROM sys_columns WHERE table_id = 1", no_parameters)?
+    if list_count(nullable_rows.rows) != 7 or list_get(list_get(nullable_rows.rows, 0), 0).text_value != "table_id": return err("YDBv1 persistent SELECT did not scan rows containing unrelated NULL fields")
+    let null_key_ordinals: YazaSqlQueryResultV1 = yaza_db_execute_select_v1(initialized.storage.file, initialized.storage.header, "SELECT key_ordinal FROM sys_columns WHERE table_id = 1 AND key_ordinal IS NULL", no_parameters)?
+    if list_count(null_key_ordinals.rows) != 6: return err("YDBv1 persistent SELECT did not apply IS NULL to stored catalog values")
+    var null_ordinal_index: Number = 0
+    while null_ordinal_index < list_count(null_key_ordinals.rows):
+        if not list_get(list_get(null_key_ordinals.rows, null_ordinal_index), 0).is_null: return err("YDBv1 persistent SELECT did not preserve SQL NULL in its projected value")
+        set null_ordinal_index = null_ordinal_index + 1
+    let nonnull_key_ordinals: YazaSqlQueryResultV1 = yaza_db_execute_select_v1(initialized.storage.file, initialized.storage.header, "SELECT key_ordinal FROM sys_columns WHERE table_id = 1 AND key_ordinal IS NOT NULL", no_parameters)?
+    if list_count(nonnull_key_ordinals.rows) != 1 or list_get(list_get(nonnull_key_ordinals.rows, 0), 0).is_null: return err("YDBv1 persistent SELECT did not apply IS NOT NULL to stored catalog values")
+    let default_values: YazaSqlQueryResultV1 = yaza_db_execute_select_v1(initialized.storage.file, initialized.storage.header, "SELECT default_text FROM sys_columns WHERE table_id = 1 LIMIT 1", no_parameters)?
+    if list_count(default_values.rows) != 1 or not list_get(list_get(default_values.rows, 0), 0).is_null: return err("YDBv1 persistent SELECT did not materialize a stored NULL projection")
+
+    let wal_closed: Boolean = yaza_db_wal_log_close_v1(initialized.wal)?
+    let storage_closed: Boolean = yaza_db_storage_close_v1(initialized.storage)?
+    if not wal_closed or not storage_closed: return err("YDBv1 catalog snapshot handles did not close")
+    let removed: Boolean = remove(root, "catalog-snapshot-smoke.ydb")?
+    if not removed: return err("YDBv1 catalog snapshot fixture could not remove its database")
+    let synced: Boolean = sync_directory(root)?
+    if not synced: return err("YDBv1 catalog snapshot fixture cleanup sync failed")
+    let root_closed: Boolean = close(root)?
+    if not root_closed: return err("YDBv1 catalog snapshot fixture root did not close")
+    return ok(snapshot.version)
+
+start:
+    let outcome: Result[Number, Text] = yaza_base_catalog_snapshot_v1_check(arg(1))
+    if result_is_ok(outcome):
+        say "yazabase-catalog-snapshot-v1-ok commit-ts=" + number_text(result_unwrap(outcome))
+    else:
+        say result_unwrap_error(outcome)

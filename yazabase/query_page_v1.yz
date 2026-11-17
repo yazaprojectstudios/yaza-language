@@ -1,0 +1,271 @@
+# Typed, bounded keyset pages for stable single-table SQL reads.
+# Pages use a fixed MVCC snapshot and clustered-key order. The cursor checksum
+# detects accidental query/bind mismatches; it is not an authentication token.
+use "std/convert"
+use "./btree_scan_v1"
+use "./catalog_snapshot_v1"
+use "./catalog_storage_v1"
+use "./key_codec_v1"
+use "./query_v1"
+use "./sql_binder_v1"
+use "./sql_executor_v1"
+use "./storage_v1"
+use "./wal_v1"
+
+shape YazaDbQueryPageTokenV1:
+    version: Number
+    db_uuid: Bytes
+    schema_fingerprint: Number
+    table_id: Number
+    snapshot_ts: Number
+    query_fingerprint: Number
+    rows_emitted: Number
+    last_key: Bytes
+
+shape YazaDbQueryPageV1:
+    query_result: YazaSqlQueryResultV1
+    snapshot_ts: Number
+    has_more: Boolean
+    next_token: Option[YazaDbQueryPageTokenV1]
+
+shape YazaDbQueryPageFingerprintV1:
+    primary: Number
+    secondary: Number
+
+# Portable URL-safe representation for API/JDBC cursors. The token is only a
+# continuation hint: callers must authenticate it independently and must sign
+# it before exposing it as a trusted client token.
+fn yaza_db_query_page_token_encode_v1(token: YazaDbQueryPageTokenV1) -> Result[Text, Text]:
+    if token.version != 1 or bytes_length(token.db_uuid) != 16 or token.schema_fingerprint < 0 or token.table_id < 1 or token.snapshot_ts < 1 or token.query_fingerprint < 0 or token.rows_emitted < 0 or bytes_length(token.last_key) < 1 or bytes_length(token.last_key) > 2048:
+        return err("YDBv1 query-page token fields are outside their encoding bounds")
+    let uuid_hex: Result[Text, Text] = convert_try_hex_encode(token.db_uuid)
+    let key_hex: Result[Text, Text] = convert_try_hex_encode(token.last_key)
+    if not result_is_ok(uuid_hex) or not result_is_ok(key_hex): return err("YDBv1 query-page token bytes could not be encoded")
+    let fields: TextList = text_list()
+    if not list_try_push(fields, "YQP1") or not list_try_push(fields, number_text(token.version)) or not list_try_push(fields, result_unwrap(uuid_hex)) or not list_try_push(fields, number_text(token.schema_fingerprint)) or not list_try_push(fields, number_text(token.table_id)) or not list_try_push(fields, number_text(token.snapshot_ts)) or not list_try_push(fields, number_text(token.query_fingerprint)) or not list_try_push(fields, number_text(token.rows_emitted)) or not list_try_push(fields, result_unwrap(key_hex)):
+        return err("YDBv1 query-page token fields could not be assembled")
+    let token_text: Text = text_join(fields, "|")
+    let token_bytes: Result[Bytes, Text] = bytes_try_from_text(token_text)
+    if not result_is_ok(token_bytes): return err("YDBv1 query-page token could not be encoded as UTF-8")
+    return convert_try_base64url_encode(result_unwrap(token_bytes))
+
+fn yaza_db_query_page_token_decode_v1(encoded: Text) -> Result[YazaDbQueryPageTokenV1, Text]:
+    if text_length(encoded) < 1 or text_length(encoded) > 8192: return err("YDBv1 query-page token text is outside its encoding bound")
+    let decoded_bytes: Result[Bytes, Text] = convert_try_base64url_decode(encoded)
+    if not result_is_ok(decoded_bytes): return err("YDBv1 query-page token is not valid Base64URL")
+    let decoded_text: Result[Text, Text] = bytes_try_to_text(result_unwrap(decoded_bytes))
+    if not result_is_ok(decoded_text): return err("YDBv1 query-page token is not valid UTF-8")
+    let fields: TextList = text_split(result_unwrap(decoded_text), "|")
+    if list_count(fields) != 9 or list_get(fields, 0) != "YQP1": return err("YDBv1 query-page token has an unknown version or field count")
+    let version_result: Result[Number, Text] = number_try_parse(list_get(fields, 1))
+    let schema_result: Result[Number, Text] = number_try_parse(list_get(fields, 3))
+    let table_result: Result[Number, Text] = number_try_parse(list_get(fields, 4))
+    let snapshot_result: Result[Number, Text] = number_try_parse(list_get(fields, 5))
+    let query_result: Result[Number, Text] = number_try_parse(list_get(fields, 6))
+    let rows_result: Result[Number, Text] = number_try_parse(list_get(fields, 7))
+    if not result_is_ok(version_result) or not result_is_ok(schema_result) or not result_is_ok(table_result) or not result_is_ok(snapshot_result) or not result_is_ok(query_result) or not result_is_ok(rows_result):
+        return err("YDBv1 query-page token contains a malformed integer field")
+    let version: Number = result_unwrap(version_result)
+    let schema_fingerprint: Number = result_unwrap(schema_result)
+    let table_id: Number = result_unwrap(table_result)
+    let snapshot_ts: Number = result_unwrap(snapshot_result)
+    let query_fingerprint: Number = result_unwrap(query_result)
+    let rows_emitted: Number = result_unwrap(rows_result)
+    if version != 1 or schema_fingerprint < 0 or table_id < 1 or snapshot_ts < 1 or query_fingerprint < 0 or rows_emitted < 0:
+        return err("YDBv1 query-page token integer fields are outside their bounds")
+    let uuid_result: Result[Bytes, Text] = convert_try_hex_decode(list_get(fields, 2))
+    let key_result: Result[Bytes, Text] = convert_try_hex_decode(list_get(fields, 8))
+    if not result_is_ok(uuid_result) or not result_is_ok(key_result): return err("YDBv1 query-page token contains malformed hexadecimal bytes")
+    let db_uuid: Bytes = result_unwrap(uuid_result)
+    let last_key: Bytes = result_unwrap(key_result)
+    if bytes_length(db_uuid) != 16 or bytes_length(last_key) < 1 or bytes_length(last_key) > 2048:
+        return err("YDBv1 query-page token UUID or clustered-key length is invalid")
+    return ok(YazaDbQueryPageTokenV1(version, db_uuid, schema_fingerprint, table_id, snapshot_ts, query_fingerprint, rows_emitted, last_key))
+
+fn yaza_db_query_page_max_size_v1() -> Number:
+    return 256
+
+fn yaza_db_query_page_hash_byte_v1(state: YazaDbQueryPageFingerprintV1, byte_value: Number) -> YazaDbQueryPageFingerprintV1:
+    let primary: Number = (state.primary * 131 + byte_value + 1) % 2147483647
+    let secondary: Number = (state.secondary * 257 + byte_value + 1) % 2147483629
+    return YazaDbQueryPageFingerprintV1(primary, secondary)
+
+fn yaza_db_query_page_hash_text_v1(state: YazaDbQueryPageFingerprintV1, value: Text) -> YazaDbQueryPageFingerprintV1:
+    var current: YazaDbQueryPageFingerprintV1 = state
+    let length: Number = text_length(value)
+    set current = yaza_db_query_page_hash_text_bytes_v1(current, number_text(length))
+    var index: Number = 0
+    while index < length:
+        set current = yaza_db_query_page_hash_byte_v1(current, text_byte(value, index))
+        set index = index + 1
+    return yaza_db_query_page_hash_byte_v1(current, 0)
+
+fn yaza_db_query_page_hash_text_bytes_v1(state: YazaDbQueryPageFingerprintV1, value: Text) -> YazaDbQueryPageFingerprintV1:
+    var current: YazaDbQueryPageFingerprintV1 = state
+    var index: Number = 0
+    while index < text_length(value):
+        set current = yaza_db_query_page_hash_byte_v1(current, text_byte(value, index))
+        set index = index + 1
+    return yaza_db_query_page_hash_byte_v1(current, 255)
+
+fn yaza_db_query_page_hash_bytes_v1(state: YazaDbQueryPageFingerprintV1, value: Bytes) -> YazaDbQueryPageFingerprintV1:
+    var current: YazaDbQueryPageFingerprintV1 = state
+    let length: Number = bytes_length(value)
+    set current = yaza_db_query_page_hash_text_bytes_v1(current, number_text(length))
+    var index: Number = 0
+    while index < length:
+        set current = yaza_db_query_page_hash_byte_v1(current, bytes_get(value, index))
+        set index = index + 1
+    return yaza_db_query_page_hash_byte_v1(current, 0)
+
+fn yaza_db_query_page_fingerprint_v1(source: Text, parameters: List[YazaSqlValueV1]) -> Result[Number, Text]:
+    if text_length(source) > 65536 or list_count(parameters) > 4096: return err("YDBv1 query-page fingerprint input exceeds its structural bound")
+    var state: YazaDbQueryPageFingerprintV1 = YazaDbQueryPageFingerprintV1(1, 7)
+    set state = yaza_db_query_page_hash_text_v1(state, "YAZA-QUERY-PAGE-V1")
+    set state = yaza_db_query_page_hash_text_v1(state, source)
+    set state = yaza_db_query_page_hash_text_v1(state, number_text(list_count(parameters)))
+    var parameter_index: Number = 0
+    var total_text_bytes: Number = 0
+    while parameter_index < list_count(parameters):
+        let parameter: YazaSqlValueV1 = list_get(parameters, parameter_index)
+        set state = yaza_db_query_page_hash_text_v1(state, number_text(parameter.type_id))
+        if parameter.is_null: set state = yaza_db_query_page_hash_text_v1(state, "null")
+        else: set state = yaza_db_query_page_hash_text_v1(state, "value")
+        set state = yaza_db_query_page_hash_text_v1(state, number_text(parameter.integer_value))
+        set state = yaza_db_query_page_hash_text_v1(state, number_text(float64_bits(parameter.float_value)))
+        if parameter.boolean_value: set state = yaza_db_query_page_hash_text_v1(state, "true")
+        else: set state = yaza_db_query_page_hash_text_v1(state, "false")
+        var parameter_text_bytes: Number = text_length(parameter.text_value)
+        if parameter.type_id == 16: set parameter_text_bytes = bytes_length(parameter.bytes_value)
+        if parameter_text_bytes > 67108864 - total_text_bytes: return err("YDBv1 query-page bind text exceeds its 64 MiB fingerprint bound")
+        set total_text_bytes = total_text_bytes + parameter_text_bytes
+        if parameter.type_id == 16: set state = yaza_db_query_page_hash_bytes_v1(state, parameter.bytes_value)
+        else: set state = yaza_db_query_page_hash_text_v1(state, parameter.text_value)
+        if parameter.source_literal: set state = yaza_db_query_page_hash_text_v1(state, "source-literal")
+        else: set state = yaza_db_query_page_hash_text_v1(state, "bound-value")
+        set state = yaza_db_query_page_hash_text_v1(state, number_text(parameter.source_start_byte))
+        set state = yaza_db_query_page_hash_text_v1(state, number_text(parameter.source_end_byte))
+        set parameter_index = parameter_index + 1
+    return ok(state.primary * 2147483629 + state.secondary)
+
+fn yaza_db_query_page_schema_fingerprint_v1(table: YazaSqlTableSchemaV1, schema_version: Number) -> Number:
+    var state: YazaDbQueryPageFingerprintV1 = YazaDbQueryPageFingerprintV1(11, 19)
+    set state = yaza_db_query_page_hash_text_v1(state, "YAZA-QUERY-PAGE-SCHEMA-V1")
+    set state = yaza_db_query_page_hash_text_v1(state, number_text(table.table_id))
+    set state = yaza_db_query_page_hash_text_v1(state, number_text(schema_version))
+    set state = yaza_db_query_page_hash_text_v1(state, table.name)
+    set state = yaza_db_query_page_hash_text_v1(state, number_text(list_count(table.columns)))
+    var column_index: Number = 0
+    while column_index < list_count(table.columns):
+        let column: YazaSqlColumnSchemaV1 = list_get(table.columns, column_index)
+        set state = yaza_db_query_page_hash_text_v1(state, column.name)
+        set state = yaza_db_query_page_hash_text_v1(state, number_text(column.type_id))
+        if column.nullable: set state = yaza_db_query_page_hash_text_v1(state, "nullable")
+        else: set state = yaza_db_query_page_hash_text_v1(state, "not-null")
+        set state = yaza_db_query_page_hash_text_v1(state, number_text(column.ordinal))
+        set column_index = column_index + 1
+    return state.primary * 2147483629 + state.secondary
+
+fn yaza_db_query_page_validate_plan_v1(plan: YazaSqlBoundPlanV1) -> Result[Boolean, Text]:
+    if plan.right_table_id != 0: return err("YDBv1 query pages currently require a single-table SELECT")
+    if plan.distinct or list_count(plan.group_by_columns) > 0 or plan.having_root >= 0:
+        return err("YDBv1 query pages require a non-aggregate SELECT without DISTINCT, GROUP BY, or HAVING")
+    if list_count(plan.subqueries) > 0: return err("YDBv1 query pages do not yet materialize subqueries")
+    var projection_index: Number = 0
+    while projection_index < list_count(plan.projections):
+        if list_get(plan.projections, projection_index).aggregate_kind != 0: return err("YDBv1 query pages do not support aggregate projections")
+        set projection_index = projection_index + 1
+    return ok(true)
+
+fn yaza_db_query_page_validate_order_v1(plan: YazaSqlBoundPlanV1, key_ordinals: List[Number]) -> Result[Boolean, Text]:
+    if list_count(plan.order_by) == 0: return ok(true)
+    if list_count(plan.order_by) != list_count(key_ordinals): return err("YDBv1 query pages support ORDER BY only on the complete clustered key")
+    var order_index: Number = 0
+    while order_index < list_count(plan.order_by):
+        let term: YazaSqlBoundOrderTermV1 = list_get(plan.order_by, order_index)
+        if term.descending: return err("YDBv1 query pages support ascending clustered-key order only")
+        if term.projection_ordinal < 0 or term.projection_ordinal >= list_count(plan.projections): return err("YDBv1 query-page ORDER BY projection is outside its bound plan")
+        let projection: YazaSqlBoundProjectionV1 = list_get(plan.projections, term.projection_ordinal)
+        if projection.aggregate_kind != 0 or projection.column_ordinal != list_get(key_ordinals, order_index): return err("YDBv1 query pages support ORDER BY only on the complete clustered key")
+        set order_index = order_index + 1
+    return ok(true)
+
+fn yaza_db_execute_select_page_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], page_size: Number, continuation: Option[YazaDbQueryPageTokenV1]) -> Result[YazaDbQueryPageV1, Text]:
+    if storage.root != wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid): return err("YDBv1 query page storage and WAL handles belong to different databases")
+    if page_size < 1 or page_size > yaza_db_query_page_max_size_v1(): return err("YDBv1 query-page size must be between 1 and 256")
+    let loaded: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(storage.file, storage.header)?
+    let catalog_snapshot: YazaSqlCatalogSnapshotV1 = loaded.sql_snapshot
+    let parsed: YazaSqlSelectAstV3 = yaza_sql_parse_select_v3(source)?
+    let plan: YazaSqlBoundPlanV1 = yaza_sql_bind_select_v1(source, parsed, catalog_snapshot)?
+    let validation: Result[Boolean, Text] = yaza_db_query_page_validate_plan_v1(plan)
+    if not result_is_ok(validation): return err(result_unwrap_error(validation))
+    let table_index: Number = yaza_db_catalog_snapshot_table_index_v1(catalog_snapshot.tables, plan.table_id)
+    if table_index < 0 or table_index >= list_count(loaded.root_page_ids) or table_index >= list_count(loaded.table_schema_versions): return err("YDBv1 query-page table has no persisted root page or schema version")
+    let table_root_page_id: Number = list_get(loaded.root_page_ids, table_index)
+    let table_schema: YazaSqlTableSchemaV1 = list_get(catalog_snapshot.tables, table_index)
+    let table_schema_version: Number = list_get(loaded.table_schema_versions, table_index)
+    let schema_fingerprint: Number = yaza_db_query_page_schema_fingerprint_v1(table_schema, table_schema_version)
+    let prepared: List[YazaSqlValueV1] = yaza_db_query_prepare_filter_v1(plan, catalog_snapshot.version, table_schema.columns, parameters)?
+    let fingerprint: Number = yaza_db_query_page_fingerprint_v1(source, parameters)?
+    var snapshot_ts: Number = storage.header.next_commit_ts - 1
+    var start_after_key: Bytes = bytes_from_text("")
+    if option_is_some(continuation):
+        let token: YazaDbQueryPageTokenV1 = option_unwrap(continuation)
+        if token.version != 1 or bytes_length(token.db_uuid) != 16 or not bytes_equal(token.db_uuid, storage.header.db_uuid): return err("YDBv1 query-page token belongs to a different database or token version")
+        if token.schema_fingerprint != schema_fingerprint or token.table_id != plan.table_id: return err("YDBv1 query-page token is stale for the current table schema")
+        if token.snapshot_ts < 1 or token.snapshot_ts > storage.header.next_commit_ts - 1: return err("YDBv1 query-page token snapshot is outside the committed range")
+        if token.query_fingerprint != fingerprint: return err("YDBv1 query-page token does not match this SQL source and bind set")
+        if bytes_length(token.last_key) < 1 or bytes_length(token.last_key) > 2048: return err("YDBv1 query-page token has an invalid clustered-key cursor")
+        set snapshot_ts = token.snapshot_ts
+        set start_after_key = token.last_key
+    let empty_transactions: List[YazaDbTxnStatusV1] = List[YazaDbTxnStatusV1]()
+    let table_exists: Boolean = yaza_db_query_table_exists_at_snapshot_v1(storage, wal, plan.table_id, snapshot_ts, 0, empty_transactions)?
+    if not table_exists: return err("YDBv1 query-page table did not exist at its fixed snapshot")
+    let catalog: YazaDbCatalogRootV1 = yaza_db_catalog_storage_read_root_v1(storage.file, storage.header)?
+    let key_ordinals: List[Number] = yaza_db_query_clustered_key_ordinals_v1(storage.file, storage.header, catalog, plan.table_id, table_root_page_id, catalog_snapshot.version, list_count(table_schema.columns))?
+    let order_validation: Result[Boolean, Text] = yaza_db_query_page_validate_order_v1(plan, key_ordinals)
+    if not result_is_ok(order_validation): return err(result_unwrap_error(order_validation))
+    var rows_emitted: Number = 0
+    if option_is_some(continuation): set rows_emitted = option_unwrap(continuation).rows_emitted
+    if rows_emitted < 0 or rows_emitted > 9223372036854775807 - page_size: return err("YDBv1 query-page token emitted-row counter is invalid")
+    if plan.has_limit and rows_emitted > plan.limit: return err("YDBv1 query-page token has passed the SQL LIMIT")
+    if plan.has_limit and option_is_some(continuation) and rows_emitted >= plan.limit: return err("YDBv1 query-page continuation is already at its SQL LIMIT")
+    var returned_row_limit: Number = page_size
+    var scan_limit: Number = page_size + 1
+    if plan.has_limit:
+        let remaining_limit: Number = plan.limit - rows_emitted
+        if remaining_limit <= page_size:
+            set returned_row_limit = remaining_limit
+            set scan_limit = remaining_limit
+    var scan: YazaDbBtreeScanResultV1 = YazaDbBtreeScanResultV1(List[YazaDbRowV1](), 0, 0, none)
+    if scan_limit > 0 and plan.where_root >= 0:
+        set scan = yaza_db_btree_read_rows_after_key_where_at_snapshot_v1(storage.root, wal.db_uuid, wal.next_lsn, storage.file, storage.header, table_root_page_id, table_schema.columns, table_schema_version, key_ordinals, snapshot_ts, 0, empty_transactions, start_after_key, scan_limit, plan, prepared, List[YazaSqlSubqueryValuesV1]())?
+    elif scan_limit > 0:
+        set scan = yaza_db_btree_read_rows_after_key_at_snapshot_v1(storage.root, wal.db_uuid, wal.next_lsn, storage.file, storage.header, table_root_page_id, table_schema.columns, table_schema_version, key_ordinals, snapshot_ts, 0, empty_transactions, start_after_key, scan_limit)?
+    let stored_rows: List[YazaDbRowV1] = scan.rows
+    var has_more: Boolean = list_count(stored_rows) > returned_row_limit
+    if plan.has_limit and rows_emitted + returned_row_limit >= plan.limit: set has_more = false
+    let memory_table: YazaSqlMemoryTableV1 = yaza_db_query_memory_table_v1(plan.table_id, catalog_snapshot.version, table_schema.columns, stored_rows)?
+    var executed: YazaSqlQueryResultV1 = YazaSqlQueryResultV1(List[YazaSqlBoundProjectionV1](), List[List[YazaSqlValueV1]](), 0, 0, 0, 0)
+    if plan.where_root >= 0:
+        set executed = yaza_sql_execute_memory_with_scan_v1(plan, memory_table, parameters, List[YazaSqlSubqueryValuesV1](), scan.work_units, 0, true)?
+    else:
+        set executed = yaza_sql_execute_memory_with_subqueries_v1(plan, memory_table, parameters, List[YazaSqlSubqueryValuesV1]())?
+    if list_count(executed.rows) != list_count(stored_rows): return err("YDBv1 keyset scan and SQL projection returned different row counts")
+    let page_rows_result: Result[List[List[YazaSqlValueV1]], Text] = list_try_new()
+    if not result_is_ok(page_rows_result): return err("YDBv1 query page could not allocate its bounded result rows")
+    let page_rows: List[List[YazaSqlValueV1]] = result_unwrap(page_rows_result)
+    if not list_try_reserve(page_rows, returned_row_limit): return err("YDBv1 query page could not reserve its bounded result rows")
+    var row_index: Number = 0
+    while row_index < returned_row_limit and row_index < list_count(executed.rows):
+        if not list_try_push(page_rows, list_get(executed.rows, row_index)): return err("YDBv1 query page could not append a projected row")
+        set row_index = row_index + 1
+    var next_token: Option[YazaDbQueryPageTokenV1] = none
+    if has_more:
+        if list_count(stored_rows) != returned_row_limit + 1: return err("YDBv1 query page scan violated its one-row lookahead bound")
+        let last_row: YazaDbRowV1 = list_get(stored_rows, returned_row_limit - 1)
+        let last_key: Bytes = yaza_db_key_encode_composite_v1(last_row.values, last_row.nulls, table_schema.columns, key_ordinals)?
+        let token: YazaDbQueryPageTokenV1 = YazaDbQueryPageTokenV1(1, storage.header.db_uuid, schema_fingerprint, plan.table_id, snapshot_ts, fingerprint, rows_emitted + returned_row_limit, last_key)
+        set next_token = some(token)
+    let page_result: YazaSqlQueryResultV1 = YazaSqlQueryResultV1(executed.columns, page_rows, executed.work_units, executed.auxiliary_rows, executed.auxiliary_cells, executed.auxiliary_text_bytes)
+    return ok(YazaDbQueryPageV1(page_result, snapshot_ts, has_more, next_token))

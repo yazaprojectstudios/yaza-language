@@ -1,0 +1,228 @@
+# Schema binding for the bounded INSERT ... VALUES AST.
+# This stage resolves columns and parameter types; row construction and storage
+# mutation are performed by later execution layers.
+use "sql_insert_v1"
+use "sql_binder_v1"
+use "sql_executor_v1"
+use "./sql_decimal_v1"
+use "./sql_date_v1"
+use "./sql_uuid_v1"
+use "./sql_temporal_v1"
+
+shape YazaSqlBoundInsertCellV1:
+    column_ordinal: Number
+    type_id: Number
+    literal_kind: Number
+    parameter_ordinal: Number
+    start_byte: Number
+    end_byte: Number
+    is_null_literal: Boolean
+
+shape YazaSqlBoundInsertRowV1:
+    cells: List[YazaSqlBoundInsertCellV1]
+
+shape YazaSqlBoundInsertPlanV1:
+    version: Number
+    catalog_version: Number
+    table_id: Number
+    source: Text
+    columns: List[YazaSqlColumnSchemaV1]
+    column_defaults: List[Text]
+    input_column_ordinals: List[Number]
+    rows: List[YazaSqlBoundInsertRowV1]
+    parameters: List[YazaSqlBoundParameterV1]
+    parameter_style: Number
+
+fn yaza_sql_bind_insert_column_ordinal_v1(source: Text, table: YazaSqlTableSchemaV1, name: YazaSqlNameV2) -> Result[Number, Text]:
+    if not yaza_sql_bind_v1_name_valid(source, name): return err("SQL INSERT binder received an invalid column name span")
+    if name.part_count != 1 or name.wildcard: return err(yaza_sql_bind_v1_error(source, name.start_byte, "SQL INSERT binder supports unqualified column names only"))
+    var found_ordinal: Number = -1
+    var ordinal: Number = 0
+    while ordinal < list_count(table.columns):
+        let column: YazaSqlColumnSchemaV1 = list_get(table.columns, ordinal)
+        if yaza_sql_bind_v1_identifier_matches(source, name.first_token, column.name):
+            if found_ordinal >= 0: return err(yaza_sql_bind_v1_error(source, name.start_byte, "SQL INSERT binder found an ambiguous column name"))
+            set found_ordinal = ordinal
+        set ordinal = ordinal + 1
+    if found_ordinal < 0: return err(yaza_sql_bind_v1_error(source, name.start_byte, "SQL INSERT binder could not resolve column"))
+    return ok(found_ordinal)
+
+fn yaza_sql_bind_insert_integer_literal_v1(source: Text, token: YazaSqlTokenV1) -> Boolean:
+    if token.start_byte < 0 or token.end_byte <= token.start_byte or token.end_byte > text_length(source): return false
+    var offset: Number = token.start_byte
+    if text_byte(source, offset) == 45 or text_byte(source, offset) == 43: set offset = offset + 1
+    if offset >= token.end_byte: return false
+    while offset < token.end_byte:
+        let byte: Number = text_byte(source, offset)
+        if byte < 48 or byte > 57: return false
+        set offset = offset + 1
+    return true
+
+fn yaza_sql_bind_insert_literal_v1(source: Text, token: YazaSqlTokenV1, column: YazaSqlColumnSchemaV1) -> Result[Boolean, Text]:
+    if not yaza_sql_bind_v1_token_valid(source, token): return err("SQL INSERT binder received an invalid literal span")
+    if yaza_sql_bind_v1_keyword(source, token, "DEFAULT"): return ok(true)
+    if token.kind == 3:
+        let literal: Text = text_slice(source, token.start_byte, token.end_byte - token.start_byte)
+        if column.type_id == 2 or column.type_id == 3 or column.type_id == 4:
+            if not yaza_sql_bind_insert_integer_literal_v1(source, token): return err(yaza_sql_bind_v1_error(source, token.start_byte, "SQL INSERT integer column requires an integer literal"))
+            let parsed: Result[Number, Text] = number_try_parse(literal)
+            if not result_is_ok(parsed): return err(yaza_sql_bind_v1_error(source, token.start_byte, "SQL INSERT integer literal is out of range"))
+            let value: Number = result_unwrap(parsed)
+            if column.type_id == 2 and (value < -32768 or value > 32767): return err(yaza_sql_bind_v1_error(source, token.start_byte, "SQL INSERT SMALLINT literal is out of range"))
+            if column.type_id == 3 and (value < -2147483648 or value > 2147483647): return err(yaza_sql_bind_v1_error(source, token.start_byte, "SQL INSERT INTEGER literal is out of range"))
+            return ok(true)
+        if column.type_id == 6:
+            let parsed_float: Result[Float64, Text] = float64_try_parse(literal)
+            if not result_is_ok(parsed_float): return err(yaza_sql_bind_v1_error(source, token.start_byte, "SQL INSERT DOUBLE literal is invalid or out of range"))
+            return ok(true)
+        if column.type_id == 10:
+            let parsed_decimal: Result[YazaSqlDecimalV1, Text] = yaza_sql_decimal_parse_v1(literal, column.precision, column.scale)
+            if not result_is_ok(parsed_decimal): return err(yaza_sql_bind_v1_error(source, token.start_byte, "SQL INSERT DECIMAL literal is invalid, inexact at the declared scale, or out of range"))
+            return ok(true)
+        return err(yaza_sql_bind_v1_error(source, token.start_byte, "SQL INSERT numeric literal does not match the target column"))
+    if token.kind == 4:
+        if (column.type_id != 9 and column.type_id != 11 and column.type_id != 12 and column.type_id != 13 and column.type_id != 14 and column.type_id != 15) or token.end_byte - token.start_byte < 2 or text_byte(source, token.start_byte) != 39 or text_byte(source, token.end_byte - 1) != 39:
+            return err(yaza_sql_bind_v1_error(source, token.start_byte, "SQL INSERT text literal does not match the target column"))
+        if column.type_id == 11:
+            let decoded_date: Text = yaza_sql_decode_text_literal_v1(source, token.start_byte, token.end_byte)?
+            let parsed_date: Number = yaza_sql_date_parse_v1(decoded_date)?
+        elif column.type_id == 12:
+            let uuid_literal: Text = text_slice(source, token.start_byte + 1, token.end_byte - token.start_byte - 2)
+            let parsed_uuid: Bytes = yaza_sql_uuid_parse_v1(uuid_literal)?
+        elif column.type_id == 13:
+            let time_literal: Text = yaza_sql_decode_text_literal_v1(source, token.start_byte, token.end_byte)?
+            let parsed_time: Number = yaza_sql_time_parse_v1(time_literal)?
+        elif column.type_id == 14:
+            let timestamp_literal: Text = yaza_sql_decode_text_literal_v1(source, token.start_byte, token.end_byte)?
+            let parsed_timestamp: Number = yaza_sql_timestamp_parse_v1(timestamp_literal)?
+        elif column.type_id == 15:
+            let timestamp_literal: Text = yaza_sql_decode_text_literal_v1(source, token.start_byte, token.end_byte)?
+            let parsed_timestamp: Number = yaza_sql_timestamptz_parse_v1(timestamp_literal)?
+        return ok(true)
+    if token.kind == 8:
+        if column.type_id != 16: return err(yaza_sql_bind_v1_error(source, token.start_byte, "SQL INSERT BLOB literal does not match the target column"))
+        let decoded_blob: Bytes = yaza_sql_decode_blob_literal_v1(source, token.start_byte, token.end_byte)?
+        let validated_blob: YazaSqlValueV1 = yaza_sql_value_blob_v1(decoded_blob)?
+        return ok(true)
+    if yaza_sql_bind_v1_keyword(source, token, "TRUE") or yaza_sql_bind_v1_keyword(source, token, "FALSE"):
+        if column.type_id != 1: return err(yaza_sql_bind_v1_error(source, token.start_byte, "SQL INSERT Boolean literal does not match the target column"))
+        return ok(true)
+    if yaza_sql_bind_v1_keyword(source, token, "NULL"):
+        if not column.nullable: return err(yaza_sql_bind_v1_error(source, token.start_byte, "SQL INSERT NULL literal targets a NOT NULL column"))
+        return ok(true)
+    return err(yaza_sql_bind_v1_error(source, token.start_byte, "SQL INSERT value is not a supported literal"))
+
+fn yaza_sql_bind_insert_v1(source: Text, insert: YazaSqlInsertAstV1, catalog: YazaSqlCatalogSnapshotV1) -> Result[YazaSqlBoundInsertPlanV1, Text]:
+    if insert.version != 1 or not yaza_sql_bind_v1_span_valid(source, insert.start_byte, insert.end_byte): return err("SQL INSERT binder received an invalid syntax tree")
+    if catalog.version <= 0 or list_count(catalog.tables) == 0 or list_count(catalog.tables) > 1024: return err("SQL INSERT binder requires a bounded, versioned catalog snapshot")
+    if not yaza_sql_bind_v1_name_valid(source, insert.table_name) or insert.table_name.part_count != 1: return err(yaza_sql_bind_v1_error(source, insert.table_name.start_byte, "SQL INSERT binder supports one-part table names only"))
+    if list_count(insert.rows) == 0 or list_count(insert.rows) > 1024 or insert.values_per_row < 1 or insert.values_per_row > 1024: return err("SQL INSERT binder received row metadata outside its bounds")
+
+    var table_index: Number = -1
+    var candidate_index: Number = 0
+    while candidate_index < list_count(catalog.tables):
+        let candidate: YazaSqlTableSchemaV1 = list_get(catalog.tables, candidate_index)
+        if candidate.table_id <= 0 or text_length(candidate.name) == 0: return err("SQL INSERT binder received an invalid catalog table")
+        var prior_index: Number = 0
+        while prior_index < candidate_index:
+            if list_get(catalog.tables, prior_index).table_id == candidate.table_id: return err("SQL INSERT binder catalog contains duplicate table IDs")
+            set prior_index = prior_index + 1
+        if yaza_sql_bind_v1_identifier_matches(source, insert.table_name.first_token, candidate.name):
+            if table_index >= 0: return err(yaza_sql_bind_v1_error(source, insert.table_name.start_byte, "SQL INSERT binder found an ambiguous table name"))
+            set table_index = candidate_index
+        set candidate_index = candidate_index + 1
+    if table_index < 0: return err(yaza_sql_bind_v1_error(source, insert.table_name.start_byte, "SQL INSERT binder could not resolve table"))
+    let table: YazaSqlTableSchemaV1 = list_get(catalog.tables, table_index)
+    if table.table_id <= 0 or list_count(table.columns) == 0 or list_count(table.columns) > 1024: return err("SQL INSERT binder table schema is outside its bounds")
+    let defaults_created: Result[List[Text], Text] = list_try_new()
+    if not result_is_ok(defaults_created): return err("SQL INSERT binder could not allocate column DEFAULT metadata")
+    let column_defaults: List[Text] = result_unwrap(defaults_created)
+    if not list_try_reserve(column_defaults, list_count(table.columns)): return err("SQL INSERT binder could not reserve column DEFAULT metadata")
+    var schema_index: Number = 0
+    while schema_index < list_count(table.columns):
+        let column: YazaSqlColumnSchemaV1 = list_get(table.columns, schema_index)
+        if column.ordinal != schema_index or text_length(column.name) == 0 or not yaza_sql_executor_type_supported_v1(column.type_id): return err("SQL INSERT binder received an invalid or unsupported catalog column")
+        let default_expression: Text = yaza_sql_catalog_default_expression_v1(catalog, table.table_id, schema_index)
+        if text_length(default_expression) > 4096 or not list_try_push(column_defaults, default_expression): return err("SQL INSERT binder received invalid or oversized catalog default metadata")
+        set schema_index = schema_index + 1
+
+    let ordinals_created: Result[List[Number], Text] = list_try_new()
+    let parameters_created: Result[List[YazaSqlBoundParameterV1], Text] = list_try_new()
+    let rows_created: Result[List[YazaSqlBoundInsertRowV1], Text] = list_try_new()
+    if not result_is_ok(ordinals_created) or not result_is_ok(parameters_created) or not result_is_ok(rows_created): return err("SQL INSERT binder could not allocate plan metadata")
+    let input_ordinals: List[Number] = result_unwrap(ordinals_created)
+    let parameters: List[YazaSqlBoundParameterV1] = result_unwrap(parameters_created)
+    let bound_rows: List[YazaSqlBoundInsertRowV1] = result_unwrap(rows_created)
+    if not list_try_reserve(input_ordinals, insert.values_per_row) or not list_try_reserve(parameters, insert.values_per_row) or not list_try_reserve(bound_rows, list_count(insert.rows)): return err("SQL INSERT binder could not reserve plan metadata")
+
+    if insert.has_column_list:
+        if list_count(insert.columns) != insert.values_per_row: return err("SQL INSERT binder column count does not match VALUES width")
+        var input_index: Number = 0
+        while input_index < list_count(insert.columns):
+            let column_name: YazaSqlNameV2 = list_get(insert.columns, input_index)
+            let ordinal: Number = yaza_sql_bind_insert_column_ordinal_v1(source, table, column_name)?
+            var prior_column: Number = 0
+            while prior_column < list_count(input_ordinals):
+                if list_get(input_ordinals, prior_column) == ordinal: return err(yaza_sql_bind_v1_error(source, column_name.start_byte, "SQL INSERT column list repeats a column"))
+                set prior_column = prior_column + 1
+            if not list_try_push(input_ordinals, ordinal): return err("SQL INSERT binder could not append an input column")
+            set input_index = input_index + 1
+    else:
+        if insert.values_per_row != list_count(table.columns): return err(yaza_sql_bind_v1_error(source, insert.start_byte, "SQL INSERT without a column list must provide every table column"))
+        var input_index: Number = 0
+        while input_index < list_count(table.columns):
+            if not list_try_push(input_ordinals, input_index): return err("SQL INSERT binder could not append an input column")
+            set input_index = input_index + 1
+
+    set schema_index = 0
+    while schema_index < list_count(table.columns):
+        var supplied: Boolean = false
+        var input_index: Number = 0
+        while input_index < list_count(input_ordinals):
+            if list_get(input_ordinals, input_index) == schema_index: set supplied = true
+            set input_index = input_index + 1
+        let column: YazaSqlColumnSchemaV1 = list_get(table.columns, schema_index)
+        if not supplied and text_length(list_get(column_defaults, schema_index)) == 0 and not column.nullable: return err(yaza_sql_bind_v1_error(source, insert.start_byte, "SQL INSERT omitted a NOT NULL column without a supported DEFAULT"))
+        set schema_index = schema_index + 1
+
+    var parameter_style: Number = 0
+    var row_index: Number = 0
+    while row_index < list_count(insert.rows):
+        let source_row: List[YazaSqlTokenV1] = list_get(insert.rows, row_index)
+        if list_count(source_row) != list_count(input_ordinals): return err("SQL INSERT binder row width does not match the target columns")
+        let cells_created: Result[List[YazaSqlBoundInsertCellV1], Text] = list_try_new()
+        if not result_is_ok(cells_created): return err("SQL INSERT binder could not allocate a bound row")
+        let cells: List[YazaSqlBoundInsertCellV1] = result_unwrap(cells_created)
+        if not list_try_reserve(cells, list_count(source_row)): return err("SQL INSERT binder could not reserve a bound row")
+        var cell_index: Number = 0
+        while cell_index < list_count(source_row):
+            let token: YazaSqlTokenV1 = list_get(source_row, cell_index)
+            let column_ordinal: Number = list_get(input_ordinals, cell_index)
+            let column: YazaSqlColumnSchemaV1 = list_get(table.columns, column_ordinal)
+            var parameter_ordinal: Number = -1
+            var is_null_literal: Boolean = false
+            var literal_kind: Number = token.kind
+            if token.kind == 5:
+                let registered: Number = yaza_sql_bind_v1_register_parameter(source, token, column.type_id, parameters, parameter_style)?
+                set parameter_ordinal = registered
+                let first_byte: Number = text_byte(source, token.start_byte)
+                if first_byte == 63: set parameter_style = 1
+                elif first_byte == 36: set parameter_style = 2
+                else: set parameter_style = 3
+            else:
+                let literal_valid: Boolean = yaza_sql_bind_insert_literal_v1(source, token, column)?
+                if yaza_sql_bind_v1_keyword(source, token, "NULL"): set is_null_literal = true
+                if yaza_sql_bind_v1_keyword(source, token, "DEFAULT"): set literal_kind = 9
+            let cell: YazaSqlBoundInsertCellV1 = YazaSqlBoundInsertCellV1(column_ordinal, column.type_id, literal_kind, parameter_ordinal, token.start_byte, token.end_byte, is_null_literal)
+            if not list_try_push(cells, cell): return err("SQL INSERT binder could not append a bound value")
+            set cell_index = cell_index + 1
+        if not list_try_push(bound_rows, YazaSqlBoundInsertRowV1(cells)): return err("SQL INSERT binder could not append a bound row")
+        set row_index = row_index + 1
+
+    var parameter_index: Number = 0
+    while parameter_index < list_count(parameters):
+        let parameter: YazaSqlBoundParameterV1 = list_get(parameters, parameter_index)
+        if parameter.type_id < 1 or not yaza_sql_executor_type_supported_v1(parameter.type_id): return err("SQL INSERT binder parameter has an unsupported target type")
+        if parameter.style == 2 and parameter.ordinal != parameter_index: return err(yaza_sql_bind_v1_error(source, parameter.first_start_byte, "SQL binder positional parameter numbers must be contiguous from $1"))
+        set parameter_index = parameter_index + 1
+    return ok(YazaSqlBoundInsertPlanV1(1, catalog.version, table.table_id, source, table.columns, column_defaults, input_ordinals, bound_rows, parameters, parameter_style))

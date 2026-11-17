@@ -1,0 +1,209 @@
+use "std/fs"
+use "../yazabase/page_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/checkpoint_v1"
+use "../yazabase/transaction_v1"
+use "../yazabase/row_v1"
+use "../yazabase/sql_binder_v1"
+use "../yazabase/sql_executor_v1"
+use "../yazabase/sql_insert_v1"
+use "../yazabase/sql_insert_bind_v1"
+use "../yazabase/sql_insert_exec_v1"
+use "../yazabase/sql_insert_write_v1"
+use "../yazabase/wal_v1"
+
+fn yazabase_transaction_row_columns_v1() -> List[YazaSqlColumnSchemaV1]:
+    let columns: List[YazaSqlColumnSchemaV1] = List[YazaSqlColumnSchemaV1]()
+    list_push(columns, YazaSqlColumnSchemaV1("id", 4, false, 0, 0, 0, ""))
+    list_push(columns, YazaSqlColumnSchemaV1("name", 9, false, 1, 0, 0, ""))
+    return columns
+
+fn yazabase_transaction_row_values_v1(row_id: Number, name: Text) -> List[YazaSqlValueV1]:
+    let values: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    list_push(values, yaza_sql_executor_value_v1(4, row_id, 0.0, false, ""))
+    list_push(values, yaza_sql_value_text_v1(name))
+    return values
+
+fn yazabase_transaction_row_nulls_v1() -> List[Boolean]:
+    let nulls: List[Boolean] = List[Boolean]()
+    list_push(nulls, false)
+    list_push(nulls, false)
+    return nulls
+
+fn yazabase_transaction_row_key_ordinals_v1() -> List[Number]:
+    let ordinals: List[Number] = List[Number]()
+    list_push(ordinals, 0)
+    return ordinals
+
+fn yazabase_transaction_row_matches_v1(page: Bytes, page_id: Number, columns: List[YazaSqlColumnSchemaV1], expected_id: Number, expected_name: Text, expected_version: Number) -> Result[Boolean, Text]:
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, page_id)?
+    var slot_index: Number = 0
+    while slot_index < header.count:
+        let slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(page, slot_index, page_id)?
+        let row: YazaDbRowV1 = yaza_db_row_decode_v1(slot.payload, columns)?
+        if row.version_ts == expected_version and list_count(row.values) == 2 and list_count(row.nulls) == 2:
+            if not list_get(row.nulls, 0) and not list_get(row.nulls, 1):
+                let actual_id: YazaSqlValueV1 = list_get(row.values, 0)
+                let actual_name: YazaSqlValueV1 = list_get(row.values, 1)
+                if actual_id.integer_value == expected_id and actual_name.text_value == expected_name: return ok(true)
+        set slot_index = slot_index + 1
+    return ok(false)
+
+fn yazabase_transaction_row_has_version_v1(page: Bytes, page_id: Number, columns: List[YazaSqlColumnSchemaV1], expected_txn_id: Number) -> Result[Boolean, Text]:
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, page_id)?
+    var slot_index: Number = 0
+    while slot_index < header.count:
+        let slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(page, slot_index, page_id)?
+        let row: YazaDbRowV1 = yaza_db_row_decode_v1(slot.payload, columns)?
+        if row.version_ts < 0:
+            let decoded_txn_id: Number = yaza_db_row_version_txn_decode_v1(row.version_ts)?
+            if decoded_txn_id == expected_txn_id: return ok(true)
+        set slot_index = slot_index + 1
+    return ok(false)
+
+fn yazabase_transaction_check_v1(root_path: Text) -> Result[Number, Text]:
+    let root: Number = root_open(root_path)?
+    let db_uuid: Bytes = bytes_from_text("txn-writer-uuid1")
+    let initial_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(db_uuid, 0, 1, 1, 0, 2, 1)
+    let storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, "transaction-writer-smoke.ydb", initial_header)?
+    let wal: YazaDbWalLogV1 = yaza_db_wal_log_open_for_v1(root, db_uuid)?
+
+    # Fixture genesis: reserve page 3 as an empty leaf before transaction tests.
+    let bitmap: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, 2)?
+    let claimed: Boolean = yaza_db_bitmap_page_set_allocated_v1(bitmap, 1, true, 0, 2)?
+    if not claimed: return err("YDBv1 transaction fixture could not reserve its leaf page")
+    let bitmap_written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, bitmap)?
+    if bitmap_written != yaza_db_page_size_v1(): return err("YDBv1 transaction fixture could not persist its bitmap")
+    let empty_leaf: Bytes = yaza_db_page_new_v1(3, 0, 1, 0)?
+    let leaf_written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, empty_leaf)?
+    if leaf_written != yaza_db_page_size_v1(): return err("YDBv1 transaction fixture could not persist its leaf")
+
+    let columns: List[YazaSqlColumnSchemaV1] = yazabase_transaction_row_columns_v1()
+    let key_ordinals: List[Number] = yazabase_transaction_row_key_ordinals_v1()
+    let nulls: List[Boolean] = yazabase_transaction_row_nulls_v1()
+    let begun: YazaDbWriteTransactionV1 = yaza_db_write_transaction_begin_v1(storage, wal)?
+    if not yaza_db_write_transaction_tail_fits_v1(begun, 1): return err("YDBv1 transaction tail budget rejected one valid leaf mutation")
+    if yaza_db_write_transaction_tail_fits_v1(begun, 100000): return err("YDBv1 transaction tail budget accepted an impossible pending-write reservation")
+    let over_budget_wal: YazaDbWalLogV1 = YazaDbWalLogV1(begun.wal.root, begun.wal.db_uuid, begun.wal.file, begun.wal.segment_index, begun.wal.segment_base_lsn, 67108864 - 65536 + 1)
+    let over_budget_transaction: YazaDbWriteTransactionV1 = YazaDbWriteTransactionV1(begun.storage, over_budget_wal, begun.txn_id, begun.commit_ts, begun.last_lsn, begun.pending_pages, begun.pending_keys_hex, begun.pending_rows_hex, begun.active)
+    if yaza_db_write_transaction_tail_fits_v1(over_budget_transaction, 0): return err("YDBv1 transaction tail budget accepted a WAL tail beyond the recovery bound")
+    let committed_values: List[YazaSqlValueV1] = yazabase_transaction_row_values_v1(101, "committed-row")
+    let inserted: YazaDbWriteTransactionV1 = yaza_db_write_transaction_insert_row_v1(begun, 3, committed_values, nulls, columns, key_ordinals)?
+    let second_values: List[YazaSqlValueV1] = yazabase_transaction_row_values_v1(103, "committed-row-103")
+    let inserted_second: YazaDbWriteTransactionV1 = yaza_db_write_transaction_insert_row_v1(inserted, 3, second_values, nulls, columns, key_ordinals)?
+    let third_values: List[YazaSqlValueV1] = yazabase_transaction_row_values_v1(104, "committed-row-104")
+    let inserted_third: YazaDbWriteTransactionV1 = yaza_db_write_transaction_insert_row_v1(inserted_second, 3, third_values, nulls, columns, key_ordinals)?
+    let pending_page: Bytes = yaza_db_storage_read_page_v1(inserted_third.storage.file, inserted_third.storage.header, 3)?
+    let pending_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(pending_page, 3)?
+    if pending_header.count != 3: return err("YDBv1 multi-row transaction did not stage all three leaf entries")
+    let pending_row_marked: Boolean = yazabase_transaction_row_has_version_v1(pending_page, 3, columns, 1)?
+    if not pending_row_marked: return err("YDBv1 in-progress row did not carry its transaction tag before COMMIT")
+    let committed: YazaDbWriteCommitV1 = yaza_db_write_transaction_commit_v1(inserted_third)?
+    if committed.txn_id != 1 or committed.commit_ts != 1 or committed.storage.header.next_txn_id != 2 or committed.storage.header.next_commit_ts != 2: return err("YDBv1 transaction commit did not publish its counters")
+    let first_wal_closed: Boolean = yaza_db_wal_log_close_v1(committed.wal)?
+    let first_storage_closed: Boolean = yaza_db_storage_close_v1(committed.storage)?
+    if not first_wal_closed or not first_storage_closed: return err("YDBv1 committed transaction handles could not close")
+
+    let recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "transaction-writer-smoke.ydb")?
+    let committed_page: Bytes = yaza_db_storage_read_page_v1(recovered.storage.file, recovered.storage.header, 3)?
+    let committed_row_ok: Boolean = yazabase_transaction_row_matches_v1(committed_page, 3, columns, 101, "committed-row", 1)?
+    let second_committed_row_ok: Boolean = yazabase_transaction_row_matches_v1(committed_page, 3, columns, 103, "committed-row-103", 1)?
+    let third_committed_row_ok: Boolean = yazabase_transaction_row_matches_v1(committed_page, 3, columns, 104, "committed-row-104", 1)?
+    if not committed_row_ok or not second_committed_row_ok or not third_committed_row_ok: return err("YDBv1 transaction commit did not preserve every row in the transaction")
+
+    # Simulate a process crash after the page mutation is durable but before COMMIT.
+    let loser: YazaDbWriteTransactionV1 = yaza_db_write_transaction_begin_v1(recovered.storage, recovered.wal)?
+    let loser_values: List[YazaSqlValueV1] = yazabase_transaction_row_values_v1(102, "loser-row")
+    let loser_updated: YazaDbWriteTransactionV1 = yaza_db_write_transaction_insert_row_v1(loser, 3, loser_values, nulls, columns, key_ordinals)?
+    let loser_page: Bytes = yaza_db_storage_read_page_v1(loser_updated.storage.file, loser_updated.storage.header, 3)?
+    let loser_row_marked: Boolean = yazabase_transaction_row_has_version_v1(loser_page, 3, columns, 2)?
+    if not loser_row_marked: return err("YDBv1 loser row did not carry its in-progress transaction tag")
+    let loser_wal_closed: Boolean = yaza_db_wal_log_close_v1(loser_updated.wal)?
+    let loser_storage_closed: Boolean = yaza_db_storage_close_v1(loser_updated.storage)?
+    if not loser_wal_closed or not loser_storage_closed: return err("YDBv1 loser transaction handles could not close")
+    let undone: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "transaction-writer-smoke.ydb")?
+    let undone_page: Bytes = yaza_db_storage_read_page_v1(undone.storage.file, undone.storage.header, 3)?
+    let committed_after_undo: Boolean = yazabase_transaction_row_matches_v1(undone_page, 3, columns, 101, "committed-row", 1)?
+    let final_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(undone_page, 3)?
+    if not committed_after_undo: return err("YDBv1 loser undo damaged the committed row")
+    if final_header.count != 3: return err("YDBv1 startup recovery retained an uncommitted row or damaged committed rows")
+    if undone.storage.header.next_txn_id != 3 or undone.storage.header.next_commit_ts != 2: return err("YDBv1 recovery published invalid transaction counters")
+    let committed_version_loser: YazaDbWriteTransactionV1 = yaza_db_write_transaction_begin_v1(undone.storage, undone.wal)?
+    let committed_version_values: List[YazaSqlValueV1] = yazabase_transaction_row_values_v1(105, "fast-row-105")
+    let committed_version_insert: YazaDbWriteTransactionV1 = yaza_db_write_transaction_insert_committed_row_v1(committed_version_loser, 3, committed_version_values, nulls, columns, key_ordinals)?
+    if list_count(committed_version_insert.pending_pages) != 0 or list_count(committed_version_insert.pending_keys_hex) != 0 or list_count(committed_version_insert.pending_rows_hex) != 0: return err("YDBv1 committed-version insert retained redundant COMMIT-stamp metadata")
+    let committed_version_page: Bytes = yaza_db_storage_read_page_v1(committed_version_insert.storage.file, committed_version_insert.storage.header, 3)?
+    let committed_version_visible_before_commit: Boolean = yazabase_transaction_row_matches_v1(committed_version_page, 3, columns, 105, "fast-row-105", 2)?
+    if not committed_version_visible_before_commit: return err("YDBv1 SQL fast insert did not store its reserved commit timestamp")
+    let committed_version_wal_closed: Boolean = yaza_db_wal_log_close_v1(committed_version_insert.wal)?
+    let committed_version_storage_closed: Boolean = yaza_db_storage_close_v1(committed_version_insert.storage)?
+    if not committed_version_wal_closed or not committed_version_storage_closed: return err("YDBv1 SQL fast loser handles could not close")
+    let committed_version_undo: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "transaction-writer-smoke.ydb")?
+    let committed_version_undo_page: Bytes = yaza_db_storage_read_page_v1(committed_version_undo.storage.file, committed_version_undo.storage.header, 3)?
+    let committed_version_loser_remains: Boolean = yazabase_transaction_row_matches_v1(committed_version_undo_page, 3, columns, 105, "fast-row-105", 2)?
+    let committed_version_undo_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(committed_version_undo_page, 3)?
+    if committed_version_loser_remains or committed_version_undo_header.count != 3: return err("YDBv1 recovery retained a positive-timestamp SQL row without COMMIT")
+    if committed_version_undo.storage.header.next_txn_id != 4 or committed_version_undo.storage.header.next_commit_ts != 2: return err("YDBv1 positive-timestamp loser recovery published invalid counters")
+    let wal_end: Number = committed_version_undo.wal.next_lsn
+    let checkpoint_lsn: Number = committed_version_undo.storage.header.checkpoint_lsn
+    let committed_version_undo_wal_closed: Boolean = yaza_db_wal_log_close_v1(committed_version_undo.wal)?
+    let committed_version_undo_storage_closed: Boolean = yaza_db_storage_close_v1(committed_version_undo.storage)?
+    if not committed_version_undo_wal_closed or not committed_version_undo_storage_closed: return err("YDBv1 positive-timestamp recovery handles could not close")
+
+    let reopened: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "transaction-writer-smoke.ydb")?
+    if reopened.applied_checkpoint_count != 0 or reopened.storage.header.checkpoint_lsn != checkpoint_lsn or reopened.wal.next_lsn != wal_end: return err("YDBv1 write transaction recovery was not idempotent")
+    let reopened_wal_closed: Boolean = yaza_db_wal_log_close_v1(reopened.wal)?
+    let reopened_storage_closed: Boolean = yaza_db_storage_close_v1(reopened.storage)?
+    if not reopened_wal_closed or not reopened_storage_closed: return err("YDBv1 idempotence handles could not close")
+
+    let sql_insert_cases: Number = yazabase_transaction_sql_insert_check_v1(root)?
+    if sql_insert_cases != 1: return err("YDBv1 SQL INSERT write fixture reported an invalid case count")
+
+    let root_closed: Boolean = close(root)?
+    if not root_closed: return err("YDBv1 transaction fixture root could not close")
+    return ok(5)
+
+fn yazabase_transaction_sql_insert_catalog_v1() -> YazaSqlCatalogSnapshotV1:
+    let tables: List[YazaSqlTableSchemaV1] = List[YazaSqlTableSchemaV1]()
+    list_push(tables, YazaSqlTableSchemaV1(5, "items", yazabase_transaction_row_columns_v1()))
+    return YazaSqlCatalogSnapshotV1(7, tables, List[YazaSqlColumnDefaultV1]())
+
+fn yazabase_transaction_sql_insert_plan_v1(source: Text, catalog: YazaSqlCatalogSnapshotV1) -> Result[YazaSqlBoundInsertPlanV1, Text]:
+    let parsed: Result[YazaSqlInsertAstV1, Text] = yaza_sql_parse_insert_v1(source)
+    if not result_is_ok(parsed): return err(result_unwrap_error(parsed))
+    return yaza_sql_bind_insert_v1(source, result_unwrap(parsed), catalog)
+
+fn yazabase_transaction_sql_insert_materialized_v1(source: Text, catalog: YazaSqlCatalogSnapshotV1) -> Result[YazaSqlInsertMaterializedV1, Text]:
+    let plan: YazaSqlBoundInsertPlanV1 = yazabase_transaction_sql_insert_plan_v1(source, catalog)?
+    let parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    return yaza_sql_materialize_insert_v1(plan, parameters)
+
+fn yazabase_transaction_sql_insert_check_v1(root: Number) -> Result[Number, Text]:
+    let opened: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "transaction-writer-smoke.ydb")?
+    let catalog: YazaSqlCatalogSnapshotV1 = yazabase_transaction_sql_insert_catalog_v1()
+    let key_ordinals: List[Number] = yazabase_transaction_row_key_ordinals_v1()
+    let duplicate_source: Text = "INSERT INTO items VALUES (107, 'duplicate-a'), (107, 'duplicate-b')"
+    let duplicate_batch: YazaSqlInsertMaterializedV1 = yazabase_transaction_sql_insert_materialized_v1(duplicate_source, catalog)?
+    let duplicate_result: Result[YazaDbWriteCommitV1, Text] = yaza_db_sql_insert_write_v1(opened.storage, opened.wal, 3, key_ordinals, duplicate_batch)
+    if result_is_ok(duplicate_result): return err("YDBv1 SQL INSERT preflight accepted a duplicate key within the batch")
+
+    let source: Text = "INSERT INTO items VALUES (105, 'sql''quote'), (106, 'sql-row-106')"
+    let batch: YazaSqlInsertMaterializedV1 = yazabase_transaction_sql_insert_materialized_v1(source, catalog)?
+    let committed: YazaDbWriteCommitV1 = yaza_db_sql_insert_write_v1(opened.storage, opened.wal, 3, key_ordinals, batch)?
+    let page: Bytes = yaza_db_storage_read_page_v1(committed.storage.file, committed.storage.header, 3)?
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, 3)?
+    if header.count != 5 or committed.txn_id != 4 or committed.commit_ts != 2: return err("YDBv1 SQL INSERT batch did not commit both rows atomically")
+    let first_sql_row: Boolean = yazabase_transaction_row_matches_v1(page, 3, yazabase_transaction_row_columns_v1(), 105, "sql'quote", 2)?
+    let second_sql_row: Boolean = yazabase_transaction_row_matches_v1(page, 3, yazabase_transaction_row_columns_v1(), 106, "sql-row-106", 2)?
+    if not first_sql_row or not second_sql_row: return err("YDBv1 SQL INSERT did not persist the decoded rows")
+    let wal_closed: Boolean = yaza_db_wal_log_close_v1(committed.wal)?
+    let storage_closed: Boolean = yaza_db_storage_close_v1(committed.storage)?
+    if not wal_closed or not storage_closed: return err("YDBv1 SQL INSERT writer handles could not close")
+    return ok(1)
+
+start:
+    let outcome: Result[Number, Text] = yazabase_transaction_check_v1(arg(1))
+    if result_is_ok(outcome):
+        say "yazabase-transaction-v1-ok cases=" + number_text(result_unwrap(outcome))
+    else:
+        say result_unwrap_error(outcome)

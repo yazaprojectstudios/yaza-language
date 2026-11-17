@@ -1,0 +1,85 @@
+use "../yazabase/sql_binder_v1"
+use "../yazabase/sql_executor_v1"
+use "../yazabase/sql_join_v1"
+use "../yazabase/sql_parser_v3"
+use "../yazabase/sql_set_v1"
+use "../yazabase/query_v1"
+
+fn variable_width_budget_id_v1() -> YazaSqlValueV1:
+    return YazaSqlValueV1(4, 1, 0.0, false, "", bytes_empty(), false, -1, -1, false)
+
+fn variable_width_budget_value_v1(blob: Bytes) -> YazaSqlValueV1:
+    return result_unwrap(yaza_sql_value_blob_v1(blob))
+
+fn variable_width_budget_binder_v1(source: Text, catalog: YazaSqlCatalogSnapshotV1) -> Result[YazaSqlBoundPlanV1, Text]:
+    let parsed: YazaSqlSelectAstV3 = yaza_sql_parse_select_v3(source)?
+    return yaza_sql_bind_select_v1(source, parsed, catalog)
+
+fn variable_width_budget_executor_counts_blob_v1(blob_value: YazaSqlValueV1) -> Boolean:
+    let columns: List[YazaSqlColumnSchemaV1] = [YazaSqlColumnSchemaV1("id", 4, false, 0, 0, 0, ""), YazaSqlColumnSchemaV1("payload", 16, false, 1, 0, 0, "")]
+    let catalog: YazaSqlCatalogSnapshotV1 = YazaSqlCatalogSnapshotV1(11, [YazaSqlTableSchemaV1(5, "blob_rows", columns)], List[YazaSqlColumnDefaultV1]())
+    let source: Text = "SELECT payload FROM blob_rows"
+    let bound: Result[YazaSqlBoundPlanV1, Text] = variable_width_budget_binder_v1(source, catalog)
+    if not result_is_ok(bound):
+        say "executor bind failed: " + result_unwrap_error(bound)
+        return false
+    let rows: List[List[YazaSqlValueV1]] = [[variable_width_budget_id_v1(), blob_value], [variable_width_budget_id_v1(), blob_value]]
+    let table: YazaSqlMemoryTableV1 = YazaSqlMemoryTableV1(5, 11, [4, 16], rows, 0)
+    let executed: Result[YazaSqlQueryResultV1, Text] = yaza_sql_execute_memory_v1(result_unwrap(bound), table, List[YazaSqlValueV1]())
+    if result_is_ok(executed):
+        say "executor accepted an over-budget BLOB input"
+        return false
+    if text_find(result_unwrap_error(executed), "variable-width input byte budget") < 0:
+        say "executor rejected with: " + result_unwrap_error(executed)
+        return false
+    return true
+
+fn variable_width_budget_join_counts_blob_v1(blob_value: YazaSqlValueV1) -> Boolean:
+    let columns: List[YazaSqlColumnSchemaV1] = [YazaSqlColumnSchemaV1("id", 4, false, 0, 0, 0, ""), YazaSqlColumnSchemaV1("payload", 16, false, 1, 0, 0, "")]
+    let tables: List[YazaSqlTableSchemaV1] = [YazaSqlTableSchemaV1(5, "left_rows", columns), YazaSqlTableSchemaV1(6, "right_rows", columns)]
+    let catalog: YazaSqlCatalogSnapshotV1 = YazaSqlCatalogSnapshotV1(11, tables, List[YazaSqlColumnDefaultV1]())
+    let source: Text = "SELECT l.id FROM left_rows AS l INNER JOIN right_rows AS r ON l.id = r.id"
+    let bound: Result[YazaSqlBoundPlanV1, Text] = variable_width_budget_binder_v1(source, catalog)
+    if not result_is_ok(bound): return false
+    let row: List[YazaSqlValueV1] = [variable_width_budget_id_v1(), blob_value]
+    let left: YazaSqlMemoryTableV1 = YazaSqlMemoryTableV1(5, 11, [4, 16], [row], 0)
+    let right: YazaSqlMemoryTableV1 = YazaSqlMemoryTableV1(6, 11, [4, 16], [row], 0)
+    if not result_is_ok(yaza_sql_join_validate_input_v1(left)) or not result_is_ok(yaza_sql_join_validate_input_v1(right)): return false
+    let joined: Result[YazaSqlMemoryTableV1, Text] = yaza_sql_join_inner_memory_v1(result_unwrap(bound), left, right)
+    if result_is_ok(joined): return false
+    return text_find(result_unwrap_error(joined), "combined variable-width source budget") >= 0
+
+fn variable_width_budget_set_and_cte_count_blob_v1(blob_value: YazaSqlValueV1, blob_size: Number) -> Boolean:
+    let columns: List[YazaSqlBoundProjectionV1] = [YazaSqlBoundProjectionV1(0, 16, true, "payload", -1, -1, 0, 0, 0)]
+    let row: List[YazaSqlValueV1] = [blob_value]
+    let result: YazaSqlQueryResultV1 = YazaSqlQueryResultV1(columns, [row], 0, 0, 0, 0)
+
+    let set_validation: Result[Boolean, Text] = yaza_sql_set_validate_results_v1(result, result)
+    if result_is_ok(set_validation): return false
+    if text_find(result_unwrap_error(set_validation), "variable-width input exceeds") < 0: return false
+
+    let cte_validation: Result[YazaDbQueryCteBudgetV1, Text] = yaza_db_query_validate_cte_result_budget_v1(result, 0, 0, blob_size, 0)
+    if result_is_ok(cte_validation): return false
+    if text_find(result_unwrap_error(cte_validation), "variable-width byte budget") < 0: return false
+
+    let accounted: Result[Number, Text] = yaza_db_query_result_text_bytes_v1(result)
+    return result_is_ok(accounted) and result_unwrap(accounted) == blob_size
+
+start:
+    let initial_used: Number = arena_used()
+    arena_scope 134217728:
+        let blob_size: Number = 33554433
+        let allocated_blob: Result[Bytes, Text] = bytes_try_new_zeroed(blob_size)
+        assert result_is_ok(allocated_blob)
+        let blob_value: YazaSqlValueV1 = variable_width_budget_value_v1(result_unwrap(allocated_blob))
+        if not variable_width_budget_executor_counts_blob_v1(blob_value):
+            say "executor BLOB budget fixture failed"
+            exit(1)
+        if not variable_width_budget_join_counts_blob_v1(blob_value):
+            say "JOIN BLOB budget fixture failed"
+            exit(1)
+        if not variable_width_budget_set_and_cte_count_blob_v1(blob_value, blob_size):
+            say "set/CTE BLOB budget fixture failed"
+            exit(1)
+    assert arena_used() == initial_used
+    say "yazabase-sql-variable-width-budget-v1-ok"

@@ -1,0 +1,232 @@
+# Structured database query descriptions.
+# Application code supplies identifiers and typed values, never SQL fragments.
+use "core"
+
+variant DbComparison:
+    Equal
+    NotEqual
+    LessThan
+    LessThanOrEqual
+    GreaterThan
+    GreaterThanOrEqual
+
+variant DbLogicalOperator:
+    And
+    Or
+
+shape DbPredicate:
+    column: Text
+    comparison: DbComparison
+    value: DbValue
+    join: DbLogicalOperator
+
+shape DbSelect:
+    table: Text
+    columns: TextList
+    predicates: List[DbPredicate]
+    order_column: Option[Text]
+    order_descending: Boolean
+    limit: Option[Number]
+    offset: Option[Number]
+
+fn db_query_error(kind: DbErrorKind, message: Text) -> DbError:
+    let provider_code: Option[Text] = none
+    return db_error(kind, message, provider_code, false)
+
+fn db_comparison_allows_null(comparison: DbComparison) -> Boolean:
+    match comparison:
+        Equal:
+            return true
+        NotEqual:
+            return true
+        LessThan:
+            return false
+        LessThanOrEqual:
+            return false
+        GreaterThan:
+            return false
+        GreaterThanOrEqual:
+            return false
+    return false
+
+fn db_predicate_is_valid(predicate: DbPredicate) -> Boolean:
+    if not db_identifier_is_plain_ascii(predicate.column):
+        return false
+    if not db_value_is_valid(predicate.value):
+        return false
+    if db_value_is_null(predicate.value) and not db_comparison_allows_null(predicate.comparison):
+        return false
+    return true
+
+fn db_select_new(table: Text, columns: TextList) -> Result[DbSelect, DbError]:
+    if not db_identifier_is_plain_ascii(table):
+        return err(db_query_error(DbErrorKind::Configuration, "Database table identifier is invalid"))
+    let column_count: Number = list_count(columns)
+    if column_count < 1 or column_count > 64:
+        return err(db_query_error(DbErrorKind::Configuration, "Database projection must contain between 1 and 64 columns"))
+    var index: Number = 0
+    while index < column_count:
+        let column: Text = list_get(columns, index)
+        if not db_identifier_is_plain_ascii(column):
+            return err(db_query_error(DbErrorKind::Configuration, "Database projection contains an invalid column identifier"))
+        var prior: Number = 0
+        while prior < index:
+            if list_get(columns, prior) == column:
+                return err(db_query_error(DbErrorKind::Configuration, "Database projection contains a duplicate column"))
+            set prior = prior + 1
+        set index = index + 1
+    let predicates: List[DbPredicate] = List[DbPredicate]()
+    let no_order: Option[Text] = none
+    let no_limit: Option[Number] = none
+    let no_offset: Option[Number] = none
+    return ok(DbSelect(table, columns, predicates, no_order, false, no_limit, no_offset))
+
+# Each call appends one AND predicate without mutating an earlier descriptor.
+# Predicates are capped at 16 to bound generated SQL and parameter work.
+fn db_select_append_predicate(query: DbSelect, column: Text, comparison: DbComparison, value: DbValue, join: DbLogicalOperator) -> Result[DbSelect, DbError]:
+    let predicate_count: Number = list_count(query.predicates)
+    if predicate_count >= 16:
+        return err(db_query_error(DbErrorKind::UnsupportedFeature, "Structured queries support at most 16 filter conditions"))
+    let predicate: DbPredicate = DbPredicate(column, comparison, value, join)
+    if not db_predicate_is_valid(predicate):
+        return err(db_query_error(DbErrorKind::Configuration, "Database filter is invalid or uses an unsupported NULL comparison"))
+    var predicates: List[DbPredicate] = List[DbPredicate]()
+    for existing in query.predicates:
+        list_push(predicates, existing)
+    list_push(predicates, predicate)
+    return ok(DbSelect(query.table, query.columns, predicates, query.order_column, query.order_descending, query.limit, query.offset))
+
+fn db_select_where(query: DbSelect, column: Text, comparison: DbComparison, value: DbValue) -> Result[DbSelect, DbError]:
+    return db_select_append_predicate(query, column, comparison, value, DbLogicalOperator::And)
+
+fn db_select_or_where(query: DbSelect, column: Text, comparison: DbComparison, value: DbValue) -> Result[DbSelect, DbError]:
+    return db_select_append_predicate(query, column, comparison, value, DbLogicalOperator::Or)
+
+fn db_select_order_by(query: DbSelect, column: Text, descending: Boolean) -> Result[DbSelect, DbError]:
+    if option_is_some(query.order_column):
+        return err(db_query_error(DbErrorKind::UnsupportedFeature, "This query descriptor supports one ordering column"))
+    if not db_identifier_is_plain_ascii(column):
+        return err(db_query_error(DbErrorKind::Configuration, "Database ordering column identifier is invalid"))
+    let order: Option[Text] = some(column)
+    return ok(DbSelect(query.table, query.columns, query.predicates, order, descending, query.limit, query.offset))
+
+fn db_select_page(query: DbSelect, limit: Number, offset: Number) -> Result[DbSelect, DbError]:
+    if limit < 1 or limit > 10000 or offset < 0 or offset > 2147483647:
+        return err(db_query_error(DbErrorKind::Configuration, "Database page requires limit 1..10000 and offset 0..2147483647"))
+    let selected_limit: Option[Number] = some(limit)
+    let selected_offset: Option[Number] = some(offset)
+    return ok(DbSelect(query.table, query.columns, query.predicates, query.order_column, query.order_descending, selected_limit, selected_offset))
+
+fn db_select_is_valid(query: DbSelect) -> Boolean:
+    if not db_identifier_is_plain_ascii(query.table):
+        return false
+    let count: Number = list_count(query.columns)
+    if count < 1 or count > 64:
+        return false
+    var index: Number = 0
+    while index < count:
+        let column: Text = list_get(query.columns, index)
+        if not db_identifier_is_plain_ascii(column):
+            return false
+        var prior: Number = 0
+        while prior < index:
+            if list_get(query.columns, prior) == column:
+                return false
+            set prior = prior + 1
+        set index = index + 1
+    let predicate_count: Number = list_count(query.predicates)
+    if predicate_count > 16:
+        return false
+    set index = 0
+    while index < predicate_count:
+        if not db_predicate_is_valid(list_get(query.predicates, index)):
+            return false
+        set index = index + 1
+    if option_is_some(query.order_column) and not db_identifier_is_plain_ascii(option_unwrap(query.order_column)):
+        return false
+    if option_is_some(query.limit):
+        let limit: Number = option_unwrap(query.limit)
+        if limit < 1 or limit > 10000:
+            return false
+    if option_is_some(query.offset):
+        let offset: Number = option_unwrap(query.offset)
+        if offset < 0 or offset > 2147483647:
+            return false
+    return true
+
+fn db_comparison_postgres_operator(comparison: DbComparison) -> Text:
+    match comparison:
+        Equal:
+            return "="
+        NotEqual:
+            return "<>"
+        LessThan:
+            return "<"
+        LessThanOrEqual:
+            return "<="
+        GreaterThan:
+            return ">"
+        GreaterThanOrEqual:
+            return ">="
+    return ""
+
+# Lower the validated query structure to SQL syntax. Bind values are represented
+# only by placeholders here; provider adapters encode them separately.
+fn db_select_postgres_sql(query: DbSelect) -> Result[Text, DbError]:
+    if not db_select_is_valid(query):
+        return err(db_query_error(DbErrorKind::Configuration, "Structured database query is invalid or exceeds its bounds"))
+    var statement: Text = "SELECT "
+    var index: Number = 0
+    let column_count: Number = list_count(query.columns)
+    while index < column_count:
+        if index > 0:
+            set statement = statement + ", "
+        set statement = statement + "\"" + list_get(query.columns, index) + "\""
+        set index = index + 1
+    set statement = statement + " FROM \"" + query.table + "\""
+    let predicate_count: Number = list_count(query.predicates)
+    var parameter_index: Number = 1
+    var where_expression: Text = ""
+    set index = 0
+    while index < predicate_count:
+        let predicate: DbPredicate = list_get(query.predicates, index)
+        var condition: Text = "\"" + predicate.column + "\""
+        if db_value_is_null(predicate.value):
+            match predicate.comparison:
+                Equal:
+                    set condition = condition + " IS NULL"
+                NotEqual:
+                    set condition = condition + " IS NOT NULL"
+                LessThan:
+                    return err(db_query_error(DbErrorKind::Configuration, "SQL NULL supports only equality and inequality filters"))
+                LessThanOrEqual:
+                    return err(db_query_error(DbErrorKind::Configuration, "SQL NULL supports only equality and inequality filters"))
+                GreaterThan:
+                    return err(db_query_error(DbErrorKind::Configuration, "SQL NULL supports only equality and inequality filters"))
+                GreaterThanOrEqual:
+                    return err(db_query_error(DbErrorKind::Configuration, "SQL NULL supports only equality and inequality filters"))
+        else:
+            set condition = condition + " " + db_comparison_postgres_operator(predicate.comparison) + " $" + number_text(parameter_index)
+            set parameter_index = parameter_index + 1
+        if index == 0:
+            set where_expression = condition
+        else:
+            match predicate.join:
+                And:
+                    set where_expression = "(" + where_expression + " AND " + condition + ")"
+                Or:
+                    set where_expression = "(" + where_expression + " OR " + condition + ")"
+        set index = index + 1
+    if predicate_count > 0:
+        set statement = statement + " WHERE " + where_expression
+    if option_is_some(query.order_column):
+        set statement = statement + " ORDER BY \"" + option_unwrap(query.order_column) + "\""
+        if query.order_descending:
+            set statement = statement + " DESC"
+        else:
+            set statement = statement + " ASC"
+    if option_is_some(query.limit):
+        set statement = statement + " LIMIT " + number_text(option_unwrap(query.limit))
+    if option_is_some(query.offset):
+        set statement = statement + " OFFSET " + number_text(option_unwrap(query.offset))
+    return ok(statement)

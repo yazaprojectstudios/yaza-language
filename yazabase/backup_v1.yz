@@ -1,0 +1,255 @@
+# Offline, verified YDBv1 file-and-WAL copy. The source database lock is held
+# through staging; the destination database filename is published last.
+use "std/fs"
+use "./checkpoint_v1"
+use "./storage_v1"
+use "./wal_v1"
+
+shape YazaDbBackupReportV1:
+    file_count: Number
+    wal_segment_count: Number
+    bytes_copied: Number
+
+fn yaza_db_backup_max_chunk_bytes_v1() -> Number:
+    return 8388608
+
+fn yaza_db_backup_data_stage_name_v1(db_uuid: Bytes) -> Result[Text, Text]:
+    let uuid_hex: Text = yaza_db_storage_uuid_hex_v1(db_uuid)?
+    return ok(".yaza-backup-" + uuid_hex + "-data.tmp")
+
+fn yaza_db_backup_wal_stage_name_v1(db_uuid: Bytes, segment_index: Number) -> Result[Text, Text]:
+    if segment_index < 0 or segment_index >= yaza_db_wal_max_segment_count_v1(): return err("YDBv1 backup WAL segment index is outside its bound")
+    let uuid_hex: Text = yaza_db_storage_uuid_hex_v1(db_uuid)?
+    return ok(".yaza-backup-" + uuid_hex + "-wal-" + number_text(segment_index) + ".tmp")
+
+fn yaza_db_backup_name_matches_v1(names: Bytes, offset: Number, name_length: Number, target: Text) -> Boolean:
+    if name_length != text_length(target): return false
+    var byte_index: Number = 0
+    while byte_index < name_length:
+        if bytes_get(names, offset + byte_index) != text_byte(target, byte_index): return false
+        set byte_index = byte_index + 1
+    return true
+
+fn yaza_db_backup_name_present_v1(names: Bytes, target: Text) -> Number:
+    let names_length: Number = bytes_length(names)
+    var offset: Number = 0
+    while offset < names_length:
+        var end: Number = offset
+        while end < names_length and bytes_get(names, end) != 0:
+            set end = end + 1
+        if end >= names_length: return -1
+        if yaza_db_backup_name_matches_v1(names, offset, end - offset, target): return 1
+        set offset = end + 1
+    return 0
+
+fn yaza_db_backup_check_target_v1(destination_root: Number, database_name: Text, db_uuid: Bytes, wal_count: Number) -> Number:
+    arena_scope 50331648:
+        let names_result: Result[Bytes, Text] = list_names(destination_root)
+        if not result_is_ok(names_result): return 1
+        let names: Bytes = result_unwrap(names_result)
+        let database_present: Number = yaza_db_backup_name_present_v1(names, database_name)
+        if database_present < 0: return 2
+        if database_present != 0: return 3
+        let existing_wal_count: Result[Number, Text] = yaza_db_wal_segment_count_for_v1(destination_root, db_uuid)
+        if not result_is_ok(existing_wal_count): return 4
+        if result_unwrap(existing_wal_count) != 0: return 5
+        let data_stage_result: Result[Text, Text] = yaza_db_backup_data_stage_name_v1(db_uuid)
+        if not result_is_ok(data_stage_result): return 7
+        let data_stage: Text = result_unwrap(data_stage_result)
+        let data_stage_present: Number = yaza_db_backup_name_present_v1(names, data_stage)
+        if data_stage_present < 0: return 2
+        if data_stage_present != 0: return 6
+        var segment_index: Number = 0
+        while segment_index < wal_count:
+            let wal_stage_result: Result[Text, Text] = yaza_db_backup_wal_stage_name_v1(db_uuid, segment_index)
+            if not result_is_ok(wal_stage_result): return 7
+            let wal_stage: Text = result_unwrap(wal_stage_result)
+            let stage_present: Number = yaza_db_backup_name_present_v1(names, wal_stage)
+            if stage_present < 0: return 2
+            if stage_present != 0: return 6
+            set segment_index = segment_index + 1
+    return 0
+
+fn yaza_db_backup_copy_chunk_v1(source_file: Number, destination_file: Number, offset: Number, length: Number) -> Number:
+    if offset < 0 or length < 0 or length > yaza_db_backup_max_chunk_bytes_v1(): return 1
+    arena_scope 20971520:
+        let source_bytes_result: Result[Bytes, Text] = read_exact(source_file, offset, length)
+        if not result_is_ok(source_bytes_result): return 2
+        let source_bytes: Bytes = result_unwrap(source_bytes_result)
+        let write_result: Result[Number, Text] = write_exact(destination_file, offset, source_bytes)
+        if not result_is_ok(write_result): return 3
+        if result_unwrap(write_result) != length: return 4
+        let verification_result: Result[Bytes, Text] = read_exact(destination_file, offset, length)
+        if not result_is_ok(verification_result): return 5
+        if not bytes_equal(source_bytes, result_unwrap(verification_result)): return 6
+    return 0
+
+fn yaza_db_backup_remove_stages_v1(destination_root: Number, db_uuid: Bytes, wal_count: Number) -> Number:
+    var segment_index: Number = 0
+    while segment_index < wal_count:
+        let stage_name: Result[Text, Text] = yaza_db_backup_wal_stage_name_v1(db_uuid, segment_index)
+        if result_is_ok(stage_name):
+            let ignored_remove: Result[Boolean, Text] = remove(destination_root, result_unwrap(stage_name))
+        set segment_index = segment_index + 1
+    let data_stage: Result[Text, Text] = yaza_db_backup_data_stage_name_v1(db_uuid)
+    if result_is_ok(data_stage):
+        let ignored_remove_data: Result[Boolean, Text] = remove(destination_root, result_unwrap(data_stage))
+    return 0
+
+fn yaza_db_backup_remove_published_wal_v1(destination_root: Number, db_uuid: Bytes, wal_count: Number) -> Number:
+    var segment_index: Number = 0
+    while segment_index < wal_count:
+        let wal_name: Result[Text, Text] = yaza_db_wal_segment_name_for_v1(segment_index, db_uuid)
+        if result_is_ok(wal_name):
+            let ignored_remove: Result[Boolean, Text] = remove(destination_root, result_unwrap(wal_name))
+        set segment_index = segment_index + 1
+    return 0
+
+fn yaza_db_backup_copy_file_staged_v1(source_root: Number, destination_root: Number, source_name: Text, stage_name: Text) -> Result[Number, Text]:
+    let source_result: Result[Number, Text] = open_read(source_root, source_name)
+    if not result_is_ok(source_result): return err("YDBv1 backup could not open a source file")
+    let source_file: Number = result_unwrap(source_result)
+    let size_result: Result[Number, Text] = file_size(source_file)
+    if not result_is_ok(size_result):
+        let ignored_source_close: Result[Boolean, Text] = close(source_file)
+        return err("YDBv1 backup could not measure a source file")
+    let file_length: Number = result_unwrap(size_result)
+    if file_length < 0 or file_length > 1099511627776:
+        let ignored_source_close: Result[Boolean, Text] = close(source_file)
+        return err("YDBv1 backup source file exceeds the 1 TiB VFS limit")
+    let destination_result: Result[Number, Text] = create_exclusive(destination_root, stage_name)
+    if not result_is_ok(destination_result):
+        let ignored_source_close: Result[Boolean, Text] = close(source_file)
+        return err("YDBv1 backup staging filename already exists or cannot be created")
+    let destination_file: Number = result_unwrap(destination_result)
+    var offset: Number = 0
+    while offset < file_length:
+        var chunk_length: Number = yaza_db_backup_max_chunk_bytes_v1()
+        if chunk_length > file_length - offset: set chunk_length = file_length - offset
+        let chunk_status: Number = yaza_db_backup_copy_chunk_v1(source_file, destination_file, offset, chunk_length)
+        if chunk_status != 0:
+            let ignored_destination_close: Result[Boolean, Text] = close(destination_file)
+            let ignored_source_close: Result[Boolean, Text] = close(source_file)
+            let ignored_remove: Result[Boolean, Text] = remove(destination_root, stage_name)
+            let ignored_sync: Result[Boolean, Text] = sync_directory(destination_root)
+            if chunk_status == 2: return err("YDBv1 backup source read failed")
+            if chunk_status == 3 or chunk_status == 4: return err("YDBv1 backup staging write failed or was incomplete")
+            if chunk_status == 5: return err("YDBv1 backup staging read-back failed")
+            if chunk_status == 6: return err("YDBv1 backup read-back bytes do not match the source")
+            return err("YDBv1 backup copy chunk is outside its bound")
+        set offset = offset + chunk_length
+    let synced: Result[Boolean, Text] = sync(destination_file)
+    if not result_is_ok(synced) or not result_unwrap(synced):
+        let ignored_destination_close: Result[Boolean, Text] = close(destination_file)
+        let ignored_source_close: Result[Boolean, Text] = close(source_file)
+        let ignored_remove: Result[Boolean, Text] = remove(destination_root, stage_name)
+        let ignored_directory_sync: Result[Boolean, Text] = sync_directory(destination_root)
+        return err("YDBv1 backup staging file sync failed")
+    let destination_closed: Result[Boolean, Text] = close(destination_file)
+    let source_closed: Result[Boolean, Text] = close(source_file)
+    if not result_is_ok(destination_closed) or not result_is_ok(source_closed) or not result_unwrap(destination_closed) or not result_unwrap(source_closed):
+        let ignored_remove: Result[Boolean, Text] = remove(destination_root, stage_name)
+        let ignored_directory_sync: Result[Boolean, Text] = sync_directory(destination_root)
+        return err("YDBv1 backup staging handles could not be closed")
+    return ok(file_length)
+
+fn yaza_db_backup_copy_locked_v1(source_root: Number, source_storage: YazaDbStorageHandleV1, destination_root: Number, database_name: Text) -> Result[YazaDbBackupReportV1, Text]:
+    let db_uuid: Bytes = source_storage.header.db_uuid
+    let wal_count_result: Result[Number, Text] = yaza_db_wal_segment_count_for_v1(source_root, db_uuid)
+    if not result_is_ok(wal_count_result): return err(result_unwrap_error(wal_count_result))
+    let wal_count: Number = result_unwrap(wal_count_result)
+    if wal_count < 1 or wal_count > yaza_db_wal_max_segment_count_v1(): return err("YDBv1 backup source WAL segment count is outside its bound")
+    let target_status: Number = yaza_db_backup_check_target_v1(destination_root, database_name, db_uuid, wal_count)
+    if target_status == 1: return err("YDBv1 backup could not list the destination directory")
+    if target_status == 2: return err("YDBv1 backup destination listing is malformed")
+    if target_status == 3: return err("YDBv1 backup refuses to replace an existing database file")
+    if target_status == 4: return err("YDBv1 backup destination WAL discovery failed")
+    if target_status == 5: return err("YDBv1 backup refuses to replace existing WAL segments for this database identity")
+    if target_status == 6: return err("YDBv1 backup found staging files from an earlier incomplete operation")
+    if target_status == 7: return err("YDBv1 backup could not form a bounded staging filename")
+
+    let owner_registered: Result[Boolean, Text] = yaza_db_storage_register_uuid_owner_v1(destination_root, database_name, db_uuid)
+    if not result_is_ok(owner_registered): return err("YDBv1 backup destination cannot claim the source database identity")
+    if not result_unwrap(owner_registered): return err("YDBv1 backup destination identity registration failed")
+
+    var total_bytes: Number = 0
+    var segment_index: Number = 0
+    while segment_index < wal_count:
+        let source_wal_name: Text = yaza_db_wal_segment_name_for_v1(segment_index, db_uuid)?
+        let stage_wal_name: Text = yaza_db_backup_wal_stage_name_v1(db_uuid, segment_index)?
+        let copied_wal: Result[Number, Text] = yaza_db_backup_copy_file_staged_v1(source_root, destination_root, source_wal_name, stage_wal_name)
+        if not result_is_ok(copied_wal):
+            let ignored_cleanup: Number = yaza_db_backup_remove_stages_v1(destination_root, db_uuid, segment_index)
+            let ignored_sync: Result[Boolean, Text] = sync_directory(destination_root)
+            return err(result_unwrap_error(copied_wal))
+        set total_bytes = total_bytes + result_unwrap(copied_wal)
+        set segment_index = segment_index + 1
+
+    let data_stage_name: Text = yaza_db_backup_data_stage_name_v1(db_uuid)?
+    let copied_database: Result[Number, Text] = yaza_db_backup_copy_file_staged_v1(source_root, destination_root, database_name, data_stage_name)
+    if not result_is_ok(copied_database):
+        let ignored_cleanup: Number = yaza_db_backup_remove_stages_v1(destination_root, db_uuid, wal_count)
+        let ignored_sync: Result[Boolean, Text] = sync_directory(destination_root)
+        return err(result_unwrap_error(copied_database))
+    set total_bytes = total_bytes + result_unwrap(copied_database)
+
+    set segment_index = 0
+    while segment_index < wal_count:
+        let stage_wal_name: Text = yaza_db_backup_wal_stage_name_v1(db_uuid, segment_index)?
+        let final_wal_name: Text = yaza_db_wal_segment_name_for_v1(segment_index, db_uuid)?
+        let published: Result[Boolean, Text] = rename(destination_root, stage_wal_name, final_wal_name)
+        if not result_is_ok(published) or not result_unwrap(published):
+            let ignored_remove_published: Number = yaza_db_backup_remove_published_wal_v1(destination_root, db_uuid, segment_index)
+            let ignored_remove_stages: Number = yaza_db_backup_remove_stages_v1(destination_root, db_uuid, wal_count)
+            let ignored_sync: Result[Boolean, Text] = sync_directory(destination_root)
+            return err("YDBv1 backup could not publish a complete WAL segment set")
+        set segment_index = segment_index + 1
+
+    let wal_directory_sync: Result[Boolean, Text] = sync_directory(destination_root)
+    if not result_is_ok(wal_directory_sync) or not result_unwrap(wal_directory_sync):
+        let ignored_remove_published: Number = yaza_db_backup_remove_published_wal_v1(destination_root, db_uuid, wal_count)
+        let ignored_remove_stages: Number = yaza_db_backup_remove_stages_v1(destination_root, db_uuid, wal_count)
+        let ignored_sync: Result[Boolean, Text] = sync_directory(destination_root)
+        return err("YDBv1 backup WAL directory sync failed before database publication")
+
+    let published_database: Result[Boolean, Text] = rename(destination_root, data_stage_name, database_name)
+    if not result_is_ok(published_database) or not result_unwrap(published_database):
+        let ignored_remove_published: Number = yaza_db_backup_remove_published_wal_v1(destination_root, db_uuid, wal_count)
+        let ignored_remove_stages: Number = yaza_db_backup_remove_stages_v1(destination_root, db_uuid, wal_count)
+        let ignored_sync: Result[Boolean, Text] = sync_directory(destination_root)
+        return err("YDBv1 backup could not atomically publish the database file")
+    let database_directory_sync: Result[Boolean, Text] = sync_directory(destination_root)
+    if not result_is_ok(database_directory_sync) or not result_unwrap(database_directory_sync):
+        return err("YDBv1 backup files are published, but destination directory sync failed; verify before use")
+    return ok(YazaDbBackupReportV1(wal_count + 1, wal_count, total_bytes))
+
+fn yaza_db_backup_v1(source_root: Number, database_name: Text, destination_root: Number) -> Result[YazaDbBackupReportV1, Text]:
+    if text_length(database_name) == 0 or text_length(database_name) > 255: return err("YDBv1 backup database name is outside the VFS component limit")
+    let destination_lock_result: Result[Number, Text] = lock_exclusive(destination_root, database_name)
+    if not result_is_ok(destination_lock_result): return err("YDBv1 backup could not lock the destination database name")
+    let destination_lock: Number = result_unwrap(destination_lock_result)
+    let source_result: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_open_recovered_v1(source_root, database_name)
+    if not result_is_ok(source_result):
+        let ignored_lock_close: Result[Boolean, Text] = close(destination_lock)
+        return err("YDBv1 backup could not open/recover its source: " + result_unwrap_error(source_result))
+    let source: YazaDbCheckpointRecoveryV1 = result_unwrap(source_result)
+    let copied: Result[YazaDbBackupReportV1, Text] = yaza_db_backup_copy_locked_v1(source_root, source.storage, destination_root, database_name)
+    let source_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(source.wal)
+    let source_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(source.storage)
+    let destination_lock_close: Result[Boolean, Text] = close(destination_lock)
+    if not result_is_ok(source_wal_close) or not result_is_ok(source_storage_close) or not result_is_ok(destination_lock_close):
+        if not result_is_ok(copied): return err(result_unwrap_error(copied))
+        return err("YDBv1 backup completed copying files but could not close all database/lock handles")
+    if not result_unwrap(source_wal_close) or not result_unwrap(source_storage_close) or not result_unwrap(destination_lock_close):
+        if not result_is_ok(copied): return err(result_unwrap_error(copied))
+        return err("YDBv1 backup completed copying files but a database/lock handle remained open")
+    if not result_is_ok(copied): return err(result_unwrap_error(copied))
+
+    let verification_result: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_open_recovered_v1(destination_root, database_name)
+    if not result_is_ok(verification_result): return err("YDBv1 backup files were published but failed reopen/recovery verification: " + result_unwrap_error(verification_result))
+    let verification: YazaDbCheckpointRecoveryV1 = result_unwrap(verification_result)
+    let verification_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(verification.wal)
+    let verification_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(verification.storage)
+    if not result_is_ok(verification_wal_close) or not result_is_ok(verification_storage_close): return err("YDBv1 backup passed reopen verification but could not close verification handles")
+    if not result_unwrap(verification_wal_close) or not result_unwrap(verification_storage_close): return err("YDBv1 backup passed reopen verification but verification handles remained open")
+    return ok(result_unwrap(copied))

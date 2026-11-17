@@ -1,0 +1,119 @@
+# Provisional YDBv1 system-catalog root directory.
+use "./page_v1"
+use "./meta_free_v1"
+
+shape YazaDbCatalogRootV1:
+    sys_tables_root: Number
+    sys_columns_root: Number
+    sys_indexes_root: Number
+    sys_constraints_root: Number
+    next_object_id: Number
+    generation: Number
+    # Zero preserves the original four-root YCRT v1 descriptor. A nonzero
+    # value opts into the v2 descriptor carrying the private sys_views root.
+    sys_views_root: Number
+
+fn yaza_db_catalog_meta_kind_root_v1() -> Number:
+    return 1
+
+fn yaza_db_catalog_root_payload_size_v1() -> Number:
+    return 56
+
+fn yaza_db_catalog_root_payload_size_v2() -> Number:
+    return 64
+
+fn yaza_db_catalog_max_page_id_v1() -> Number:
+    return 4611686018427387903
+
+fn yaza_db_catalog_roots_valid_v1(catalog_page_id: Number, catalog: YazaDbCatalogRootV1) -> Boolean:
+    let maximum: Number = yaza_db_catalog_max_page_id_v1()
+    if catalog_page_id < 2 or catalog_page_id > maximum: return false
+    if catalog.sys_tables_root < 2 or catalog.sys_tables_root > maximum: return false
+    if catalog.sys_columns_root < 2 or catalog.sys_columns_root > maximum: return false
+    if catalog.sys_indexes_root < 2 or catalog.sys_indexes_root > maximum: return false
+    if catalog.sys_constraints_root < 2 or catalog.sys_constraints_root > maximum: return false
+    if catalog.sys_tables_root == catalog_page_id or catalog.sys_columns_root == catalog_page_id or catalog.sys_indexes_root == catalog_page_id or catalog.sys_constraints_root == catalog_page_id: return false
+    if catalog.sys_tables_root == catalog.sys_columns_root or catalog.sys_tables_root == catalog.sys_indexes_root or catalog.sys_tables_root == catalog.sys_constraints_root: return false
+    if catalog.sys_columns_root == catalog.sys_indexes_root or catalog.sys_columns_root == catalog.sys_constraints_root or catalog.sys_indexes_root == catalog.sys_constraints_root: return false
+    if catalog.sys_views_root < 0 or catalog.sys_views_root > maximum: return false
+    if catalog.sys_views_root != 0:
+        if catalog.sys_views_root < 2 or catalog.sys_views_root == catalog_page_id: return false
+        if catalog.sys_views_root == catalog.sys_tables_root or catalog.sys_views_root == catalog.sys_columns_root or catalog.sys_views_root == catalog.sys_indexes_root or catalog.sys_views_root == catalog.sys_constraints_root: return false
+    if catalog.next_object_id < 1 or catalog.next_object_id > maximum: return false
+    if catalog.generation < 1 or catalog.generation > maximum: return false
+    return true
+
+fn yaza_db_catalog_root_page_encode_v1(page_id: Number, page_lsn: Number, catalog: YazaDbCatalogRootV1) -> Result[Bytes, Text]:
+    if page_lsn < 0 or not yaza_db_catalog_roots_valid_v1(page_id, catalog): return err("YDBv1 catalog root descriptor fields are invalid")
+    let has_views_root: Boolean = catalog.sys_views_root != 0
+    var payload_size: Number = yaza_db_catalog_root_payload_size_v1()
+    var descriptor_version: Number = 1
+    var system_catalog_count: Number = 4
+    if has_views_root:
+        set payload_size = yaza_db_catalog_root_payload_size_v2()
+        set descriptor_version = 2
+        set system_catalog_count = 5
+    let payload_result: Result[Bytes, Text] = bytes_try_new_zeroed(payload_size)
+    if not result_is_ok(payload_result): return err(result_unwrap_error(payload_result))
+    let payload: Bytes = result_unwrap(payload_result)
+    if not yaza_db_write_bytes_v1(payload, 0, bytes_from_text("YCRT")): return err("YDBv1 catalog-root payload magic could not be written")
+    if not yaza_db_write_uint_le_v1(payload, 4, descriptor_version, 2): return err("YDBv1 catalog-root payload version could not be written")
+    if not yaza_db_write_uint_le_v1(payload, 6, system_catalog_count, 2): return err("YDBv1 system-catalog count could not be written")
+    if not yaza_db_write_uint_le_v1(payload, 8, catalog.sys_tables_root, 8): return err("YDBv1 sys_tables root could not be written")
+    if not yaza_db_write_uint_le_v1(payload, 16, catalog.sys_columns_root, 8): return err("YDBv1 sys_columns root could not be written")
+    if not yaza_db_write_uint_le_v1(payload, 24, catalog.sys_indexes_root, 8): return err("YDBv1 sys_indexes root could not be written")
+    if not yaza_db_write_uint_le_v1(payload, 32, catalog.sys_constraints_root, 8): return err("YDBv1 sys_constraints root could not be written")
+    if has_views_root:
+        if not yaza_db_write_uint_le_v1(payload, 40, catalog.sys_views_root, 8): return err("YDBv1 sys_views root could not be written")
+        if not yaza_db_write_uint_le_v1(payload, 48, catalog.next_object_id, 8): return err("YDBv1 next object ID could not be written")
+        if not yaza_db_write_uint_le_v1(payload, 56, catalog.generation, 8): return err("YDBv1 catalog generation could not be written")
+    else:
+        if not yaza_db_write_uint_le_v1(payload, 40, catalog.next_object_id, 8): return err("YDBv1 next object ID could not be written")
+        if not yaza_db_write_uint_le_v1(payload, 48, catalog.generation, 8): return err("YDBv1 catalog generation could not be written")
+    return yaza_db_meta_page_encode_v1(page_id, page_lsn, yaza_db_catalog_meta_kind_root_v1(), 1, payload)
+
+fn yaza_db_catalog_root_page_decode_v1(page: Bytes, expected_page_id: Number) -> Result[YazaDbCatalogRootV1, Text]:
+    let metadata: YazaDbMetaPageV1 = yaza_db_meta_page_decode_v1(page, expected_page_id)?
+    if metadata.kind != yaza_db_catalog_meta_kind_root_v1(): return err("YDBv1 META page does not contain a catalog-root descriptor")
+    let magic: Bytes = bytes_try_slice(metadata.payload, 0, 4)?
+    if not bytes_equal(magic, bytes_from_text("YCRT")): return err("YDBv1 catalog-root payload magic is invalid")
+    let payload_version: Number = yaza_db_read_uint_le_v1(metadata.payload, 4, 2)?
+    let system_catalog_count: Number = yaza_db_read_uint_le_v1(metadata.payload, 6, 2)?
+    if payload_version == 1:
+        if system_catalog_count != 4 or bytes_length(metadata.payload) != yaza_db_catalog_root_payload_size_v1(): return err("YDBv1 catalog-root v1 payload header or length is unsupported")
+    elif payload_version == 2:
+        if system_catalog_count != 5 or bytes_length(metadata.payload) != yaza_db_catalog_root_payload_size_v2(): return err("YDBv1 catalog-root v2 payload header or length is unsupported")
+    else:
+        return err("YDBv1 catalog-root payload version is unsupported")
+    let sys_tables_root: Number = yaza_db_read_uint_le_v1(metadata.payload, 8, 8)?
+    let sys_columns_root: Number = yaza_db_read_uint_le_v1(metadata.payload, 16, 8)?
+    let sys_indexes_root: Number = yaza_db_read_uint_le_v1(metadata.payload, 24, 8)?
+    let sys_constraints_root: Number = yaza_db_read_uint_le_v1(metadata.payload, 32, 8)?
+    var sys_views_root: Number = 0
+    var next_object_id: Number = 0
+    var generation: Number = 0
+    if payload_version == 2:
+        set sys_views_root = yaza_db_read_uint_le_v1(metadata.payload, 40, 8)?
+        set next_object_id = yaza_db_read_uint_le_v1(metadata.payload, 48, 8)?
+        set generation = yaza_db_read_uint_le_v1(metadata.payload, 56, 8)?
+    else:
+        set next_object_id = yaza_db_read_uint_le_v1(metadata.payload, 40, 8)?
+        set generation = yaza_db_read_uint_le_v1(metadata.payload, 48, 8)?
+    let catalog: YazaDbCatalogRootV1 = YazaDbCatalogRootV1(sys_tables_root, sys_columns_root, sys_indexes_root, sys_constraints_root, next_object_id, generation, sys_views_root)
+    if not yaza_db_catalog_roots_valid_v1(expected_page_id, catalog): return err("YDBv1 catalog-root page references are invalid")
+    return ok(catalog)
+
+fn yaza_db_catalog_root_validate_header_v1(page: Bytes, expected_page_id: Number, file_header: YazaDbFileHeaderV1) -> Result[YazaDbCatalogRootV1, Text]:
+    if file_header.catalog_root != expected_page_id: return err("YDBv1 catalog-root page does not match the file header")
+    if expected_page_id < 2 or expected_page_id >= file_header.page_count: return err("YDBv1 catalog-root page is outside the logical database")
+    let catalog: YazaDbCatalogRootV1 = yaza_db_catalog_root_page_decode_v1(page, expected_page_id)?
+    let roots: List[Number] = [catalog.sys_tables_root, catalog.sys_columns_root, catalog.sys_indexes_root, catalog.sys_constraints_root]
+    if catalog.sys_views_root != 0 and not list_try_push(roots, catalog.sys_views_root): return err("YDBv1 catalog-root validation could not allocate its optional sys_views root")
+    var index: Number = 0
+    while index < list_count(roots):
+        let root_page_id: Number = list_get(roots, index)
+        if root_page_id >= file_header.page_count: return err("YDBv1 system-catalog root is outside the logical database")
+        let address: YazaDbBitmapAddressV1 = yaza_db_bitmap_address_v1(root_page_id)?
+        if address.is_bitmap_page: return err("YDBv1 system-catalog root points to a BITMAP page")
+        set index = index + 1
+    return ok(catalog)

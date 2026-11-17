@@ -1,0 +1,365 @@
+use "std/fs"
+use "../yazabase/allocator_v1"
+use "../yazabase/checkpoint_v1"
+use "../yazabase/page_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/wal_v1"
+
+fn yaza_base_checkpoint_v1_check(root_path: Text) -> Result[Number, Text]:
+    let heap_cursors: List[Number] = [11, 90, 30, 70]
+    let undo_heap: List[Number] = [0, 0, 0, 0]
+    var undo_heap_count: Number = 0
+    set undo_heap_count = yaza_db_checkpoint_undo_heap_push_v1(undo_heap, heap_cursors, undo_heap_count, 0)
+    set undo_heap_count = yaza_db_checkpoint_undo_heap_push_v1(undo_heap, heap_cursors, undo_heap_count, 1)
+    set undo_heap_count = yaza_db_checkpoint_undo_heap_push_v1(undo_heap, heap_cursors, undo_heap_count, 2)
+    set undo_heap_count = yaza_db_checkpoint_undo_heap_push_v1(undo_heap, heap_cursors, undo_heap_count, 3)
+    if undo_heap_count != 4: return err("YDBv1 recovery LSN heap did not accept its bounded test entries")
+    let undo_heap_pop1: YazaDbCheckpointUndoHeapPopV1 = yaza_db_checkpoint_undo_heap_pop_v1(undo_heap, heap_cursors, undo_heap_count)
+    if not undo_heap_pop1.valid or undo_heap_pop1.slot != 1: return err("YDBv1 recovery LSN heap did not select the greatest cursor")
+    set undo_heap_count = undo_heap_pop1.count
+    let undo_heap_pop2: YazaDbCheckpointUndoHeapPopV1 = yaza_db_checkpoint_undo_heap_pop_v1(undo_heap, heap_cursors, undo_heap_count)
+    if not undo_heap_pop2.valid or undo_heap_pop2.slot != 3: return err("YDBv1 recovery LSN heap lost order while sifting down")
+    set undo_heap_count = undo_heap_pop2.count
+    let undo_heap_pop3: YazaDbCheckpointUndoHeapPopV1 = yaza_db_checkpoint_undo_heap_pop_v1(undo_heap, heap_cursors, undo_heap_count)
+    if not undo_heap_pop3.valid or undo_heap_pop3.slot != 2: return err("YDBv1 recovery LSN heap returned an entry out of order")
+    set undo_heap_count = undo_heap_pop3.count
+    let undo_heap_pop4: YazaDbCheckpointUndoHeapPopV1 = yaza_db_checkpoint_undo_heap_pop_v1(undo_heap, heap_cursors, undo_heap_count)
+    if not undo_heap_pop4.valid or undo_heap_pop4.slot != 0 or undo_heap_pop4.count != 0: return err("YDBv1 recovery LSN heap did not drain in descending order")
+
+    let root: Number = root_open(root_path)?
+    let image_uuid: Bytes = bytes_from_text("sys-image-uuid01")
+    let image_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(image_uuid, 0, 1, 1, 0, 2, 1)
+    let image_storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, "system-image-smoke.ydb", image_header)?
+    let image_bitmap: Bytes = yaza_db_storage_read_page_v1(image_storage.file, image_storage.header, 2)?
+    let image_page_allocated: Boolean = yaza_db_bitmap_page_set_allocated_v1(image_bitmap, 1, true, 1, 2)?
+    if not image_page_allocated: return err("YDBv1 system-image fixture could not reserve its data page")
+    let image_bitmap_written: Number = yaza_db_storage_write_page_sync_v1(image_storage.file, image_storage.header, image_bitmap)?
+    if image_bitmap_written != yaza_db_page_size_v1(): return err("YDBv1 system-image fixture bitmap write was incomplete")
+    let image_log: YazaDbWalLogV1 = yaza_db_wal_log_open_for_v1(root, image_uuid)?
+    let image_seed: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(image_log, YazaDbWalRecordV1(0, 0, 0, yaza_db_wal_type_skip_v1(), 0, bytes_from_text("")))?
+    let image_lsn: Number = image_seed.log.next_lsn
+    let image_page: Bytes = yaza_db_page_new_v1(3, image_lsn, 1, 0)?
+    let image_payload: Bytes = yaza_db_wal_page_image_payload_encode_v1(3, image_lsn, image_page)?
+    let image_append: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(image_seed.log, YazaDbWalRecordV1(0, 0, 0, yaza_db_wal_type_full_page_image_v1(), 0, image_payload))?
+    let image_log_closed: Boolean = yaza_db_wal_log_close_v1(image_append.log)?
+    let image_storage_closed: Boolean = yaza_db_storage_close_v1(image_storage)?
+    if not image_log_closed or not image_storage_closed: return err("YDBv1 system-image fixture could not close before recovery")
+    let recovered_image: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "system-image-smoke.ydb")?
+    let recovered_image_page: Bytes = yaza_db_storage_read_page_v1(recovered_image.storage.file, recovered_image.storage.header, 3)?
+    if not bytes_equal(recovered_image_page, image_page): return err("YDBv1 startup recovery did not replay a system FULL_PAGE_IMAGE")
+    let recovered_image_wal_end: Number = recovered_image.wal.next_lsn
+    let recovered_image_log_closed: Boolean = yaza_db_wal_log_close_v1(recovered_image.wal)?
+    let recovered_image_storage_closed: Boolean = yaza_db_storage_close_v1(recovered_image.storage)?
+    if not recovered_image_log_closed or not recovered_image_storage_closed: return err("YDBv1 recovered system-image handles could not close")
+    let recovered_image_again: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "system-image-smoke.ydb")?
+    let recovered_image_page_again: Bytes = yaza_db_storage_read_page_v1(recovered_image_again.storage.file, recovered_image_again.storage.header, 3)?
+    if not bytes_equal(recovered_image_page_again, image_page) or recovered_image_again.wal.next_lsn != recovered_image_wal_end: return err("YDBv1 system FULL_PAGE_IMAGE restart replay was not idempotent")
+    let recovered_image_again_log_closed: Boolean = yaza_db_wal_log_close_v1(recovered_image_again.wal)?
+    let recovered_image_again_storage_closed: Boolean = yaza_db_storage_close_v1(recovered_image_again.storage)?
+    if not recovered_image_again_log_closed or not recovered_image_again_storage_closed: return err("YDBv1 idempotent system-image handles could not close")
+    let image_wal_name: Text = yaza_db_wal_segment_name_for_v1(0, image_uuid)?
+    let image_database_removed: Boolean = remove(root, "system-image-smoke.ydb")?
+    let image_wal_removed: Boolean = remove(root, image_wal_name)?
+    if not image_database_removed or not image_wal_removed: return err("YDBv1 system-image fixture cleanup failed")
+    let image_cleanup_sync: Boolean = sync_directory(root)?
+    if not image_cleanup_sync: return err("YDBv1 system-image fixture cleanup sync failed")
+
+    let uuid: Bytes = bytes_from_text("checkpoint-uuid1")
+    let initial: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(uuid, 0, 1, 1, 0, 2, 1)
+    let storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, "checkpoint-smoke.ydb", initial)?
+    let log: YazaDbWalLogV1 = yaza_db_wal_log_open_for_v1(root, uuid)?
+    let oversized_tail_log: YazaDbWalLogV1 = YazaDbWalLogV1(log.root, log.db_uuid, log.file, log.segment_index, log.segment_base_lsn, yaza_db_checkpoint_recovery_max_tail_bytes_v1() + 1)
+    let oversized_tail: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_checkpoint_reconcile_impl_v1(storage, oversized_tail_log)
+    if result_is_ok(oversized_tail): return err("YDBv1 checkpoint recovery accepted a WAL tail over its 64 MiB bound")
+    if not text_starts_with(result_unwrap_error(oversized_tail), "YDBv1 WAL recovery tail exceeds 64 MiB"): return err("YDBv1 oversized WAL tail was rejected for an unexpected reason")
+    if yaza_db_bitmap_page_bit_count_v1() != 130688: return err("YDBv1 BITMAP capacity does not match the selected 48-byte header policy")
+    let boundary_start: YazaDbBitmapAddressV1 = yaza_db_bitmap_address_v1(130689)?
+    let boundary_next: YazaDbBitmapAddressV1 = yaza_db_bitmap_address_v1(130690)?
+    if boundary_start.bitmap_page_id != 2 or boundary_start.bit_index != 130687 or boundary_start.is_bitmap_page: return err("YDBv1 final bit before the next BITMAP range maps incorrectly")
+    if boundary_next.bitmap_page_id != 130690 or boundary_next.bit_index != 0 or not boundary_next.is_bitmap_page: return err("YDBv1 next BITMAP range start maps incorrectly")
+    let ordinary_growth_ranges: Number = yaza_db_storage_new_bitmap_range_count_v1(4096, 8192)?
+    let boundary_growth_ranges: Number = yaza_db_storage_new_bitmap_range_count_v1(126976, 131072)?
+    let post_boundary_growth_ranges: Number = yaza_db_storage_new_bitmap_range_count_v1(131072, 135168)?
+    if ordinary_growth_ranges != 0: return err("YDBv1 ordinary chunk growth created a BITMAP range too early")
+    if boundary_growth_ranges != 1: return err("YDBv1 48-byte-header mapping did not create one BITMAP at its first chunk boundary")
+    if post_boundary_growth_ranges != 0: return err("YDBv1 ordinary growth after the BITMAP boundary created an extra range")
+
+    let initial_size: Number = file_size(storage.file)?
+    let initial_next_lsn: Number = log.next_lsn
+    let active_rejected: Result[YazaDbCheckpointResultV1, Text] = yaza_db_storage_extend_preallocated_chunk_v1(storage, log, 1)
+    if result_is_ok(active_rejected): return err("YDBv1 chunk extension accepted a nonzero active transaction count")
+    let rejected_size: Number = file_size(storage.file)?
+    if rejected_size != initial_size or log.next_lsn != initial_next_lsn: return err("YDBv1 rejected extension changed the file or WAL state")
+    let unallocated_root: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(storage.header.db_uuid, storage.header.checkpoint_lsn, storage.header.next_txn_id, storage.header.next_commit_ts, 3, storage.header.page_count, storage.header.flags)
+    let invalid_catalog_begin: Result[YazaDbCheckpointStartV1, Text] = yaza_db_checkpoint_begin_v1(storage, log, unallocated_root, 0)
+    if result_is_ok(invalid_catalog_begin): return err("YDBv1 checkpoint accepted an unallocated catalog root")
+    if log.next_lsn != initial_next_lsn: return err("YDBv1 rejected catalog root changed the WAL")
+
+    let clean: YazaDbCheckpointResultV1 = yaza_db_checkpoint_clean_v1(storage, log, 0)?
+    if clean.begin_record.rec_type != yaza_db_wal_type_checkpoint_begin_v1() or clean.end_record.rec_type != yaza_db_wal_type_checkpoint_end_v1(): return err("YDBv1 clean checkpoint wrote the wrong WAL record types")
+    let first_snapshot: YazaDbCheckpointSnapshotV1 = yaza_db_checkpoint_end_payload_decode_v1(clean.end_record)?
+    if first_snapshot.begin_lsn != clean.begin_record.lsn or first_snapshot.page_count != clean.storage.header.page_count: return err("YDBv1 clean checkpoint end record does not describe its durable state")
+    if clean.storage.header.checkpoint_lsn != clean.end_record.lsn: return err("YDBv1 clean checkpoint did not publish its end LSN to both headers")
+
+    let extended: YazaDbCheckpointResultV1 = yaza_db_storage_extend_preallocated_chunk_v1(clean.storage, clean.wal, 0)?
+    if extended.storage.header.page_count != yaza_db_storage_preallocated_page_count_v1() * 2: return err("YDBv1 extension did not publish exactly one additional 64 MiB page range")
+    if extended.storage.header.checkpoint_lsn != extended.end_record.lsn: return err("YDBv1 extension published the wrong checkpoint LSN")
+    let extended_size: Number = file_size(extended.storage.file)?
+    if extended_size != yaza_db_storage_preallocation_granule_v1() * 2: return err("YDBv1 extension did not preallocate and sync the next 64 MiB chunk")
+    let second_snapshot: YazaDbCheckpointSnapshotV1 = yaza_db_checkpoint_end_payload_decode_v1(extended.end_record)?
+    if second_snapshot.begin_lsn != extended.begin_record.lsn or second_snapshot.page_count != extended.storage.header.page_count: return err("YDBv1 extension checkpoint end record does not describe the new page range")
+    let bitmap: Bytes = yaza_db_storage_read_page_v1(extended.storage.file, extended.storage.header, 2)?
+    let first_free: Boolean = yaza_db_bitmap_page_bit_for_page_v1(bitmap, 3, 2)?
+    if first_free: return err("YDBv1 chunk extension changed an existing allocation bit")
+
+    let closed_log: Boolean = yaza_db_wal_log_close_v1(extended.wal)?
+    if not closed_log: return err("YDBv1 checkpoint fixture WAL close failed")
+    let closed_storage: Boolean = yaza_db_storage_close_v1(extended.storage)?
+    if not closed_storage: return err("YDBv1 checkpoint fixture storage close failed")
+    let reopened_storage: YazaDbStorageHandleV1 = yaza_db_storage_open_v1(root, "checkpoint-smoke.ydb")?
+    if reopened_storage.header.page_count != extended.storage.header.page_count or reopened_storage.header.checkpoint_lsn != extended.end_record.lsn: return err("YDBv1 reopen did not select the durable extended header")
+    let reopened_log: YazaDbWalLogV1 = yaza_db_wal_log_open_for_v1(root, uuid)?
+    if reopened_log.next_lsn != extended.end_record.lsn + yaza_db_wal_header_size_v1() + yaza_db_checkpoint_end_payload_size_v1(): return err("YDBv1 WAL reopen did not recover after the clean checkpoint")
+    let recovery_start: YazaDbCheckpointStartV1 = yaza_db_checkpoint_begin_v1(reopened_storage, reopened_log, reopened_storage.header, 0)?
+    let recovery_end: YazaDbCheckpointEndV1 = yaza_db_checkpoint_append_end_v1(reopened_storage, recovery_start)?
+    let crash_end_lsn: Number = recovery_end.end_record.lsn
+    let closed_unpublished_log: Boolean = yaza_db_wal_log_close_v1(recovery_end.wal)?
+    if not closed_unpublished_log: return err("YDBv1 unpublished-checkpoint WAL close failed")
+    let closed_before_crash_storage: Boolean = yaza_db_storage_close_v1(reopened_storage)?
+    if not closed_before_crash_storage: return err("YDBv1 pre-recovery storage close failed")
+    let stale_storage: YazaDbStorageHandleV1 = yaza_db_storage_open_v1(root, "checkpoint-smoke.ydb")?
+    if stale_storage.header.checkpoint_lsn != extended.end_record.lsn: return err("YDBv1 crash fixture did not preserve the old header before reconciliation")
+    let closed_stale_storage: Boolean = yaza_db_storage_close_v1(stale_storage)?
+    if not closed_stale_storage: return err("YDBv1 stale-header fixture storage close failed")
+    let reconciled: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "checkpoint-smoke.ydb")?
+    if reconciled.applied_checkpoint_count != 1 or reconciled.storage.header.checkpoint_lsn != crash_end_lsn: return err("YDBv1 recovery did not publish the durable CHECKPOINT_END")
+    let closed_recovery_log: Boolean = yaza_db_wal_log_close_v1(reconciled.wal)?
+    if not closed_recovery_log: return err("YDBv1 reconciled WAL close failed")
+    let closed_recovered_storage: Boolean = yaza_db_storage_close_v1(reconciled.storage)?
+    if not closed_recovered_storage: return err("YDBv1 reconciled storage close failed")
+
+    let idempotent: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "checkpoint-smoke.ydb")?
+    if idempotent.applied_checkpoint_count != 0 or idempotent.storage.header.checkpoint_lsn != crash_end_lsn: return err("YDBv1 checkpoint recovery was not idempotent")
+    let incomplete_start: YazaDbCheckpointStartV1 = yaza_db_checkpoint_begin_v1(idempotent.storage, idempotent.wal, idempotent.storage.header, 0)?
+    let incomplete_lsn: Number = incomplete_start.record.lsn
+    let closed_incomplete_log: Boolean = yaza_db_wal_log_close_v1(incomplete_start.wal)?
+    if not closed_incomplete_log: return err("YDBv1 incomplete-checkpoint WAL close failed")
+    let closed_before_incomplete_recovery: Boolean = yaza_db_storage_close_v1(idempotent.storage)?
+    if not closed_before_incomplete_recovery: return err("YDBv1 pre-incomplete-recovery storage close failed")
+    let ignored_incomplete_recovery: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "checkpoint-smoke.ydb")?
+    if ignored_incomplete_recovery.applied_checkpoint_count != 0 or ignored_incomplete_recovery.storage.header.checkpoint_lsn != crash_end_lsn or incomplete_lsn >= ignored_incomplete_recovery.wal.next_lsn: return err("YDBv1 recovery published an incomplete checkpoint BEGIN")
+    let expected_first_log_end: Number = ignored_incomplete_recovery.wal.next_lsn
+    let closed_incomplete_recovery_log: Boolean = yaza_db_wal_log_close_v1(ignored_incomplete_recovery.wal)?
+    if not closed_incomplete_recovery_log: return err("YDBv1 incomplete-recovery WAL close failed")
+    let closed_incomplete_recovery_storage: Boolean = yaza_db_storage_close_v1(ignored_incomplete_recovery.storage)?
+    if not closed_incomplete_recovery_storage: return err("YDBv1 incomplete-recovery storage close failed")
+
+    let crash_uuid: Bytes = bytes_from_text("alloc-crash-uuid")
+    let crash_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(crash_uuid, 0, 1, 1, 0, 2, 1)
+    let crash_storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, "allocator-crash-smoke.ydb", crash_header)?
+    let crash_log: YazaDbWalLogV1 = yaza_db_wal_log_open_for_v1(root, crash_uuid)?
+    let crash_seed: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(crash_log, YazaDbWalRecordV1(0, 0, 1, yaza_db_wal_type_mtr_end_v1(), 0, bytes_from_text("")))?
+    let uncommitted_bitmap_payload: Bytes = yaza_db_page_space_payload_encode_v1(1, 3, 2, 1)?
+    let durable_unapplied: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(crash_seed.log, YazaDbWalRecordV1(0, crash_seed.record.lsn, 1, yaza_db_wal_type_page_alloc_v1(), 0, uncommitted_bitmap_payload))?
+    let crash_lsn: Number = durable_unapplied.record.lsn
+    let closed_crash_log: Boolean = yaza_db_wal_log_close_v1(durable_unapplied.log)?
+    if not closed_crash_log: return err("YDBv1 unresolved PAGE_ALLOC WAL close failed")
+    let closed_crash_storage: Boolean = yaza_db_storage_close_v1(crash_storage)?
+    if not closed_crash_storage: return err("YDBv1 unresolved PAGE_ALLOC storage close failed")
+    let recovered_page_space: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "allocator-crash-smoke.ydb")?
+    if recovered_page_space.applied_checkpoint_count != 1: return err("YDBv1 startup recovery did not publish a checkpoint after undoing the loser transaction")
+    if recovered_page_space.storage.header.next_txn_id != 2: return err("YDBv1 startup recovery did not advance the transaction ID counter")
+    if recovered_page_space.storage.header.checkpoint_lsn <= crash_lsn: return err("YDBv1 startup recovery checkpoint does not cover the durable PAGE_ALLOC")
+    let recovered_bitmap: Bytes = yaza_db_storage_read_page_v1(recovered_page_space.storage.file, recovered_page_space.storage.header, 2)?
+    let recovered_allocated: Boolean = yaza_db_bitmap_page_bit_for_page_v1(recovered_bitmap, 3, 2)?
+    if recovered_allocated: return err("YDBv1 loser transaction undo left its PAGE_ALLOC bit set")
+    let recovered_wal_end: Number = recovered_page_space.wal.next_lsn
+    let closed_recovered_page_log: Boolean = yaza_db_wal_log_close_v1(recovered_page_space.wal)?
+    let closed_recovered_page_storage: Boolean = yaza_db_storage_close_v1(recovered_page_space.storage)?
+    if not closed_recovered_page_log or not closed_recovered_page_storage: return err("YDBv1 recovered PAGE_ALLOC fixture handles could not close")
+    let recovered_page_again: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "allocator-crash-smoke.ydb")?
+    if recovered_page_again.applied_checkpoint_count != 0 or recovered_page_again.wal.next_lsn != recovered_wal_end: return err("YDBv1 loser transaction recovery was not idempotent")
+    let closed_recovered_page_again_log: Boolean = yaza_db_wal_log_close_v1(recovered_page_again.wal)?
+    let closed_recovered_page_again_storage: Boolean = yaza_db_storage_close_v1(recovered_page_again.storage)?
+    if not closed_recovered_page_again_log or not closed_recovered_page_again_storage: return err("YDBv1 idempotent recovery handles could not close")
+    let removed_crash_database: Boolean = remove(root, "allocator-crash-smoke.ydb")?
+    let crash_wal_name: Text = yaza_db_wal_segment_name_for_v1(0, crash_uuid)?
+    let removed_crash_wal: Boolean = remove(root, crash_wal_name)?
+    if not removed_crash_database or not removed_crash_wal: return err("YDBv1 unresolved PAGE_ALLOC fixture cleanup failed")
+    let synced_crash_cleanup: Boolean = sync_directory(root)?
+    if not synced_crash_cleanup: return err("YDBv1 unresolved PAGE_ALLOC cleanup directory sync failed")
+
+    let clr_uuid: Bytes = bytes_from_text("alloc-clr-uuid01")
+    let clr_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(clr_uuid, 0, 1, 1, 0, 2, 1)
+    let clr_storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, "allocator-clr-smoke.ydb", clr_header)?
+    let clr_log: YazaDbWalLogV1 = yaza_db_wal_log_open_for_v1(root, clr_uuid)?
+    let clr_seed: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(clr_log, YazaDbWalRecordV1(0, 0, 1, yaza_db_wal_type_mtr_end_v1(), 0, bytes_from_text("")))?
+    let clr_alloc_payload: Bytes = yaza_db_page_space_payload_encode_v1(1, 3, 2, 1)?
+    let clr_alloc: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(clr_seed.log, YazaDbWalRecordV1(0, clr_seed.record.lsn, 1, yaza_db_wal_type_page_alloc_v1(), 0, clr_alloc_payload))?
+    let valid_clr_payload: Bytes = yaza_db_compensation_payload_encode_v1(2, 3, 2, 1, clr_seed.record.lsn, clr_alloc.record.lsn)?
+    let valid_clr: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(clr_alloc.log, YazaDbWalRecordV1(0, clr_alloc.record.lsn, 1, yaza_db_wal_type_compensation_v1(), 0, valid_clr_payload))?
+    let closed_clr_log: Boolean = yaza_db_wal_log_close_v1(valid_clr.log)?
+    let closed_clr_storage: Boolean = yaza_db_storage_close_v1(clr_storage)?
+    if not closed_clr_log or not closed_clr_storage: return err("YDBv1 durable-CLR crash fixture could not close before recovery")
+    let recovered_clr: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "allocator-clr-smoke.ydb")?
+    if recovered_clr.applied_checkpoint_count != 1 or recovered_clr.storage.header.next_txn_id != 2: return err("YDBv1 startup did not resume an active transaction from its durable CLR")
+    let recovered_clr_bitmap: Bytes = yaza_db_storage_read_page_v1(recovered_clr.storage.file, recovered_clr.storage.header, 2)?
+    let recovered_clr_allocated: Boolean = yaza_db_bitmap_page_bit_for_page_v1(recovered_clr_bitmap, 3, 2)?
+    if recovered_clr_allocated: return err("YDBv1 durable CLR replay did not leave the loser page allocation undone")
+    let recovered_clr_log_closed: Boolean = yaza_db_wal_log_close_v1(recovered_clr.wal)?
+    let recovered_clr_storage_closed: Boolean = yaza_db_storage_close_v1(recovered_clr.storage)?
+    if not recovered_clr_log_closed or not recovered_clr_storage_closed: return err("YDBv1 recovered durable-CLR handles could not close")
+    let removed_clr_database: Boolean = remove(root, "allocator-clr-smoke.ydb")?
+    let clr_wal_name: Text = yaza_db_wal_segment_name_for_v1(0, clr_uuid)?
+    let removed_clr_wal: Boolean = remove(root, clr_wal_name)?
+    if not removed_clr_database or not removed_clr_wal: return err("YDBv1 durable-CLR fixture cleanup failed")
+    let synced_clr_cleanup: Boolean = sync_directory(root)?
+    if not synced_clr_cleanup: return err("YDBv1 durable-CLR cleanup directory sync failed")
+
+    let forged_clr_uuid: Bytes = bytes_from_text("forged-clr-uuid1")
+    let forged_clr_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(forged_clr_uuid, 0, 1, 1, 0, 2, 1)
+    let forged_clr_storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, "forged-clr-smoke.ydb", forged_clr_header)?
+    let forged_clr_log: YazaDbWalLogV1 = yaza_db_wal_log_open_for_v1(root, forged_clr_uuid)?
+    let forged_clr_seed: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(forged_clr_log, YazaDbWalRecordV1(0, 0, 1, yaza_db_wal_type_mtr_end_v1(), 0, bytes_from_text("")))?
+    let forged_alloc_payload: Bytes = yaza_db_page_space_payload_encode_v1(1, 3, 2, 1)?
+    let forged_alloc: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(forged_clr_seed.log, YazaDbWalRecordV1(0, forged_clr_seed.record.lsn, 1, yaza_db_wal_type_page_alloc_v1(), 0, forged_alloc_payload))?
+    let forged_payload: Bytes = yaza_db_compensation_payload_encode_v1(1, 3, 2, 1, forged_clr_seed.record.lsn, forged_alloc.record.lsn)?
+    let forged_clr: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(forged_alloc.log, YazaDbWalRecordV1(0, forged_alloc.record.lsn, 1, yaza_db_wal_type_compensation_v1(), 0, forged_payload))?
+    let forged_log_closed: Boolean = yaza_db_wal_log_close_v1(forged_clr.log)?
+    let forged_storage_closed: Boolean = yaza_db_storage_close_v1(forged_clr_storage)?
+    if not forged_log_closed or not forged_storage_closed: return err("YDBv1 forged-CLR fixture could not close before validation")
+    let forged_recovery: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_open_recovered_v1(root, "forged-clr-smoke.ydb")
+    if result_is_ok(forged_recovery):
+        let accepted_forged_clr: YazaDbCheckpointRecoveryV1 = result_unwrap(forged_recovery)
+        let ignored_forged_log_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(accepted_forged_clr.wal)
+        let ignored_forged_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(accepted_forged_clr.storage)
+        return err("YDBv1 recovery accepted a COMPENSATION that repeats rather than inverses PAGE_ALLOC")
+    if not text_starts_with(result_unwrap_error(forged_recovery), "YDBv1 COMPENSATION does not exactly undo"): return err("YDBv1 recovery rejected a forged CLR for an unexpected reason")
+    let forged_check_storage: YazaDbStorageHandleV1 = yaza_db_storage_open_v1(root, "forged-clr-smoke.ydb")?
+    let forged_check_bitmap: Bytes = yaza_db_storage_read_page_v1(forged_check_storage.file, forged_check_storage.header, 2)?
+    let forged_check_allocated: Boolean = yaza_db_bitmap_page_bit_for_page_v1(forged_check_bitmap, 3, 2)?
+    if forged_check_allocated: return err("YDBv1 malformed CLR mutated allocator state before analysis completed")
+    let forged_check_closed: Boolean = yaza_db_storage_close_v1(forged_check_storage)?
+    if not forged_check_closed: return err("YDBv1 forged-CLR validation storage close failed")
+    let removed_forged_database: Boolean = remove(root, "forged-clr-smoke.ydb")?
+    let forged_wal_name: Text = yaza_db_wal_segment_name_for_v1(0, forged_clr_uuid)?
+    let removed_forged_wal: Boolean = remove(root, forged_wal_name)?
+    if not removed_forged_database or not removed_forged_wal: return err("YDBv1 forged-CLR fixture cleanup failed")
+    let synced_forged_cleanup: Boolean = sync_directory(root)?
+    if not synced_forged_cleanup: return err("YDBv1 forged-CLR cleanup directory sync failed")
+
+    let order_uuid: Bytes = bytes_from_text("undo-order-uuid1")
+    let order_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(order_uuid, 0, 1, 1, 0, 2, 1)
+    let order_storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, "undo-order-smoke.ydb", order_header)?
+    let initial_order_bitmap: Bytes = yaza_db_storage_read_page_v1(order_storage.file, order_storage.header, 2)?
+    let reserved_order_bit: Boolean = yaza_db_bitmap_page_set_allocated_v1(initial_order_bitmap, 1, true, 0, 2)?
+    if not reserved_order_bit: return err("YDBv1 global-undo fixture could not establish its initially allocated page")
+    let synced_initial_order_bitmap: Number = yaza_db_storage_write_page_sync_v1(order_storage.file, order_storage.header, initial_order_bitmap)?
+    let order_log: YazaDbWalLogV1 = yaza_db_wal_log_open_for_v1(root, order_uuid)?
+    let order_tx1_seed: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(order_log, YazaDbWalRecordV1(0, 0, 1, yaza_db_wal_type_mtr_end_v1(), 0, bytes_from_text("")))?
+    let order_free_payload: Bytes = yaza_db_page_space_payload_encode_v1(2, 3, 2, 1)?
+    let order_tx1_free: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(order_tx1_seed.log, YazaDbWalRecordV1(0, order_tx1_seed.record.lsn, 1, yaza_db_wal_type_page_free_v1(), 0, order_free_payload))?
+    let order_tx2_seed: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(order_tx1_free.log, YazaDbWalRecordV1(0, 0, 2, yaza_db_wal_type_mtr_end_v1(), 0, bytes_from_text("")))?
+    let order_alloc_payload: Bytes = yaza_db_page_space_payload_encode_v1(1, 3, 2, 1)?
+    let order_tx2_alloc: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(order_tx2_seed.log, YazaDbWalRecordV1(0, order_tx2_seed.record.lsn, 2, yaza_db_wal_type_page_alloc_v1(), 0, order_alloc_payload))?
+    let applied_order_free: Boolean = yaza_db_allocator_redo_page_space_v1(order_storage, order_tx1_free.record, order_tx2_alloc.log.next_lsn)?
+    let applied_order_alloc: Boolean = yaza_db_allocator_redo_page_space_v1(order_storage, order_tx2_alloc.record, order_tx2_alloc.log.next_lsn)?
+    if not applied_order_free or not applied_order_alloc: return err("YDBv1 global-undo fixture could not apply its interleaved page-space records")
+    let order_log_closed: Boolean = yaza_db_wal_log_close_v1(order_tx2_alloc.log)?
+    let order_storage_closed: Boolean = yaza_db_storage_close_v1(order_storage)?
+    if not order_log_closed or not order_storage_closed: return err("YDBv1 global-undo fixture could not close before recovery")
+    let recovered_order: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "undo-order-smoke.ydb")?
+    if recovered_order.applied_checkpoint_count != 1 or recovered_order.storage.header.next_txn_id != 3: return err("YDBv1 global loser undo did not checkpoint both interleaved transactions")
+    let recovered_order_bitmap: Bytes = yaza_db_storage_read_page_v1(recovered_order.storage.file, recovered_order.storage.header, 2)?
+    let recovered_order_allocated: Boolean = yaza_db_bitmap_page_bit_for_page_v1(recovered_order_bitmap, 3, 2)?
+    if not recovered_order_allocated: return err("YDBv1 loser undo did not follow reverse global LSN order for the shared allocation bit")
+    let recovered_order_log_closed: Boolean = yaza_db_wal_log_close_v1(recovered_order.wal)?
+    let recovered_order_storage_closed: Boolean = yaza_db_storage_close_v1(recovered_order.storage)?
+    if not recovered_order_log_closed or not recovered_order_storage_closed: return err("YDBv1 global-undo recovery handles could not close")
+    let removed_order_database: Boolean = remove(root, "undo-order-smoke.ydb")?
+    let order_wal_name: Text = yaza_db_wal_segment_name_for_v1(0, order_uuid)?
+    let removed_order_wal: Boolean = remove(root, order_wal_name)?
+    if not removed_order_database or not removed_order_wal: return err("YDBv1 global-undo fixture cleanup failed")
+    let synced_order_cleanup: Boolean = sync_directory(root)?
+    if not synced_order_cleanup: return err("YDBv1 global-undo cleanup directory sync failed")
+
+    let txn_uuid: Bytes = bytes_from_text("txn-chain-uuid01")
+    let txn_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(txn_uuid, 0, 1, 1, 0, 2, 1)
+    let txn_storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, "txn-chain-smoke.ydb", txn_header)?
+    let txn_log: YazaDbWalLogV1 = yaza_db_wal_log_open_for_v1(root, txn_uuid)?
+    let txn_first: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(txn_log, YazaDbWalRecordV1(0, 0, 1, yaza_db_wal_type_mtr_end_v1(), 0, bytes_from_text("")))?
+    let txn_commit_payload: Bytes = yaza_db_wal_commit_payload_encode_v1(1)?
+    let txn_commit: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(txn_first.log, YazaDbWalRecordV1(0, txn_first.record.lsn, 1, yaza_db_wal_type_commit_v1(), 0, txn_commit_payload))?
+    let txn_log_closed: Boolean = yaza_db_wal_log_close_v1(txn_commit.log)?
+    let txn_storage_closed: Boolean = yaza_db_storage_close_v1(txn_storage)?
+    if not txn_log_closed or not txn_storage_closed: return err("YDBv1 transaction-chain fixture could not close before recovery")
+    let recovered_commit: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "txn-chain-smoke.ydb")?
+    if recovered_commit.applied_checkpoint_count != 1: return err("YDBv1 committed transaction recovery did not publish a checkpoint")
+    if recovered_commit.storage.header.next_txn_id != 2 or recovered_commit.storage.header.next_commit_ts != 2: return err("YDBv1 committed transaction recovery did not restore its durable counters")
+    let committed_checkpoint_lsn: Number = recovered_commit.storage.header.checkpoint_lsn
+    let committed_wal_end: Number = recovered_commit.wal.next_lsn
+    let recovered_commit_log_closed: Boolean = yaza_db_wal_log_close_v1(recovered_commit.wal)?
+    let recovered_commit_storage_closed: Boolean = yaza_db_storage_close_v1(recovered_commit.storage)?
+    if not recovered_commit_log_closed or not recovered_commit_storage_closed: return err("YDBv1 recovered commit fixture handles could not close")
+    let recovered_commit_again: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "txn-chain-smoke.ydb")?
+    if recovered_commit_again.applied_checkpoint_count != 0 or recovered_commit_again.storage.header.checkpoint_lsn != committed_checkpoint_lsn or recovered_commit_again.wal.next_lsn != committed_wal_end: return err("YDBv1 committed transaction recovery was not idempotent")
+    let recovered_commit_again_log_closed: Boolean = yaza_db_wal_log_close_v1(recovered_commit_again.wal)?
+    let recovered_commit_again_storage_closed: Boolean = yaza_db_storage_close_v1(recovered_commit_again.storage)?
+    if not recovered_commit_again_log_closed or not recovered_commit_again_storage_closed: return err("YDBv1 idempotent committed recovery handles could not close")
+    let malformed_txn_log: YazaDbWalLogV1 = yaza_db_wal_log_open_for_v1(root, txn_uuid)?
+    let malformed_txn_first: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(malformed_txn_log, YazaDbWalRecordV1(0, 0, 2, yaza_db_wal_type_mtr_end_v1(), 0, bytes_from_text("")))?
+    let malformed_commit_payload: Bytes = yaza_db_wal_commit_payload_encode_v1(2)?
+    let malformed_txn_commit: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(malformed_txn_first.log, YazaDbWalRecordV1(0, 0, 2, yaza_db_wal_type_commit_v1(), 0, malformed_commit_payload))?
+    let malformed_txn_log_closed: Boolean = yaza_db_wal_log_close_v1(malformed_txn_commit.log)?
+    if not malformed_txn_log_closed: return err("YDBv1 malformed transaction-chain WAL close failed")
+    let malformed_chain: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_open_recovered_v1(root, "txn-chain-smoke.ydb")
+    if result_is_ok(malformed_chain):
+        let unexpectedly_open_chain: YazaDbCheckpointRecoveryV1 = result_unwrap(malformed_chain)
+        let ignored_chain_log_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(unexpectedly_open_chain.wal)
+        let ignored_chain_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(unexpectedly_open_chain.storage)
+        return err("YDBv1 recovery accepted a COMMIT with the wrong transaction prev_lsn")
+    let malformed_chain_error: Text = result_unwrap_error(malformed_chain)
+    if not text_starts_with(malformed_chain_error, "YDBv1 transaction WAL prev_lsn does not match"): return err("YDBv1 malformed transaction chain was rejected for an unexpected reason: " + malformed_chain_error)
+    let removed_txn_database: Boolean = remove(root, "txn-chain-smoke.ydb")?
+    let txn_wal_name: Text = yaza_db_wal_segment_name_for_v1(0, txn_uuid)?
+    let removed_txn_wal: Boolean = remove(root, txn_wal_name)?
+    if not removed_txn_database or not removed_txn_wal: return err("YDBv1 transaction-chain fixture cleanup failed")
+    let synced_txn_cleanup: Boolean = sync_directory(root)?
+    if not synced_txn_cleanup: return err("YDBv1 transaction-chain cleanup directory sync failed")
+
+    let second_uuid: Bytes = bytes_from_text("second-db-uuid01")
+    let second_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(second_uuid, 0, 1, 1, 0, 2, 1)
+    let second_storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, "second-smoke.ydb", second_header)?
+    let second_log: YazaDbWalLogV1 = yaza_db_wal_log_open_for_v1(root, second_uuid)?
+    let second_append: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(second_log, YazaDbWalRecordV1(0, 0, 1, yaza_db_wal_type_mtr_end_v1(), 0, bytes_from_text("")))?
+    let first_namespace_count: Number = yaza_db_wal_segment_count_for_v1(root, uuid)?
+    let second_namespace_count: Number = yaza_db_wal_segment_count_for_v1(root, second_uuid)?
+    if first_namespace_count != 1 or second_namespace_count != 1: return err("YDBv1 WAL segment discovery mixed independent database UUID namespaces")
+    let closed_second_log: Boolean = yaza_db_wal_log_close_v1(second_append.log)?
+    if not closed_second_log: return err("YDBv1 second database WAL close failed")
+    let first_log_after_second_append: YazaDbWalLogV1 = yaza_db_wal_log_open_for_v1(root, uuid)?
+    if first_log_after_second_append.next_lsn != expected_first_log_end: return err("YDBv1 first database WAL end changed after a different database appended")
+    let closed_first_log: Boolean = yaza_db_wal_log_close_v1(first_log_after_second_append)?
+    if not closed_first_log: return err("YDBv1 first database WAL close after isolation check failed")
+    let closed_second_storage: Boolean = yaza_db_storage_close_v1(second_storage)?
+    if not closed_second_storage: return err("YDBv1 second database storage close failed")
+    let removed_second_database: Boolean = remove(root, "second-smoke.ydb")?
+    let second_wal_name: Text = yaza_db_wal_segment_name_for_v1(0, second_uuid)?
+    let removed_second_wal: Boolean = remove(root, second_wal_name)?
+    if not removed_second_database or not removed_second_wal: return err("YDBv1 second database fixture cleanup failed")
+    let synced_second_cleanup: Boolean = sync_directory(root)?
+    if not synced_second_cleanup: return err("YDBv1 second database cleanup directory sync failed")
+    let ignored_remove: Boolean = remove(root, "checkpoint-smoke.ydb")?
+    if not ignored_remove: return err("YDBv1 checkpoint fixture database removal failed")
+    let ignored_sync: Boolean = sync_directory(root)?
+    if not ignored_sync: return err("YDBv1 checkpoint fixture directory sync failed")
+    let ignored_root_close: Boolean = close(root)?
+    if not ignored_root_close: return err("YDBv1 checkpoint fixture root close failed")
+    return ok(extended.storage.header.page_count)
+
+start:
+    let outcome: Result[Number, Text] = yaza_base_checkpoint_v1_check(arg(1))
+    if result_is_ok(outcome):
+        say "yazabase-checkpoint-v1-ok pages=" + number_text(result_unwrap(outcome))
+    else:
+        say result_unwrap_error(outcome)

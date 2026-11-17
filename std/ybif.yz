@@ -1,0 +1,98 @@
+# YAZA Binary Interchange Format (YBIF) v1
+# Specification: proposal-yaza-llvm-backend-parity.md (lines 171-198)
+# Magic: "YBIF" (0x59 0x42 0x49 0x46), Version: 1
+
+fn ybif_header() -> Bytes:
+    let magic: Bytes = bytes_from_text("YBIF")
+    let ver: Bytes = bytes_from_number(1)
+    return bytes_concat(magic, ver)
+
+fn ybif_is_valid_header(data: Bytes) -> Boolean:
+    if bytes_length(data) < 5: return false
+    let magic: Bytes = bytes_slice(data, 0, 4)
+    if not bytes_equal(magic, bytes_from_text("YBIF")): return false
+    if bytes_get(data, 4) != 1: return false
+    return true
+
+fn ybif_u32_le(val: Number) -> Bytes:
+    var v: Number = val
+    if v < 0: set v = 0
+    let b0: Bytes = bytes_from_number(v % 256)
+    let b1: Bytes = bytes_from_number((v / 256) % 256)
+    let b2: Bytes = bytes_from_number((v / 65536) % 256)
+    let b3: Bytes = bytes_from_number((v / 16777216) % 256)
+    return bytes_concat(bytes_concat(b0, b1), bytes_concat(b2, b3))
+
+fn ybif_read_u32_le(data: Bytes, offset: Number) -> Number:
+    if offset + 4 > bytes_length(data): return 0
+    let b0: Number = bytes_get(data, offset)
+    let b1: Number = bytes_get(data, offset + 1)
+    let b2: Number = bytes_get(data, offset + 2)
+    let b3: Number = bytes_get(data, offset + 3)
+    return b0 + (b1 * 256) + (b2 * 65536) + (b3 * 16777216)
+
+fn ybif_encode_null() -> Bytes:
+    return bytes_from_number(0)
+
+fn ybif_encode_bool(val: Boolean) -> Bytes:
+    if val: return bytes_from_number(2)
+    return bytes_from_number(1)
+
+fn ybif_encode_number(val: Number) -> Bytes:
+    let tag: Bytes = bytes_from_number(3)
+    var sign: Number = 0
+    var abs_val: Number = val
+    if val < 0:
+        set sign = 1
+        set abs_val = 0 - val
+    let sign_byte: Bytes = bytes_from_number(sign)
+    let b0: Bytes = bytes_from_number(abs_val % 256)
+    let b1: Bytes = bytes_from_number((abs_val / 256) % 256)
+    let b2: Bytes = bytes_from_number((abs_val / 65536) % 256)
+    let b3: Bytes = bytes_from_number((abs_val / 16777216) % 256)
+    let b4: Bytes = bytes_from_number((abs_val / 4294967296) % 256)
+    let b5: Bytes = bytes_from_number((abs_val / 1099511627776) % 256)
+    let b6: Bytes = bytes_from_number((abs_val / 281474976710656) % 256)
+    let num_bytes: Bytes = bytes_concat(bytes_concat(bytes_concat(b0, b1), bytes_concat(b2, b3)), bytes_concat(bytes_concat(b4, b5), b6))
+    return bytes_concat(bytes_concat(tag, sign_byte), num_bytes)
+
+fn ybif_encode_text(val: Text) -> Bytes:
+    let tag: Bytes = bytes_from_number(4)
+    let payload: Bytes = bytes_from_text(val)
+    let len: Bytes = ybif_u32_le(bytes_length(payload))
+    return bytes_concat(bytes_concat(tag, len), payload)
+
+fn ybif_encode_bytes(val: Bytes) -> Bytes:
+    let tag: Bytes = bytes_from_number(5)
+    let len: Bytes = ybif_u32_le(bytes_length(val))
+    return bytes_concat(bytes_concat(tag, len), val)
+
+fn ybif_encode_error(code: Number, message: Text) -> Bytes:
+    let tag: Bytes = bytes_from_number(8)
+    let code_bytes: Bytes = ybif_u32_le(code)
+    let msg_payload: Bytes = bytes_from_text(message)
+    let msg_len: Bytes = ybif_u32_le(bytes_length(msg_payload))
+    return bytes_concat(ybif_header(), bytes_concat(bytes_concat(bytes_concat(tag, code_bytes), msg_len), msg_payload))
+
+# Encodes a SQL table result in YBIF format:
+# Header + Tag 9 + column_count (4B) + columns (len + text) + row_count (4B) + row cells
+fn ybif_encode_sql_result(columns: List[Text], rows_json_format: List[Text], row_count: Number) -> Bytes:
+    var body: Bytes = bytes_from_number(9)
+    let col_count: Number = list_count(columns)
+    set body = bytes_concat(body, ybif_u32_le(col_count))
+    var i: Number = 0
+    while i < col_count:
+        let col_name: Text = list_get(columns, i)
+        let col_bytes: Bytes = bytes_from_text(col_name)
+        set body = bytes_concat(body, ybif_u32_le(bytes_length(col_bytes)))
+        set body = bytes_concat(body, col_bytes)
+        set i = i + 1
+    set body = bytes_concat(body, ybif_u32_le(row_count))
+    var r: Number = 0
+    while r < list_count(rows_json_format):
+        let row_text: Text = list_get(rows_json_format, r)
+        let row_bytes: Bytes = bytes_from_text(row_text)
+        set body = bytes_concat(body, ybif_u32_le(bytes_length(row_bytes)))
+        set body = bytes_concat(body, row_bytes)
+        set r = r + 1
+    return bytes_concat(ybif_header(), body)

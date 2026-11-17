@@ -1,0 +1,113 @@
+use "../yazabase/sql_explain_v1"
+
+fn test_catalog() -> YazaSqlCatalogSnapshotV1:
+    let columns: List[YazaSqlColumnSchemaV1] = List[YazaSqlColumnSchemaV1]()
+    list_push(columns, YazaSqlColumnSchemaV1("id", 4, false, 0, 0, 0, ""))
+    list_push(columns, YazaSqlColumnSchemaV1("title", 9, false, 1, 0, 0, ""))
+    list_push(columns, YazaSqlColumnSchemaV1("active", 1, false, 2, 0, 0, ""))
+    list_push(columns, YazaSqlColumnSchemaV1("score", 6, true, 3, 0, 0, ""))
+    let profile_columns: List[YazaSqlColumnSchemaV1] = List[YazaSqlColumnSchemaV1]()
+    list_push(profile_columns, YazaSqlColumnSchemaV1("item_id", 4, false, 0, 0, 0, ""))
+    list_push(profile_columns, YazaSqlColumnSchemaV1("title", 9, false, 1, 0, 0, ""))
+    let tables: List[YazaSqlTableSchemaV1] = List[YazaSqlTableSchemaV1]()
+    list_push(tables, YazaSqlTableSchemaV1(5, "items", columns))
+    list_push(tables, YazaSqlTableSchemaV1(6, "profiles", profile_columns))
+    return YazaSqlCatalogSnapshotV1(7, tables, List[YazaSqlColumnDefaultV1]())
+
+fn rejects_malformed_count_plan(catalog: YazaSqlCatalogSnapshotV1) -> Boolean:
+    let source: Text = "SELECT COUNT(*) FROM items"
+    let parsed: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(source)
+    if not result_is_ok(parsed): return false
+    let bound: Result[YazaSqlBoundPlanV1, Text] = yaza_sql_bind_select_v1(source, result_unwrap(parsed), catalog)
+    if not result_is_ok(bound): return false
+    var malformed: YazaSqlBoundPlanV1 = result_unwrap(bound)
+    let projection: YazaSqlBoundProjectionV1 = list_get(malformed.projections, 0)
+    let wrong_type: YazaSqlBoundProjectionV1 = YazaSqlBoundProjectionV1(projection.column_ordinal, 3, false, "count", projection.source_start_byte, projection.source_end_byte, projection.aggregate_kind, projection.precision, projection.scale)
+    list_set(malformed.projections, 0, wrong_type)
+    return not result_is_ok(yaza_sql_explain_bound_select_v1(malformed))
+
+start:
+    arena_scope 524288:
+        let catalog: YazaSqlCatalogSnapshotV1 = test_catalog()
+        let full_source: Text = "SELECT DISTINCT id AS item_id, title FROM items WHERE id = $1 ORDER BY title LIMIT 10"
+        let full_plan: Result[Text, Text] = yaza_sql_explain_select_v1(full_source, catalog)
+        assert result_is_ok(full_plan)
+        let full_text: Text = result_unwrap(full_plan)
+        assert text_find(full_text, "YazaBase logical plan v1 (physical access path not shown)") >= 0
+        assert text_find(full_text, "0: Scan(table_id=5)") >= 0
+        assert text_find(full_text, "1: Filter(expression_root=0)") >= 0
+        assert text_find(full_text, "2: Project(columns=2)") >= 0
+        assert text_find(full_text, "3: Distinct") >= 0
+        assert text_find(full_text, "4: Sort(keys=1)") >= 0
+        assert text_find(full_text, "5: Limit(rows=10)") >= 0
+
+        let scan_source: Text = "SELECT title FROM items"
+        let scan_plan: Result[Text, Text] = yaza_sql_explain_select_v1(scan_source, catalog)
+        assert result_is_ok(scan_plan)
+        let scan_text: Text = result_unwrap(scan_plan)
+        assert text_find(scan_text, "1: Project(columns=1)") >= 0
+        assert text_find(scan_text, "Filter(") == -1
+
+        let join_source: Text = "SELECT i.id, p.title FROM items AS i INNER JOIN profiles AS p ON i.id = p.item_id WHERE p.title = 'active'"
+        let join_plan: Result[Text, Text] = yaza_sql_explain_select_v1(join_source, catalog)
+        assert result_is_ok(join_plan)
+        let join_text: Text = result_unwrap(join_plan)
+        assert text_find(join_text, "0: Scan(table_id=5)") >= 0
+        assert text_find(join_text, "1: Scan(table_id=6)") >= 0
+        assert text_find(join_text, "2: InnerJoin(table_id=6,left_key=0,right_key=0)") >= 0
+        assert text_find(join_text, "3: Filter(expression_root=0)") >= 0
+        assert text_find(join_text, "4: Project(columns=2)") >= 0
+
+        let left_join_source: Text = "SELECT i.id, p.title FROM items AS i LEFT JOIN profiles AS p ON i.id = p.item_id"
+        let left_join_plan: Result[Text, Text] = yaza_sql_explain_select_v1(left_join_source, catalog)
+        assert result_is_ok(left_join_plan)
+        assert text_find(result_unwrap(left_join_plan), "2: LeftJoin(table_id=6,left_key=0,right_key=0)") >= 0
+
+        let right_join_source: Text = "SELECT i.id, p.title FROM items AS i RIGHT JOIN profiles AS p ON i.id = p.item_id"
+        let right_join_plan: Result[Text, Text] = yaza_sql_explain_select_v1(right_join_source, catalog)
+        assert result_is_ok(right_join_plan)
+        assert text_find(result_unwrap(right_join_plan), "2: RightJoin(normalized_to_left,table_id=6,left_key=0,right_key=0)") >= 0
+
+        let aggregate_source: Text = "SELECT COUNT(*) AS total FROM items WHERE active = TRUE"
+        let aggregate_plan: Result[Text, Text] = yaza_sql_explain_select_v1(aggregate_source, catalog)
+        assert result_is_ok(aggregate_plan)
+        let aggregate_text: Text = result_unwrap(aggregate_plan)
+        assert text_find(aggregate_text, "1: Filter(expression_root=0)") >= 0
+        assert text_find(aggregate_text, "2: Aggregate(function=COUNT(*))") >= 0
+        assert text_find(aggregate_text, "Project(") == -1
+
+        let sum_source: Text = "SELECT SUM(score) AS total FROM items"
+        let sum_plan: Result[Text, Text] = yaza_sql_explain_select_v1(sum_source, catalog)
+        assert result_is_ok(sum_plan)
+        assert text_find(result_unwrap(sum_plan), "1: Aggregate(function=SUM(score))") >= 0
+
+        let multiple_source: Text = "SELECT SUM(id), COUNT(*) FROM items"
+        let multiple_plan: Result[Text, Text] = yaza_sql_explain_select_v1(multiple_source, catalog)
+        assert result_is_ok(multiple_plan)
+        assert text_find(result_unwrap(multiple_plan), "1: Aggregate(functions=SUM(id),COUNT(*))") >= 0
+
+        let average_source: Text = "SELECT AVG(score) FROM items"
+        let average_plan: Result[Text, Text] = yaza_sql_explain_select_v1(average_source, catalog)
+        assert result_is_ok(average_plan)
+        assert text_find(result_unwrap(average_plan), "1: Aggregate(function=AVG(score))") >= 0
+
+        let grouped_source: Text = "SELECT active, COUNT(*) FROM items GROUP BY active ORDER BY active"
+        let grouped_plan: Result[Text, Text] = yaza_sql_explain_select_v1(grouped_source, catalog)
+        assert result_is_ok(grouped_plan)
+        assert text_find(result_unwrap(grouped_plan), "1: Aggregate(functions=GROUP KEY,COUNT(*),group_by_columns=1)") >= 0
+        assert text_find(result_unwrap(grouped_plan), "2: Sort(keys=1)") >= 0
+
+        let having_source: Text = "SELECT active, COUNT(*) AS total FROM items GROUP BY active HAVING total > 1 ORDER BY active"
+        let having_plan: Result[Text, Text] = yaza_sql_explain_select_v1(having_source, catalog)
+        assert result_is_ok(having_plan)
+        let having_text: Text = result_unwrap(having_plan)
+        assert text_find(having_text, "1: Aggregate(functions=GROUP KEY,COUNT(*),group_by_columns=1)") >= 0
+        assert text_find(having_text, "2: Filter(phase=HAVING,expression_root=0)") >= 0
+        assert text_find(having_text, "3: Sort(keys=1)") >= 0
+
+        assert rejects_malformed_count_plan(catalog)
+
+        let invalid_source: Text = "SELECT missing FROM items"
+        let invalid_plan: Result[Text, Text] = yaza_sql_explain_select_v1(invalid_source, catalog)
+        assert not result_is_ok(invalid_plan)
+    say "yazabase-sql-explain-v1-ok"

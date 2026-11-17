@@ -1,0 +1,554 @@
+# Bounded persistent UPDATE over the typed SELECT predicate and LEAF WAL paths.
+# This bounded profile updates non-key columns with typed values and supported
+# integer expressions. It preflights row, overflow, and index changes before WAL.
+use "./catalog_snapshot_v1"
+use "./catalog_storage_v1"
+use "./key_codec_v1"
+use "./mvcc_history_v1"
+use "./overflow_v1"
+use "./page_v1"
+use "./page_wal_v1"
+use "./query_v1"
+use "./row_v1"
+use "./sql_binder_v1"
+use "./sql_delete_query_v1"
+use "./sql_executor_v1"
+use "./sql_insert_bind_v1"
+use "./sql_insert_exec_v1"
+use "./sql_parser_v3"
+use "./sql_update_v1"
+use "./sql_foreign_key_v1"
+use "./sql_check_v1"
+use "./index_maintenance_v1"
+use "./storage_v1"
+use "./transaction_v1"
+use "./wal_v1"
+
+shape YazaDbSqlUpdateAssignmentValueV1:
+    column_ordinal: Number
+    expression_source_ordinal: Number
+    expression_right_source_ordinal: Number
+    expression_operator: Number
+    value: YazaSqlValueV1
+
+shape YazaDbSqlUpdateTargetV1:
+    key: Bytes
+    page_id: Number
+    values: List[YazaSqlValueV1]
+    nulls: List[Boolean]
+    overflow_refs: List[YazaDbOverflowRefV1]
+    index_updates: List[YazaDbSecondaryIndexUpdateV1]
+
+shape YazaDbSqlUpdateOverflowBudgetV1:
+    page_count: Number
+    byte_count: Number
+
+shape YazaSqlUpdatePredicateSourceV1:
+    source: Text
+    positional_source_ordinals: List[Number]
+
+fn yaza_db_sql_update_unique_batch_conflict_v1(prior_targets: List[YazaDbSqlUpdateTargetV1], candidate: YazaDbSecondaryIndexUpdateV1) -> Boolean:
+    let index_id: Number = candidate.old_target.index.index_id
+    if list_get(candidate.new_entry.nulls, 0): return false
+    var target_index: Number = 0
+    while target_index < list_count(prior_targets):
+        let prior_target: YazaDbSqlUpdateTargetV1 = list_get(prior_targets, target_index)
+        var update_index: Number = 0
+        while update_index < list_count(prior_target.index_updates):
+            let prior_update: YazaDbSecondaryIndexUpdateV1 = list_get(prior_target.index_updates, update_index)
+            if prior_update.old_target.index.index_id == index_id and not list_get(prior_update.new_entry.nulls, 0) and yaza_db_index_maintenance_value_equal_v1(list_get(prior_update.new_entry.values, 0), list_get(candidate.new_entry.values, 0)):
+                return true
+            set update_index = update_index + 1
+        set target_index = target_index + 1
+    return false
+
+fn yaza_db_sql_update_overflow_budget_v1(targets: List[YazaDbSqlUpdateTargetV1], columns: List[YazaSqlColumnSchemaV1]) -> Result[YazaDbSqlUpdateOverflowBudgetV1, Text]:
+    let column_count: Number = list_count(columns)
+    let capacity: Number = yaza_db_overflow_payload_capacity_v1()
+    var page_count: Number = 0
+    var byte_count: Number = 0
+    var row_index: Number = 0
+    while row_index < list_count(targets):
+        let target: YazaDbSqlUpdateTargetV1 = list_get(targets, row_index)
+        if list_count(target.values) != column_count or list_count(target.nulls) != column_count or list_count(target.overflow_refs) != column_count: return err("YDBv1 UPDATE overflow target metadata does not match its table schema")
+        var column_index: Number = 0
+        while column_index < column_count:
+            let column: YazaSqlColumnSchemaV1 = list_get(columns, column_index)
+            let value: YazaSqlValueV1 = list_get(target.values, column_index)
+            let is_null: Boolean = list_get(target.nulls, column_index)
+            let reference: YazaDbOverflowRefV1 = list_get(target.overflow_refs, column_index)
+            if reference.first_page_id > 0:
+                let ignored_reference: Bytes = yaza_db_overflow_ref_encode_v1(reference)?
+                let value_length_result: Result[Number, Text] = yaza_sql_value_variable_length_v1(value)
+                if not result_is_ok(value_length_result): return err(result_unwrap_error(value_length_result))
+                if (column.type_id != 9 and column.type_id != 16) or is_null or result_unwrap(value_length_result) != reference.total_length: return err("YDBv1 UPDATE preserved overflow reference does not match its target value")
+            elif reference.total_length != 0 or reference.checksum != 0 or reference.reserved != 0:
+                return err("YDBv1 UPDATE empty overflow reference contains nonzero metadata")
+            elif (column.type_id == 9 or column.type_id == 16) and not is_null:
+                let value_length_result: Result[Number, Text] = yaza_sql_value_variable_length_v1(value)
+                if not result_is_ok(value_length_result): return err(result_unwrap_error(value_length_result))
+                let value_length: Number = result_unwrap(value_length_result)
+                if value_length > yaza_db_overflow_threshold_v1():
+                    if value_length > 67108864 or value_length > 16777216 - byte_count: return err("YDBv1 SQL UPDATE external TEXT/BLOB exceeds the 16 MiB transactional overflow-write budget")
+                    set byte_count = byte_count + value_length
+                    set page_count = page_count + (value_length + capacity - 1) / capacity
+            set column_index = column_index + 1
+        set row_index = row_index + 1
+    return ok(YazaDbSqlUpdateOverflowBudgetV1(page_count, byte_count))
+
+fn yaza_sql_update_find_positional_source_ordinal_v1(source_ordinals: List[Number], source_ordinal: Number) -> Number:
+    var index: Number = 0
+    while index < list_count(source_ordinals):
+        if list_get(source_ordinals, index) == source_ordinal: return index
+        set index = index + 1
+    return -1
+
+fn yaza_sql_update_bind_statement_parameters_v1(source: Text, parameters: List[YazaSqlValueV1]) -> Result[List[YazaSqlBoundParameterV1], Text]:
+    let lexed: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(source)
+    if not result_is_ok(lexed): return err(result_unwrap_error(lexed))
+    let tokens: List[YazaSqlTokenV1] = result_unwrap(lexed)
+    let bound_result: Result[List[YazaSqlBoundParameterV1], Text] = list_try_new()
+    if not result_is_ok(bound_result): return err("YDBv1 UPDATE could not allocate statement parameter metadata")
+    let bound: List[YazaSqlBoundParameterV1] = result_unwrap(bound_result)
+    var parameter_style: Number = 0
+    var token_index: Number = 0
+    while token_index < list_count(tokens) - 1:
+        let token: YazaSqlTokenV1 = list_get(tokens, token_index)
+        if token.kind == 5:
+            let registered: Number = yaza_sql_bind_v1_register_parameter(source, token, -1, bound, parameter_style)?
+            let first_byte: Number = text_byte(source, token.start_byte)
+            if first_byte == 63: set parameter_style = 1
+            elif first_byte == 36: set parameter_style = 2
+            else: set parameter_style = 3
+        set token_index = token_index + 1
+    if list_count(bound) != list_count(parameters): return err("YDBv1 UPDATE parameter count does not match the full statement")
+    return ok(bound)
+
+fn yaza_sql_update_normalize_predicate_source_v1(source: Text) -> Result[YazaSqlUpdatePredicateSourceV1, Text]:
+    let lexed: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(source)
+    if not result_is_ok(lexed): return err(result_unwrap_error(lexed))
+    let tokens: List[YazaSqlTokenV1] = result_unwrap(lexed)
+    let parts_result: Result[TextList, Text] = text_list_try_new()
+    let ordinals_result: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(parts_result) or not result_is_ok(ordinals_result): return err("YDBv1 UPDATE could not allocate normalized predicate metadata")
+    let parts: TextList = result_unwrap(parts_result)
+    let source_ordinals: List[Number] = result_unwrap(ordinals_result)
+    var source_cursor: Number = 0
+    var token_index: Number = 0
+    while token_index < list_count(tokens) - 1:
+        let token: YazaSqlTokenV1 = list_get(tokens, token_index)
+        if token.kind == 5 and text_byte(source, token.start_byte) == 36:
+            if token.start_byte < source_cursor: return err("YDBv1 UPDATE predicate parameter spans are out of order")
+            let unchanged: Result[Text, Text] = text_try_slice(source, source_cursor, token.start_byte - source_cursor)
+            if not result_is_ok(unchanged) or not list_try_push(parts, result_unwrap(unchanged)): return err("YDBv1 UPDATE could not copy its predicate source")
+            let source_ordinal: Number = yaza_sql_bind_v1_positional_index(source, token)
+            if source_ordinal < 0: return err("YDBv1 UPDATE predicate has an invalid positional parameter")
+            var local_ordinal: Number = yaza_sql_update_find_positional_source_ordinal_v1(source_ordinals, source_ordinal)
+            if local_ordinal < 0:
+                set local_ordinal = list_count(source_ordinals)
+                if not list_try_push(source_ordinals, source_ordinal): return err("YDBv1 UPDATE could not retain a positional parameter mapping")
+            if not list_try_push(parts, "$" + number_text(local_ordinal + 1)): return err("YDBv1 UPDATE could not normalize a predicate parameter")
+            set source_cursor = token.end_byte
+        set token_index = token_index + 1
+    let tail: Result[Text, Text] = text_try_slice(source, source_cursor, text_length(source) - source_cursor)
+    if not result_is_ok(tail) or not list_try_push(parts, result_unwrap(tail)): return err("YDBv1 UPDATE could not copy its predicate suffix")
+    let normalized: Result[Text, Text] = text_try_join(parts, "")
+    if not result_is_ok(normalized): return err("YDBv1 UPDATE could not join its normalized predicate")
+    return ok(YazaSqlUpdatePredicateSourceV1(result_unwrap(normalized), source_ordinals))
+
+fn yaza_sql_update_set_parameter_count_v1(parameters: List[YazaSqlBoundParameterV1], where_start_byte: Number) -> Number:
+    var count: Number = 0
+    var index: Number = 0
+    while index < list_count(parameters):
+        if list_get(parameters, index).first_start_byte < where_start_byte: set count = count + 1
+        set index = index + 1
+    return count
+
+fn yaza_db_sql_update_key_v1(row: List[YazaSqlValueV1], columns: List[YazaSqlColumnSchemaV1], key_ordinals: List[Number]) -> Result[Bytes, Text]:
+    let column_count: Number = list_count(columns)
+    if column_count < 1 or column_count > 1024 or list_count(row) != column_count: return err("YDBv1 UPDATE row width does not match the bound table schema")
+    let nulls_result: Result[List[Boolean], Text] = list_try_new()
+    if not result_is_ok(nulls_result): return err(result_unwrap_error(nulls_result))
+    let nulls: List[Boolean] = result_unwrap(nulls_result)
+    if not list_try_reserve(nulls, column_count): return err("YDBv1 UPDATE could not reserve row null metadata")
+    var ordinal: Number = 0
+    while ordinal < column_count:
+        let value: YazaSqlValueV1 = list_get(row, ordinal)
+        let column: YazaSqlColumnSchemaV1 = list_get(columns, ordinal)
+        if value.type_id != column.type_id or value.source_literal: return err("YDBv1 UPDATE query returned a value inconsistent with the catalog schema")
+        if not list_try_push(nulls, value.is_null): return err("YDBv1 UPDATE could not build row null metadata")
+        set ordinal = ordinal + 1
+    return yaza_db_key_encode_composite_v1(row, nulls, columns, key_ordinals)
+
+fn yaza_db_sql_update_close_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1) -> Unit:
+    let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(wal)
+    let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(storage)
+    return
+
+fn yaza_db_sql_update_float_is_finite_v1(value: Float64) -> Boolean:
+    let bits: Number = float64_bits(value)
+    let min_integer: Number = -9223372036854775807 - 1
+    var magnitude_bits: Number = bits
+    if bits < 0: set magnitude_bits = bits - min_integer
+    let exponent: Number = magnitude_bits / 4503599627370496
+    return exponent != 2047
+
+fn yaza_db_sql_update_eval_arithmetic_expression_v1(type_id: Number, left: YazaSqlValueV1, operator: Number, right: YazaSqlValueV1) -> Result[YazaSqlValueV1, Text]:
+    if type_id == 10:
+        if left.type_id != 10 or right.type_id != 10 or left.source_literal or right.source_literal: return err("YDBv1 UPDATE DECIMAL arithmetic operands do not match DECIMAL values")
+        if operator != 43 and operator != 45: return err("YDBv1 UPDATE DECIMAL arithmetic currently supports addition and subtraction only")
+        if left.is_null or right.is_null: return yaza_sql_value_null_v1(10)
+        let precision: Number = yaza_sql_value_decimal_precision_v1(left)
+        let scale: Number = yaza_sql_value_decimal_scale_v1(left)
+        if not yaza_sql_decimal_parameters_valid_v1(precision, scale) or yaza_sql_value_decimal_precision_v1(right) != precision or yaza_sql_value_decimal_scale_v1(right) != scale: return err("YDBv1 UPDATE DECIMAL arithmetic requires equal valid precision and scale")
+        let left_decimal: YazaSqlDecimalV1 = yaza_sql_decimal_parse_v1(left.text_value, precision, scale)?
+        let right_decimal: YazaSqlDecimalV1 = yaza_sql_decimal_parse_v1(right.text_value, precision, scale)?
+        if operator == 43:
+            let sum: YazaSqlDecimalV1 = yaza_sql_decimal_add_v1(left_decimal, right_decimal, precision)?
+            return yaza_sql_value_decimal_v1(sum)
+        let difference: YazaSqlDecimalV1 = yaza_sql_decimal_subtract_v1(left_decimal, right_decimal, precision)?
+        return yaza_sql_value_decimal_v1(difference)
+    if type_id == 6:
+        if left.is_null or right.is_null: return yaza_sql_value_null_v1(type_id)
+        if left.type_id != 6 or right.type_id != 6 or left.source_literal or right.source_literal: return err("YDBv1 UPDATE DOUBLE arithmetic operands do not match the target column")
+        let left_finite: Boolean = yaza_db_sql_update_float_is_finite_v1(left.float_value)
+        let right_finite: Boolean = yaza_db_sql_update_float_is_finite_v1(right.float_value)
+        if not left_finite or not right_finite: return err("YDBv1 UPDATE DOUBLE arithmetic requires finite operands")
+        var result_float: Float64 = 0.0
+        if operator == 43:
+            set result_float = left.float_value + right.float_value
+        else:
+            if operator == 45:
+                set result_float = left.float_value - right.float_value
+            else:
+                if operator == 42:
+                    set result_float = left.float_value * right.float_value
+                else:
+                    if operator == 47:
+                        if right.float_value == 0.0: return err("YDBv1 UPDATE DOUBLE division by zero is not allowed")
+                        set result_float = left.float_value / right.float_value
+                    else:
+                        return err("YDBv1 UPDATE DOUBLE arithmetic supports addition, subtraction, multiplication, and division only")
+        let result_finite: Boolean = yaza_db_sql_update_float_is_finite_v1(result_float)
+        if not result_finite: return err("YDBv1 UPDATE DOUBLE arithmetic overflowed to a non-finite value")
+        return ok(yaza_sql_value_double_v1(result_float))
+    if type_id < 2 or type_id > 4 or left.type_id != type_id or right.type_id != type_id or left.source_literal or right.source_literal: return err("YDBv1 UPDATE arithmetic operands do not match a supported integer column")
+    if operator != 43 and operator != 45 and operator != 42 and operator != 47 and operator != 37: return err("YDBv1 UPDATE arithmetic operator is unsupported")
+    if left.is_null or right.is_null: return yaza_sql_value_null_v1(type_id)
+    let minimum: Number = -9223372036854775807 - 1
+    let maximum: Number = 9223372036854775807
+    let left_value: Number = left.integer_value
+    let right_value: Number = right.integer_value
+    if operator == 43:
+        if right_value > 0 and left_value > maximum - right_value: return err("YDBv1 UPDATE integer addition overflows BIGINT")
+        if right_value < 0 and left_value < minimum - right_value: return err("YDBv1 UPDATE integer addition overflows BIGINT")
+        return yaza_sql_value_integer_v1(type_id, left_value + right_value)
+    if operator == 45:
+        if right_value > 0 and left_value < minimum + right_value: return err("YDBv1 UPDATE integer subtraction overflows BIGINT")
+        if right_value < 0 and left_value > maximum + right_value: return err("YDBv1 UPDATE integer subtraction overflows BIGINT")
+        return yaza_sql_value_integer_v1(type_id, left_value - right_value)
+    if operator == 42:
+        if left_value > 0:
+            if right_value > 0 and left_value > maximum / right_value: return err("YDBv1 UPDATE integer multiplication overflows BIGINT")
+            if right_value < 0 and right_value < minimum / left_value: return err("YDBv1 UPDATE integer multiplication overflows BIGINT")
+        elif left_value < 0:
+            if right_value > 0 and left_value < minimum / right_value: return err("YDBv1 UPDATE integer multiplication overflows BIGINT")
+            if right_value < 0 and left_value < maximum / right_value: return err("YDBv1 UPDATE integer multiplication overflows BIGINT")
+        return yaza_sql_value_integer_v1(type_id, left_value * right_value)
+    if operator == 47:
+        if right_value == 0: return err("YDBv1 UPDATE integer division by zero")
+        if left_value == minimum and right_value == -1: return err("YDBv1 UPDATE integer division overflows BIGINT")
+        return yaza_sql_value_integer_v1(type_id, left_value / right_value)
+    if right_value == 0: return err("YDBv1 UPDATE integer remainder by zero")
+    if left_value == minimum and right_value == -1: return yaza_sql_value_integer_v1(type_id, 0)
+    return yaza_sql_value_integer_v1(type_id, left_value % right_value)
+
+fn yaza_db_sql_update_materialize_assignments_v1(source: Text, update: YazaSqlUpdateAstV1, table: YazaSqlTableSchemaV1, key_ordinals: List[Number], parameters: List[YazaSqlValueV1]) -> Result[List[YazaDbSqlUpdateAssignmentValueV1], Text]:
+    if update.version != 1 or list_count(update.assignments) < 1 or list_count(update.assignments) > 1024: return err("YDBv1 UPDATE assignment plan is invalid or outside its bound")
+    let assignments_result: Result[List[YazaDbSqlUpdateAssignmentValueV1], Text] = list_try_new()
+    if not result_is_ok(assignments_result): return err(result_unwrap_error(assignments_result))
+    let assignments: List[YazaDbSqlUpdateAssignmentValueV1] = result_unwrap(assignments_result)
+    if not list_try_reserve(assignments, list_count(update.assignments)): return err("YDBv1 UPDATE could not reserve assignment values")
+    let bound_parameters_result: Result[List[YazaSqlBoundParameterV1], Text] = list_try_new()
+    if not result_is_ok(bound_parameters_result): return err("YDBv1 UPDATE could not allocate parameter metadata")
+    let bound_parameters: List[YazaSqlBoundParameterV1] = result_unwrap(bound_parameters_result)
+    var parameter_style: Number = 0
+    var assignment_index: Number = 0
+    while assignment_index < list_count(update.assignments):
+        let parsed_assignment: YazaSqlUpdateAssignmentV1 = list_get(update.assignments, assignment_index)
+        let ordinal: Number = yaza_sql_bind_insert_column_ordinal_v1(source, table, parsed_assignment.column_name)?
+        var prior_index: Number = 0
+        while prior_index < list_count(assignments):
+            if list_get(assignments, prior_index).column_ordinal == ordinal: return err("YDBv1 UPDATE assignment list repeats a column")
+            set prior_index = prior_index + 1
+        var key_index: Number = 0
+        while key_index < list_count(key_ordinals):
+            if list_get(key_ordinals, key_index) == ordinal: return err("YDBv1 UPDATE cannot change a clustered primary-key column in this profile")
+            set key_index = key_index + 1
+        let column: YazaSqlColumnSchemaV1 = list_get(table.columns, ordinal)
+        var expression_source_ordinal: Number = -1
+        var expression_right_source_ordinal: Number = -1
+        if parsed_assignment.expression_operator != 0:
+            if (column.type_id < 2 or column.type_id > 4) and column.type_id != 6 and column.type_id != 10: return err("YDBv1 UPDATE arithmetic currently supports SMALLINT, INTEGER, BIGINT, DOUBLE, and DECIMAL targets")
+            if column.type_id == 6 and parsed_assignment.expression_operator == 37: return err("YDBv1 UPDATE DOUBLE arithmetic supports addition, subtraction, multiplication, and division only")
+            if column.type_id == 10 and parsed_assignment.expression_operator != 43 and parsed_assignment.expression_operator != 45: return err("YDBv1 UPDATE DECIMAL arithmetic supports addition and subtraction only")
+            set expression_source_ordinal = yaza_sql_bind_insert_column_ordinal_v1(source, table, parsed_assignment.expression_column)?
+            let expression_source_column: YazaSqlColumnSchemaV1 = list_get(table.columns, expression_source_ordinal)
+            if expression_source_column.type_id != column.type_id: return err("YDBv1 UPDATE arithmetic source and target columns must have the same SQL type")
+            if column.type_id == 10 and (expression_source_column.precision != column.precision or expression_source_column.scale != column.scale): return err("YDBv1 UPDATE DECIMAL arithmetic source and target columns must have identical precision and scale")
+            if parsed_assignment.expression_right_is_column:
+                set expression_right_source_ordinal = yaza_sql_bind_insert_column_ordinal_v1(source, table, parsed_assignment.expression_right_column)?
+                let expression_right_column: YazaSqlColumnSchemaV1 = list_get(table.columns, expression_right_source_ordinal)
+                if expression_right_column.type_id != column.type_id: return err("YDBv1 UPDATE arithmetic right source and target columns must have the same SQL type")
+                if column.type_id == 10 and (expression_right_column.precision != column.precision or expression_right_column.scale != column.scale): return err("YDBv1 UPDATE DECIMAL arithmetic columns must have identical precision and scale")
+            elif parsed_assignment.value.kind != 3 and parsed_assignment.value.kind != 5:
+                return err("YDBv1 UPDATE arithmetic right operand must be a numeric literal, bind parameter, or same-typed source column")
+        elif parsed_assignment.expression_right_is_column:
+            set expression_source_ordinal = yaza_sql_bind_insert_column_ordinal_v1(source, table, parsed_assignment.expression_right_column)?
+            let expression_value_column: YazaSqlColumnSchemaV1 = list_get(table.columns, expression_source_ordinal)
+            if expression_value_column.type_id != column.type_id: return err("YDBv1 UPDATE source and target columns must have the same SQL type")
+            if column.type_id == 10 and (expression_value_column.precision != column.precision or expression_value_column.scale != column.scale): return err("YDBv1 UPDATE DECIMAL source and target columns must have identical precision and scale")
+        var parameter_ordinal: Number = -1
+        var value: YazaSqlValueV1 = yaza_sql_value_null_v1(column.type_id)?
+        if not parsed_assignment.expression_right_is_column and parsed_assignment.value.kind == 5:
+            set parameter_ordinal = yaza_sql_bind_v1_register_parameter(source, parsed_assignment.value, column.type_id, bound_parameters, parameter_style)?
+            let first_byte: Number = text_byte(source, parsed_assignment.value.start_byte)
+            if first_byte == 63: set parameter_style = 1
+            elif first_byte == 36: set parameter_style = 2
+            else: set parameter_style = 3
+        elif not parsed_assignment.expression_right_is_column:
+            let accepted: Boolean = yaza_sql_bind_insert_literal_v1(source, parsed_assignment.value, column)?
+            if not accepted: return err("YDBv1 UPDATE assignment literal does not match its target column")
+        if not parsed_assignment.expression_right_is_column:
+            if yaza_sql_bind_v1_keyword(source, parsed_assignment.value, "DEFAULT"):
+                set value = yaza_sql_insert_materialize_column_default_v1(column.default_expression, column)?
+            else:
+                let is_null: Boolean = yaza_sql_bind_v1_keyword(source, parsed_assignment.value, "NULL")
+                let cell: YazaSqlBoundInsertCellV1 = YazaSqlBoundInsertCellV1(ordinal, column.type_id, parsed_assignment.value.kind, parameter_ordinal, parsed_assignment.value.start_byte, parsed_assignment.value.end_byte, is_null)
+                set value = yaza_sql_insert_materialize_cell_v1(source, cell, column, parameters)?
+            if value.type_id != column.type_id or value.is_null and not column.nullable: return err("YDBv1 UPDATE assignment value violates its target column schema")
+        if not list_try_push(assignments, YazaDbSqlUpdateAssignmentValueV1(ordinal, expression_source_ordinal, expression_right_source_ordinal, parsed_assignment.expression_operator, value)): return err("YDBv1 UPDATE could not append an assignment")
+        set assignment_index = assignment_index + 1
+    if list_count(bound_parameters) > list_count(parameters): return err("YDBv1 UPDATE bind parameter count exceeds the supplied statement parameters")
+    var parameter_index: Number = 0
+    while parameter_index < list_count(bound_parameters):
+        let expected: YazaSqlBoundParameterV1 = list_get(bound_parameters, parameter_index)
+        if expected.ordinal != parameter_index or expected.type_id < 1 or not yaza_sql_executor_type_supported_v1(expected.type_id): return err("YDBv1 UPDATE bind parameter metadata is invalid")
+        if not yaza_sql_executor_value_matches_v1(list_get(parameters, parameter_index), expected.type_id): return err("YDBv1 UPDATE bind parameter type does not match its SET target")
+        set parameter_index = parameter_index + 1
+    return ok(assignments)
+
+fn yaza_db_execute_update_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1]) -> Result[YazaDbWriteCommitV1, Text]:
+    if storage.root != wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid): return err("YDBv1 SQL UPDATE storage and WAL handles belong to different databases")
+    let update: YazaSqlUpdateAstV1 = yaza_sql_parse_update_v1(source)?
+    let statement_parameters: List[YazaSqlBoundParameterV1] = yaza_sql_update_bind_statement_parameters_v1(source, parameters)?
+    let predicate_source: YazaSqlUpdatePredicateSourceV1 = yaza_sql_update_normalize_predicate_source_v1(update.predicate_select_source)?
+    let loaded: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(storage.file, storage.header)?
+    var view_index: Number = 0
+    while view_index < list_count(loaded.views):
+        if yaza_sql_bind_v1_identifier_matches(source, update.table_name.first_token, list_get(loaded.views, view_index).name):
+            return err("YDBv1 views are read-only; UPDATE through a view is not supported")
+        set view_index = view_index + 1
+    let parsed: YazaSqlSelectAstV3 = yaza_sql_parse_select_v3(predicate_source.source)?
+    let plan: YazaSqlBoundPlanV1 = yaza_sql_bind_select_v1(predicate_source.source, parsed, loaded.sql_snapshot)?
+    if plan.catalog_version != loaded.sql_snapshot.version: return err("YDBv1 UPDATE predicate was bound against a stale catalog snapshot")
+    if plan.distinct or plan.has_limit or list_count(plan.order_by) != 0: return err("YDBv1 UPDATE predicate plan has unsupported output modifiers")
+    let table_index: Number = yaza_db_catalog_snapshot_table_index_v1(loaded.sql_snapshot.tables, plan.table_id)
+    if table_index < 0 or table_index >= list_count(loaded.root_page_ids) or table_index >= list_count(loaded.table_schema_versions): return err("YDBv1 UPDATE target has no persisted table root or schema version")
+    let table: YazaSqlTableSchemaV1 = list_get(loaded.sql_snapshot.tables, table_index)
+    let table_schema_version: Number = list_get(loaded.table_schema_versions, table_index)
+    let table_root_page_id: Number = list_get(loaded.root_page_ids, table_index)
+    let catalog: YazaDbCatalogRootV1 = yaza_db_catalog_storage_read_root_v1(storage.file, storage.header)?
+    let key_ordinals: List[Number] = yaza_db_query_clustered_key_ordinals_v1(storage.file, storage.header, catalog, plan.table_id, table_root_page_id, loaded.sql_snapshot.version, list_count(table.columns))?
+    let indexes: List[YazaDbSecondaryIndexV1] = yaza_db_index_maintenance_load_v1(storage, loaded, table_index)?
+    let assignments: List[YazaDbSqlUpdateAssignmentValueV1] = yaza_db_sql_update_materialize_assignments_v1(source, update, table, key_ordinals, parameters)?
+    let predicate_parameters_result: Result[List[YazaSqlValueV1], Text] = list_try_new()
+    if not result_is_ok(predicate_parameters_result): return err("YDBv1 UPDATE could not allocate WHERE parameter values")
+    let predicate_parameters: List[YazaSqlValueV1] = result_unwrap(predicate_parameters_result)
+    if not list_try_reserve(predicate_parameters, list_count(plan.parameters)): return err("YDBv1 UPDATE could not reserve WHERE parameter values")
+    var parameter_style: Number = 0
+    if list_count(statement_parameters) > 0: set parameter_style = list_get(statement_parameters, 0).style
+    let set_parameter_count: Number = yaza_sql_update_set_parameter_count_v1(statement_parameters, update.where_start_byte)
+    var predicate_parameter_index: Number = 0
+    while predicate_parameter_index < list_count(plan.parameters):
+        let bound_predicate_parameter: YazaSqlBoundParameterV1 = list_get(plan.parameters, predicate_parameter_index)
+        var statement_parameter_index: Number = -1
+        if parameter_style == 1:
+            set statement_parameter_index = set_parameter_count + predicate_parameter_index
+        elif parameter_style == 2:
+            if predicate_parameter_index >= list_count(predicate_source.positional_source_ordinals): return err("YDBv1 UPDATE positional predicate map is incomplete")
+            set statement_parameter_index = list_get(predicate_source.positional_source_ordinals, predicate_parameter_index)
+        elif parameter_style == 3:
+            set statement_parameter_index = yaza_sql_bind_v1_find_parameter(statement_parameters, bound_predicate_parameter.key)
+        else:
+            return err("YDBv1 UPDATE predicate has parameters but the statement style is missing")
+        if statement_parameter_index < 0 or statement_parameter_index >= list_count(parameters): return err("YDBv1 UPDATE WHERE parameter maps outside the supplied statement values")
+        if not list_try_push(predicate_parameters, list_get(parameters, statement_parameter_index)): return err("YDBv1 UPDATE could not append a WHERE parameter value")
+        set predicate_parameter_index = predicate_parameter_index + 1
+    if parameter_style == 2 and list_count(predicate_source.positional_source_ordinals) != list_count(plan.parameters): return err("YDBv1 UPDATE positional predicate metadata does not match its bound plan")
+    let query_result: YazaSqlQueryResultV1 = yaza_db_execute_select_v1(storage.file, storage.header, predicate_source.source, predicate_parameters)?
+    let row_count: Number = list_count(query_result.rows)
+    let column_count: Number = list_count(table.columns)
+    if row_count > 900 or row_count * column_count > 1048576: return err("YDBv1 UPDATE result exceeds the bounded 900-row atomic transaction/cell profile")
+    let targets_result: Result[List[YazaDbSqlUpdateTargetV1], Text] = list_try_new()
+    if not result_is_ok(targets_result): return err(result_unwrap_error(targets_result))
+    let targets: List[YazaDbSqlUpdateTargetV1] = result_unwrap(targets_result)
+    if not list_try_reserve(targets, row_count): return err("YDBv1 UPDATE could not reserve its bounded target list")
+    var total_key_bytes: Number = 0
+    var total_row_bytes: Number = 0
+    var total_index_writes: Number = 0
+    var previous_key: Bytes = bytes_from_text("")
+    var row_index: Number = 0
+    while row_index < row_count:
+        let old_row: List[YazaSqlValueV1] = list_get(query_result.rows, row_index)
+        if list_count(old_row) != column_count: return err("YDBv1 UPDATE query returned a row with the wrong width")
+        let values_result: Result[List[YazaSqlValueV1], Text] = list_try_new()
+        let nulls_result: Result[List[Boolean], Text] = list_try_new()
+        if not result_is_ok(values_result) or not result_is_ok(nulls_result): return err("YDBv1 UPDATE could not allocate row materialization")
+        let values: List[YazaSqlValueV1] = result_unwrap(values_result)
+        let nulls: List[Boolean] = result_unwrap(nulls_result)
+        if not list_try_reserve(values, column_count) or not list_try_reserve(nulls, column_count): return err("YDBv1 UPDATE could not reserve row materialization")
+        var column_index: Number = 0
+        while column_index < column_count:
+            let value: YazaSqlValueV1 = list_get(old_row, column_index)
+            let column: YazaSqlColumnSchemaV1 = list_get(table.columns, column_index)
+            if value.type_id != column.type_id or value.source_literal: return err("YDBv1 UPDATE row does not match its stored schema")
+            if not list_try_push(values, value) or not list_try_push(nulls, value.is_null): return err("YDBv1 UPDATE could not copy a row value")
+            set column_index = column_index + 1
+        let old_key: Bytes = yaza_db_sql_update_key_v1(values, table.columns, key_ordinals)?
+        if bytes_length(old_key) > 2048 or total_key_bytes > 67108864 - bytes_length(old_key): return err("YDBv1 UPDATE key metadata exceeds its memory bound")
+        if row_index > 0 and yaza_db_compare_bytes_v1(previous_key, old_key) >= 0: return err("YDBv1 UPDATE result is not in strict clustered-key order")
+        let seek: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(storage.file, storage.header, table_root_page_id, old_key)?
+        let page: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, seek.leaf_page_id)?
+        let page_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, seek.leaf_page_id)?
+        let slot_index: Number = yaza_db_page_lower_bound_v1(page, old_key, seek.leaf_page_id)?
+        if slot_index >= page_header.count: return err("YDBv1 UPDATE selected a row absent from its current leaf")
+        let stored_key: Bytes = yaza_db_page_slot_key_v1(page, slot_index, seek.leaf_page_id)?
+        if not bytes_equal(stored_key, old_key): return err("YDBv1 UPDATE selected a row whose clustered key changed")
+        let old_slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(page, slot_index, seek.leaf_page_id)?
+        let decoded_old: YazaDbRowV1 = yaza_db_row_decode_for_schema_v1(old_slot.payload, table.columns, table_schema_version)?
+        let overflow_refs_result: Result[List[YazaDbOverflowRefV1], Text] = list_try_new()
+        if not result_is_ok(overflow_refs_result): return err("YDBv1 UPDATE could not allocate overflow-reference metadata")
+        let overflow_refs: List[YazaDbOverflowRefV1] = result_unwrap(overflow_refs_result)
+        if not list_try_reserve(overflow_refs, column_count) or list_count(decoded_old.overflow_refs) != column_count: return err("YDBv1 UPDATE overflow references do not match the row schema")
+        set column_index = 0
+        while column_index < column_count:
+            if not list_try_push(overflow_refs, list_get(decoded_old.overflow_refs, column_index)): return err("YDBv1 UPDATE could not copy overflow-reference metadata")
+            set column_index = column_index + 1
+        let selected_old: YazaDbRowV1 = YazaDbRowV1(decoded_old.version_ts, decoded_old.undo_ref, decoded_old.deleted, values, nulls, decoded_old.schema_epoch, decoded_old.schema_version, decoded_old.physical_column_count, decoded_old.text_input_bytes, decoded_old.max_text_input_bytes, decoded_old.overflow_refs)
+        let canonical_old: Bytes = yaza_db_mvcc_row_encode_exact_v1(selected_old, table.columns)?
+        if not bytes_equal(canonical_old, old_slot.payload): return err("YDBv1 UPDATE SELECT row does not match its preflighted storage image")
+        var assignment_index: Number = 0
+        while assignment_index < list_count(assignments):
+            let assignment: YazaDbSqlUpdateAssignmentValueV1 = list_get(assignments, assignment_index)
+            var assignment_value: YazaSqlValueV1 = assignment.value
+            if assignment.expression_operator != 0:
+                if assignment.expression_source_ordinal < 0 or assignment.expression_source_ordinal >= column_count: return err("YDBv1 UPDATE expression source column is outside the preflighted row")
+                let source_value: YazaSqlValueV1 = list_get(old_row, assignment.expression_source_ordinal)
+                var right_value: YazaSqlValueV1 = assignment.value
+                if assignment.expression_right_source_ordinal >= 0:
+                    if assignment.expression_right_source_ordinal >= column_count: return err("YDBv1 UPDATE expression right source column is outside the preflighted row")
+                    set right_value = list_get(old_row, assignment.expression_right_source_ordinal)
+                let calculated: YazaSqlValueV1 = yaza_db_sql_update_eval_arithmetic_expression_v1(source_value.type_id, source_value, assignment.expression_operator, right_value)?
+                set assignment_value = calculated
+            elif assignment.expression_source_ordinal >= 0:
+                if assignment.expression_source_ordinal >= column_count: return err("YDBv1 UPDATE source column is outside the preflighted row")
+                set assignment_value = list_get(old_row, assignment.expression_source_ordinal)
+            let assigned_column: YazaSqlColumnSchemaV1 = list_get(table.columns, assignment.column_ordinal)
+            if assignment_value.is_null and not assigned_column.nullable: return err("YDBv1 UPDATE NULL result targets NOT NULL column " + assigned_column.name)
+            let prior_overflow_ref: YazaDbOverflowRefV1 = list_get(decoded_old.overflow_refs, assignment.column_ordinal)
+            if prior_overflow_ref.first_page_id > 0:
+                let prior_value: YazaSqlValueV1 = list_get(old_row, assignment.column_ordinal)
+                if assignment_value.is_null or assignment_value.type_id != 9 or assignment_value.text_value != prior_value.text_value:
+                    if not list_try_set(overflow_refs, assignment.column_ordinal, yaza_db_row_empty_overflow_ref_v1()): return err("YDBv1 UPDATE could not invalidate the replaced overflow reference")
+            if not list_try_set(values, assignment.column_ordinal, assignment_value) or not list_try_set(nulls, assignment.column_ordinal, assignment_value.is_null): return err("YDBv1 UPDATE could not apply a typed row assignment")
+            set assignment_index = assignment_index + 1
+        let new_key: Bytes = yaza_db_sql_update_key_v1(values, table.columns, key_ordinals)?
+        if not bytes_equal(old_key, new_key): return err("YDBv1 UPDATE would alter the clustered key")
+        let index_updates_created: Result[List[YazaDbSecondaryIndexUpdateV1], Text] = list_try_new()
+        if not result_is_ok(index_updates_created): return err("YDBv1 UPDATE could not allocate secondary-index update metadata")
+        let index_updates: List[YazaDbSecondaryIndexUpdateV1] = result_unwrap(index_updates_created)
+        if not list_try_reserve(index_updates, list_count(indexes)): return err("YDBv1 UPDATE could not reserve secondary-index update metadata")
+        let old_nulls: List[Boolean] = yaza_db_index_maintenance_nulls_v1(old_row)?
+        var index_number: Number = 0
+        while index_number < list_count(indexes):
+            let index: YazaDbSecondaryIndexV1 = list_get(indexes, index_number)
+            let update_index: Option[YazaDbSecondaryIndexUpdateV1] = yaza_db_index_maintenance_prepare_update_v1(storage.file, storage.header, index, old_row, old_nulls, values, nulls)?
+            if option_is_some(update_index):
+                let prepared_update: YazaDbSecondaryIndexUpdateV1 = option_unwrap(update_index)
+                if index.plan.is_unique and yaza_db_sql_update_unique_batch_conflict_v1(targets, prepared_update): return err("YDBv1 UNIQUE INDEX rejects duplicate non-NULL values produced by one UPDATE statement")
+                if total_index_writes > 65536 - 2: return err("YDBv1 UPDATE secondary-index changes exceed their bounded write count")
+                set total_index_writes = total_index_writes + 2
+                if not list_try_push(index_updates, prepared_update): return err("YDBv1 UPDATE could not retain a secondary-index update")
+            set index_number = index_number + 1
+        let preflight_row: Bytes = yaza_db_row_preflight_for_schema_v1(values, nulls, table.columns, storage.header.next_commit_ts, table_schema_version)?
+        if bytes_length(preflight_row) > 4096: return err("YDBv1 UPDATE encoded row set exceeds its 64 MiB preflight bound")
+        if total_row_bytes > 67108864 - bytes_length(preflight_row): return err("YDBv1 UPDATE encoded row set exceeds its 64 MiB preflight bound")
+        if not list_try_push(targets, YazaDbSqlUpdateTargetV1(old_key, seek.leaf_page_id, values, nulls, overflow_refs, index_updates)): return err("YDBv1 UPDATE could not retain a preflighted row")
+        set total_key_bytes = total_key_bytes + bytes_length(old_key)
+        set total_row_bytes = total_row_bytes + bytes_length(preflight_row)
+        set previous_key = old_key
+        set row_index = row_index + 1
+
+    let foreign_rows_created: Result[List[List[YazaSqlValueV1]], Text] = list_try_new()
+    if not result_is_ok(foreign_rows_created): return err(result_unwrap_error(foreign_rows_created))
+    let foreign_rows: List[List[YazaSqlValueV1]] = result_unwrap(foreign_rows_created)
+    if not list_try_reserve(foreign_rows, row_count): return err("YDBv1 UPDATE could not reserve foreign-key row validation metadata")
+    set row_index = 0
+    while row_index < row_count:
+        if not list_try_push(foreign_rows, list_get(targets, row_index).values): return err("YDBv1 UPDATE could not retain a row for foreign-key validation")
+        set row_index = row_index + 1
+    let foreign_keys_valid: Boolean = yaza_db_sql_foreign_key_validate_rows_v1(storage.file, storage.header, loaded, plan.table_id, foreign_rows)?
+    if not foreign_keys_valid: return err("YDBv1 UPDATE foreign-key preflight did not complete")
+    let checks_valid: Boolean = yaza_db_sql_check_validate_rows_v1(storage.file, storage.header, loaded, plan.table_id, foreign_rows)?
+    if not checks_valid: return err("YDBv1 UPDATE CHECK preflight did not complete")
+    let mutation_count: Number = row_count + total_index_writes
+    if mutation_count > 900: return err("YDBv1 UPDATE rows and active index entries exceed the 900-row atomic transaction bound")
+    let overflow_budget: YazaDbSqlUpdateOverflowBudgetV1 = yaza_db_sql_update_overflow_budget_v1(targets, table.columns)?
+    var reserve_pages: Number = yaza_db_write_transaction_default_free_page_reserve_v1()
+    if overflow_budget.page_count + 64 > reserve_pages: set reserve_pages = overflow_budget.page_count + 64
+    if reserve_pages > yaza_db_storage_preallocated_page_count_v1(): return err("YDBv1 SQL UPDATE overflow chain exceeds the bounded transaction page-reserve profile")
+    let begun: YazaDbWriteTransactionV1 = yaza_db_write_transaction_begin_with_reserve_v1(storage, wal, reserve_pages)?
+    if begun.commit_ts != storage.header.next_commit_ts:
+        yaza_db_sql_update_close_v1(begun.storage, begun.wal)
+        return err("YDBv1 UPDATE commit timestamp changed after row preflight; reopen through recovery before reuse")
+    let leaf_record_bytes: Number = yaza_db_wal_header_size_v1() + yaza_db_wal_leaf_mutation_payload_size_v1()
+    let allocation_record_bytes: Number = yaza_db_wal_header_size_v1() + yaza_db_page_space_payload_size_v1()
+    let page_image_record_bytes: Number = yaza_db_wal_header_size_v1() + yaza_db_wal_page_image_payload_size_v1()
+    let required_wal_bytes: Number = (mutation_count + 1) * leaf_record_bytes + overflow_budget.page_count * (allocation_record_bytes + page_image_record_bytes)
+    if not yaza_db_write_transaction_tail_fits_bytes_v1(begun, required_wal_bytes):
+        yaza_db_sql_update_close_v1(begun.storage, begun.wal)
+        return err("YDBv1 UPDATE result exceeds the bounded WAL recovery-tail budget; reopen through recovery before reuse")
+    var current: YazaDbWriteTransactionV1 = begun
+    set row_index = 0
+    while row_index < row_count:
+        let target: YazaDbSqlUpdateTargetV1 = list_get(targets, row_index)
+        let staged: Result[YazaDbWriteOverflowRowV1, Text] = yaza_db_write_transaction_stage_overflow_text_with_refs_v1(current, target.values, target.nulls, table.columns, target.overflow_refs)
+        if not result_is_ok(staged):
+            let message: Text = result_unwrap_error(staged)
+            if not text_starts_with(message, "YDBv1 overflow staging failed; writer handles were closed"):
+                yaza_db_sql_update_close_v1(current.storage, current.wal)
+            return err("YDBv1 SQL UPDATE overflow staging failed; reopen through recovery before reuse: " + message)
+        let staged_row: YazaDbWriteOverflowRowV1 = result_unwrap(staged)
+        set current = staged_row.transaction
+        let encoded_result: Result[Bytes, Text] = yaza_db_row_encode_for_schema_with_overflow_v1(target.values, target.nulls, staged_row.references, table.columns, current.commit_ts, table_schema_version)
+        if not result_is_ok(encoded_result):
+            yaza_db_sql_update_close_v1(current.storage, current.wal)
+            return err("YDBv1 SQL UPDATE row encoding failed after overflow staging; reopen through recovery: " + result_unwrap_error(encoded_result))
+        let mutated: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_mutate_leaf_v1(current, yaza_db_wal_type_leaf_update_v1(), target.page_id, target.key, result_unwrap(encoded_result))
+        if not result_is_ok(mutated): return err("YDBv1 SQL UPDATE mutation failed; reopen through recovery before reuse: " + result_unwrap_error(mutated))
+        set current = result_unwrap(mutated)
+        var index_number: Number = 0
+        while index_number < list_count(target.index_updates):
+            let updated_index: Result[YazaDbWriteTransactionV1, Text] = yaza_db_index_maintenance_apply_update_v1(current, list_get(target.index_updates, index_number))
+            if not result_is_ok(updated_index): return err("YDBv1 SQL UPDATE secondary-index mutation failed; reopen through recovery before reuse: " + result_unwrap_error(updated_index))
+            set current = result_unwrap(updated_index)
+            set index_number = index_number + 1
+        set row_index = row_index + 1
+    let committed: Result[YazaDbWriteCommitV1, Text] = yaza_db_write_transaction_commit_v1(current)
+    if not result_is_ok(committed):
+        let message: Text = result_unwrap_error(committed)
+        yaza_db_sql_update_close_v1(current.storage, current.wal)
+        return err("YDBv1 SQL UPDATE commit failed; reopen through recovery before reuse: " + message)
+    let result: YazaDbWriteCommitV1 = result_unwrap(committed)
+    return ok(YazaDbWriteCommitV1(result.storage, result.wal, result.txn_id, result.commit_ts, row_count))

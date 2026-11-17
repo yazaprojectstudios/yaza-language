@@ -1,0 +1,101 @@
+use "std/fs"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/catalog_schema_v1"
+use "../yazabase/catalog_snapshot_v1"
+use "../yazabase/index_catalog_v1"
+use "../yazabase/sql_dispatch_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/wal_v1"
+
+fn yazabase_sql_unique_constraint_persist_v1(root_path: Text) -> Result[Number, Text]:
+    let root: Number = root_open(root_path)?
+    let db_name: Text = "unique-constraint-smoke.ydb"
+    let header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_from_text("unique-uuid-0001"), 0, 1, 1, 0, 2, 1)
+    let empty_storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, db_name, header)?
+    let empty_storage_closed: Boolean = yaza_db_storage_close_v1(empty_storage)?
+    if not empty_storage_closed: return err("YDBv1 UNIQUE fixture could not close its empty database")
+    let initialized: YazaDbCatalogBootstrapV1 = yaza_db_catalog_initialize_v1(root, db_name)?
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+
+    let create_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(initialized.storage, initialized.wal, "CREATE TABLE unique_probe (id BIGINT PRIMARY KEY, email TEXT, handle TEXT UNIQUE, UNIQUE (email))", no_parameters)?
+    if not option_is_some(create_result.write_commit): return err("YDBv1 table-level UNIQUE did not commit its catalog metadata")
+    let created: YazaDbWriteCommitV1 = option_unwrap(create_result.write_commit)
+    let seed_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(created.storage, created.wal, "INSERT INTO unique_probe (id, email, handle) VALUES (1, 'one@example.test', 'alpha'), (2, NULL, 'beta'), (3, NULL, 'gamma')", no_parameters)?
+    if not option_is_some(seed_result.write_commit): return err("YDBv1 UNIQUE rejected distinct values or multiple NULL values")
+    let seeded: YazaDbWriteCommitV1 = option_unwrap(seed_result.write_commit)
+
+    let duplicate_insert: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(seeded.storage, seeded.wal, "INSERT INTO unique_probe (id, email) VALUES (4, 'one@example.test')", no_parameters)
+    if result_is_ok(duplicate_insert): return err("YDBv1 UNIQUE accepted a duplicate INSERT")
+    let duplicate_insert_error: Text = result_unwrap_error(duplicate_insert)
+    if text_find(duplicate_insert_error, "duplicate") < 0 and text_find(duplicate_insert_error, "UNIQUE") < 0: return err("YDBv1 duplicate INSERT failed for a reason other than unique enforcement")
+    let duplicate_handle_insert: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(seeded.storage, seeded.wal, "INSERT INTO unique_probe (id, email, handle) VALUES (5, 'five@example.test', 'alpha')", no_parameters)
+    if result_is_ok(duplicate_handle_insert): return err("YDBv1 second UNIQUE constraint accepted a duplicate INSERT")
+    let duplicate_update: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(seeded.storage, seeded.wal, "UPDATE unique_probe SET email = 'one@example.test' WHERE id = 2", no_parameters)
+    if result_is_ok(duplicate_update): return err("YDBv1 UNIQUE accepted a duplicate UPDATE")
+    let duplicate_update_error: Text = result_unwrap_error(duplicate_update)
+    if text_find(duplicate_update_error, "duplicate") < 0 and text_find(duplicate_update_error, "UNIQUE") < 0: return err("YDBv1 duplicate UPDATE failed for a reason other than unique enforcement")
+    let duplicate_handle_update: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(seeded.storage, seeded.wal, "UPDATE unique_probe SET handle = 'alpha' WHERE id = 2", no_parameters)
+    if result_is_ok(duplicate_handle_update): return err("YDBv1 second UNIQUE constraint accepted a duplicate UPDATE")
+    let update_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(seeded.storage, seeded.wal, "UPDATE unique_probe SET email = 'two@example.test' WHERE id = 2", no_parameters)?
+    if not option_is_some(update_result.write_commit): return err("YDBv1 UNIQUE did not accept a distinct UPDATE")
+    let updated: YazaDbWriteCommitV1 = option_unwrap(update_result.write_commit)
+    let duplicate_updated_value: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(updated.storage, updated.wal, "INSERT INTO unique_probe (id, email, handle) VALUES (5, 'two@example.test', 'epsilon')", no_parameters)
+    if result_is_ok(duplicate_updated_value): return err("YDBv1 UNIQUE index was not updated with the changed value")
+
+    let updated_wal_closed: Boolean = yaza_db_wal_log_close_v1(updated.wal)?
+    let updated_storage_closed: Boolean = yaza_db_storage_close_v1(updated.storage)?
+    if not updated_wal_closed or not updated_storage_closed: return err("YDBv1 UNIQUE fixture could not close handles before reopen")
+    let reopened: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, db_name)?
+    let catalog: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(reopened.storage.file, reopened.storage.header)?
+    var table_index: Number = 0
+    while table_index < list_count(catalog.sql_snapshot.tables) and list_get(catalog.sql_snapshot.tables, table_index).name != "unique_probe":
+        set table_index = table_index + 1
+    if table_index >= list_count(catalog.sql_snapshot.tables): return err("YDBv1 UNIQUE table did not survive recovery")
+    let table: YazaSqlTableSchemaV1 = list_get(catalog.sql_snapshot.tables, table_index)
+    let index_rows: List[YazaDbRowV1] = yaza_db_index_catalog_rows_v1(reopened.storage.file, reopened.storage.header, reopened.storage.header.next_commit_ts - 1)?
+    var unique_email_index_name: Text = ""
+    var unique_handle_index_name: Text = ""
+    var index_row_number: Number = 0
+    while index_row_number < list_count(index_rows):
+        let index_row: YazaDbRowV1 = list_get(index_rows, index_row_number)
+        if list_get(index_row.values, 1).integer_value == table.table_id and list_get(index_row.values, 4).integer_value == yaza_db_catalog_index_kind_secondary_active_v1() and list_get(index_row.values, 5).boolean_value:
+            if list_get(index_row.values, 6).text_value == "1": set unique_email_index_name = list_get(index_row.values, 2).text_value
+            elif list_get(index_row.values, 6).text_value == "2": set unique_handle_index_name = list_get(index_row.values, 2).text_value
+            else: return err("YDBv1 UNIQUE index persisted an unexpected key ordinal")
+        set index_row_number = index_row_number + 1
+    if text_length(unique_email_index_name) == 0 or text_length(unique_handle_index_name) == 0: return err("YDBv1 multiple UNIQUE backing indexes did not survive recovery")
+    let protected_email_drop: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(reopened.storage, reopened.wal, "DROP INDEX " + unique_email_index_name, no_parameters)
+    if result_is_ok(protected_email_drop): return err("YDBv1 DROP INDEX removed the first UNIQUE constraint's backing index")
+    if text_find(result_unwrap_error(protected_email_drop), "backing index") < 0: return err("YDBv1 DROP INDEX rejection did not identify the first constraint-owned backing index")
+    let protected_handle_drop: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(reopened.storage, reopened.wal, "DROP INDEX " + unique_handle_index_name, no_parameters)
+    if result_is_ok(protected_handle_drop): return err("YDBv1 DROP INDEX removed the second UNIQUE constraint's backing index")
+    if text_find(result_unwrap_error(protected_handle_drop), "backing index") < 0: return err("YDBv1 DROP INDEX rejection did not identify the second constraint-owned backing index")
+
+    let row_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(reopened.storage, reopened.wal, "SELECT email FROM unique_probe WHERE id = 2", no_parameters)?
+    if not option_is_some(row_result.query_result): return err("YDBv1 UNIQUE value query failed after recovery")
+    let row_query: YazaSqlQueryResultV1 = option_unwrap(row_result.query_result)
+    if list_count(row_query.rows) != 1 or list_get(list_get(row_query.rows, 0), 0).text_value != "two@example.test": return err("YDBv1 UNIQUE update did not persist through recovery")
+    let null_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(row_result.storage, row_result.wal, "SELECT email FROM unique_probe WHERE id = 3", no_parameters)?
+    if not option_is_some(null_result.query_result): return err("YDBv1 nullable UNIQUE query failed after recovery")
+    let null_query: YazaSqlQueryResultV1 = option_unwrap(null_result.query_result)
+    if list_count(null_query.rows) != 1 or not list_get(list_get(null_query.rows, 0), 0).is_null: return err("YDBv1 UNIQUE did not preserve NULL-distinct semantics")
+    let missing_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(null_result.storage, null_result.wal, "SELECT id FROM unique_probe WHERE id = 4", no_parameters)?
+    if not option_is_some(missing_result.query_result) or list_count(option_unwrap(missing_result.query_result).rows) != 0: return err("YDBv1 rejected duplicate INSERT left a partial row behind")
+
+    let final_wal_closed: Boolean = yaza_db_wal_log_close_v1(missing_result.wal)?
+    let final_storage_closed: Boolean = yaza_db_storage_close_v1(missing_result.storage)?
+    if not final_wal_closed or not final_storage_closed: return err("YDBv1 UNIQUE fixture final handle close failed")
+    let database_removed: Boolean = remove(root, db_name)?
+    if not database_removed: return err("YDBv1 UNIQUE fixture could not remove its database")
+    let root_synced: Boolean = sync_directory(root)?
+    if not root_synced: return err("YDBv1 UNIQUE fixture directory sync failed")
+    let root_closed: Boolean = close(root)?
+    if not root_closed: return err("YDBv1 UNIQUE fixture root close failed")
+    return ok(1)
+
+start:
+    let outcome: Result[Number, Text] = yazabase_sql_unique_constraint_persist_v1(arg(1))
+    if result_is_ok(outcome):
+        say "yazabase-sql-unique-constraint-persist-v1-ok arena-peak-bytes=" + number_text(arena_peak_used())
+    else:
+        say result_unwrap_error(outcome)

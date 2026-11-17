@@ -1,0 +1,200 @@
+use "std/fs"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/session_v1"
+use "../yazabase/sql_dispatch_v1"
+use "../yazabase/sql_executor_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/wal_v1"
+
+fn yazabase_session_expect_count_v1(session: YazaDbSessionV1, sql: Text, parameters: List[YazaSqlValueV1], expected: Number) -> Result[YazaDbSessionV1, Text]:
+    let executed: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, sql, parameters)?
+    if not option_is_some(executed.statement.query_result): return err("YDBv1 range-bound query returned no result")
+    let query: YazaSqlQueryResultV1 = option_unwrap(executed.statement.query_result)
+    if list_count(query.rows) != 1 or list_count(list_get(query.rows, 0)) != 1: return err("YDBv1 range-bound query returned a malformed COUNT row")
+    if list_get(list_get(query.rows, 0), 0).integer_value != expected: return err("YDBv1 range-bound query returned an incorrect COUNT")
+    return ok(executed.session)
+
+fn yazabase_session_v1_smoke(root_path: Text) -> Result[Number, Text]:
+    let initial_root_result: Result[Number, Text] = root_open(root_path)
+    if not result_is_ok(initial_root_result): return err("initial root open failed: " + result_unwrap_error(initial_root_result))
+    let root: Number = result_unwrap(initial_root_result)
+    let database_name: Text = "session-v1-smoke.ydb"
+    let header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_from_text("db-session-uuid1"), 0, 1, 1, 0, 2, 1)
+    let empty_storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, database_name, header)?
+    let empty_closed: Boolean = yaza_db_storage_close_v1(empty_storage)?
+    if not empty_closed: return err("YDBv1 session fixture could not close the empty database")
+    let initialized: YazaDbCatalogBootstrapV1 = yaza_db_catalog_initialize_v1(root, database_name)?
+    let initialized_wal_closed: Boolean = yaza_db_wal_log_close_v1(initialized.wal)?
+    let initialized_storage_closed: Boolean = yaza_db_storage_close_v1(initialized.storage)?
+    if not initialized_wal_closed or not initialized_storage_closed: return err("YDBv1 session fixture could not close catalog bootstrap handles")
+
+    let session_opened: YazaDbSessionV1 = yaza_db_session_open_v1(root, database_name)?
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    var session: YazaDbSessionV1 = session_opened
+    let create_result: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "CREATE TABLE session_probe (id BIGINT PRIMARY KEY, value TEXT NOT NULL)", no_parameters)?
+    set session = create_result.session
+    if create_result.statement.statement_kind != yaza_db_sql_statement_kind_create_table_v1(): return err("YDBv1 session did not dispatch CREATE TABLE")
+    let insert_result: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "INSERT INTO session_probe (id, value) VALUES (1, 'before')", no_parameters)?
+    set session = insert_result.session
+    if insert_result.statement.statement_kind != yaza_db_sql_statement_kind_insert_v1(): return err("YDBv1 session did not dispatch INSERT")
+    let update_result: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "UPDATE session_probe SET value = 'after' WHERE id = 1", no_parameters)?
+    set session = update_result.session
+    if update_result.statement.statement_kind != yaza_db_sql_statement_kind_update_v1(): return err("YDBv1 session did not dispatch UPDATE")
+    let select_result: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT value FROM session_probe WHERE id = 1", no_parameters)?
+    set session = select_result.session
+    if select_result.statement.statement_kind != yaza_db_sql_statement_kind_select_v1() or not option_is_some(select_result.statement.query_result):
+        return err("YDBv1 session did not return the SELECT result")
+    let query: YazaSqlQueryResultV1 = option_unwrap(select_result.statement.query_result)
+    if list_count(query.rows) != 1 or list_count(list_get(query.rows, 0)) != 1 or list_get(list_get(query.rows, 0), 0).text_value != "after":
+        return err("YDBv1 session did not preserve the updated row across statements")
+    let cached_update: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "UPDATE session_probe SET value = 'cached-after-write' WHERE id = 1", no_parameters)?
+    set session = cached_update.session
+    let cached_select: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT value FROM session_probe WHERE id = 1", no_parameters)?
+    set session = cached_select.session
+    if not option_is_some(cached_select.statement.query_result): return err("YDBv1 session catalog cache did not return a SELECT result after DML")
+    let cached_query: YazaSqlQueryResultV1 = option_unwrap(cached_select.statement.query_result)
+    if list_count(cached_query.rows) != 1 or list_get(list_get(cached_query.rows, 0), 0).text_value != "cached-after-write": return err("YDBv1 session did not refresh its catalog snapshot after DML")
+    let insert_second: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "INSERT INTO session_probe (id, value) VALUES (2, 'second')", no_parameters)?
+    set session = insert_second.session
+    let greater_than_hit: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT id FROM session_probe WHERE id > 1", no_parameters)?
+    set session = greater_than_hit.session
+    if not option_is_some(greater_than_hit.statement.query_result): return err("YDBv1 primary-key greater-than query returned no result")
+    let greater_than_rows: YazaSqlQueryResultV1 = option_unwrap(greater_than_hit.statement.query_result)
+    if list_count(greater_than_rows.rows) != 1 or list_get(list_get(greater_than_rows.rows, 0), 0).integer_value != 2: return err("YDBv1 primary-key greater-than seek returned incorrect rows")
+    let greater_equal: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT id FROM session_probe WHERE id >= 2", no_parameters)?
+    set session = greater_equal.session
+    if not option_is_some(greater_equal.statement.query_result) or list_count(option_unwrap(greater_equal.statement.query_result).rows) != 1 or list_get(list_get(option_unwrap(greater_equal.statement.query_result).rows, 0), 0).integer_value != 2: return err("YDBv1 primary-key greater-or-equal seek changed its inclusive boundary")
+    let greater_than_parameter_value: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 1)?
+    let greater_than_parameter: List[YazaSqlValueV1] = [greater_than_parameter_value]
+    let greater_than_bound: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT id FROM session_probe WHERE id > $1", greater_than_parameter)?
+    set session = greater_than_bound.session
+    if not option_is_some(greater_than_bound.statement.query_result) or list_count(option_unwrap(greater_than_bound.statement.query_result).rows) != 1 or list_get(list_get(option_unwrap(greater_than_bound.statement.query_result).rows, 0), 0).integer_value != 2: return err("YDBv1 primary-key greater-than parameter seek returned incorrect rows")
+    let greater_than_empty: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT id FROM session_probe WHERE id > 2", no_parameters)?
+    set session = greater_than_empty.session
+    if not option_is_some(greater_than_empty.statement.query_result) or list_count(option_unwrap(greater_than_empty.statement.query_result).rows) != 0: return err("YDBv1 primary-key greater-than seek included its exclusive boundary")
+    let greater_than_count: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT COUNT(*) FROM session_probe WHERE id > 1", no_parameters)?
+    set session = greater_than_count.session
+    if not option_is_some(greater_than_count.statement.query_result) or list_count(option_unwrap(greater_than_count.statement.query_result).rows) != 1 or list_get(list_get(option_unwrap(greater_than_count.statement.query_result).rows, 0), 0).integer_value != 1: return err("YDBv1 streaming aggregate did not preserve the primary-key greater-than range")
+    set session = yazabase_session_expect_count_v1(session, "SELECT COUNT(*) FROM session_probe WHERE value IS NULL", no_parameters, 0)?
+    set session = yazabase_session_expect_count_v1(session, "SELECT COUNT(*) FROM session_probe WHERE value IS NOT NULL", no_parameters, 2)?
+    let stream_text_min: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT MIN(value) FROM session_probe", no_parameters)?
+    set session = stream_text_min.session
+    if not option_is_some(stream_text_min.statement.query_result) or list_count(option_unwrap(stream_text_min.statement.query_result).rows) != 1 or list_get(list_get(option_unwrap(stream_text_min.statement.query_result).rows, 0), 0).text_value != "cached-after-write": return err("YDBv1 streaming TEXT aggregate lost a value after the unreferenced-TEXT scan fast path")
+    let less_than_hit: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT id FROM session_probe WHERE id < 2", no_parameters)?
+    set session = less_than_hit.session
+    if not option_is_some(less_than_hit.statement.query_result) or list_count(option_unwrap(less_than_hit.statement.query_result).rows) != 1 or list_get(list_get(option_unwrap(less_than_hit.statement.query_result).rows, 0), 0).integer_value != 1: return err("YDBv1 primary-key less-than range returned incorrect rows")
+    let less_than_parameter_value: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 2)?
+    let less_than_parameter: List[YazaSqlValueV1] = [less_than_parameter_value]
+    let less_than_bound: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT id FROM session_probe WHERE id < $1", less_than_parameter)?
+    set session = less_than_bound.session
+    if not option_is_some(less_than_bound.statement.query_result) or list_count(option_unwrap(less_than_bound.statement.query_result).rows) != 1 or list_get(list_get(option_unwrap(less_than_bound.statement.query_result).rows, 0), 0).integer_value != 1: return err("YDBv1 primary-key less-than parameter range returned incorrect rows")
+    let less_equal_hit: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT id FROM session_probe WHERE id <= 1", no_parameters)?
+    set session = less_equal_hit.session
+    if not option_is_some(less_equal_hit.statement.query_result) or list_count(option_unwrap(less_equal_hit.statement.query_result).rows) != 1 or list_get(list_get(option_unwrap(less_equal_hit.statement.query_result).rows, 0), 0).integer_value != 1: return err("YDBv1 primary-key less-or-equal range changed its inclusive boundary")
+    let less_than_empty: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT id FROM session_probe WHERE id < 1", no_parameters)?
+    set session = less_than_empty.session
+    if not option_is_some(less_than_empty.statement.query_result) or list_count(option_unwrap(less_than_empty.statement.query_result).rows) != 0: return err("YDBv1 primary-key less-than range included its exclusive boundary")
+    let less_equal_count: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT COUNT(*) FROM session_probe WHERE id <= 1", no_parameters)?
+    set session = less_equal_count.session
+    if not option_is_some(less_equal_count.statement.query_result) or list_get(list_get(option_unwrap(less_equal_count.statement.query_result).rows, 0), 0).integer_value != 1: return err("YDBv1 streaming aggregate did not preserve the primary-key less-or-equal range")
+    let range_edges_created: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "CREATE TABLE session_range_edges (id BIGINT PRIMARY KEY)", no_parameters)?
+    set session = range_edges_created.session
+    let range_edges_inserted: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "INSERT INTO session_range_edges (id) VALUES (1), (2), (3), (5), (9223372036854775807)", no_parameters)?
+    set session = range_edges_inserted.session
+    set session = yazabase_session_expect_count_v1(session, "SELECT COUNT(*) FROM session_range_edges WHERE id < 1", no_parameters, 0)?
+    set session = yazabase_session_expect_count_v1(session, "SELECT COUNT(*) FROM session_range_edges WHERE id <= 1", no_parameters, 1)?
+    set session = yazabase_session_expect_count_v1(session, "SELECT COUNT(*) FROM session_range_edges WHERE id >= 2 AND id < 5", no_parameters, 2)?
+    set session = yazabase_session_expect_count_v1(session, "SELECT COUNT(*) FROM session_range_edges WHERE id > 1 AND id <= 5", no_parameters, 3)?
+    set session = yazabase_session_expect_count_v1(session, "SELECT COUNT(*) FROM session_range_edges WHERE id >= 5 AND id < 3", no_parameters, 0)?
+    set session = yazabase_session_expect_count_v1(session, "SELECT COUNT(*) FROM session_range_edges WHERE id < 9223372036854775807", no_parameters, 4)?
+    set session = yazabase_session_expect_count_v1(session, "SELECT COUNT(*) FROM session_range_edges WHERE id <= 9223372036854775807", no_parameters, 5)?
+    let minimum_bigint: Number = -9223372036854775807 - 1
+    let minimum_parameter_value: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, minimum_bigint)?
+    let minimum_parameter: List[YazaSqlValueV1] = [minimum_parameter_value]
+    set session = yazabase_session_expect_count_v1(session, "SELECT COUNT(*) FROM session_range_edges WHERE id <= $1", minimum_parameter, 0)?
+    set session = yazabase_session_expect_count_v1(session, "SELECT COUNT(*) FROM session_range_edges WHERE id > $1", minimum_parameter, 5)?
+    set session = yazabase_session_expect_count_v1(session, "SELECT COUNT(*) FROM session_range_edges WHERE id >= $1", minimum_parameter, 5)?
+    let negative_parameter_value: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, -1)?
+    let negative_parameter: List[YazaSqlValueV1] = [negative_parameter_value]
+    set session = yazabase_session_expect_count_v1(session, "SELECT COUNT(*) FROM session_range_edges WHERE id <= $1", negative_parameter, 0)?
+    set session = yazabase_session_expect_count_v1(session, "SELECT COUNT(*) FROM session_range_edges WHERE id > $1", negative_parameter, 5)?
+    let bounded_sum: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT SUM(id) FROM session_range_edges WHERE id > 1 AND id <= 5", no_parameters)?
+    set session = bounded_sum.session
+    if not option_is_some(bounded_sum.statement.query_result) or list_get(list_get(option_unwrap(bounded_sum.statement.query_result).rows, 0), 0).integer_value != 10: return err("YDBv1 scalar integer SUM did not preserve bounded predicates")
+    let empty_primary_sum: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT SUM(id) FROM session_range_edges WHERE id < 1", no_parameters)?
+    set session = empty_primary_sum.session
+    if not option_is_some(empty_primary_sum.statement.query_result) or not list_get(list_get(option_unwrap(empty_primary_sum.statement.query_result).rows, 0), 0).is_null: return err("YDBv1 primary-key SUM did not return NULL for an empty input")
+    let overflowing_primary_sum: Result[YazaSqlQueryResultV1, Text] = yaza_db_execute_single_select_v1(session.storage.file, session.storage.header, "SELECT SUM(id) FROM session_range_edges", no_parameters)
+    if result_is_ok(overflowing_primary_sum) or result_unwrap_error(overflowing_primary_sum) != "SQL executor SUM overflowed signed BIGINT result": return err("YDBv1 primary-key SUM did not reject overflow with the signed BIGINT diagnostic")
+    let negative_key_created: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "CREATE TABLE session_negative_key (payload TEXT NOT NULL, id BIGINT PRIMARY KEY)", no_parameters)?
+    set session = negative_key_created.session
+    let negative_key_inserted: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "INSERT INTO session_negative_key (payload, id) VALUES ('left', -9), ('right', 2)", no_parameters)?
+    set session = negative_key_inserted.session
+    let negative_key_sum: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT SUM(id) FROM session_negative_key", no_parameters)?
+    set session = negative_key_sum.session
+    if not option_is_some(negative_key_sum.statement.query_result) or list_get(list_get(option_unwrap(negative_key_sum.statement.query_result).rows, 0), 0).integer_value != -7: return err("YDBv1 primary-key SUM did not capture a negative, non-leading BIGINT key")
+    let sum_values_created: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "CREATE TABLE session_sum_values (id BIGINT PRIMARY KEY, amount DOUBLE, nullable_value BIGINT)", no_parameters)?
+    set session = sum_values_created.session
+    let sum_values_inserted: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "INSERT INTO session_sum_values (id, amount, nullable_value) VALUES (1, 1.25, 2), (2, 2.5, NULL), (3, 0.0, 3)", no_parameters)?
+    set session = sum_values_inserted.session
+    let double_sum: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT SUM(amount) FROM session_sum_values", no_parameters)?
+    set session = double_sum.session
+    if not option_is_some(double_sum.statement.query_result) or list_get(list_get(option_unwrap(double_sum.statement.query_result).rows, 0), 0).float_value != 3.75: return err("YDBv1 scalar DOUBLE SUM returned an incorrect value")
+    let nullable_sum: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT SUM(nullable_value) FROM session_sum_values", no_parameters)?
+    set session = nullable_sum.session
+    if not option_is_some(nullable_sum.statement.query_result) or list_get(list_get(option_unwrap(nullable_sum.statement.query_result).rows, 0), 0).integer_value != 5: return err("YDBv1 scalar SUM did not ignore NULL values")
+    let empty_sum: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT SUM(nullable_value) FROM session_sum_values WHERE id < 1", no_parameters)?
+    set session = empty_sum.session
+    if not option_is_some(empty_sum.statement.query_result) or not list_get(list_get(option_unwrap(empty_sum.statement.query_result).rows, 0), 0).is_null: return err("YDBv1 scalar SUM did not return NULL for an empty input")
+    let create_after_cache: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "CREATE TABLE session_aux (id BIGINT PRIMARY KEY)", no_parameters)?
+    set session = create_after_cache.session
+    let select_after_ddl: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT id FROM session_aux WHERE id = 1", no_parameters)?
+    set session = select_after_ddl.session
+    if not option_is_some(select_after_ddl.statement.query_result) or list_count(option_unwrap(select_after_ddl.statement.query_result).rows) != 0:
+        return err("YDBv1 session catalog cache was not invalidated after CREATE TABLE")
+    let checkpoint_before_delete: Number = session.storage.header.checkpoint_lsn
+    let next_commit_before_delete: Number = session.storage.header.next_commit_ts
+    let deferred_delete: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "DELETE FROM session_probe WHERE id = 2", no_parameters)?
+    set session = deferred_delete.session
+    if not option_is_some(deferred_delete.statement.write_commit) or option_unwrap(deferred_delete.statement.write_commit).affected_rows != 1:
+        return err("YDBv1 session deferred DELETE did not commit exactly one row")
+    let deferred_commit: YazaDbWriteCommitV1 = option_unwrap(deferred_delete.statement.write_commit)
+    if deferred_commit.storage.header.checkpoint_lsn != checkpoint_before_delete or deferred_commit.storage.header.next_commit_ts != next_commit_before_delete + 1:
+        return err("YDBv1 session DELETE did not preserve durable-WAL/deferred-checkpoint state")
+    let uncheckpointed_wal_closed: Boolean = yaza_db_wal_log_close_v1(session.wal)?
+    let uncheckpointed_storage_closed: Boolean = yaza_db_storage_close_v1(session.storage)?
+    let uncheckpointed_root_closed: Boolean = close(session.root)?
+    if not uncheckpointed_wal_closed or not uncheckpointed_storage_closed or not uncheckpointed_root_closed:
+        return err("YDBv1 session could not close after a committed but uncheckpointed DELETE")
+
+    let reopen_root_result: Result[Number, Text] = root_open(root_path)
+    if not result_is_ok(reopen_root_result): return err("root open after deferred-checkpoint session close failed: " + result_unwrap_error(reopen_root_result))
+    let reopen_root: Number = result_unwrap(reopen_root_result)
+    var reopened_session: YazaDbSessionV1 = yaza_db_session_open_v1(reopen_root, database_name)?
+    let recovered_delete: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(reopened_session, "SELECT id FROM session_probe WHERE id = 2", no_parameters)?
+    set reopened_session = recovered_delete.session
+    if not option_is_some(recovered_delete.statement.query_result) or list_count(option_unwrap(recovered_delete.statement.query_result).rows) != 0:
+        return err("YDBv1 startup recovery did not replay the durable session DELETE")
+    let invalid_query: Result[YazaDbSessionStatementV1, Text] = yaza_db_session_execute_v1(reopened_session, "SELECT absent FROM session_probe", no_parameters)
+    if result_is_ok(invalid_query): return err("YDBv1 session accepted a SELECT of an unknown column")
+
+    let recovered_root_result: Result[Number, Text] = root_open(root_path)
+    if not result_is_ok(recovered_root_result): return err("root open after statement-error cleanup failed: " + result_unwrap_error(recovered_root_result))
+    let recovered_root: Number = result_unwrap(recovered_root_result)
+    let recovered_session: YazaDbSessionV1 = yaza_db_session_open_v1(recovered_root, database_name)?
+    let recovered_select: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(recovered_session, "SELECT value FROM session_probe WHERE id = 1", no_parameters)?
+    if not option_is_some(recovered_select.statement.query_result): return err("YDBv1 session could not query after error-triggered close and recovery")
+    let recovered_query: YazaSqlQueryResultV1 = option_unwrap(recovered_select.statement.query_result)
+    if list_count(recovered_query.rows) != 1 or list_get(list_get(recovered_query.rows, 0), 0).text_value != "cached-after-write":
+        return err("YDBv1 session recovery changed the committed value")
+    let recovered_closed: Boolean = yaza_db_session_close_v1(recovered_select.session)?
+    if not recovered_closed: return err("YDBv1 recovered session close returned false")
+    return ok(0)
+
+start:
+    let path: Text = arg(1)
+    let result: Result[Number, Text] = yazabase_session_v1_smoke(path)
+    if not result_is_ok(result):
+        say "yazabase-session-v1-error: " + result_unwrap_error(result)
+        exit(1)
+    say "yazabase-session-v1-ok"

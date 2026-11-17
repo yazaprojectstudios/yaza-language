@@ -1,0 +1,1335 @@
+# YDBv1 byte-level file/page codec. Database semantics remain in YAZA.
+
+shape YazaDbFileHeaderV1:
+    db_uuid: Bytes
+    checkpoint_lsn: Number
+    next_txn_id: Number
+    next_commit_ts: Number
+    catalog_root: Number
+    page_count: Number
+    flags: Number
+
+shape YazaDbPageHeaderV1:
+    page_lsn: Number
+    checksum: Number
+    page_type: Number
+    level: Number
+    count: Number
+    space_used: Number
+    data_start: Number
+    prefix_len: Number
+    low_fence_offset: Number
+    low_fence_len: Number
+    high_fence_offset: Number
+    high_fence_len: Number
+    upper: Number
+    page_id: Number
+
+shape YazaDbPageSlotV1:
+    offset: Number
+    key_len: Number
+    payload_len: Number
+    key_head: Number
+    key_suffix: Bytes
+    payload: Bytes
+
+shape YazaDbPageSlotSpanV1:
+    offset: Number
+    key_len: Number
+    payload_len: Number
+    key_head: Number
+    payload_offset: Number
+
+shape YazaDbBitmapAddressV1:
+    bitmap_page_id: Number
+    bit_index: Number
+    segment_index: Number
+    is_bitmap_page: Boolean
+
+shape YazaDbLeafSplitV1:
+    left_page: Bytes
+    right_page: Bytes
+    separator: Bytes
+    split_index: Number
+    left_count: Number
+    right_count: Number
+
+shape YazaDbInnerSplitV1:
+    left_page: Bytes
+    right_page: Bytes
+    separator: Bytes
+    split_index: Number
+    left_count: Number
+    right_count: Number
+
+shape YazaDbInnerRootGrowthV1:
+    root_page: Bytes
+    left_child_page: Bytes
+    right_child_page: Bytes
+    separator: Bytes
+    split_index: Number
+
+shape YazaDbLeafRootGrowthV1:
+    root_page: Bytes
+    left_child_page: Bytes
+    right_child_page: Bytes
+    separator: Bytes
+    split_index: Number
+
+fn yaza_db_page_size_v1() -> Number:
+    return 16384
+
+fn yaza_db_file_header_size_v1() -> Number:
+    return 80
+
+fn yaza_db_page_header_size_v1() -> Number:
+    return 48
+
+fn yaza_db_page_slot_size_v1() -> Number:
+    return 12
+
+fn yaza_db_bitmap_page_payload_bytes_v1() -> Number:
+    return yaza_db_page_size_v1() - yaza_db_page_header_size_v1()
+
+fn yaza_db_bitmap_page_bit_count_v1() -> Number:
+    return yaza_db_bitmap_page_payload_bytes_v1() * 8
+
+fn yaza_db_bitmap_address_v1(page_id: Number) -> Result[YazaDbBitmapAddressV1, Text]:
+    if page_id < 2: return err("YDBv1 header page IDs are not represented in the allocation bitmap")
+    let capacity: Number = yaza_db_bitmap_page_bit_count_v1()
+    let relative_page_id: Number = page_id - 2
+    let segment_index: Number = relative_page_id / capacity
+    let bit_index: Number = relative_page_id % capacity
+    let bitmap_page_id: Number = 2 + segment_index * capacity
+    return ok(YazaDbBitmapAddressV1(bitmap_page_id, bit_index, segment_index, bit_index == 0))
+
+fn yaza_db_read_uint_le_v1(input: Bytes, offset: Number, width: Number) -> Result[Number, Text]:
+    if width < 1 or width > 8: return err("YDBv1 integer width is invalid")
+    let length: Number = bytes_length(input)
+    if offset < 0 or length < width or offset > length - width: return err("YDBv1 integer range is outside the buffer")
+    if width == 8 and bytes_get(input, offset + 7) > 127: return err("YDBv1 u64 value exceeds the signed Number range")
+    var result: Number = 0
+    var multiplier: Number = 1
+    var index: Number = 0
+    while index < width:
+        set result = result + bytes_get(input, offset + index) * multiplier
+        if index + 1 < width: set multiplier = multiplier * 256
+        set index = index + 1
+    return ok(result)
+
+fn yaza_db_read_int_le_v1(input: Bytes, offset: Number, width: Number) -> Result[Number, Text]:
+    if width != 2 and width != 4 and width != 8: return err("YDBv1 signed integer width must be 2, 4, or 8 bytes")
+    let length: Number = bytes_length(input)
+    if offset < 0 or length < width or offset > length - width: return err("YDBv1 signed integer range is outside the buffer")
+    let negative: Boolean = bytes_get(input, offset + width - 1) >= 128
+    var result: Number = 0
+    var multiplier: Number = 1
+    var index: Number = 0
+    while index < width:
+        var byte_value: Number = bytes_get(input, offset + index)
+        if negative: set byte_value = 255 - byte_value
+        set result = result + byte_value * multiplier
+        if index + 1 < width: set multiplier = multiplier * 256
+        set index = index + 1
+    if negative:
+        if result == 9223372036854775807: return ok(-9223372036854775807 - 1)
+        return ok(-(result + 1))
+    return ok(result)
+
+fn yaza_db_read_uint_be32_v1(input: Bytes, offset: Number) -> Result[Number, Text]:
+    let length: Number = bytes_length(input)
+    if offset < 0 or length < 4 or offset > length - 4: return err("YDBv1 key-head range is outside the buffer")
+    let b0: Number = bytes_get(input, offset)
+    let b1: Number = bytes_get(input, offset + 1)
+    let b2: Number = bytes_get(input, offset + 2)
+    let b3: Number = bytes_get(input, offset + 3)
+    return ok(b0 * 16777216 + b1 * 65536 + b2 * 256 + b3)
+
+fn yaza_db_compare_byte_ranges_v1(left: Bytes, left_offset: Number, left_length: Number, right: Bytes, right_offset: Number, right_length: Number) -> Number:
+    var shortest: Number = left_length
+    if right_length < shortest: set shortest = right_length
+    var index: Number = 0
+    while index < shortest:
+        let left_byte: Number = bytes_get(left, left_offset + index)
+        let right_byte: Number = bytes_get(right, right_offset + index)
+        if left_byte < right_byte: return -1
+        if left_byte > right_byte: return 1
+        set index = index + 1
+    if left_length < right_length: return -1
+    if left_length > right_length: return 1
+    return 0
+
+# Compare a validated slot's full key (shared page prefix plus on-page suffix)
+# without allocating a concatenated Bytes value for each scanned row.
+fn yaza_db_page_slot_span_compare_key_v1(page: Bytes, header: YazaDbPageHeaderV1, slot: YazaDbPageSlotSpanV1, key: Bytes) -> Result[Number, Text]:
+    let page_length: Number = bytes_length(page)
+    let key_length: Number = bytes_length(key)
+    if page_length != yaza_db_page_size_v1() or header.page_id < 2 or header.prefix_len < 0 or header.prefix_len > 2048 or slot.offset < header.data_start or slot.offset > page_length or slot.key_len < 0 or slot.key_len > page_length - slot.offset:
+        return err("YDBv1 validated slot key comparison has an invalid page or key span")
+    let prefix_offset: Number = page_length - header.prefix_len
+    var prefix_common: Number = header.prefix_len
+    if key_length < prefix_common: set prefix_common = key_length
+    if prefix_common > 0:
+        let prefix_order: Number = yaza_db_compare_byte_ranges_v1(page, prefix_offset, prefix_common, key, 0, prefix_common)
+        if prefix_order != 0: return ok(prefix_order)
+    if key_length < header.prefix_len: return ok(1)
+    let suffix_order: Number = yaza_db_compare_byte_ranges_v1(page, slot.offset, slot.key_len, key, header.prefix_len, key_length - header.prefix_len)
+    return ok(suffix_order)
+
+fn yaza_db_write_uint_be32_v1(output: Bytes, offset: Number, value: Number) -> Boolean:
+    let length: Number = bytes_length(output)
+    if value < 0 or value > 4294967295: return false
+    if offset < 0 or length < 4 or offset > length - 4: return false
+    let b0: Number = value / 16777216
+    let remainder0: Number = value % 16777216
+    let b1: Number = remainder0 / 65536
+    let remainder1: Number = remainder0 % 65536
+    let b2: Number = remainder1 / 256
+    let b3: Number = remainder1 % 256
+    return bytes_try_set(output, offset, b0) and bytes_try_set(output, offset + 1, b1) and bytes_try_set(output, offset + 2, b2) and bytes_try_set(output, offset + 3, b3)
+
+fn yaza_db_write_uint_le_v1(output: Bytes, offset: Number, value: Number, width: Number) -> Boolean:
+    if width < 1 or width > 8 or value < 0: return false
+    let length: Number = bytes_length(output)
+    if offset < 0 or length < width or offset > length - width: return false
+    var limit: Number = 1
+    var limit_index: Number = 0
+    while limit_index < width and width < 8:
+        set limit = limit * 256
+        set limit_index = limit_index + 1
+    if width < 8 and value >= limit: return false
+    var remainder: Number = value
+    var index: Number = 0
+    while index < width:
+        let byte_value: Number = remainder % 256
+        if not bytes_try_set(output, offset + index, byte_value): return false
+        set remainder = remainder / 256
+        set index = index + 1
+    return remainder == 0
+
+fn yaza_db_write_int_le_v1(output: Bytes, offset: Number, value: Number, width: Number) -> Boolean:
+    if width != 2 and width != 4 and width != 8: return false
+    if width == 2 and (value < -32768 or value > 32767): return false
+    if width == 4 and (value < -2147483648 or value > 2147483647): return false
+    let length: Number = bytes_length(output)
+    if offset < 0 or length < width or offset > length - width: return false
+    let negative: Boolean = value < 0
+    var remainder: Number = value
+    if negative: set remainder = -(value + 1)
+    var index: Number = 0
+    while index < width:
+        var byte_value: Number = remainder % 256
+        if negative: set byte_value = 255 - byte_value
+        if not bytes_try_set(output, offset + index, byte_value): return false
+        set remainder = remainder / 256
+        set index = index + 1
+    return remainder == 0
+
+fn yaza_db_write_bytes_v1(output: Bytes, offset: Number, source: Bytes) -> Boolean:
+    let source_length: Number = bytes_length(source)
+    let output_length: Number = bytes_length(output)
+    if offset < 0 or output_length < source_length or offset > output_length - source_length: return false
+    var index: Number = 0
+    while index < source_length:
+        if not bytes_try_set(output, offset + index, bytes_get(source, index)): return false
+        set index = index + 1
+    return true
+
+fn yaza_db_read_file_header_v1(input: Bytes) -> Result[YazaDbFileHeaderV1, Text]:
+    if bytes_length(input) != yaza_db_page_size_v1(): return err("YDBv1 file-header copy must occupy one 16 KiB page")
+    let magic: Bytes = bytes_from_text("YDBv1")
+    var magic_index: Number = 0
+    while magic_index < 5:
+        if bytes_get(input, magic_index) != bytes_get(magic, magic_index): return err("YDBv1 file-header magic is invalid")
+        set magic_index = magic_index + 1
+    if bytes_get(input, 5) != 0 or bytes_get(input, 6) != 0 or bytes_get(input, 7) != 0: return err("YDBv1 file-header magic padding is invalid")
+    let version: Number = yaza_db_read_uint_le_v1(input, 8, 4)?
+    let page_size: Number = yaza_db_read_uint_le_v1(input, 12, 4)?
+    if version != 1: return err("YDBv1 file format version is unsupported")
+    if page_size != yaza_db_page_size_v1(): return err("YDBv1 page size is invalid")
+    let stored_crc: Number = yaza_db_read_uint_le_v1(input, 76, 4)?
+    if bytes_ydbv1_checksum_zeroed_range(input, 76, 4) != stored_crc: return err("YDBv1 file-header checksum mismatch")
+    let flags: Number = yaza_db_read_uint_le_v1(input, 72, 4)?
+    if flags != 1: return err("YDBv1 file-header flags are unsupported")
+    var padding_index: Number = yaza_db_file_header_size_v1()
+    while padding_index < yaza_db_page_size_v1():
+        if bytes_get(input, padding_index) != 0: return err("YDBv1 file-header page padding is not zero")
+        set padding_index = padding_index + 1
+    let db_uuid: Bytes = bytes_try_slice(input, 16, 16)?
+    let checkpoint_lsn: Number = yaza_db_read_uint_le_v1(input, 32, 8)?
+    let next_txn_id: Number = yaza_db_read_uint_le_v1(input, 40, 8)?
+    let next_commit_ts: Number = yaza_db_read_uint_le_v1(input, 48, 8)?
+    let catalog_root: Number = yaza_db_read_uint_le_v1(input, 56, 8)?
+    let page_count: Number = yaza_db_read_uint_le_v1(input, 64, 8)?
+    if next_txn_id < 1 or next_commit_ts < 1 or page_count < 2: return err("YDBv1 file-header counters are invalid")
+    if catalog_root != 0 and (catalog_root < 2 or catalog_root >= page_count): return err("YDBv1 catalog root is outside the allocated page range")
+    return ok(YazaDbFileHeaderV1(db_uuid, checkpoint_lsn, next_txn_id, next_commit_ts, catalog_root, page_count, flags))
+
+fn yaza_db_write_file_header_v1(header: YazaDbFileHeaderV1) -> Result[Bytes, Text]:
+    if bytes_length(header.db_uuid) != 16: return err("YDBv1 database UUID must be exactly 16 bytes")
+    if header.checkpoint_lsn < 0 or header.next_txn_id < 1 or header.next_commit_ts < 1: return err("YDBv1 file-header counters must be non-negative")
+    if header.catalog_root < 0 or header.page_count < 2 or (header.catalog_root != 0 and (header.catalog_root < 2 or header.catalog_root >= header.page_count)): return err("YDBv1 catalog root or page count is invalid")
+    if header.flags != 1: return err("YDBv1 file-header flags are unsupported")
+    let made: Result[Bytes, Text] = bytes_try_new_zeroed(yaza_db_page_size_v1())
+    if not result_is_ok(made): return err(result_unwrap_error(made))
+    let output: Bytes = result_unwrap(made)
+    let magic: Bytes = bytes_from_text("YDBv1")
+    if not yaza_db_write_bytes_v1(output, 0, magic): return err("YDBv1 file-header magic could not be written")
+    if not yaza_db_write_uint_le_v1(output, 8, 1, 4): return err("YDBv1 file-header version could not be written")
+    if not yaza_db_write_uint_le_v1(output, 12, yaza_db_page_size_v1(), 4): return err("YDBv1 file-header page size could not be written")
+    if not yaza_db_write_bytes_v1(output, 16, header.db_uuid): return err("YDBv1 file-header UUID could not be written")
+    if not yaza_db_write_uint_le_v1(output, 32, header.checkpoint_lsn, 8): return err("YDBv1 checkpoint LSN could not be written")
+    if not yaza_db_write_uint_le_v1(output, 40, header.next_txn_id, 8): return err("YDBv1 next transaction ID could not be written")
+    if not yaza_db_write_uint_le_v1(output, 48, header.next_commit_ts, 8): return err("YDBv1 next commit timestamp could not be written")
+    if not yaza_db_write_uint_le_v1(output, 56, header.catalog_root, 8): return err("YDBv1 catalog root could not be written")
+    if not yaza_db_write_uint_le_v1(output, 64, header.page_count, 8): return err("YDBv1 page count could not be written")
+    if not yaza_db_write_uint_le_v1(output, 72, header.flags, 4): return err("YDBv1 flags could not be written")
+    if not yaza_db_write_uint_le_v1(output, 76, bytes_ydbv1_checksum_zeroed_range(output, 76, 4), 4): return err("YDBv1 file-header checksum could not be written")
+    return ok(output)
+
+fn yaza_db_range_valid_v1(offset: Number, length: Number, lower_bound: Number) -> Boolean:
+    if length == 0: return offset == 0
+    if offset < lower_bound or length > 2048: return false
+    if offset > yaza_db_page_size_v1() - length: return false
+    return true
+
+fn yaza_db_compare_bytes_v1(left: Bytes, right: Bytes) -> Number:
+    let left_length: Number = bytes_length(left)
+    let right_length: Number = bytes_length(right)
+    var index: Number = 0
+    var shortest: Number = left_length
+    if right_length < left_length: set shortest = right_length
+    while index < shortest:
+        let left_byte: Number = bytes_get(left, index)
+        let right_byte: Number = bytes_get(right, index)
+        if left_byte < right_byte: return -1
+        if left_byte > right_byte: return 1
+        set index = index + 1
+    if left_length < right_length: return -1
+    if left_length > right_length: return 1
+    return 0
+
+fn yaza_db_page_finalize_v1(page: Bytes) -> Result[Bytes, Text]:
+    if bytes_length(page) != yaza_db_page_size_v1(): return err("YDBv1 page must be exactly 16 KiB")
+    let checksum: Number = bytes_ydbv1_checksum_zeroed_range(page, 8, 4)
+    if not yaza_db_write_uint_le_v1(page, 8, checksum, 4): return err("YDBv1 page checksum could not be written")
+    return ok(page)
+
+fn yaza_db_page_new_v1(page_id: Number, page_lsn: Number, page_type: Number, level: Number) -> Result[Bytes, Text]:
+    if page_id < 2 or page_lsn < 0: return err("YDBv1 page ID and LSN are invalid")
+    if page_type != 1 and page_type != 2 and page_type != 3 and page_type != 4 and page_type != 5 and page_type != 6: return err("YDBv1 page type does not have a codec in this slice")
+    if page_type == 1 and level != 0: return err("YDBv1 leaf page level must be zero")
+    if page_type == 2 and level < 1: return err("YDBv1 inner page level must be positive")
+    if page_type > 2 and level != 0: return err("YDBv1 non-index page level must be zero")
+    let made: Result[Bytes, Text] = bytes_try_new_zeroed(yaza_db_page_size_v1())
+    if not result_is_ok(made): return err(result_unwrap_error(made))
+    let page: Bytes = result_unwrap(made)
+    if not yaza_db_write_uint_le_v1(page, 0, page_lsn, 8): return err("YDBv1 page LSN could not be written")
+    if not bytes_try_set(page, 12, page_type) or not bytes_try_set(page, 13, level): return err("YDBv1 page type or level could not be written")
+    var data_start: Number = yaza_db_page_size_v1()
+    var space_used: Number = 0
+    if page_type == 5:
+        set data_start = yaza_db_page_header_size_v1()
+        set space_used = yaza_db_bitmap_page_payload_bytes_v1()
+    if not yaza_db_write_uint_le_v1(page, 16, space_used, 2): return err("YDBv1 page space_used could not be written")
+    if not yaza_db_write_uint_le_v1(page, 18, data_start, 2): return err("YDBv1 data start could not be written")
+    if not yaza_db_write_uint_le_v1(page, 40, page_id, 8): return err("YDBv1 page ID could not be written")
+    return yaza_db_page_finalize_v1(page)
+
+fn yaza_db_page_set_upper_v1(page: Bytes, child_page_id: Number) -> Boolean:
+    if bytes_length(page) != yaza_db_page_size_v1() or bytes_get(page, 12) != 2: return false
+    if child_page_id < 2 or child_page_id > 4611686018427387903: return false
+    return yaza_db_write_uint_le_v1(page, 32, child_page_id * 2, 8)
+
+fn yaza_db_page_bytes_have_prefix_v1(value: Bytes, prefix: Bytes) -> Boolean:
+    let prefix_length: Number = bytes_length(prefix)
+    if bytes_length(value) < prefix_length: return false
+    var index: Number = 0
+    while index < prefix_length:
+        if bytes_get(value, index) != bytes_get(prefix, index): return false
+        set index = index + 1
+    return true
+
+fn yaza_db_page_set_prefix_v1(page: Bytes, prefix: Bytes) -> Result[Number, Text]:
+    if bytes_length(page) != yaza_db_page_size_v1(): return err("YDBv1 page must be exactly 16 KiB")
+    let page_type: Number = bytes_get(page, 12)
+    if page_type != 1 and page_type != 2: return err("YDBv1 shared prefixes are supported only on leaf and inner pages")
+    let prefix_length: Number = bytes_length(prefix)
+    if prefix_length < 1 or prefix_length > 2048: return err("YDBv1 shared prefix length is outside the key limit")
+    let count: Number = yaza_db_read_uint_le_v1(page, 14, 2)?
+    let current_prefix_length: Number = yaza_db_read_uint_le_v1(page, 20, 2)?
+    if count != 0 or current_prefix_length != 0: return err("YDBv1 shared prefix must be set once on an empty page")
+    let data_start: Number = yaza_db_page_size_v1() - prefix_length
+    if data_start < yaza_db_page_header_size_v1(): return err("YDBv1 shared prefix overlaps the page header")
+    if not yaza_db_write_bytes_v1(page, data_start, prefix): return err("YDBv1 shared prefix could not be copied")
+    if not yaza_db_write_uint_le_v1(page, 18, data_start, 2): return err("YDBv1 shared-prefix data_start could not be written")
+    if not yaza_db_write_uint_le_v1(page, 20, prefix_length, 2): return err("YDBv1 shared-prefix length could not be written")
+    if not yaza_db_write_uint_le_v1(page, 16, prefix_length, 2): return err("YDBv1 shared-prefix space_used could not be written")
+    let finalized: Bytes = yaza_db_page_finalize_v1(page)?
+    return ok(prefix_length)
+
+fn yaza_db_page_add_slot_v1(page: Bytes, full_key: Bytes, payload: Bytes) -> Result[Number, Text]:
+    if bytes_length(page) != yaza_db_page_size_v1(): return err("YDBv1 page must be exactly 16 KiB")
+    let page_type: Number = bytes_get(page, 12)
+    if page_type != 1 and page_type != 2: return err("YDBv1 slots are supported only on leaf and inner pages")
+    let prefix_len: Number = yaza_db_read_uint_le_v1(page, 20, 2)?
+    let full_key_length: Number = bytes_length(full_key)
+    let payload_length: Number = bytes_length(payload)
+    if full_key_length < 1 or full_key_length > 2048 or payload_length > 4096: return err("YDBv1 slot key or payload exceeds its page limit")
+    var prefix_length: Number = 0
+    var prefix_offset: Number = yaza_db_page_size_v1()
+    if prefix_len > 0:
+        set prefix_length = prefix_len
+        set prefix_offset = yaza_db_page_size_v1() - prefix_length
+        let prefix: Bytes = bytes_try_slice(page, prefix_offset, prefix_length)?
+        if full_key_length < prefix_length or not yaza_db_page_bytes_have_prefix_v1(full_key, prefix): return err("YDBv1 slot key does not contain the page's shared prefix")
+    let key_length: Number = full_key_length - prefix_length
+    let count: Number = yaza_db_read_uint_le_v1(page, 14, 2)?
+    if count >= 1361: return err("YDBv1 slot array is full")
+    let current_data_start: Number = yaza_db_read_uint_le_v1(page, 18, 2)?
+    let new_count: Number = count + 1
+    let new_data_start: Number = current_data_start - key_length - payload_length
+    let slot_end: Number = yaza_db_page_header_size_v1() + new_count * yaza_db_page_slot_size_v1()
+    if current_data_start < 0 or new_data_start < slot_end: return err("YDBv1 page has insufficient free space")
+    let key_copy: Bytes = bytes_try_slice(full_key, prefix_length, key_length)?
+    let payload_copy: Bytes = bytes_try_slice(payload, 0, payload_length)?
+    if count > 0:
+        let previous_slot: Number = yaza_db_page_header_size_v1() + (count - 1) * yaza_db_page_slot_size_v1()
+        let previous_offset: Number = yaza_db_read_uint_le_v1(page, previous_slot, 2)?
+        let previous_key_length: Number = yaza_db_read_uint_le_v1(page, previous_slot + 2, 2)?
+        let previous_suffix: Bytes = bytes_try_slice(page, previous_offset, previous_key_length)?
+        var previous_full_key: Bytes = previous_suffix
+        if prefix_length > 0:
+            let prefix: Bytes = bytes_try_slice(page, prefix_offset, prefix_length)?
+            set previous_full_key = bytes_try_concat(prefix, previous_suffix)?
+        if yaza_db_compare_byte_ranges_v1(previous_full_key, 0, bytes_length(previous_full_key), full_key, 0, full_key_length) >= 0: return err("YDBv1 leaf/index keys must be appended in strict byte order")
+    let slot_offset: Number = yaza_db_page_header_size_v1() + count * yaza_db_page_slot_size_v1()
+    if not yaza_db_write_bytes_v1(page, new_data_start, key_copy): return err("YDBv1 slot key could not be copied")
+    if not yaza_db_write_bytes_v1(page, new_data_start + key_length, payload_copy): return err("YDBv1 slot payload could not be copied")
+    if not yaza_db_write_uint_le_v1(page, slot_offset, new_data_start, 2): return err("YDBv1 slot offset could not be written")
+    if not yaza_db_write_uint_le_v1(page, slot_offset + 2, key_length, 2): return err("YDBv1 slot key length could not be written")
+    if not yaza_db_write_uint_le_v1(page, slot_offset + 4, payload_length, 2): return err("YDBv1 slot payload length could not be written")
+    var key_head: Number = 0
+    var key_index: Number = 0
+    while key_index < 4:
+        set key_head = key_head * 256
+        if key_index < key_length: set key_head = key_head + bytes_get(key_copy, key_index)
+        set key_index = key_index + 1
+    if not yaza_db_write_uint_be32_v1(page, slot_offset + 6, key_head): return err("YDBv1 slot key head could not be written")
+    if not yaza_db_write_uint_le_v1(page, slot_offset + 10, 0, 2): return err("YDBv1 slot reserved field could not be cleared")
+    if not yaza_db_write_uint_le_v1(page, 14, new_count, 2): return err("YDBv1 slot count could not be updated")
+    if not yaza_db_write_uint_le_v1(page, 18, new_data_start, 2): return err("YDBv1 data start could not be updated")
+    let space_used: Number = new_count * yaza_db_page_slot_size_v1() + yaza_db_page_size_v1() - new_data_start
+    if not yaza_db_write_uint_le_v1(page, 16, space_used, 2): return err("YDBv1 used-space counter could not be updated")
+    return ok(new_count - 1)
+
+fn yaza_db_page_insert_slot_v1(page: Bytes, full_key: Bytes, payload: Bytes) -> Result[Bytes, Text]:
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, -1)?
+    if header.page_type != 1 and header.page_type != 2: return err("YDBv1 slot insertion requires a leaf or inner page")
+    let key_length: Number = bytes_length(full_key)
+    let payload_length: Number = bytes_length(payload)
+    if key_length < 1 or key_length > 2048 or payload_length > 4096: return err("YDBv1 inserted slot key or payload exceeds its page limit")
+    let insert_at: Number = yaza_db_page_lower_bound_v1(page, full_key, header.page_id)?
+    if insert_at < header.count:
+        let existing_key: Bytes = yaza_db_page_slot_key_v1(page, insert_at, header.page_id)?
+        if yaza_db_compare_bytes_v1(existing_key, full_key) == 0: return err("YDBv1 cannot insert a duplicate page key")
+    if header.low_fence_len > 0:
+        let low_fence: Bytes = bytes_try_slice(page, header.low_fence_offset, header.low_fence_len)?
+        if yaza_db_compare_bytes_v1(full_key, low_fence) < 0: return err("YDBv1 inserted key is below the page low fence")
+    if header.high_fence_len > 0:
+        let high_fence: Bytes = bytes_try_slice(page, header.high_fence_offset, header.high_fence_len)?
+        if yaza_db_compare_bytes_v1(full_key, high_fence) >= 0: return err("YDBv1 inserted key is at or above the page high fence")
+    let rebuilt_result: Result[Bytes, Text] = yaza_db_page_new_v1(header.page_id, header.page_lsn, header.page_type, header.level)
+    if not result_is_ok(rebuilt_result): return err(result_unwrap_error(rebuilt_result))
+    var rebuilt: Bytes = result_unwrap(rebuilt_result)
+    if header.page_type == 2:
+        if not yaza_db_page_set_upper_v1(rebuilt, header.upper / 2): return err("YDBv1 rebuilt inner-page upper child could not be preserved")
+    if header.prefix_len > 0:
+        let old_prefix: Bytes = bytes_try_slice(page, yaza_db_page_size_v1() - header.prefix_len, header.prefix_len)?
+        let prefix_result: Result[Number, Text] = yaza_db_page_set_prefix_v1(rebuilt, old_prefix)
+        if not result_is_ok(prefix_result): return err(result_unwrap_error(prefix_result))
+    var old_index: Number = 0
+    var inserted: Boolean = false
+    while old_index <= header.count:
+        var should_insert: Boolean = not inserted and old_index == header.count
+        if not inserted and old_index < header.count:
+            let old_key: Bytes = yaza_db_page_slot_key_v1(page, old_index, header.page_id)?
+            if yaza_db_compare_bytes_v1(full_key, old_key) < 0: set should_insert = true
+        if should_insert:
+            let add_new: Result[Number, Text] = yaza_db_page_add_slot_v1(rebuilt, full_key, payload)
+            if not result_is_ok(add_new): return err(result_unwrap_error(add_new))
+            set inserted = true
+        if old_index < header.count:
+            let old_slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(page, old_index, header.page_id)?
+            let old_full_key: Bytes = yaza_db_page_slot_key_v1(page, old_index, header.page_id)?
+            let add_old: Result[Number, Text] = yaza_db_page_add_slot_v1(rebuilt, old_full_key, old_slot.payload)
+            if not result_is_ok(add_old): return err(result_unwrap_error(add_old))
+        set old_index = old_index + 1
+    if not inserted: return err("YDBv1 slot insertion did not place its new key")
+    if header.low_fence_len > 0 or header.high_fence_len > 0:
+        let low_fence: Bytes = bytes_try_slice(page, header.low_fence_offset, header.low_fence_len)?
+        let high_fence: Bytes = bytes_try_slice(page, header.high_fence_offset, header.high_fence_len)?
+        let count: Number = yaza_db_read_uint_le_v1(rebuilt, 14, 2)?
+        let data_start: Number = yaza_db_read_uint_le_v1(rebuilt, 18, 2)?
+        let descriptor_end: Number = yaza_db_page_header_size_v1() + count * yaza_db_page_slot_size_v1()
+        let fence_bytes: Number = bytes_length(low_fence) + bytes_length(high_fence)
+        let fence_start: Number = data_start - fence_bytes
+        if fence_start < descriptor_end: return err("YDBv1 inserted page cannot retain its fences within the free-space bound")
+        if header.low_fence_len > 0 and not yaza_db_write_bytes_v1(rebuilt, fence_start, low_fence): return err("YDBv1 low fence could not be copied to the rebuilt page")
+        if header.high_fence_len > 0 and not yaza_db_write_bytes_v1(rebuilt, fence_start + header.low_fence_len, high_fence): return err("YDBv1 high fence could not be copied to the rebuilt page")
+        var low_offset: Number = 0
+        if header.low_fence_len > 0: set low_offset = fence_start
+        if not yaza_db_write_uint_le_v1(rebuilt, 24, low_offset, 2) or not yaza_db_write_uint_le_v1(rebuilt, 26, header.low_fence_len, 2): return err("YDBv1 low-fence descriptor could not be rebuilt")
+        var high_offset: Number = 0
+        if header.high_fence_len > 0: set high_offset = fence_start + header.low_fence_len
+        if not yaza_db_write_uint_le_v1(rebuilt, 28, high_offset, 2) or not yaza_db_write_uint_le_v1(rebuilt, 30, header.high_fence_len, 2): return err("YDBv1 high-fence descriptor could not be rebuilt")
+        if not yaza_db_write_uint_le_v1(rebuilt, 18, fence_start, 2): return err("YDBv1 rebuilt page data start could not include its fences")
+        let space_used: Number = count * yaza_db_page_slot_size_v1() + yaza_db_page_size_v1() - fence_start
+        if not yaza_db_write_uint_le_v1(rebuilt, 16, space_used, 2): return err("YDBv1 rebuilt page used-space counter could not include its fences")
+    let finalized: Bytes = yaza_db_page_finalize_v1(rebuilt)?
+    let verified: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(finalized, header.page_id)?
+    if verified.page_type != header.page_type or verified.level != header.level or verified.page_lsn != header.page_lsn or verified.count != header.count + 1 or verified.upper != header.upper or verified.prefix_len != header.prefix_len: return err("YDBv1 rebuilt page failed its metadata round-trip validation")
+    return ok(finalized)
+
+fn yaza_db_page_insert_sorted_slot_v1(page: Bytes, full_key: Bytes, payload: Bytes) -> Result[Bytes, Text]:
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, -1)?
+    if header.page_type != 1 and header.page_type != 2: return err("YDBv1 sorted slot insertion requires a leaf or inner page")
+    if header.count > 0:
+        let last_slot: YazaDbPageSlotV1 = yaza_db_page_slot_from_validated_header_v1(page, header, header.count - 1)?
+        let last_key: Bytes = yaza_db_page_slot_key_from_validated_header_v1(page, header, last_slot)?
+        if yaza_db_compare_bytes_v1(last_key, full_key) >= 0:
+            return yaza_db_page_insert_slot_v1(page, full_key, payload)
+    if header.low_fence_len > 0:
+        let low_fence: Bytes = bytes_try_slice(page, header.low_fence_offset, header.low_fence_len)?
+        if yaza_db_compare_bytes_v1(full_key, low_fence) < 0: return err("YDBv1 appended key is below the page low fence")
+    if header.high_fence_len > 0:
+        let high_fence: Bytes = bytes_try_slice(page, header.high_fence_offset, header.high_fence_len)?
+        if yaza_db_compare_bytes_v1(full_key, high_fence) >= 0: return err("YDBv1 appended key is at or above the page high fence")
+    let appended_page: Bytes = bytes_try_slice(page, 0, yaza_db_page_size_v1())?
+    let added_slot: Number = yaza_db_page_add_slot_v1(appended_page, full_key, payload)?
+    if added_slot != header.count: return err("YDBv1 sorted append did not add the final slot")
+    let finalized: Bytes = yaza_db_page_finalize_v1(appended_page)?
+    let verified: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(finalized, header.page_id)?
+    if verified.page_type != header.page_type or verified.level != header.level or verified.page_lsn != header.page_lsn or verified.count != header.count + 1 or verified.upper != header.upper or verified.prefix_len != header.prefix_len:
+        return err("YDBv1 appended page failed its metadata round-trip validation")
+    return ok(finalized)
+
+fn yaza_db_page_set_fences_v1(page: Bytes, has_low_fence: Boolean, low_fence: Bytes, has_high_fence: Boolean, high_fence: Bytes) -> Result[Bytes, Text]:
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, -1)?
+    if header.page_type != 1 and header.page_type != 2: return err("YDBv1 fences are supported only on leaf and inner pages")
+    if header.low_fence_len != 0 or header.high_fence_len != 0: return err("YDBv1 fence setter requires a page without existing fences")
+    var low_length: Number = 0
+    var high_length: Number = 0
+    if has_low_fence:
+        set low_length = bytes_length(low_fence)
+        if low_length < 1 or low_length > 2048: return err("YDBv1 low fence length is outside the key limit")
+    if has_high_fence:
+        set high_length = bytes_length(high_fence)
+        if high_length < 1 or high_length > 2048: return err("YDBv1 high fence length is outside the key limit")
+    if has_low_fence and has_high_fence and yaza_db_compare_bytes_v1(low_fence, high_fence) > 0: return err("YDBv1 low fence sorts after the high fence")
+    let descriptor_end: Number = yaza_db_page_header_size_v1() + header.count * yaza_db_page_slot_size_v1()
+    let fence_start: Number = header.data_start - low_length - high_length
+    if fence_start < descriptor_end: return err("YDBv1 page has insufficient room for its fences")
+    if has_low_fence and not yaza_db_write_bytes_v1(page, fence_start, low_fence): return err("YDBv1 low fence could not be written")
+    if has_high_fence and not yaza_db_write_bytes_v1(page, fence_start + low_length, high_fence): return err("YDBv1 high fence could not be written")
+    var low_offset: Number = 0
+    var high_offset: Number = 0
+    if has_low_fence: set low_offset = fence_start
+    if has_high_fence: set high_offset = fence_start + low_length
+    if not yaza_db_write_uint_le_v1(page, 24, low_offset, 2) or not yaza_db_write_uint_le_v1(page, 26, low_length, 2): return err("YDBv1 low-fence descriptor could not be written")
+    if not yaza_db_write_uint_le_v1(page, 28, high_offset, 2) or not yaza_db_write_uint_le_v1(page, 30, high_length, 2): return err("YDBv1 high-fence descriptor could not be written")
+    if not yaza_db_write_uint_le_v1(page, 18, fence_start, 2): return err("YDBv1 fenced page data start could not be written")
+    let space_used: Number = header.count * yaza_db_page_slot_size_v1() + yaza_db_page_size_v1() - fence_start
+    if not yaza_db_write_uint_le_v1(page, 16, space_used, 2): return err("YDBv1 fenced page space counter could not be written")
+    let finalized: Bytes = yaza_db_page_finalize_v1(page)?
+    let verified: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(finalized, header.page_id)?
+    if verified.low_fence_len != low_length or verified.high_fence_len != high_length: return err("YDBv1 fence metadata failed round-trip validation")
+    return ok(finalized)
+
+fn yaza_db_page_edit_leaf_slot_v1(source: Bytes, page_lsn: Number, full_key: Bytes, payload: Bytes, operation: Number) -> Result[Bytes, Text]:
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(source, -1)?
+    if header.page_type != 1 or header.level != 0: return err("YDBv1 leaf slot edit requires a level-zero LEAF page")
+    if page_lsn <= header.page_lsn: return err("YDBv1 leaf slot edit LSN must advance the source page")
+    if operation != 1 and operation != 2: return err("YDBv1 leaf slot edit operation is invalid")
+    if bytes_length(full_key) < 1 or bytes_length(full_key) > 2048: return err("YDBv1 edited leaf key is outside its bound")
+    if operation == 1 and bytes_length(payload) > 4096: return err("YDBv1 replacement leaf payload exceeds its bound")
+    if header.low_fence_len > 0:
+        let low_fence: Bytes = bytes_try_slice(source, header.low_fence_offset, header.low_fence_len)?
+        if yaza_db_compare_bytes_v1(full_key, low_fence) < 0: return err("YDBv1 edited key sorts below the leaf low fence")
+    if header.high_fence_len > 0:
+        let high_fence: Bytes = bytes_try_slice(source, header.high_fence_offset, header.high_fence_len)?
+        if yaza_db_compare_bytes_v1(full_key, high_fence) >= 0: return err("YDBv1 edited key sorts at or above the leaf high fence")
+    let target_index: Number = yaza_db_page_lower_bound_from_validated_header_v1(source, header, full_key, 0)?
+    if target_index >= header.count: return err("YDBv1 leaf slot edit key does not exist")
+    let target_slot: YazaDbPageSlotV1 = yaza_db_page_slot_from_validated_header_v1(source, header, target_index)?
+    let existing_key: Bytes = yaza_db_page_slot_key_from_validated_header_v1(source, header, target_slot)?
+    if not bytes_equal(existing_key, full_key): return err("YDBv1 leaf slot edit key does not exist")
+
+    # A same-length replacement leaves every slot offset and the packed data
+    # boundary unchanged. Update only that payload on a private page copy; this
+    # is especially important for DELETE, whose tombstone preserves the row's
+    # encoded values and therefore has the same byte length as the prior row.
+    if operation == 1:
+        let descriptor: Number = yaza_db_page_header_size_v1() + target_index * yaza_db_page_slot_size_v1()
+        let slot_offset: Number = yaza_db_read_uint_le_v1(source, descriptor, 2)?
+        let key_length: Number = yaza_db_read_uint_le_v1(source, descriptor + 2, 2)?
+        let stored_payload_length: Number = yaza_db_read_uint_le_v1(source, descriptor + 4, 2)?
+        if stored_payload_length == bytes_length(payload):
+            let updated: Bytes = bytes_try_slice(source, 0, yaza_db_page_size_v1())?
+            if not yaza_db_write_bytes_v1(updated, slot_offset + key_length, payload): return err("YDBv1 same-size leaf payload could not be replaced")
+            if not yaza_db_write_uint_le_v1(updated, 0, page_lsn, 8): return err("YDBv1 same-size leaf replacement LSN could not be written")
+            let finalized: Bytes = yaza_db_page_finalize_v1(updated)?
+            let verified: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(finalized, header.page_id)?
+            if verified.page_type != 1 or verified.level != 0 or verified.page_lsn != page_lsn or verified.count != header.count or verified.prefix_len != header.prefix_len or verified.low_fence_len != header.low_fence_len or verified.high_fence_len != header.high_fence_len:
+                return err("YDBv1 same-size leaf replacement failed metadata validation")
+            return ok(finalized)
+
+    let created: Bytes = yaza_db_page_new_v1(header.page_id, page_lsn, 1, 0)?
+    if header.prefix_len > 0:
+        let prefix: Bytes = bytes_try_slice(source, yaza_db_page_size_v1() - header.prefix_len, header.prefix_len)?
+        let ignored_prefix: Number = yaza_db_page_set_prefix_v1(created, prefix)?
+    var index: Number = 0
+    while index < header.count:
+        if index != target_index or operation == 1:
+            var slot_key: Bytes = bytes_from_text("")
+            var slot_payload: Bytes = bytes_from_text("")
+            if index == target_index:
+                set slot_key = existing_key
+                set slot_payload = payload
+            else:
+                let slot: YazaDbPageSlotV1 = yaza_db_page_slot_from_validated_header_v1(source, header, index)?
+                set slot_key = yaza_db_page_slot_key_from_validated_header_v1(source, header, slot)?
+                set slot_payload = slot.payload
+            let ignored_added_slot: Number = yaza_db_page_add_slot_v1(created, slot_key, slot_payload)?
+        set index = index + 1
+
+    let packed_page: Bytes = yaza_db_page_finalize_v1(created)?
+    var fenced_page: Bytes = packed_page
+    if header.low_fence_len > 0 or header.high_fence_len > 0:
+        var low_fence: Bytes = bytes_from_text("")
+        var high_fence: Bytes = bytes_from_text("")
+        if header.low_fence_len > 0: set low_fence = bytes_try_slice(source, header.low_fence_offset, header.low_fence_len)?
+        if header.high_fence_len > 0: set high_fence = bytes_try_slice(source, header.high_fence_offset, header.high_fence_len)?
+        set fenced_page = yaza_db_page_set_fences_v1(packed_page, header.low_fence_len > 0, low_fence, header.high_fence_len > 0, high_fence)?
+    let verified: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(fenced_page, header.page_id)?
+    var expected_count: Number = header.count
+    if operation == 2: set expected_count = header.count - 1
+    if verified.page_type != 1 or verified.level != 0 or verified.page_lsn != page_lsn or verified.count != expected_count or verified.prefix_len != header.prefix_len or verified.low_fence_len != header.low_fence_len or verified.high_fence_len != header.high_fence_len: return err("YDBv1 edited leaf page failed metadata validation")
+    return ok(fenced_page)
+
+fn yaza_db_page_replace_leaf_slot_v1(source: Bytes, page_lsn: Number, full_key: Bytes, payload: Bytes) -> Result[Bytes, Text]:
+    return yaza_db_page_edit_leaf_slot_v1(source, page_lsn, full_key, payload, 1)
+
+fn yaza_db_page_replace_leaf_slots_v1(source: Bytes, page_lsn: Number, keys: List[Bytes], payloads: List[Bytes]) -> Result[Bytes, Text]:
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(source, -1)?
+    let update_count: Number = list_count(keys)
+    if header.page_type != 1 or header.level != 0: return err("YDBv1 batched leaf replacement requires a level-zero LEAF page")
+    if page_lsn <= header.page_lsn or update_count < 1 or update_count > header.count or list_count(payloads) != update_count: return err("YDBv1 batched leaf replacement metadata is invalid")
+
+    let created: Bytes = yaza_db_page_new_v1(header.page_id, page_lsn, 1, 0)?
+    if header.prefix_len > 0:
+        let prefix: Bytes = bytes_try_slice(source, yaza_db_page_size_v1() - header.prefix_len, header.prefix_len)?
+        let ignored_prefix: Number = yaza_db_page_set_prefix_v1(created, prefix)?
+    var old_index: Number = 0
+    var update_index: Number = 0
+    while old_index < header.count:
+        let old_slot: YazaDbPageSlotV1 = yaza_db_page_slot_from_validated_header_v1(source, header, old_index)?
+        let old_key: Bytes = yaza_db_page_slot_key_from_validated_header_v1(source, header, old_slot)?
+        var selected_payload: Bytes = old_slot.payload
+        if update_index < update_count:
+            let update_key: Bytes = list_get(keys, update_index)
+            let comparison: Number = yaza_db_compare_bytes_v1(update_key, old_key)
+            if comparison < 0: return err("YDBv1 batched leaf replacement keys are absent or not strictly ordered")
+            if comparison == 0:
+                set selected_payload = list_get(payloads, update_index)
+                if bytes_length(selected_payload) > 4096: return err("YDBv1 batched leaf replacement payload exceeds its bound")
+                set update_index = update_index + 1
+        let ignored_added_slot: Number = yaza_db_page_add_slot_v1(created, old_key, selected_payload)?
+        set old_index = old_index + 1
+    if update_index != update_count: return err("YDBv1 batched leaf replacement references a missing key")
+
+    let packed_page: Bytes = yaza_db_page_finalize_v1(created)?
+    var result_page: Bytes = packed_page
+    if header.low_fence_len > 0 or header.high_fence_len > 0:
+        var low_fence: Bytes = bytes_from_text("")
+        var high_fence: Bytes = bytes_from_text("")
+        if header.low_fence_len > 0: set low_fence = bytes_try_slice(source, header.low_fence_offset, header.low_fence_len)?
+        if header.high_fence_len > 0: set high_fence = bytes_try_slice(source, header.high_fence_offset, header.high_fence_len)?
+        set result_page = yaza_db_page_set_fences_v1(packed_page, header.low_fence_len > 0, low_fence, header.high_fence_len > 0, high_fence)?
+    let verified: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(result_page, header.page_id)?
+    if verified.page_type != 1 or verified.level != 0 or verified.page_lsn != page_lsn or verified.count != header.count or verified.prefix_len != header.prefix_len or verified.low_fence_len != header.low_fence_len or verified.high_fence_len != header.high_fence_len:
+        return err("YDBv1 batched leaf replacement failed metadata validation")
+    return ok(result_page)
+
+fn yaza_db_page_delete_leaf_slot_v1(source: Bytes, page_lsn: Number, full_key: Bytes) -> Result[Bytes, Text]:
+    return yaza_db_page_edit_leaf_slot_v1(source, page_lsn, full_key, bytes_from_text(""), 2)
+
+fn yaza_db_page_rebuild_leaf_range_v1(source: Bytes, page_id: Number, page_lsn: Number, start_index: Number, end_index: Number, has_low_fence: Boolean, low_fence: Bytes, has_high_fence: Boolean, high_fence: Bytes) -> Result[Bytes, Text]:
+    let source_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(source, -1)?
+    if source_header.page_type != 1: return err("YDBv1 leaf range rebuild requires a LEAF page")
+    if page_id < 2 or page_lsn < source_header.page_lsn or start_index < 0 or end_index > source_header.count or start_index >= end_index: return err("YDBv1 leaf rebuild range, page ID, or LSN is invalid")
+    let page: Bytes = yaza_db_page_new_v1(page_id, page_lsn, 1, 0)?
+    var prefix: Bytes = bytes_from_text("")
+    if source_header.prefix_len > 0:
+        set prefix = bytes_try_slice(source, yaza_db_page_size_v1() - source_header.prefix_len, source_header.prefix_len)?
+        let ignored_prefix: Number = yaza_db_page_set_prefix_v1(page, prefix)?
+    var index: Number = start_index
+    while index < end_index:
+        let descriptor: Number = yaza_db_page_header_size_v1() + index * yaza_db_page_slot_size_v1()
+        let slot_offset: Number = yaza_db_read_uint_le_v1(source, descriptor, 2)?
+        let key_length: Number = yaza_db_read_uint_le_v1(source, descriptor + 2, 2)?
+        let payload_length: Number = yaza_db_read_uint_le_v1(source, descriptor + 4, 2)?
+        let suffix: Bytes = bytes_try_slice(source, slot_offset, key_length)?
+        let payload: Bytes = bytes_try_slice(source, slot_offset + key_length, payload_length)?
+        var full_key: Bytes = suffix
+        if source_header.prefix_len > 0: set full_key = bytes_try_concat(prefix, suffix)?
+        let ignored_added_slot: Number = yaza_db_page_add_slot_v1(page, full_key, payload)?
+        set index = index + 1
+    let finalized: Bytes = yaza_db_page_finalize_v1(page)?
+    return yaza_db_page_set_fences_v1(finalized, has_low_fence, low_fence, has_high_fence, high_fence)
+
+fn yaza_db_page_split_leaf_v1(page: Bytes, right_page_id: Number, split_lsn: Number) -> Result[YazaDbLeafSplitV1, Text]:
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, -1)?
+    if header.page_type != 1: return err("YDBv1 leaf split requires a LEAF page")
+    if header.count < 2: return err("YDBv1 leaf split requires at least two slots")
+    if right_page_id < 2 or right_page_id > 4611686018427387903 or right_page_id == header.page_id: return err("YDBv1 leaf split right page ID is invalid")
+    if split_lsn <= header.page_lsn: return err("YDBv1 leaf split LSN must advance the source page")
+    var prefix: Bytes = bytes_from_text("")
+    if header.prefix_len > 0: set prefix = bytes_try_slice(page, yaza_db_page_size_v1() - header.prefix_len, header.prefix_len)?
+    var old_low: Bytes = bytes_from_text("")
+    var old_high: Bytes = bytes_from_text("")
+    if header.low_fence_len > 0: set old_low = bytes_try_slice(page, header.low_fence_offset, header.low_fence_len)?
+    if header.high_fence_len > 0: set old_high = bytes_try_slice(page, header.high_fence_offset, header.high_fence_len)?
+    var total_weight: Number = 0
+    var slot_index: Number = 0
+    while slot_index < header.count:
+        let descriptor: Number = yaza_db_page_header_size_v1() + slot_index * yaza_db_page_slot_size_v1()
+        let slot_offset: Number = yaza_db_read_uint_le_v1(page, descriptor, 2)?
+        let key_length: Number = yaza_db_read_uint_le_v1(page, descriptor + 2, 2)?
+        let payload_length: Number = yaza_db_read_uint_le_v1(page, descriptor + 4, 2)?
+        let suffix: Bytes = bytes_try_slice(page, slot_offset, key_length)?
+        var full_key: Bytes = suffix
+        if header.prefix_len > 0: set full_key = bytes_try_concat(prefix, suffix)?
+        if header.low_fence_len > 0 and yaza_db_compare_bytes_v1(full_key, old_low) < 0: return err("YDBv1 leaf contains a key below its low fence")
+        if header.high_fence_len > 0 and yaza_db_compare_bytes_v1(full_key, old_high) >= 0: return err("YDBv1 leaf contains a key at or above its high fence")
+        set total_weight = total_weight + yaza_db_page_slot_size_v1() + key_length + payload_length
+        set slot_index = slot_index + 1
+    var left_weight: Number = 0
+    var best_difference: Number = 9223372036854775807
+    var split_index: Number = 0
+    set slot_index = 0
+    while slot_index + 1 < header.count:
+        let split_descriptor: Number = yaza_db_page_header_size_v1() + slot_index * yaza_db_page_slot_size_v1()
+        let split_suffix_length: Number = yaza_db_read_uint_le_v1(page, split_descriptor + 2, 2)?
+        let split_key_length: Number = split_suffix_length + header.prefix_len
+        let split_payload_length: Number = yaza_db_read_uint_le_v1(page, split_descriptor + 4, 2)?
+        set left_weight = left_weight + yaza_db_page_slot_size_v1() + split_key_length - header.prefix_len + split_payload_length
+        let right_weight: Number = total_weight - left_weight
+        let left_used: Number = left_weight + header.prefix_len + header.low_fence_len + split_key_length
+        let right_used: Number = right_weight + header.prefix_len + header.high_fence_len + split_key_length
+        if left_used <= yaza_db_page_size_v1() - yaza_db_page_header_size_v1() and right_used <= yaza_db_page_size_v1() - yaza_db_page_header_size_v1():
+            var difference: Number = left_used - right_used
+            if difference < 0: set difference = -difference
+            if difference < best_difference:
+                set best_difference = difference
+                set split_index = slot_index + 1
+        set slot_index = slot_index + 1
+    if split_index <= 0: return err("YDBv1 leaf cannot be split while preserving both fence ranges")
+    let separator: Bytes = yaza_db_page_slot_key_v1(page, split_index, header.page_id)?
+    let left_page: Bytes = yaza_db_page_rebuild_leaf_range_v1(page, header.page_id, split_lsn, 0, split_index, header.low_fence_len > 0, old_low, true, separator)?
+    let right_page: Bytes = yaza_db_page_rebuild_leaf_range_v1(page, right_page_id, split_lsn, split_index, header.count, true, separator, header.high_fence_len > 0, old_high)?
+    let left_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(left_page, header.page_id)?
+    let right_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(right_page, right_page_id)?
+    if left_header.count != split_index or right_header.count != header.count - split_index: return err("YDBv1 leaf split slot counts failed validation")
+    return ok(YazaDbLeafSplitV1(left_page, right_page, separator, split_index, left_header.count, right_header.count))
+
+fn yaza_db_page_inner_child_page_id_v1(payload: Bytes) -> Result[Number, Text]:
+    if bytes_length(payload) != 8: return err("YDBv1 inner split child payload must be one 8-byte disk pointer")
+    let pointer: Number = yaza_db_read_uint_le_v1(payload, 0, 8)?
+    if pointer < 4 or pointer % 2 != 0: return err("YDBv1 inner split child pointer is reserved, swizzled, or misaligned")
+    let page_id: Number = pointer / 2
+    if page_id < 2 or page_id > 4611686018427387903: return err("YDBv1 inner split child page ID is outside the supported range")
+    return ok(page_id)
+
+fn yaza_db_page_rebuild_inner_range_v1(source: Bytes, page_id: Number, page_lsn: Number, level: Number, start_index: Number, end_index: Number, upper_child_page_id: Number, has_low_fence: Boolean, low_fence: Bytes, has_high_fence: Boolean, high_fence: Bytes) -> Result[Bytes, Text]:
+    let source_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(source, -1)?
+    if source_header.page_type != 2 or level != source_header.level or level < 1: return err("YDBv1 inner range rebuild requires the source inner-page level")
+    if page_id < 2 or page_lsn < source_header.page_lsn or start_index < 0 or end_index < start_index or end_index > source_header.count: return err("YDBv1 inner range, page ID, or LSN is invalid")
+    if upper_child_page_id < 2 or upper_child_page_id > 4611686018427387903 or upper_child_page_id == page_id: return err("YDBv1 rebuilt inner page upper child is invalid")
+    let page: Bytes = yaza_db_page_new_v1(page_id, page_lsn, 2, level)?
+    if not yaza_db_page_set_upper_v1(page, upper_child_page_id): return err("YDBv1 rebuilt inner page upper child could not be set")
+    if source_header.prefix_len > 0 and end_index > start_index:
+        let prefix: Bytes = bytes_try_slice(source, yaza_db_page_size_v1() - source_header.prefix_len, source_header.prefix_len)?
+        let ignored_prefix: Number = yaza_db_page_set_prefix_v1(page, prefix)?
+    var index: Number = start_index
+    while index < end_index:
+        let key: Bytes = yaza_db_page_slot_key_v1(source, index, source_header.page_id)?
+        let slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(source, index, source_header.page_id)?
+        let ignored_slot: Number = yaza_db_page_add_slot_v1(page, key, slot.payload)?
+        set index = index + 1
+    let packed: Bytes = yaza_db_page_finalize_v1(page)?
+    return yaza_db_page_set_fences_v1(packed, has_low_fence, low_fence, has_high_fence, high_fence)
+
+fn yaza_db_page_split_inner_as_children_v1(page: Bytes, left_page_id: Number, right_page_id: Number, split_lsn: Number) -> Result[YazaDbInnerSplitV1, Text]:
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, -1)?
+    if header.page_type != 2 or header.level < 1: return err("YDBv1 inner split requires an INNER page")
+    if header.count < 3: return err("YDBv1 inner split requires at least three separator slots so both outputs retain at least two children")
+    if left_page_id < 2 or left_page_id > 4611686018427387903 or right_page_id < 2 or right_page_id > 4611686018427387903 or left_page_id == right_page_id: return err("YDBv1 inner split child page IDs are invalid")
+    if split_lsn <= header.page_lsn: return err("YDBv1 inner split LSN must advance the source page")
+    let upper_child_page_id: Number = header.upper / 2
+    if upper_child_page_id == header.page_id or upper_child_page_id == left_page_id or upper_child_page_id == right_page_id: return err("YDBv1 inner split source upper pointer forms a self-cycle")
+    var prefix: Bytes = bytes_from_text("")
+    if header.prefix_len > 0: set prefix = bytes_try_slice(page, yaza_db_page_size_v1() - header.prefix_len, header.prefix_len)?
+    var old_low: Bytes = bytes_from_text("")
+    var old_high: Bytes = bytes_from_text("")
+    if header.low_fence_len > 0: set old_low = bytes_try_slice(page, header.low_fence_offset, header.low_fence_len)?
+    if header.high_fence_len > 0: set old_high = bytes_try_slice(page, header.high_fence_offset, header.high_fence_len)?
+    var total_weight: Number = 0
+    var slot_index: Number = 0
+    while slot_index < header.count:
+        let key: Bytes = yaza_db_page_slot_key_v1(page, slot_index, header.page_id)?
+        let slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(page, slot_index, header.page_id)?
+        let child_page_id: Number = yaza_db_page_inner_child_page_id_v1(slot.payload)?
+        if child_page_id == header.page_id or child_page_id == left_page_id or child_page_id == right_page_id: return err("YDBv1 inner split source contains a self-referencing child")
+        if header.low_fence_len > 0 and yaza_db_compare_bytes_v1(key, old_low) <= 0: return err("YDBv1 inner separator is not above its inclusive low fence")
+        if header.high_fence_len > 0 and yaza_db_compare_bytes_v1(key, old_high) >= 0: return err("YDBv1 inner separator is at or above its exclusive high fence")
+        set total_weight = total_weight + yaza_db_page_slot_size_v1() + slot.key_len + slot.payload_len
+        set slot_index = slot_index + 1
+    var left_weight: Number = 0
+    var best_difference: Number = 9223372036854775807
+    var split_index: Number = -1
+    set slot_index = 0
+    while slot_index < header.count:
+        let slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(page, slot_index, header.page_id)?
+        let separator: Bytes = yaza_db_page_slot_key_v1(page, slot_index, header.page_id)?
+        let promoted_weight: Number = yaza_db_page_slot_size_v1() + slot.key_len + slot.payload_len
+        let right_weight: Number = total_weight - left_weight - promoted_weight
+        var left_prefix_bytes: Number = 0
+        if slot_index > 0: set left_prefix_bytes = header.prefix_len
+        var right_prefix_bytes: Number = 0
+        if slot_index + 1 < header.count: set right_prefix_bytes = header.prefix_len
+        let left_used: Number = left_weight + left_prefix_bytes + header.low_fence_len + bytes_length(separator)
+        let right_used: Number = right_weight + right_prefix_bytes + bytes_length(separator) + header.high_fence_len
+        if slot_index > 0 and slot_index + 1 < header.count and left_used <= yaza_db_page_size_v1() - yaza_db_page_header_size_v1() and right_used <= yaza_db_page_size_v1() - yaza_db_page_header_size_v1():
+            var difference: Number = left_used - right_used
+            if difference < 0: set difference = -difference
+            if difference < best_difference:
+                set best_difference = difference
+                set split_index = slot_index
+        set left_weight = left_weight + promoted_weight
+        set slot_index = slot_index + 1
+    if split_index < 0: return err("YDBv1 inner page cannot be split while preserving both fence ranges")
+    let separator: Bytes = yaza_db_page_slot_key_v1(page, split_index, header.page_id)?
+    let promoted_slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(page, split_index, header.page_id)?
+    let left_upper_child: Number = yaza_db_page_inner_child_page_id_v1(promoted_slot.payload)?
+    let left_page: Bytes = yaza_db_page_rebuild_inner_range_v1(page, left_page_id, split_lsn, header.level, 0, split_index, left_upper_child, header.low_fence_len > 0, old_low, true, separator)?
+    let right_page: Bytes = yaza_db_page_rebuild_inner_range_v1(page, right_page_id, split_lsn, header.level, split_index + 1, header.count, upper_child_page_id, true, separator, header.high_fence_len > 0, old_high)?
+    let left_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(left_page, left_page_id)?
+    let right_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(right_page, right_page_id)?
+    if left_header.page_type != 2 or right_header.page_type != 2 or left_header.level != header.level or right_header.level != header.level: return err("YDBv1 inner split output type or level failed validation")
+    if left_header.count != split_index or right_header.count != header.count - split_index - 1: return err("YDBv1 inner split slot counts failed validation")
+    if left_header.upper != left_upper_child * 2 or right_header.upper != header.upper: return err("YDBv1 inner split child-pointer transfer failed validation")
+    return ok(YazaDbInnerSplitV1(left_page, right_page, separator, split_index, left_header.count, right_header.count))
+
+fn yaza_db_page_split_inner_v1(page: Bytes, right_page_id: Number, split_lsn: Number) -> Result[YazaDbInnerSplitV1, Text]:
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, -1)?
+    return yaza_db_page_split_inner_as_children_v1(page, header.page_id, right_page_id, split_lsn)
+
+fn yaza_db_page_restamp_inner_v1(page: Bytes, page_lsn: Number) -> Result[Bytes, Text]:
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, -1)?
+    if header.page_type != 2 or header.level < 1 or header.count < 1: return err("YDBv1 inner-page restamp requires a non-empty INNER page")
+    if page_lsn < header.page_lsn: return err("YDBv1 inner-page restamp cannot move its LSN backwards")
+    let upper_child_page_id: Number = header.upper / 2
+    var low_fence: Bytes = bytes_from_text("")
+    var high_fence: Bytes = bytes_from_text("")
+    if header.low_fence_len > 0: set low_fence = bytes_try_slice(page, header.low_fence_offset, header.low_fence_len)?
+    if header.high_fence_len > 0: set high_fence = bytes_try_slice(page, header.high_fence_offset, header.high_fence_len)?
+    return yaza_db_page_rebuild_inner_range_v1(page, header.page_id, page_lsn, header.level, 0, header.count, upper_child_page_id, header.low_fence_len > 0, low_fence, header.high_fence_len > 0, high_fence)
+
+fn yaza_db_page_grow_inner_root_v1(source: Bytes, left_child_page_id: Number, right_child_page_id: Number, root_lsn: Number) -> Result[YazaDbInnerRootGrowthV1, Text]:
+    let source_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(source, -1)?
+    if source_header.page_type != 2 or source_header.level < 1: return err("YDBv1 root growth requires an INNER root")
+    if source_header.level >= 254: return err("YDBv1 root growth exceeds the supported page-level range")
+    if root_lsn <= source_header.page_lsn: return err("YDBv1 root growth LSN must advance the source root")
+    let split: YazaDbInnerSplitV1 = yaza_db_page_split_inner_as_children_v1(source, left_child_page_id, right_child_page_id, root_lsn)?
+    let root: Bytes = yaza_db_page_new_v1(source_header.page_id, root_lsn, 2, source_header.level + 1)?
+    if not yaza_db_page_set_upper_v1(root, right_child_page_id): return err("YDBv1 grown root could not install its right child")
+    let left_pointer: Bytes = bytes_try_new_zeroed(8)?
+    if not yaza_db_write_uint_le_v1(left_pointer, 0, left_child_page_id * 2, 8): return err("YDBv1 grown root left child pointer could not be encoded")
+    let inserted: Number = yaza_db_page_add_slot_v1(root, split.separator, left_pointer)?
+    if inserted != 0: return err("YDBv1 grown root separator was not inserted at slot zero")
+    let packed: Bytes = yaza_db_page_finalize_v1(root)?
+    var old_low: Bytes = bytes_from_text("")
+    var old_high: Bytes = bytes_from_text("")
+    if source_header.low_fence_len > 0: set old_low = bytes_try_slice(source, source_header.low_fence_offset, source_header.low_fence_len)?
+    if source_header.high_fence_len > 0: set old_high = bytes_try_slice(source, source_header.high_fence_offset, source_header.high_fence_len)?
+    var grown_root: Bytes = packed
+    if source_header.low_fence_len > 0 or source_header.high_fence_len > 0:
+        set grown_root = yaza_db_page_set_fences_v1(packed, source_header.low_fence_len > 0, old_low, source_header.high_fence_len > 0, old_high)?
+    let root_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(grown_root, source_header.page_id)?
+    let left_slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(grown_root, 0, source_header.page_id)?
+    let routed_left_id: Number = yaza_db_page_inner_child_page_id_v1(left_slot.payload)?
+    let left_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(split.left_page, left_child_page_id)?
+    let right_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(split.right_page, right_child_page_id)?
+    if root_header.page_type != 2 or root_header.level != source_header.level + 1 or root_header.count != 1 or root_header.upper != right_child_page_id * 2 or routed_left_id != left_child_page_id: return err("YDBv1 grown root did not route its two child ranges")
+    if left_header.level != source_header.level or right_header.level != source_header.level or left_header.page_lsn != root_lsn or right_header.page_lsn != root_lsn: return err("YDBv1 grown root children have an invalid level or LSN")
+    return ok(YazaDbInnerRootGrowthV1(grown_root, split.left_page, split.right_page, split.separator, split.split_index))
+
+fn yaza_db_page_grow_leaf_root_v1(source: Bytes, left_child_page_id: Number, right_child_page_id: Number, root_lsn: Number) -> Result[YazaDbLeafRootGrowthV1, Text]:
+    let source_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(source, -1)?
+    if source_header.page_type != 1 or source_header.level != 0: return err("YDBv1 leaf-root growth requires a LEAF root")
+    if source_header.low_fence_len != 0 or source_header.high_fence_len != 0: return err("YDBv1 leaf-root growth requires an unfenced root page")
+    if left_child_page_id < 2 or right_child_page_id < 2 or left_child_page_id == right_child_page_id or left_child_page_id == source_header.page_id or right_child_page_id == source_header.page_id: return err("YDBv1 leaf-root child page IDs are invalid")
+    if root_lsn <= source_header.page_lsn: return err("YDBv1 leaf-root growth LSN must advance the source root")
+    let split: YazaDbLeafSplitV1 = yaza_db_page_split_leaf_v1(source, right_child_page_id, root_lsn)?
+    let left_page: Bytes = yaza_db_page_rebuild_leaf_range_v1(source, left_child_page_id, root_lsn, 0, split.split_index, false, bytes_from_text(""), true, split.separator)?
+    let root: Bytes = yaza_db_page_new_v1(source_header.page_id, root_lsn, 2, 1)?
+    if not yaza_db_page_set_upper_v1(root, right_child_page_id): return err("YDBv1 leaf-grown root could not install its right child")
+    let left_pointer: Bytes = bytes_try_new_zeroed(8)?
+    if not yaza_db_write_uint_le_v1(left_pointer, 0, left_child_page_id * 2, 8): return err("YDBv1 leaf-grown root left child pointer could not be encoded")
+    let inserted: Number = yaza_db_page_add_slot_v1(root, split.separator, left_pointer)?
+    if inserted != 0: return err("YDBv1 leaf-grown root separator was not inserted at slot zero")
+    let root_page: Bytes = yaza_db_page_finalize_v1(root)?
+    let root_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(root_page, source_header.page_id)?
+    let root_slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(root_page, 0, source_header.page_id)?
+    let left_pointer_page_id: Number = yaza_db_page_inner_child_page_id_v1(root_slot.payload)?
+    let left_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(left_page, left_child_page_id)?
+    let right_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(split.right_page, right_child_page_id)?
+    if root_header.page_type != 2 or root_header.level != 1 or root_header.count != 1 or root_header.upper != right_child_page_id * 2 or left_pointer_page_id != left_child_page_id: return err("YDBv1 leaf-grown root does not route its two child pages")
+    if left_header.page_type != 1 or right_header.page_type != 1 or left_header.level != 0 or right_header.level != 0 or left_header.page_lsn != root_lsn or right_header.page_lsn != root_lsn: return err("YDBv1 leaf-grown root children have an invalid type, level, or LSN")
+    if left_header.count != split.split_index or right_header.count != source_header.count - split.split_index: return err("YDBv1 leaf-grown root children did not preserve every source slot")
+    return ok(YazaDbLeafRootGrowthV1(root_page, left_page, split.right_page, split.separator, split.split_index))
+
+fn yaza_db_page_insert_leaf_split_into_parent_v1(parent: Bytes, page_lsn: Number, child_page_id: Number, separator: Bytes, right_page_id: Number) -> Result[Bytes, Text]:
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(parent, -1)?
+    if header.page_type != 2 or header.level < 1: return err("YDBv1 leaf-split parent update requires an INNER page")
+    if page_lsn <= header.page_lsn: return err("YDBv1 leaf-split parent update LSN must advance the parent")
+    if child_page_id < 2 or right_page_id < 2 or child_page_id == right_page_id or child_page_id == header.page_id or right_page_id == header.page_id: return err("YDBv1 leaf-split parent child IDs are invalid")
+    let separator_length: Number = bytes_length(separator)
+    if separator_length < 1 or separator_length > 2048: return err("YDBv1 leaf-split separator is outside its key bound")
+    let upper_child_id: Number = header.upper / 2
+    var target_index: Number = -1
+    var target_count: Number = 0
+    var slot_index: Number = 0
+    while slot_index < header.count:
+        let slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(parent, slot_index, header.page_id)?
+        let pointed_page_id: Number = yaza_db_page_inner_child_page_id_v1(slot.payload)?
+        if pointed_page_id == child_page_id:
+            set target_index = slot_index
+            set target_count = target_count + 1
+        set slot_index = slot_index + 1
+    var split_upper_child: Boolean = false
+    if upper_child_id == child_page_id:
+        set target_count = target_count + 1
+        set split_upper_child = true
+    if target_count != 1: return err("YDBv1 leaf-split child must appear exactly once in its parent")
+    var old_high: Bytes = bytes_from_text("")
+    var has_old_high: Boolean = false
+    if target_index >= 0:
+        set old_high = yaza_db_page_slot_key_v1(parent, target_index, header.page_id)?
+        set has_old_high = true
+        if yaza_db_compare_bytes_v1(separator, old_high) >= 0: return err("YDBv1 leaf-split separator must precede the old child high fence")
+        if target_index > 0:
+            let previous_separator: Bytes = yaza_db_page_slot_key_v1(parent, target_index - 1, header.page_id)?
+            if yaza_db_compare_bytes_v1(separator, previous_separator) <= 0: return err("YDBv1 leaf-split separator must follow the previous parent separator")
+    else:
+        if not split_upper_child: return err("YDBv1 leaf-split target child is not in the parent")
+        if header.count > 0:
+            let last_separator: Bytes = yaza_db_page_slot_key_v1(parent, header.count - 1, header.page_id)?
+            if yaza_db_compare_bytes_v1(separator, last_separator) <= 0: return err("YDBv1 upper-child split separator must follow the final parent separator")
+    if header.low_fence_len > 0:
+        let low_fence: Bytes = bytes_try_slice(parent, header.low_fence_offset, header.low_fence_len)?
+        if yaza_db_compare_bytes_v1(separator, low_fence) <= 0: return err("YDBv1 leaf-split separator must be above the parent's inclusive low fence")
+    if header.high_fence_len > 0:
+        let high_fence: Bytes = bytes_try_slice(parent, header.high_fence_offset, header.high_fence_len)?
+        if yaza_db_compare_bytes_v1(separator, high_fence) >= 0: return err("YDBv1 leaf-split separator must be below the parent's exclusive high fence")
+
+    var new_upper_child: Number = upper_child_id
+    if split_upper_child: set new_upper_child = right_page_id
+    let rebuilt: Bytes = yaza_db_page_new_v1(header.page_id, page_lsn, 2, header.level)?
+    if not yaza_db_page_set_upper_v1(rebuilt, new_upper_child): return err("YDBv1 rebuilt split parent upper child could not be set")
+    if header.prefix_len > 0:
+        let prefix: Bytes = bytes_try_slice(parent, yaza_db_page_size_v1() - header.prefix_len, header.prefix_len)?
+        let ignored_prefix: Number = yaza_db_page_set_prefix_v1(rebuilt, prefix)?
+    var inserted_split_separator: Boolean = false
+    set slot_index = 0
+    while slot_index <= header.count:
+        if split_upper_child and slot_index == header.count:
+            let left_pointer: Bytes = bytes_try_new_zeroed(8)?
+            if not yaza_db_write_uint_le_v1(left_pointer, 0, child_page_id * 2, 8): return err("YDBv1 split-parent left child pointer could not be encoded")
+            let inserted: Number = yaza_db_page_add_slot_v1(rebuilt, separator, left_pointer)?
+            set inserted_split_separator = true
+        elif slot_index < header.count:
+            if slot_index == target_index:
+                let left_pointer: Bytes = bytes_try_new_zeroed(8)?
+                let right_pointer: Bytes = bytes_try_new_zeroed(8)?
+                if not yaza_db_write_uint_le_v1(left_pointer, 0, child_page_id * 2, 8) or not yaza_db_write_uint_le_v1(right_pointer, 0, right_page_id * 2, 8): return err("YDBv1 split-parent child pointers could not be encoded")
+                let added_left: Number = yaza_db_page_add_slot_v1(rebuilt, separator, left_pointer)?
+                let added_right: Number = yaza_db_page_add_slot_v1(rebuilt, old_high, right_pointer)?
+                set inserted_split_separator = true
+            else:
+                let old_key: Bytes = yaza_db_page_slot_key_v1(parent, slot_index, header.page_id)?
+                let old_slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(parent, slot_index, header.page_id)?
+                let ignored_slot: Number = yaza_db_page_add_slot_v1(rebuilt, old_key, old_slot.payload)?
+        set slot_index = slot_index + 1
+    if not inserted_split_separator: return err("YDBv1 split-parent separator was not inserted")
+    let packed: Bytes = yaza_db_page_finalize_v1(rebuilt)?
+    var fenced: Bytes = packed
+    if header.low_fence_len > 0 or header.high_fence_len > 0:
+        var low_fence: Bytes = bytes_from_text("")
+        var high_fence: Bytes = bytes_from_text("")
+        if header.low_fence_len > 0: set low_fence = bytes_try_slice(parent, header.low_fence_offset, header.low_fence_len)?
+        if header.high_fence_len > 0: set high_fence = bytes_try_slice(parent, header.high_fence_offset, header.high_fence_len)?
+        set fenced = yaza_db_page_set_fences_v1(packed, header.low_fence_len > 0, low_fence, header.high_fence_len > 0, high_fence)?
+    let verified: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(fenced, header.page_id)?
+    if verified.page_type != 2 or verified.level != header.level or verified.page_lsn != page_lsn or verified.count != header.count + 1 or verified.upper != new_upper_child * 2 or verified.prefix_len != header.prefix_len or verified.low_fence_len != header.low_fence_len or verified.high_fence_len != header.high_fence_len: return err("YDBv1 rebuilt split parent failed metadata validation")
+    if has_old_high:
+        let new_left_index: Number = yaza_db_page_lower_bound_v1(fenced, separator, header.page_id)?
+        let new_right_index: Number = yaza_db_page_lower_bound_v1(fenced, old_high, header.page_id)?
+        let left_slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(fenced, new_left_index, header.page_id)?
+        let right_slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(fenced, new_right_index, header.page_id)?
+        let routed_left_page_id: Number = yaza_db_page_inner_child_page_id_v1(left_slot.payload)?
+        let routed_right_page_id: Number = yaza_db_page_inner_child_page_id_v1(right_slot.payload)?
+        if routed_left_page_id != child_page_id or routed_right_page_id != right_page_id: return err("YDBv1 rebuilt split parent routes the two child ranges incorrectly")
+    else:
+        let new_index: Number = yaza_db_page_lower_bound_v1(fenced, separator, header.page_id)?
+        let left_slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(fenced, new_index, header.page_id)?
+        let routed_left_page_id: Number = yaza_db_page_inner_child_page_id_v1(left_slot.payload)?
+        if routed_left_page_id != child_page_id or verified.upper != right_page_id * 2: return err("YDBv1 rebuilt split parent routes its upper child ranges incorrectly")
+    return ok(fenced)
+
+fn yaza_db_page_header_decode_v1(page: Bytes, expected_page_id: Number) -> Result[YazaDbPageHeaderV1, Text]:
+    if bytes_length(page) != yaza_db_page_size_v1(): return err("YDBv1 page must be exactly 16 KiB")
+    let stored_crc: Number = yaza_db_read_uint_le_v1(page, 8, 4)?
+    if bytes_ydbv1_checksum_zeroed_range(page, 8, 4) != stored_crc: return err("YDBv1 page checksum mismatch")
+    let page_lsn: Number = yaza_db_read_uint_le_v1(page, 0, 8)?
+    let page_type: Number = bytes_get(page, 12)
+    let level: Number = bytes_get(page, 13)
+    let count: Number = yaza_db_read_uint_le_v1(page, 14, 2)?
+    let space_used: Number = yaza_db_read_uint_le_v1(page, 16, 2)?
+    let data_start: Number = yaza_db_read_uint_le_v1(page, 18, 2)?
+    let prefix_len: Number = yaza_db_read_uint_le_v1(page, 20, 2)?
+    let reserved: Number = yaza_db_read_uint_le_v1(page, 22, 2)?
+    let low_fence_offset: Number = yaza_db_read_uint_le_v1(page, 24, 2)?
+    let low_fence_len: Number = yaza_db_read_uint_le_v1(page, 26, 2)?
+    let high_fence_offset: Number = yaza_db_read_uint_le_v1(page, 28, 2)?
+    let high_fence_len: Number = yaza_db_read_uint_le_v1(page, 30, 2)?
+    let upper: Number = yaza_db_read_uint_le_v1(page, 32, 8)?
+    let page_id: Number = yaza_db_read_uint_le_v1(page, 40, 8)?
+    if page_type != 1 and page_type != 2 and page_type != 3 and page_type != 4 and page_type != 5 and page_type != 6: return err("YDBv1 page type does not have a codec in this slice")
+    if page_id < 2 or (expected_page_id >= 0 and page_id != expected_page_id): return err("YDBv1 page ID does not match its location")
+    if reserved != 0: return err("YDBv1 page reserved header bytes are non-zero")
+    if prefix_len > 2048: return err("YDBv1 shared key prefix exceeds the key limit")
+    if prefix_len > 0 and page_type != 1 and page_type != 2: return err("YDBv1 shared key prefixes are supported only on leaf and inner pages")
+    let prefix_offset: Number = yaza_db_page_size_v1() - prefix_len
+    if prefix_len > 0 and data_start > prefix_offset: return err("YDBv1 page data overlaps its shared key prefix")
+    if prefix_len > 0 and count == 0: return err("YDBv1 page has a shared prefix but no slots")
+    if page_type == 1 and level != 0: return err("YDBv1 leaf page level is invalid")
+    if page_type == 2 and level == 0: return err("YDBv1 inner page level is invalid")
+    if page_type > 2 and level != 0: return err("YDBv1 non-index page level is invalid")
+    if page_type == 2:
+        if upper < 4 or upper % 2 != 0: return err("YDBv1 inner-page upper child pointer is invalid")
+    else:
+        if page_type == 3:
+            if upper != 0 and (upper < 4 or upper % 2 != 0): return err("YDBv1 overflow-page next pointer is invalid")
+        else:
+            if upper != 0: return err("YDBv1 non-inner page has a non-zero upper pointer")
+    if page_type == 3:
+        if count != 0 or prefix_len != 0: return err("YDBv1 overflow page cannot contain slots or a shared prefix")
+        if low_fence_offset != 0 or low_fence_len != 0 or high_fence_offset != 0 or high_fence_len != 0: return err("YDBv1 overflow page cannot contain index fences")
+    if page_type == 4:
+        if count != 0 or prefix_len != 0 or upper != 0: return err("YDBv1 META page cannot contain slots, a shared prefix, or an upper pointer")
+        if low_fence_offset != 0 or low_fence_len != 0 or high_fence_offset != 0 or high_fence_len != 0: return err("YDBv1 META page cannot contain index fences")
+        if space_used < 16: return err("YDBv1 META page payload envelope is truncated")
+        var metadata_padding_offset: Number = yaza_db_page_header_size_v1()
+        while metadata_padding_offset < data_start:
+            if bytes_get(page, metadata_padding_offset) != 0: return err("YDBv1 META page has non-zero bytes before its payload envelope")
+            set metadata_padding_offset = metadata_padding_offset + 1
+    if page_type == 5:
+        if count != 0 or prefix_len != 0 or upper != 0: return err("YDBv1 bitmap page cannot contain slots, a shared prefix, or an upper pointer")
+        if data_start != yaza_db_page_header_size_v1() or space_used != yaza_db_bitmap_page_payload_bytes_v1(): return err("YDBv1 bitmap page must use its entire post-header area")
+        if low_fence_offset != 0 or low_fence_len != 0 or high_fence_offset != 0 or high_fence_len != 0: return err("YDBv1 bitmap page cannot contain index fences")
+    if page_type == 6:
+        if count != 0 or prefix_len != 0 or upper != 0: return err("YDBv1 FREE page cannot contain slots, a shared prefix, or an upper pointer")
+        if data_start != yaza_db_page_size_v1() or space_used != 0: return err("YDBv1 FREE page must use the canonical empty-page layout")
+        if low_fence_offset != 0 or low_fence_len != 0 or high_fence_offset != 0 or high_fence_len != 0: return err("YDBv1 FREE page cannot contain index fences")
+        var free_padding_offset: Number = yaza_db_page_header_size_v1()
+        while free_padding_offset < yaza_db_page_size_v1():
+            if bytes_get(page, free_padding_offset) != 0: return err("YDBv1 FREE page body must be zero-filled")
+            set free_padding_offset = free_padding_offset + 1
+    if count > 1361: return err("YDBv1 slot count exceeds the page limit")
+    let slot_end: Number = yaza_db_page_header_size_v1() + count * yaza_db_page_slot_size_v1()
+    if data_start < slot_end or data_start > yaza_db_page_size_v1(): return err("YDBv1 slot array overlaps or exceeds the data area")
+    if space_used != count * yaza_db_page_slot_size_v1() + yaza_db_page_size_v1() - data_start: return err("YDBv1 space_used does not match occupied slot and data bytes")
+    if not yaza_db_range_valid_v1(low_fence_offset, low_fence_len, data_start): return err("YDBv1 low-fence range is invalid")
+    if not yaza_db_range_valid_v1(high_fence_offset, high_fence_len, data_start): return err("YDBv1 high-fence range is invalid")
+    if low_fence_len > 0 and low_fence_offset + low_fence_len > prefix_offset: return err("YDBv1 low fence overlaps the shared prefix")
+    if high_fence_len > 0 and high_fence_offset + high_fence_len > prefix_offset: return err("YDBv1 high fence overlaps the shared prefix")
+    if low_fence_len > 0 and high_fence_len > 0 and yaza_db_compare_byte_ranges_v1(page, low_fence_offset, low_fence_len, page, high_fence_offset, high_fence_len) > 0: return err("YDBv1 low fence sorts after the high fence")
+    if low_fence_len > 0 and high_fence_len > 0 and low_fence_offset < high_fence_offset + high_fence_len and high_fence_offset < low_fence_offset + low_fence_len: return err("YDBv1 low and high fences overlap")
+    var previous_head: Number = -1
+    var previous_key_offset: Number = 0
+    var previous_key_len: Number = 0
+    var previous_record_offset: Number = yaza_db_page_size_v1()
+    var index: Number = 0
+    while index < count:
+        let descriptor: Number = yaza_db_page_header_size_v1() + index * yaza_db_page_slot_size_v1()
+        let record_offset: Number = yaza_db_read_uint_le_v1(page, descriptor, 2)?
+        let key_len: Number = yaza_db_read_uint_le_v1(page, descriptor + 2, 2)?
+        let payload_len: Number = yaza_db_read_uint_le_v1(page, descriptor + 4, 2)?
+        let key_head: Number = yaza_db_read_uint_be32_v1(page, descriptor + 6)?
+        let slot_reserved: Number = yaza_db_read_uint_le_v1(page, descriptor + 10, 2)?
+        if slot_reserved != 0: return err("YDBv1 slot reserved bytes are non-zero")
+        if key_len > 2048 or payload_len > 4096: return err("YDBv1 slot key or payload length is invalid")
+        if key_len == 0 and prefix_len == 0: return err("YDBv1 slot has an empty key without a shared prefix")
+        if record_offset < data_start or record_offset > yaza_db_page_size_v1() - key_len - payload_len: return err("YDBv1 slot body is outside the page data area")
+        if record_offset + key_len + payload_len > previous_record_offset: return err("YDBv1 slot bodies overlap or are not packed in reverse key order")
+        var computed_head: Number = 0
+        var head_index: Number = 0
+        while head_index < 4:
+            set computed_head = computed_head * 256
+            if head_index < key_len: set computed_head = computed_head + bytes_get(page, record_offset + head_index)
+            set head_index = head_index + 1
+        if key_head != computed_head: return err("YDBv1 slot key_head does not match its key suffix")
+        if index > 0:
+            if key_head < previous_head: return err("YDBv1 slot keys are not ordered by key_head")
+            if key_head == previous_head:
+                if yaza_db_compare_byte_ranges_v1(page, previous_key_offset, previous_key_len, page, record_offset, key_len) >= 0: return err("YDBv1 slot keys are not in strict byte order")
+        if record_offset + key_len + payload_len > yaza_db_page_size_v1() - prefix_len: return err("YDBv1 slot body overlaps the shared prefix")
+        if low_fence_len > 0 and record_offset < low_fence_offset + low_fence_len and low_fence_offset < record_offset + key_len + payload_len: return err("YDBv1 slot overlaps the low fence")
+        if high_fence_len > 0 and record_offset < high_fence_offset + high_fence_len and high_fence_offset < record_offset + key_len + payload_len: return err("YDBv1 slot overlaps the high fence")
+        set previous_head = key_head
+        set previous_key_offset = record_offset
+        set previous_key_len = key_len
+        set previous_record_offset = record_offset
+        set index = index + 1
+    return ok(YazaDbPageHeaderV1(page_lsn, stored_crc, page_type, level, count, space_used, data_start, prefix_len, low_fence_offset, low_fence_len, high_fence_offset, high_fence_len, upper, page_id))
+
+fn yaza_db_page_slot_v1(page: Bytes, slot_index: Number, expected_page_id: Number) -> Result[YazaDbPageSlotV1, Text]:
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, expected_page_id)?
+    if slot_index < 0 or slot_index >= header.count: return err("YDBv1 slot index is outside the page")
+    let descriptor: Number = yaza_db_page_header_size_v1() + slot_index * yaza_db_page_slot_size_v1()
+    let offset: Number = yaza_db_read_uint_le_v1(page, descriptor, 2)?
+    let key_len: Number = yaza_db_read_uint_le_v1(page, descriptor + 2, 2)?
+    let payload_len: Number = yaza_db_read_uint_le_v1(page, descriptor + 4, 2)?
+    let key_head: Number = yaza_db_read_uint_be32_v1(page, descriptor + 6)?
+    let key_suffix: Bytes = bytes_try_slice(page, offset, key_len)?
+    let payload: Bytes = bytes_try_slice(page, offset + key_len, payload_len)?
+    return ok(YazaDbPageSlotV1(offset, key_len, payload_len, key_head, key_suffix, payload))
+
+fn yaza_db_page_slot_key_v1(page: Bytes, slot_index: Number, expected_page_id: Number) -> Result[Bytes, Text]:
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, expected_page_id)?
+    let slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(page, slot_index, expected_page_id)?
+    if header.prefix_len == 0: return ok(slot.key_suffix)
+    let prefix: Bytes = bytes_try_slice(page, yaza_db_page_size_v1() - header.prefix_len, header.prefix_len)?
+    return bytes_try_concat(prefix, slot.key_suffix)
+
+# Fast cursor accessor for a page whose complete CRC, header, slot table, and
+# key ordering were already checked by yaza_db_page_header_decode_v1. The scan
+# holds the page immutable, so rechecking its identity and every descriptor here
+# would duplicate that full-page validation. bytes_try_slice still enforces the
+# physical source bounds for each returned key and payload.
+fn yaza_db_page_slot_from_validated_header_v1(page: Bytes, header: YazaDbPageHeaderV1, slot_index: Number) -> Result[YazaDbPageSlotV1, Text]:
+    if slot_index < 0 or slot_index >= header.count: return err("YDBv1 slot index is outside the validated page")
+    let descriptor: Number = yaza_db_page_header_size_v1() + slot_index * yaza_db_page_slot_size_v1()
+    let offset: Number = yaza_db_read_uint_le_v1(page, descriptor, 2)?
+    let key_len: Number = yaza_db_read_uint_le_v1(page, descriptor + 2, 2)?
+    let payload_len: Number = yaza_db_read_uint_le_v1(page, descriptor + 4, 2)?
+    let key_head: Number = yaza_db_read_uint_be32_v1(page, descriptor + 6)?
+    let key_suffix: Bytes = bytes_try_slice(page, offset, key_len)?
+    let payload: Bytes = bytes_try_slice(page, offset + key_len, payload_len)?
+    return ok(YazaDbPageSlotV1(offset, key_len, payload_len, key_head, key_suffix, payload))
+
+fn yaza_db_page_slot_key_from_validated_header_v1(page: Bytes, header: YazaDbPageHeaderV1, slot: YazaDbPageSlotV1) -> Result[Bytes, Text]:
+    if header.prefix_len == 0: return ok(slot.key_suffix)
+    if header.prefix_len > 2048 or bytes_length(slot.key_suffix) != slot.key_len: return err("YDBv1 validated slot key prefix or suffix is invalid")
+    let prefix: Bytes = bytes_try_slice(page, yaza_db_page_size_v1() - header.prefix_len, header.prefix_len)?
+    return bytes_try_concat(prefix, slot.key_suffix)
+
+fn yaza_db_page_slot_span_from_validated_header_v1(page: Bytes, header: YazaDbPageHeaderV1, slot_index: Number) -> Result[YazaDbPageSlotSpanV1, Text]:
+    if slot_index < 0 or slot_index >= header.count: return err("YDBv1 slot index is outside the validated page")
+    let descriptor: Number = yaza_db_page_header_size_v1() + slot_index * yaza_db_page_slot_size_v1()
+    let offset: Number = yaza_db_read_uint_le_v1(page, descriptor, 2)?
+    let key_len: Number = yaza_db_read_uint_le_v1(page, descriptor + 2, 2)?
+    let payload_len: Number = yaza_db_read_uint_le_v1(page, descriptor + 4, 2)?
+    let key_head: Number = yaza_db_read_uint_be32_v1(page, descriptor + 6)?
+    let page_length: Number = bytes_length(page)
+    if offset < header.data_start or offset > page_length or key_len > page_length - offset or payload_len > page_length - offset - key_len:
+        return err("YDBv1 validated slot span is outside the page payload area")
+    return ok(YazaDbPageSlotSpanV1(offset, key_len, payload_len, key_head, offset + key_len))
+
+fn yaza_db_page_slot_key_from_validated_span_v1(page: Bytes, header: YazaDbPageHeaderV1, slot: YazaDbPageSlotSpanV1) -> Result[Bytes, Text]:
+    let suffix: Bytes = bytes_try_slice(page, slot.offset, slot.key_len)?
+    if header.prefix_len == 0: return ok(suffix)
+    if header.prefix_len > 2048: return err("YDBv1 validated slot key prefix is invalid")
+    let prefix: Bytes = bytes_try_slice(page, yaza_db_page_size_v1() - header.prefix_len, header.prefix_len)?
+    return bytes_try_concat(prefix, suffix)
+
+fn yaza_db_page_key_head_for_range_v1(input: Bytes, offset: Number, length: Number) -> Number:
+    var head: Number = 0
+    var index: Number = 0
+    while index < 4:
+        set head = head * 256
+        if index < length: set head = head + bytes_get(input, offset + index)
+        set index = index + 1
+    return head
+
+fn yaza_db_page_lower_bound_v1(page: Bytes, key: Bytes, expected_page_id: Number) -> Result[Number, Text]:
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, expected_page_id)?
+    return yaza_db_page_lower_bound_validated_header_v1(page, header, key)
+
+# Search a page whose full checksum, header, slot table, and key ordering have
+# already been validated. This is for callers that retain the immutable page
+# image and its decoded header across several lookups in one operation.
+fn yaza_db_page_lower_bound_validated_header_v1(page: Bytes, header: YazaDbPageHeaderV1, key: Bytes) -> Result[Number, Text]:
+    return yaza_db_page_lower_bound_from_validated_header_v1(page, header, key, 0)
+
+# Continue a lower-bound search at a known safe point. Ordered scans may start
+# after their previous match; a direct equality check handles adjacent keys in
+# O(1), and binary search remains the fallback if a predicate leaves gaps.
+fn yaza_db_page_lower_bound_from_validated_header_v1(page: Bytes, header: YazaDbPageHeaderV1, key: Bytes, start_index: Number) -> Result[Number, Text]:
+    if bytes_length(page) != yaza_db_page_size_v1() or header.page_id < 2 or (header.page_type != 1 and header.page_type != 2):
+        return err("YDBv1 validated lower-bound search requires an immutable validated index page")
+    let stored_page_id: Number = yaza_db_read_uint_le_v1(page, 40, 8)?
+    if stored_page_id != header.page_id: return err("YDBv1 validated lower-bound page identity changed")
+    if header.page_type != 1 and header.page_type != 2: return err("YDBv1 lower-bound search requires a leaf or inner page")
+    if start_index < 0 or start_index > header.count: return err("YDBv1 lower-bound continuation index is outside the validated page")
+    let key_length: Number = bytes_length(key)
+    var key_offset: Number = 0
+    var suffix_length: Number = key_length
+    if header.prefix_len > 0:
+        let prefix_offset: Number = yaza_db_page_size_v1() - header.prefix_len
+        var matches_prefix: Boolean = key_length >= header.prefix_len
+        var prefix_index: Number = 0
+        while matches_prefix and prefix_index < header.prefix_len:
+            if bytes_get(key, prefix_index) != bytes_get(page, prefix_offset + prefix_index): set matches_prefix = false
+            set prefix_index = prefix_index + 1
+        if not matches_prefix:
+            let prefix_order: Number = yaza_db_compare_byte_ranges_v1(key, 0, key_length, page, prefix_offset, header.prefix_len)
+            if prefix_order < 0: return ok(0)
+            return ok(header.count)
+        set key_offset = header.prefix_len
+        set suffix_length = key_length - header.prefix_len
+    let target_head: Number = yaza_db_page_key_head_for_range_v1(key, key_offset, suffix_length)
+    var low: Number = start_index
+    var high: Number = header.count
+    if low < high:
+        let descriptor: Number = yaza_db_page_header_size_v1() + low * yaza_db_page_slot_size_v1()
+        let stored_offset: Number = yaza_db_read_uint_le_v1(page, descriptor, 2)?
+        let stored_key_length: Number = yaza_db_read_uint_le_v1(page, descriptor + 2, 2)?
+        let stored_head: Number = yaza_db_read_uint_be32_v1(page, descriptor + 6)?
+        var first_order: Number = 0
+        if target_head < stored_head:
+            set first_order = 1
+        elif target_head > stored_head:
+            set first_order = -1
+        else:
+            set first_order = yaza_db_compare_byte_ranges_v1(page, stored_offset, stored_key_length, key, key_offset, suffix_length)
+        if first_order >= 0: return ok(low)
+        set low = low + 1
+    while low < high:
+        let middle: Number = low + (high - low) / 2
+        let descriptor: Number = yaza_db_page_header_size_v1() + middle * yaza_db_page_slot_size_v1()
+        let stored_offset: Number = yaza_db_read_uint_le_v1(page, descriptor, 2)?
+        let stored_key_length: Number = yaza_db_read_uint_le_v1(page, descriptor + 2, 2)?
+        let stored_head: Number = yaza_db_read_uint_be32_v1(page, descriptor + 6)?
+        if target_head < stored_head:
+            set high = middle
+        else:
+            if target_head > stored_head:
+                set low = middle + 1
+            else:
+                let order: Number = yaza_db_compare_byte_ranges_v1(page, stored_offset, stored_key_length, key, key_offset, suffix_length)
+                if order >= 0:
+                    set high = middle
+                else:
+                    set low = middle + 1
+    return ok(low)
+
+# Internal fast path: callers must already have validated the page and bit index.
+fn yaza_db_bitmap_page_bit_unchecked_v1(page: Bytes, bit_index: Number) -> Boolean:
+    let byte_offset: Number = yaza_db_page_header_size_v1() + bit_index / 8
+    let bit_in_byte: Number = bit_index % 8
+    var mask: Number = 1
+    var shift: Number = 0
+    while shift < bit_in_byte:
+        set mask = mask * 2
+        set shift = shift + 1
+    let byte_value: Number = bytes_get(page, byte_offset)
+    return byte_value / mask % 2 == 1
+
+fn yaza_db_bitmap_page_bit_v1(page: Bytes, bit_index: Number, expected_page_id: Number) -> Result[Boolean, Text]:
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, expected_page_id)?
+    if header.page_type != 5: return err("YDBv1 bitmap operation requires a BITMAP page")
+    if bit_index < 0 or bit_index >= yaza_db_bitmap_page_bit_count_v1(): return err("YDBv1 bitmap bit index is outside the page capacity")
+    return ok(yaza_db_bitmap_page_bit_unchecked_v1(page, bit_index))
+
+fn yaza_db_bitmap_page_set_allocated_v1(page: Bytes, bit_index: Number, allocated: Boolean, page_lsn: Number, expected_page_id: Number) -> Result[Boolean, Text]:
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, expected_page_id)?
+    if header.page_type != 5: return err("YDBv1 bitmap operation requires a BITMAP page")
+    if bit_index < 0 or bit_index >= yaza_db_bitmap_page_bit_count_v1(): return err("YDBv1 bitmap bit index is outside the page capacity")
+    if page_lsn < header.page_lsn: return err("YDBv1 bitmap page LSN cannot move backwards")
+    let byte_offset: Number = yaza_db_page_header_size_v1() + bit_index / 8
+    let bit_in_byte: Number = bit_index % 8
+    var mask: Number = 1
+    var shift: Number = 0
+    while shift < bit_in_byte:
+        set mask = mask * 2
+        set shift = shift + 1
+    let byte_value: Number = bytes_get(page, byte_offset)
+    let was_allocated: Boolean = byte_value / mask % 2 == 1
+    if was_allocated == allocated: return ok(false)
+    var next_value: Number = byte_value + mask
+    if was_allocated: set next_value = byte_value - mask
+    if not bytes_try_set(page, byte_offset, next_value): return err("YDBv1 bitmap bit could not be updated")
+    if not yaza_db_write_uint_le_v1(page, 0, page_lsn, 8): return err("YDBv1 bitmap page LSN could not be updated")
+    let finalized: Bytes = yaza_db_page_finalize_v1(page)?
+    return ok(true)
+
+fn yaza_db_bitmap_page_find_free_v1(page: Bytes, start_bit: Number, end_bit_exclusive: Number, expected_page_id: Number) -> Result[Number, Text]:
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, expected_page_id)?
+    if header.page_type != 5: return err("YDBv1 free-bit search requires a BITMAP page")
+    let capacity: Number = yaza_db_bitmap_page_bit_count_v1()
+    if start_bit < 0 or end_bit_exclusive < start_bit or end_bit_exclusive > capacity: return err("YDBv1 free-bit search range is outside the BITMAP page")
+    if start_bit == end_bit_exclusive: return ok(-1)
+    let first_byte: Number = start_bit / 8
+    let last_byte: Number = (end_bit_exclusive - 1) / 8
+    # Inspect one byte at a time, then test only the requested bits in the edge bytes.
+    var byte_index: Number = first_byte
+    while byte_index <= last_byte:
+        let byte_value: Number = bytes_get(page, yaza_db_page_header_size_v1() + byte_index)
+        var first_bit_in_byte: Number = 0
+        if byte_index == first_byte: set first_bit_in_byte = start_bit % 8
+        var end_bit_in_byte: Number = 8
+        if byte_index == last_byte and end_bit_exclusive % 8 != 0: set end_bit_in_byte = end_bit_exclusive % 8
+        var bit_in_byte: Number = 0
+        var mask: Number = 1
+        while bit_in_byte < first_bit_in_byte:
+            set mask = mask * 2
+            set bit_in_byte = bit_in_byte + 1
+        set bit_in_byte = first_bit_in_byte
+        while bit_in_byte < end_bit_in_byte:
+            if byte_value / mask % 2 == 0: return ok(byte_index * 8 + bit_in_byte)
+            set mask = mask * 2
+            set bit_in_byte = bit_in_byte + 1
+        set byte_index = byte_index + 1
+    return ok(-1)
+
+fn yaza_db_bitmap_page_new_mapped_v1(bitmap_page_id: Number, page_lsn: Number) -> Result[Bytes, Text]:
+    let address: YazaDbBitmapAddressV1 = yaza_db_bitmap_address_v1(bitmap_page_id)?
+    if not address.is_bitmap_page or address.bitmap_page_id != bitmap_page_id: return err("YDBv1 BITMAP page ID is not at the start of its mapped range")
+    let page: Bytes = yaza_db_page_new_v1(bitmap_page_id, page_lsn, 5, 0)?
+    let self_allocated: Boolean = yaza_db_bitmap_page_set_allocated_v1(page, 0, true, page_lsn, bitmap_page_id)?
+    if not self_allocated: return err("YDBv1 new BITMAP page did not reserve its own page ID")
+    return ok(page)
+
+fn yaza_db_bitmap_page_bit_for_page_v1(page: Bytes, mapped_page_id: Number, expected_bitmap_page_id: Number) -> Result[Boolean, Text]:
+    let address: YazaDbBitmapAddressV1 = yaza_db_bitmap_address_v1(mapped_page_id)?
+    if address.bitmap_page_id != expected_bitmap_page_id: return err("YDBv1 page ID belongs to a different BITMAP range")
+    return yaza_db_bitmap_page_bit_v1(page, address.bit_index, expected_bitmap_page_id)
+
+fn yaza_db_bitmap_page_set_page_allocated_v1(page: Bytes, mapped_page_id: Number, allocated: Boolean, page_lsn: Number, expected_bitmap_page_id: Number) -> Result[Boolean, Text]:
+    let address: YazaDbBitmapAddressV1 = yaza_db_bitmap_address_v1(mapped_page_id)?
+    if address.bitmap_page_id != expected_bitmap_page_id: return err("YDBv1 page ID belongs to a different BITMAP range")
+    if address.is_bitmap_page and not allocated: return err("YDBv1 BITMAP metadata pages cannot be marked free")
+    return yaza_db_bitmap_page_set_allocated_v1(page, address.bit_index, allocated, page_lsn, expected_bitmap_page_id)

@@ -1,0 +1,81 @@
+use "../yazabase/sql_lexer_v1"
+
+fn yaza_base_sql_lexer_v1_smoke() -> Boolean:
+    let source: Text = "SELECT \"name\", id FROM café WHERE id >= :minimum AND active = 'it''s'; -- trailing comment\n"
+    let parsed: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(source)
+    if not result_is_ok(parsed): return false
+    let tokens: List[YazaSqlTokenV1] = result_unwrap(parsed)
+    if list_count(tokens) != 16: return false
+
+    let first: YazaSqlTokenV1 = list_get(tokens, 0)
+    if first.kind != 1 or first.start_byte != 0 or first.end_byte != 6: return false
+    let quoted_name: YazaSqlTokenV1 = list_get(tokens, 1)
+    if quoted_name.kind != 2 or text_slice(source, quoted_name.start_byte, quoted_name.end_byte - quoted_name.start_byte) != "\"name\"": return false
+    let table_name: YazaSqlTokenV1 = list_get(tokens, 5)
+    if table_name.kind != 1 or text_slice(source, table_name.start_byte, table_name.end_byte - table_name.start_byte) != "café": return false
+    if table_name.end_byte - table_name.start_byte != 5: return false
+    let comparison: YazaSqlTokenV1 = list_get(tokens, 8)
+    if comparison.kind != 7 or text_slice(source, comparison.start_byte, comparison.end_byte - comparison.start_byte) != ">=": return false
+    let named_parameter: YazaSqlTokenV1 = list_get(tokens, 9)
+    if named_parameter.kind != 5 or text_slice(source, named_parameter.start_byte, named_parameter.end_byte - named_parameter.start_byte) != ":minimum": return false
+    let string_value: YazaSqlTokenV1 = list_get(tokens, 13)
+    if string_value.kind != 4 or text_slice(source, string_value.start_byte, string_value.end_byte - string_value.start_byte) != "'it''s'": return false
+    let end_token: YazaSqlTokenV1 = list_get(tokens, 15)
+    if end_token.kind != 0 or end_token.start_byte != text_length(source) or end_token.end_byte != text_length(source): return false
+
+    let other_parameters: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1("SELECT $7, ? FROM t /* valid comment */")
+    if not result_is_ok(other_parameters): return false
+    let parameter_tokens: List[YazaSqlTokenV1] = result_unwrap(other_parameters)
+    if list_count(parameter_tokens) != 7: return false
+    if list_get(parameter_tokens, 1).kind != 5 or list_get(parameter_tokens, 3).kind != 5: return false
+
+    let unicode_source: Text = "SELECT '🦉' FROM 名"
+    let unicode_result: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(unicode_source)
+    if not result_is_ok(unicode_result): return false
+    let unicode_tokens: List[YazaSqlTokenV1] = result_unwrap(unicode_result)
+    if list_count(unicode_tokens) != 5: return false
+    if list_get(unicode_tokens, 1).end_byte - list_get(unicode_tokens, 1).start_byte != 6: return false
+    if list_get(unicode_tokens, 3).end_byte - list_get(unicode_tokens, 3).start_byte != 3: return false
+
+    let location_source: Text = "first\r\ncafé\nlast"
+    let unicode_location: Result[YazaSqlSourceLocationV1, Text] = yaza_sql_v1_location(location_source, 11)
+    if not result_is_ok(unicode_location): return false
+    if result_unwrap(unicode_location).line != 2 or result_unwrap(unicode_location).column != 5: return false
+    let next_line: Result[YazaSqlSourceLocationV1, Text] = yaza_sql_v1_location(location_source, 13)
+    if not result_is_ok(next_line) or result_unwrap(next_line).line != 3 or result_unwrap(next_line).column != 1: return false
+    let source_end: Result[YazaSqlSourceLocationV1, Text] = yaza_sql_v1_location(location_source, text_length(location_source))
+    if not result_is_ok(source_end) or result_unwrap(source_end).line != 3 or result_unwrap(source_end).column != 5: return false
+    let lone_carriage_return: Result[YazaSqlSourceLocationV1, Text] = yaza_sql_v1_location("a\rb", 2)
+    if not result_is_ok(lone_carriage_return) or result_unwrap(lone_carriage_return).line != 2 or result_unwrap(lone_carriage_return).column != 1: return false
+    if result_is_ok(yaza_sql_v1_location(location_source, -1)) or result_is_ok(yaza_sql_v1_location(location_source, text_length(location_source) + 1)): return false
+
+    let bad_character: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1("SELECT @x")
+    if result_is_ok(bad_character): return false
+    if result_unwrap_error(bad_character) != "SQL lexer unsupported character at byte 7": return false
+
+    let bad_string: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1("SELECT 'unfinished")
+    if result_is_ok(bad_string): return false
+    if result_unwrap_error(bad_string) != "SQL lexer unterminated string at byte 7": return false
+
+    let bad_comment: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1("SELECT t /* unfinished")
+    if result_is_ok(bad_comment): return false
+    if result_unwrap_error(bad_comment) != "SQL lexer unterminated block comment at byte 9": return false
+
+    let bad_exponent: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1("1e+")
+    if result_is_ok(bad_exponent): return false
+    if result_unwrap_error(bad_exponent) != "SQL lexer exponent has no digits at byte 1": return false
+
+    let before_quota_failure: Number = arena_used()
+    arena_scope 1:
+        let quota_failure: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1("SELECT id")
+        if result_is_ok(quota_failure): return false
+        if result_unwrap_error(quota_failure) != "SQL lexer could not allocate its token list": return false
+    if arena_used() != before_quota_failure: return false
+    return true
+
+start:
+    let initial_used: Number = arena_used()
+    arena_scope 65536:
+        assert yaza_base_sql_lexer_v1_smoke()
+    assert arena_used() == initial_used
+    say "yazabase-sql-lexer-v1-ok"

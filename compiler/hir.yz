@@ -1,0 +1,104 @@
+# Hello World HIR slice built on YAZA's existing lexer and line parser.
+use "../../yaza-language/compiler/lexer"
+use "../../yaza-language/compiler/expression_parser"
+
+shape HirSay:
+    text: Text
+    source_line: Number
+
+shape HirStatement:
+    kind: Text
+    text: Text
+    loop_variable: Text
+    range_start: Number
+    range_end: Number
+    body: List[HirSay]
+    source_line: Number
+
+shape HirProgram:
+    statements: List[HirStatement]
+
+fn parse_hello_say(tokens: TextList, source_line: Number) -> HirSay:
+    if list_count(tokens) != 2 or list_get(tokens, 0) != "I:say":
+        fail("LLVM HIR: this slice supports only `say \"plain text\"` statements (line " + number_text(source_line) + ")")
+    let literal_token: Text = list_get(tokens, 1)
+    if not text_starts_with(literal_token, "S:\"") or text_length(literal_token) < 4:
+        fail("LLVM HIR: `say` requires a plain Text literal (line " + number_text(source_line) + ")")
+    let message: Text = text_slice(literal_token, 3, text_length(literal_token) - 4)
+    if text_find(message, "\\") >= 0 or text_find(message, "{") >= 0 or text_find(message, "}") >= 0:
+        fail("LLVM HIR: escapes and interpolation are outside this slice (line " + number_text(source_line) + ")")
+    return HirSay(message, source_line)
+
+fn parse_hello_range_bound(token: Text, source_line: Number) -> Number:
+    if not text_starts_with(token, "N:"):
+        fail("LLVM HIR: range bounds must be non-negative integer literals (line " + number_text(source_line) + ")")
+    let digits: Text = text_slice(token, 2, text_length(token) - 2)
+    if text_length(digits) > 18:
+        fail("LLVM HIR: range bound is too large for this slice (line " + number_text(source_line) + ")")
+    return number_parse(digits)
+
+fn parse_hello_hir(source: Text) -> HirProgram:
+    let parsed_lines: TextList = parse_program(source)
+    let source_lines: TextList = text_lines(source)
+    let statements: List[HirStatement] = List[HirStatement]()
+    let parsed_count: Number = list_count(parsed_lines)
+    var parsed_index: Number = 0
+    var saw_start: Boolean = false
+
+    while parsed_index < parsed_count:
+        let record: Text = list_get(parsed_lines, parsed_index)
+        let fields: TextList = text_split(record, "|")
+        let indent: Number = number_parse(list_get(fields, 0))
+        let source_line: Number = number_parse(list_get(fields, 1))
+        let original_line: Text = text_trim(list_get(source_lines, source_line - 1))
+        let tokens: TextList = lex(original_line)
+        let token_count: Number = list_count(tokens)
+
+        if not saw_start:
+            if indent != 0 or token_count != 2 or list_get(tokens, 0) != "I:start" or list_get(tokens, 1) != "P::":
+                fail("LLVM HIR: expected `start:` as the first statement (line " + number_text(source_line) + ")")
+            else:
+                set saw_start = true
+                set parsed_index = parsed_index + 1
+        else:
+            if indent != 4:
+                fail("LLVM HIR: expected a statement or range loop indented by four spaces (line " + number_text(source_line) + ")")
+            else:
+                if token_count > 0 and list_get(tokens, 0) == "I:for":
+                    if token_count != 8 or not text_starts_with(list_get(tokens, 1), "I:") or list_get(tokens, 2) != "I:in" or list_get(tokens, 4) != "P:." or list_get(tokens, 5) != "P:." or list_get(tokens, 7) != "P::":
+                        fail("LLVM HIR: expected `for name in start..end:` with integer literal bounds (line " + number_text(source_line) + ")")
+                    let loop_variable: Text = text_slice(list_get(tokens, 1), 2, text_length(list_get(tokens, 1)) - 2)
+                    let range_start: Number = parse_hello_range_bound(list_get(tokens, 3), source_line)
+                    let range_end: Number = parse_hello_range_bound(list_get(tokens, 6), source_line)
+                    let body: List[HirSay] = List[HirSay]()
+                    set parsed_index = parsed_index + 1
+                    var scanning_body: Boolean = true
+                    while parsed_index < parsed_count and scanning_body:
+                        let body_record: Text = list_get(parsed_lines, parsed_index)
+                        let body_fields: TextList = text_split(body_record, "|")
+                        let body_indent: Number = number_parse(list_get(body_fields, 0))
+                        if body_indent == 8:
+                            let body_line: Number = number_parse(list_get(body_fields, 1))
+                            let body_source: Text = text_trim(list_get(source_lines, body_line - 1))
+                            let body_tokens: TextList = lex(body_source)
+                            list_push(body, parse_hello_say(body_tokens, body_line))
+                            set parsed_index = parsed_index + 1
+                        else:
+                            if body_indent > 4:
+                                fail("LLVM HIR: nested blocks are outside the range-loop slice (line " + list_get(body_fields, 1) + ")")
+                            else:
+                                set scanning_body = false
+                    if list_count(body) == 0:
+                        fail("LLVM HIR: range loop must contain at least one `say` statement (line " + number_text(source_line) + ")")
+                    list_push(statements, HirStatement("range", "", loop_variable, range_start, range_end, body, source_line))
+                else:
+                    let body: List[HirSay] = List[HirSay]()
+                    let say: HirSay = parse_hello_say(tokens, source_line)
+                    list_push(statements, HirStatement("say", say.text, "", 0, 0, body, source_line))
+                    set parsed_index = parsed_index + 1
+
+    if not saw_start:
+        fail("LLVM HIR: expected a `start:` block")
+    if list_count(statements) == 0:
+        fail("LLVM HIR: expected at least one `say` statement or range loop")
+    return HirProgram(statements)

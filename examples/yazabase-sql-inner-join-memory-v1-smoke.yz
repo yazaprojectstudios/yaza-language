@@ -1,0 +1,390 @@
+use "../yazabase/sql_join_v1"
+use "../yazabase/sql_explain_v1"
+
+shape YazaSqlJoinTablesV1:
+    left: YazaSqlMemoryTableV1
+    right: YazaSqlMemoryTableV1
+
+fn join_test_catalog() -> YazaSqlCatalogSnapshotV1:
+    let item_columns: List[YazaSqlColumnSchemaV1] = [YazaSqlColumnSchemaV1("id", 4, false, 0, 0, 0, ""), YazaSqlColumnSchemaV1("label", 9, false, 1, 0, 0, "")]
+    let profile_columns: List[YazaSqlColumnSchemaV1] = [YazaSqlColumnSchemaV1("user_id", 4, true, 0, 0, 0, ""), YazaSqlColumnSchemaV1("active", 1, false, 1, 0, 0, ""), YazaSqlColumnSchemaV1("note", 9, false, 2, 0, 0, "")]
+    let tables: List[YazaSqlTableSchemaV1] = [YazaSqlTableSchemaV1(5, "items", item_columns), YazaSqlTableSchemaV1(6, "profiles", profile_columns)]
+    return YazaSqlCatalogSnapshotV1(7, tables, List[YazaSqlColumnDefaultV1]())
+
+fn join_test_left_row(id: Number, label: Text) -> List[YazaSqlValueV1]:
+    return [result_unwrap(yaza_sql_value_integer_v1(4, id)), yaza_sql_value_text_v1(label)]
+
+fn join_test_right_row(user_id: YazaSqlValueV1, active: Boolean, note: Text) -> List[YazaSqlValueV1]:
+    return [user_id, yaza_sql_value_boolean_v1(active), yaza_sql_value_text_v1(note)]
+
+fn join_test_tables() -> YazaSqlJoinTablesV1:
+    let left_types: List[Number] = [4, 9]
+    let left_rows: List[List[YazaSqlValueV1]] = [join_test_left_row(1, "one"), join_test_left_row(2, "two"), join_test_left_row(3, "three")]
+    let right_types: List[Number] = [4, 1, 9]
+    let null_key: YazaSqlValueV1 = result_unwrap(yaza_sql_value_null_v1(4))
+    let right_rows: List[List[YazaSqlValueV1]] = [join_test_right_row(result_unwrap(yaza_sql_value_integer_v1(4, 1)), true, "alpha"), join_test_right_row(result_unwrap(yaza_sql_value_integer_v1(4, 1)), false, "omega"), join_test_right_row(result_unwrap(yaza_sql_value_integer_v1(4, 2)), true, "beta"), join_test_right_row(null_key, true, "null-key"), join_test_right_row(result_unwrap(yaza_sql_value_integer_v1(4, 9)), true, "unmatched"), join_test_right_row(result_unwrap(yaza_sql_value_integer_v1(4, 14)), true, "hash-collision-only")]
+    return YazaSqlJoinTablesV1(YazaSqlMemoryTableV1(5, 7, left_types, left_rows, 0), YazaSqlMemoryTableV1(6, 7, right_types, right_rows, 0))
+
+fn join_hash_scale_profile() -> Boolean:
+    let source: Text = "SELECT i.id, p.note FROM items AS i INNER JOIN profiles AS p ON i.id = p.user_id"
+    let parsed: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(source)
+    if not result_is_ok(parsed): return false
+    let catalog: YazaSqlCatalogSnapshotV1 = join_test_catalog()
+    let bound: Result[YazaSqlBoundPlanV1, Text] = yaza_sql_bind_select_v1(source, result_unwrap(parsed), catalog)
+    if not result_is_ok(bound): return false
+    let left_created: Result[List[List[YazaSqlValueV1]], Text] = list_try_new()
+    let right_created: Result[List[List[YazaSqlValueV1]], Text] = list_try_new()
+    if not result_is_ok(left_created) or not result_is_ok(right_created): return false
+    let left_rows: List[List[YazaSqlValueV1]] = result_unwrap(left_created)
+    let right_rows: List[List[YazaSqlValueV1]] = result_unwrap(right_created)
+    if not list_try_reserve(left_rows, 512) or not list_try_reserve(right_rows, 512): return false
+    var row_index: Number = 0
+    while row_index < 512:
+        if not list_try_push(left_rows, join_test_left_row(row_index, "left")): return false
+        let right_key: Result[YazaSqlValueV1, Text] = yaza_sql_value_integer_v1(4, row_index)
+        if not result_is_ok(right_key): return false
+        let active: Boolean = row_index % 2 == 0
+        if not list_try_push(right_rows, join_test_right_row(result_unwrap(right_key), active, "right")): return false
+        set row_index = row_index + 1
+    let left_table: YazaSqlMemoryTableV1 = YazaSqlMemoryTableV1(5, 7, [4, 9], left_rows, 0)
+    let right_table: YazaSqlMemoryTableV1 = YazaSqlMemoryTableV1(6, 7, [4, 1, 9], right_rows, 0)
+    let joined: Result[YazaSqlMemoryTableV1, Text] = yaza_sql_join_inner_memory_v1(result_unwrap(bound), left_table, right_table)
+    if not result_is_ok(joined): return false
+    let output: YazaSqlMemoryTableV1 = result_unwrap(joined)
+    return output.join_work_units >= 512 and output.join_work_units < 131072 and list_count(output.rows) == 512
+
+fn join_single_scalar_case(type_id: Number, left_key: YazaSqlValueV1, right_key: YazaSqlValueV1, expected_rows: Number) -> Boolean:
+    let source: Text = "SELECT i.id, p.note FROM items AS i INNER JOIN profiles AS p ON i.id = p.user_id"
+    let left_columns: List[YazaSqlColumnSchemaV1] = [YazaSqlColumnSchemaV1("id", type_id, false, 0, 0, 0, ""), YazaSqlColumnSchemaV1("label", 9, false, 1, 0, 0, "")]
+    let right_columns: List[YazaSqlColumnSchemaV1] = [YazaSqlColumnSchemaV1("user_id", type_id, true, 0, 0, 0, ""), YazaSqlColumnSchemaV1("active", 1, false, 1, 0, 0, ""), YazaSqlColumnSchemaV1("note", 9, false, 2, 0, 0, "")]
+    let catalog: YazaSqlCatalogSnapshotV1 = YazaSqlCatalogSnapshotV1(7, [YazaSqlTableSchemaV1(5, "items", left_columns), YazaSqlTableSchemaV1(6, "profiles", right_columns)], List[YazaSqlColumnDefaultV1]())
+    let parsed: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(source)
+    if not result_is_ok(parsed): return false
+    let bound: Result[YazaSqlBoundPlanV1, Text] = yaza_sql_bind_select_v1(source, result_unwrap(parsed), catalog)
+    if not result_is_ok(bound): return false
+    let left_row_created: Result[List[YazaSqlValueV1], Text] = list_try_new()
+    let right_row_created: Result[List[YazaSqlValueV1], Text] = list_try_new()
+    let left_rows_created: Result[List[List[YazaSqlValueV1]], Text] = list_try_new()
+    let right_rows_created: Result[List[List[YazaSqlValueV1]], Text] = list_try_new()
+    if not result_is_ok(left_row_created) or not result_is_ok(right_row_created) or not result_is_ok(left_rows_created) or not result_is_ok(right_rows_created): return false
+    let left_row: List[YazaSqlValueV1] = result_unwrap(left_row_created)
+    let right_row: List[YazaSqlValueV1] = result_unwrap(right_row_created)
+    let left_rows: List[List[YazaSqlValueV1]] = result_unwrap(left_rows_created)
+    let right_rows: List[List[YazaSqlValueV1]] = result_unwrap(right_rows_created)
+    if not list_try_push(left_row, left_key) or not list_try_push(left_row, yaza_sql_value_text_v1("left")): return false
+    if not list_try_push(right_row, right_key) or not list_try_push(right_row, yaza_sql_value_boolean_v1(true)) or not list_try_push(right_row, yaza_sql_value_text_v1("right")): return false
+    if not list_try_push(left_rows, left_row) or not list_try_push(right_rows, right_row): return false
+    let left_table: YazaSqlMemoryTableV1 = YazaSqlMemoryTableV1(5, 7, [type_id, 9], left_rows, 0)
+    let right_table: YazaSqlMemoryTableV1 = YazaSqlMemoryTableV1(6, 7, [type_id, 1, 9], right_rows, 0)
+    let joined: Result[YazaSqlMemoryTableV1, Text] = yaza_sql_join_inner_memory_v1(result_unwrap(bound), left_table, right_table)
+    if expected_rows < 0: return not result_is_ok(joined)
+    if not result_is_ok(joined): return false
+    return list_count(result_unwrap(joined).rows) == expected_rows
+
+fn join_scalar_profile() -> Boolean:
+    let false_key: YazaSqlValueV1 = yaza_sql_value_boolean_v1(false)
+    let text_key: YazaSqlValueV1 = yaza_sql_value_text_v1("café")
+    let positive_zero: YazaSqlValueV1 = yaza_sql_value_double_v1(0.0)
+    let negative_zero_bits: Number = -9223372036854775807 - 1
+    let negative_zero: YazaSqlValueV1 = yaza_sql_value_double_v1(float64_from_bits(negative_zero_bits))
+    let null_text: YazaSqlValueV1 = result_unwrap(yaza_sql_value_null_v1(9))
+    let nan_key: YazaSqlValueV1 = yaza_sql_value_double_v1(float64_from_bits(9221120237041090561))
+    if not join_single_scalar_case(1, false_key, false_key, 1): say "join bool hash case failed"
+    if not join_single_scalar_case(9, text_key, text_key, 1): say "join text hash case failed"
+    if not join_single_scalar_case(4, result_unwrap(yaza_sql_value_integer_v1(4, -9000000001)), result_unwrap(yaza_sql_value_integer_v1(4, -9000000001)), 1): say "join integer hash case failed"
+    if not join_single_scalar_case(6, positive_zero, negative_zero, 1): say "join signed-zero hash case failed"
+    if not join_single_scalar_case(9, null_text, null_text, 0): say "join NULL hash case failed"
+    if not join_single_scalar_case(6, nan_key, positive_zero, -1): say "join NaN hash case failed"
+    return join_single_scalar_case(1, false_key, false_key, 1) and join_single_scalar_case(9, text_key, text_key, 1) and join_single_scalar_case(4, result_unwrap(yaza_sql_value_integer_v1(4, -9000000001)), result_unwrap(yaza_sql_value_integer_v1(4, -9000000001)), 1) and join_single_scalar_case(6, positive_zero, negative_zero, 1) and join_single_scalar_case(9, null_text, null_text, 0) and join_single_scalar_case(6, nan_key, positive_zero, -1)
+
+fn join_memory_profile() -> Boolean:
+    let source: Text = "SELECT i.id, p.note FROM items AS i INNER JOIN profiles AS p ON i.id = p.user_id WHERE p.active = TRUE ORDER BY p.note"
+    let parsed: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(source)
+    if not result_is_ok(parsed): return false
+    let catalog: YazaSqlCatalogSnapshotV1 = join_test_catalog()
+    let bound: Result[YazaSqlBoundPlanV1, Text] = yaza_sql_bind_select_v1(source, result_unwrap(parsed), catalog)
+    if not result_is_ok(bound): return false
+    let plan: YazaSqlBoundPlanV1 = result_unwrap(bound)
+    let tables: YazaSqlJoinTablesV1 = join_test_tables()
+    let joined_result: Result[YazaSqlMemoryTableV1, Text] = yaza_sql_join_inner_memory_v1(plan, tables.left, tables.right)
+    if not result_is_ok(joined_result): return false
+    let joined: YazaSqlMemoryTableV1 = result_unwrap(joined_result)
+    if joined.join_work_units < 60 or joined.join_work_units > 100 or list_count(joined.rows) != 3 or list_count(joined.column_type_ids) != 5: return false
+    let parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let executed: Result[YazaSqlQueryResultV1, Text] = yaza_sql_execute_memory_v1(plan, joined, parameters)
+    if not result_is_ok(executed): return false
+    let result: YazaSqlQueryResultV1 = result_unwrap(executed)
+    if list_count(result.columns) != 2 or list_count(result.rows) != 2: return false
+    let first: List[YazaSqlValueV1] = list_get(result.rows, 0)
+    let second: List[YazaSqlValueV1] = list_get(result.rows, 1)
+    if list_get(first, 0).integer_value != 1 or list_get(first, 1).text_value != "alpha": return false
+    if list_get(second, 0).integer_value != 2 or list_get(second, 1).text_value != "beta": return false
+
+    let aggregate_source: Text = "SELECT COUNT(*) AS matches FROM items AS i JOIN profiles AS p ON i.id = p.user_id"
+    let aggregate_parsed: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(aggregate_source)
+    if not result_is_ok(aggregate_parsed): return false
+    let aggregate_plan: Result[YazaSqlBoundPlanV1, Text] = yaza_sql_bind_select_v1(aggregate_source, result_unwrap(aggregate_parsed), catalog)
+    if not result_is_ok(aggregate_plan): return false
+    let aggregate_joined_result: Result[YazaSqlMemoryTableV1, Text] = yaza_sql_join_inner_memory_v1(result_unwrap(aggregate_plan), tables.left, tables.right)
+    if not result_is_ok(aggregate_joined_result): return false
+    let aggregate_result_exec: Result[YazaSqlQueryResultV1, Text] = yaza_sql_execute_memory_v1(result_unwrap(aggregate_plan), result_unwrap(aggregate_joined_result), parameters)
+    if not result_is_ok(aggregate_result_exec): return false
+    let aggregate_result: YazaSqlQueryResultV1 = result_unwrap(aggregate_result_exec)
+    if list_count(aggregate_result.rows) != 1 or list_get(list_get(aggregate_result.rows, 0), 0).integer_value != 3: return false
+
+    let mismatch: YazaSqlMemoryTableV1 = YazaSqlMemoryTableV1(7, 7, tables.right.column_type_ids, tables.right.rows, 0)
+    return not result_is_ok(yaza_sql_join_inner_memory_v1(plan, tables.left, mismatch))
+
+fn left_join_memory_profile() -> Boolean:
+    let source: Text = "SELECT i.id, p.note FROM items AS i LEFT OUTER JOIN profiles AS p ON i.id = p.user_id ORDER BY i.id"
+    let parsed: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(source)
+    if not result_is_ok(parsed): return false
+    let catalog: YazaSqlCatalogSnapshotV1 = join_test_catalog()
+    let bound: Result[YazaSqlBoundPlanV1, Text] = yaza_sql_bind_select_v1(source, result_unwrap(parsed), catalog)
+    if not result_is_ok(bound): return false
+    let plan: YazaSqlBoundPlanV1 = result_unwrap(bound)
+    if list_get(plan.operators, 2).kind != yaza_sql_operator_left_join_v1(): return false
+    if not list_get(plan.projections, 1).nullable: return false
+    let tables: YazaSqlJoinTablesV1 = join_test_tables()
+    let joined_result: Result[YazaSqlMemoryTableV1, Text] = yaza_sql_join_memory_v1(plan, tables.left, tables.right)
+    if not result_is_ok(joined_result): return false
+    let joined: YazaSqlMemoryTableV1 = result_unwrap(joined_result)
+    if list_count(joined.rows) != 4 or list_count(joined.column_type_ids) != 5: return false
+    let parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let executed: Result[YazaSqlQueryResultV1, Text] = yaza_sql_execute_memory_v1(plan, joined, parameters)
+    if not result_is_ok(executed): return false
+    let result: YazaSqlQueryResultV1 = result_unwrap(executed)
+    if list_count(result.columns) != 2 or list_count(result.rows) != 4 or not list_get(result.columns, 1).nullable: return false
+    var id_one_matches: Number = 0
+    var id_two_matches: Number = 0
+    var unmatched_rows: Number = 0
+    var row_index: Number = 0
+    while row_index < list_count(result.rows):
+        let row: List[YazaSqlValueV1] = list_get(result.rows, row_index)
+        let left_id: Number = list_get(row, 0).integer_value
+        let right_note: YazaSqlValueV1 = list_get(row, 1)
+        if left_id == 1: set id_one_matches = id_one_matches + 1
+        elif left_id == 2: set id_two_matches = id_two_matches + 1
+        elif left_id == 3 and right_note.is_null: set unmatched_rows = unmatched_rows + 1
+        set row_index = row_index + 1
+    if id_one_matches != 2 or id_two_matches != 1 or unmatched_rows != 1: return false
+
+    let filtered_source: Text = "SELECT i.id, p.note FROM items AS i LEFT JOIN profiles AS p ON i.id = p.user_id WHERE p.active = TRUE"
+    let filtered_parsed: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(filtered_source)
+    if not result_is_ok(filtered_parsed): return false
+    let filtered_plan_result: Result[YazaSqlBoundPlanV1, Text] = yaza_sql_bind_select_v1(filtered_source, result_unwrap(filtered_parsed), catalog)
+    if not result_is_ok(filtered_plan_result): return false
+    let filtered_plan: YazaSqlBoundPlanV1 = result_unwrap(filtered_plan_result)
+    let filtered_joined: Result[YazaSqlMemoryTableV1, Text] = yaza_sql_join_memory_v1(filtered_plan, tables.left, tables.right)
+    if not result_is_ok(filtered_joined): return false
+    let filtered_result: Result[YazaSqlQueryResultV1, Text] = yaza_sql_execute_memory_v1(filtered_plan, result_unwrap(filtered_joined), parameters)
+    if not result_is_ok(filtered_result): return false
+    if list_count(result_unwrap(filtered_result).rows) != 2: return false
+
+    let count_source: Text = "SELECT COUNT(*) AS matches FROM items AS i LEFT JOIN profiles AS p ON i.id = p.user_id"
+    let count_parsed: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(count_source)
+    if not result_is_ok(count_parsed): return false
+    let count_plan_result: Result[YazaSqlBoundPlanV1, Text] = yaza_sql_bind_select_v1(count_source, result_unwrap(count_parsed), catalog)
+    if not result_is_ok(count_plan_result): return false
+    let count_plan: YazaSqlBoundPlanV1 = result_unwrap(count_plan_result)
+    let count_joined: Result[YazaSqlMemoryTableV1, Text] = yaza_sql_join_memory_v1(count_plan, tables.left, tables.right)
+    if not result_is_ok(count_joined): return false
+    let count_result: Result[YazaSqlQueryResultV1, Text] = yaza_sql_execute_memory_v1(count_plan, result_unwrap(count_joined), parameters)
+    if not result_is_ok(count_result): return false
+    return list_count(result_unwrap(count_result).rows) == 1 and list_get(list_get(result_unwrap(count_result).rows, 0), 0).integer_value == 4
+
+fn full_join_memory_profile() -> Boolean:
+    let source: Text = "SELECT i.id, p.user_id, p.note FROM items AS i FULL OUTER JOIN profiles AS p ON i.id = p.user_id"
+    let parsed: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(source)
+    if not result_is_ok(parsed) or result_unwrap(parsed).join_type != 4: return false
+    let catalog: YazaSqlCatalogSnapshotV1 = join_test_catalog()
+    let bound_result: Result[YazaSqlBoundPlanV1, Text] = yaza_sql_bind_select_v1(source, result_unwrap(parsed), catalog)
+    if not result_is_ok(bound_result): return false
+    let plan: YazaSqlBoundPlanV1 = result_unwrap(bound_result)
+    if list_get(plan.operators, 2).kind != yaza_sql_operator_full_join_v1(): return false
+    if not list_get(plan.projections, 0).nullable or not list_get(plan.projections, 1).nullable or not list_get(plan.projections, 2).nullable: return false
+    let tables: YazaSqlJoinTablesV1 = join_test_tables()
+    let joined_result: Result[YazaSqlMemoryTableV1, Text] = yaza_sql_join_dispatch_memory_v1(plan, tables.left, tables.right)
+    if not result_is_ok(joined_result): return false
+    let joined: YazaSqlMemoryTableV1 = result_unwrap(joined_result)
+    if list_count(joined.rows) != 7 or joined.join_work_units < 3: return false
+    let parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let executed: Result[YazaSqlQueryResultV1, Text] = yaza_sql_execute_memory_v1(plan, joined, parameters)
+    if not result_is_ok(executed): return false
+    let result: YazaSqlQueryResultV1 = result_unwrap(executed)
+    if list_count(result.rows) != 7 or not list_get(result.columns, 0).nullable or not list_get(result.columns, 2).nullable: return false
+    var duplicate_matches: Number = 0
+    var left_unmatched: Number = 0
+    var right_unmatched: Number = 0
+    var row_index: Number = 0
+    while row_index < list_count(result.rows):
+        let row: List[YazaSqlValueV1] = list_get(result.rows, row_index)
+        let left_id: YazaSqlValueV1 = list_get(row, 0)
+        let right_id: YazaSqlValueV1 = list_get(row, 1)
+        let note: YazaSqlValueV1 = list_get(row, 2)
+        if left_id.is_null:
+            if note.is_null or (note.text_value != "null-key" and note.text_value != "unmatched" and note.text_value != "hash-collision-only"): return false
+            set right_unmatched = right_unmatched + 1
+        elif left_id.integer_value == 1:
+            if right_id.is_null or right_id.integer_value != 1 or note.is_null or (note.text_value != "alpha" and note.text_value != "omega"): return false
+            set duplicate_matches = duplicate_matches + 1
+        elif left_id.integer_value == 2:
+            if right_id.is_null or right_id.integer_value != 2 or note.is_null or note.text_value != "beta": return false
+        elif left_id.integer_value == 3:
+            if not right_id.is_null or not note.is_null: return false
+            set left_unmatched = left_unmatched + 1
+        else:
+            return false
+        set row_index = row_index + 1
+    if duplicate_matches != 2 or left_unmatched != 1 or right_unmatched != 3: return false
+
+    let empty_left: YazaSqlMemoryTableV1 = YazaSqlMemoryTableV1(tables.left.table_id, tables.left.catalog_version, tables.left.column_type_ids, List[List[YazaSqlValueV1]](), 0)
+    let empty_left_join: Result[YazaSqlMemoryTableV1, Text] = yaza_sql_join_dispatch_memory_v1(plan, empty_left, tables.right)
+    if not result_is_ok(empty_left_join) or list_count(result_unwrap(empty_left_join).rows) != 6: return false
+    let empty_right: YazaSqlMemoryTableV1 = YazaSqlMemoryTableV1(tables.right.table_id, tables.right.catalog_version, tables.right.column_type_ids, List[List[YazaSqlValueV1]](), 0)
+    let empty_right_join: Result[YazaSqlMemoryTableV1, Text] = yaza_sql_join_dispatch_memory_v1(plan, tables.left, empty_right)
+    if not result_is_ok(empty_right_join) or list_count(result_unwrap(empty_right_join).rows) != 3: return false
+    return true
+
+fn theta_join_case(source: Text, expected_operator: Number, expected_rows: Number) -> Boolean:
+    let parsed: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(source)
+    if not result_is_ok(parsed) or result_unwrap(parsed).join_type != 1: return false
+    let bound_result: Result[YazaSqlBoundPlanV1, Text] = yaza_sql_bind_select_v1(source, result_unwrap(parsed), join_test_catalog())
+    if not result_is_ok(bound_result): return false
+    let plan: YazaSqlBoundPlanV1 = result_unwrap(bound_result)
+    if plan.join_comparison_operator != expected_operator or list_get(plan.operators, 2).kind != yaza_sql_operator_theta_join_v1(): return false
+    let explain: Result[Text, Text] = yaza_sql_explain_bound_select_v1(plan)
+    if not result_is_ok(explain) or text_find(result_unwrap(explain), "ThetaJoin(table_id=") < 0: return false
+    let tables: YazaSqlJoinTablesV1 = join_test_tables()
+    let joined_result: Result[YazaSqlMemoryTableV1, Text] = yaza_sql_join_dispatch_memory_v1(plan, tables.left, tables.right)
+    if not result_is_ok(joined_result): return false
+    let joined: YazaSqlMemoryTableV1 = result_unwrap(joined_result)
+    if joined.join_work_units != 18: return false
+    let parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let executed: Result[YazaSqlQueryResultV1, Text] = yaza_sql_execute_memory_v1(plan, joined, parameters)
+    if not result_is_ok(executed): return false
+    let result: YazaSqlQueryResultV1 = result_unwrap(executed)
+    if list_count(result.rows) != expected_rows: return false
+    var row_index: Number = 0
+    while row_index < list_count(result.rows):
+        let row: List[YazaSqlValueV1] = list_get(result.rows, row_index)
+        let left_key: YazaSqlValueV1 = list_get(row, 0)
+        let right_key: YazaSqlValueV1 = list_get(row, 1)
+        if left_key.is_null or right_key.is_null or not yaza_sql_executor_apply_comparison_v1(yaza_sql_executor_compare_values_v1(source, left_key, right_key), expected_operator): return false
+        set row_index = row_index + 1
+
+    let rejected_outer_source: Text = "SELECT i.id FROM items AS i LEFT JOIN profiles AS p ON i.id < p.user_id"
+    let rejected_outer_parse: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(rejected_outer_source)
+    if not result_is_ok(rejected_outer_parse): return false
+    if result_is_ok(yaza_sql_bind_select_v1(rejected_outer_source, result_unwrap(rejected_outer_parse), join_test_catalog())): return false
+    return true
+
+fn theta_text_memory_profile() -> Boolean:
+    let source: Text = "SELECT i.label, p.note FROM items AS i JOIN profiles AS p ON i.label < p.note"
+    let parsed: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(source)
+    if not result_is_ok(parsed): return false
+    let bound_result: Result[YazaSqlBoundPlanV1, Text] = yaza_sql_bind_select_v1(source, result_unwrap(parsed), join_test_catalog())
+    if not result_is_ok(bound_result): return false
+    let plan: YazaSqlBoundPlanV1 = result_unwrap(bound_result)
+    let tables: YazaSqlJoinTablesV1 = join_test_tables()
+    let joined_result: Result[YazaSqlMemoryTableV1, Text] = yaza_sql_join_dispatch_memory_v1(plan, tables.left, tables.right)
+    if not result_is_ok(joined_result) or result_unwrap(joined_result).join_work_units <= 18: return false
+    let executed: Result[YazaSqlQueryResultV1, Text] = yaza_sql_execute_memory_v1(plan, result_unwrap(joined_result), List[YazaSqlValueV1]())
+    if not result_is_ok(executed): return false
+    if list_count(result_unwrap(executed).rows) != 3: return false
+    var row_index: Number = 0
+    while row_index < list_count(result_unwrap(executed).rows):
+        let row: List[YazaSqlValueV1] = list_get(result_unwrap(executed).rows, row_index)
+        if yaza_sql_executor_compare_values_v1(source, list_get(row, 0), list_get(row, 1)) >= 0: return false
+        set row_index = row_index + 1
+    return true
+
+fn theta_nan_key_rejected() -> Boolean:
+    let source: Text = "SELECT i.id, p.user_id FROM items AS i JOIN profiles AS p ON i.id < p.user_id"
+    let item_columns: List[YazaSqlColumnSchemaV1] = [YazaSqlColumnSchemaV1("id", 6, false, 0, 0, 0, "")]
+    let profile_columns: List[YazaSqlColumnSchemaV1] = [YazaSqlColumnSchemaV1("user_id", 6, false, 0, 0, 0, "")]
+    let catalog: YazaSqlCatalogSnapshotV1 = YazaSqlCatalogSnapshotV1(7, [YazaSqlTableSchemaV1(5, "items", item_columns), YazaSqlTableSchemaV1(6, "profiles", profile_columns)], List[YazaSqlColumnDefaultV1]())
+    let parsed: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(source)
+    if not result_is_ok(parsed): return false
+    let bound: Result[YazaSqlBoundPlanV1, Text] = yaza_sql_bind_select_v1(source, result_unwrap(parsed), catalog)
+    if not result_is_ok(bound): return false
+    let nan_value: YazaSqlValueV1 = yaza_sql_value_double_v1(float64_from_bits(9221120237041090561))
+    let left: YazaSqlMemoryTableV1 = YazaSqlMemoryTableV1(5, 7, [6], [[nan_value]], 0)
+    let right: YazaSqlMemoryTableV1 = YazaSqlMemoryTableV1(6, 7, [6], [[yaza_sql_value_double_v1(1.0)]], 0)
+    return not result_is_ok(yaza_sql_join_dispatch_memory_v1(result_unwrap(bound), left, right))
+
+fn cross_join_memory_profile() -> Boolean:
+    let source: Text = "SELECT i.id, p.user_id, p.note FROM items AS i CROSS JOIN profiles AS p"
+    let parsed: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(source)
+    if not result_is_ok(parsed) or result_unwrap(parsed).join_type != 5: return false
+    let bound_result: Result[YazaSqlBoundPlanV1, Text] = yaza_sql_bind_select_v1(source, result_unwrap(parsed), join_test_catalog())
+    if not result_is_ok(bound_result): return false
+    let plan: YazaSqlBoundPlanV1 = result_unwrap(bound_result)
+    if list_get(plan.operators, 2).kind != yaza_sql_operator_cross_join_v1() or plan.join_left_column_ordinal != -1 or plan.join_right_column_ordinal != -1: return false
+    if list_get(plan.projections, 0).nullable or not list_get(plan.projections, 1).nullable or list_get(plan.projections, 2).nullable: return false
+    let explain: Result[Text, Text] = yaza_sql_explain_bound_select_v1(plan)
+    if not result_is_ok(explain) or text_find(result_unwrap(explain), "CrossJoin(table_id=") < 0: return false
+    let tables: YazaSqlJoinTablesV1 = join_test_tables()
+    let joined_result: Result[YazaSqlMemoryTableV1, Text] = yaza_sql_join_dispatch_memory_v1(plan, tables.left, tables.right)
+    if not result_is_ok(joined_result): return false
+    let joined: YazaSqlMemoryTableV1 = result_unwrap(joined_result)
+    if list_count(joined.rows) != 18 or joined.join_work_units != 18 or list_count(joined.column_type_ids) != 5: return false
+    let parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let executed: Result[YazaSqlQueryResultV1, Text] = yaza_sql_execute_memory_v1(plan, joined, parameters)
+    if not result_is_ok(executed): return false
+    let result: YazaSqlQueryResultV1 = result_unwrap(executed)
+    if list_count(result.rows) != 18 or list_get(result.columns, 0).nullable or not list_get(result.columns, 1).nullable or list_get(result.columns, 2).nullable: return false
+    var row_index: Number = 0
+    while row_index < 18:
+        let row: List[YazaSqlValueV1] = list_get(result.rows, row_index)
+        let left_id: Number = list_get(row, 0).integer_value
+        let right_user_id: YazaSqlValueV1 = list_get(row, 1)
+        let right_note: Text = list_get(row, 2).text_value
+        let expected_id: Number = row_index / 6 + 1
+        if left_id != expected_id: return false
+        let right_offset: Number = row_index % 6
+        if (right_offset == 0 and (right_user_id.is_null or right_user_id.integer_value != 1)) or (right_offset == 1 and (right_user_id.is_null or right_user_id.integer_value != 1)) or (right_offset == 2 and (right_user_id.is_null or right_user_id.integer_value != 2)) or (right_offset == 3 and not right_user_id.is_null) or (right_offset == 4 and (right_user_id.is_null or right_user_id.integer_value != 9)) or (right_offset == 5 and (right_user_id.is_null or right_user_id.integer_value != 14)): return false
+        if (right_offset == 0 and right_note != "alpha") or (right_offset == 1 and right_note != "omega") or (right_offset == 2 and right_note != "beta") or (right_offset == 3 and right_note != "null-key") or (right_offset == 4 and right_note != "unmatched") or (right_offset == 5 and right_note != "hash-collision-only"): return false
+        set row_index = row_index + 1
+
+    let empty_right: YazaSqlMemoryTableV1 = YazaSqlMemoryTableV1(tables.right.table_id, tables.right.catalog_version, tables.right.column_type_ids, List[List[YazaSqlValueV1]](), 0)
+    let empty_result: Result[YazaSqlMemoryTableV1, Text] = yaza_sql_join_dispatch_memory_v1(plan, tables.left, empty_right)
+    if not result_is_ok(empty_result) or list_count(result_unwrap(empty_result).rows) != 0 or result_unwrap(empty_result).join_work_units != 0: return false
+    let empty_execution: Result[YazaSqlQueryResultV1, Text] = yaza_sql_execute_memory_v1(plan, result_unwrap(empty_result), parameters)
+    if not result_is_ok(empty_execution) or list_count(result_unwrap(empty_execution).rows) != 0: return false
+
+    let many_left_created: Result[List[List[YazaSqlValueV1]], Text] = list_try_new()
+    let many_right_created: Result[List[List[YazaSqlValueV1]], Text] = list_try_new()
+    if not result_is_ok(many_left_created) or not result_is_ok(many_right_created): return false
+    let many_left_rows: List[List[YazaSqlValueV1]] = result_unwrap(many_left_created)
+    let many_right_rows: List[List[YazaSqlValueV1]] = result_unwrap(many_right_created)
+    if not list_try_reserve(many_left_rows, 257) or not list_try_reserve(many_right_rows, 256): return false
+    var fill_index: Number = 0
+    while fill_index < 257:
+        if not list_try_push(many_left_rows, join_test_left_row(1, "x")): return false
+        set fill_index = fill_index + 1
+    set fill_index = 0
+    let one_key: YazaSqlValueV1 = result_unwrap(yaza_sql_value_integer_v1(4, 1))
+    while fill_index < 256:
+        if not list_try_push(many_right_rows, join_test_right_row(one_key, true, "x")): return false
+        set fill_index = fill_index + 1
+    let too_many: Result[YazaSqlMemoryTableV1, Text] = yaza_sql_join_dispatch_memory_v1(plan, YazaSqlMemoryTableV1(5, 7, tables.left.column_type_ids, many_left_rows, 0), YazaSqlMemoryTableV1(6, 7, tables.right.column_type_ids, many_right_rows, 0))
+    return not result_is_ok(too_many)
+
+start:
+    arena_scope 16777216:
+        assert join_memory_profile()
+        assert left_join_memory_profile()
+        assert full_join_memory_profile()
+        assert theta_join_case("SELECT i.id, p.user_id FROM items AS i JOIN profiles AS p ON i.id < p.user_id", 3, 7)
+        assert theta_join_case("SELECT i.id, p.user_id FROM items AS i JOIN profiles AS p ON i.id <= p.user_id", 4, 10)
+        assert theta_join_case("SELECT i.id, p.user_id FROM items AS i JOIN profiles AS p ON i.id > p.user_id", 5, 5)
+        assert theta_join_case("SELECT i.id, p.user_id FROM items AS i JOIN profiles AS p ON i.id >= p.user_id", 6, 8)
+        assert theta_join_case("SELECT i.id, p.user_id FROM items AS i JOIN profiles AS p ON i.id <> p.user_id", 2, 12)
+        assert theta_join_case("SELECT i.id, p.user_id FROM items AS i JOIN profiles AS p ON p.user_id > i.id", 3, 7)
+        assert theta_text_memory_profile()
+        assert theta_nan_key_rejected()
+        assert cross_join_memory_profile()
+        assert join_hash_scale_profile()
+        assert join_scalar_profile()
+    say "yazabase-sql-inner-join-memory-v1-ok"

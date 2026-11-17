@@ -1,0 +1,346 @@
+# Strict, bounded parser for absolute HTTP and HTTPS URLs.
+# This module accepts an ASCII URI subset; it preserves component escapes and
+# does not resolve DNS, normalize paths, or authorize network destinations.
+
+shape WebUrl:
+    scheme: Text
+    host: Text
+    host_kind: Text
+    port: Option[Int32]
+    path: Text
+    query: Option[Text]
+    fragment: Option[Text]
+
+fn url_hex_value(byte: Number) -> Number:
+    if byte >= 48 and byte <= 57:
+        return byte - 48
+    if byte >= 65 and byte <= 70:
+        return byte - 55
+    if byte >= 97 and byte <= 102:
+        return byte - 87
+    return -1
+
+fn url_lower_ascii(byte: Number) -> Number:
+    if byte >= 65 and byte <= 90:
+        return byte + 32
+    return byte
+
+fn url_ascii_equal_ignore_case(value: Text, expected: Text) -> Boolean:
+    if text_length(value) != text_length(expected):
+        return false
+    var index: Number = 0
+    while index < text_length(value):
+        if url_lower_ascii(text_byte(value, index)) != text_byte(expected, index):
+            return false
+        set index = index + 1
+    return true
+
+fn url_ipv4_is_valid(value: Text) -> Boolean:
+    let length: Number = text_length(value)
+    var index: Number = 0
+    var octets: Number = 0
+    var digits: Number = 0
+    var octet: Number = 0
+    var first_digit: Number = -1
+    var valid: Boolean = true
+    while index <= length and valid:
+        if index == length or text_byte(value, index) == 46:
+            if digits == 0 or digits > 3 or octet > 255 or (digits > 1 and first_digit == 48):
+                set valid = false
+            else:
+                set octets = octets + 1
+                set digits = 0
+                set octet = 0
+                set first_digit = -1
+        else:
+            let byte: Number = text_byte(value, index)
+            if byte < 48 or byte > 57:
+                set valid = false
+            else:
+                if digits == 0:
+                    set first_digit = byte
+                set digits = digits + 1
+                set octet = octet * 10 + byte - 48
+        set index = index + 1
+    return valid and octets == 4
+
+fn url_ipv6_group_count(value: Text) -> Number:
+    let length: Number = text_length(value)
+    if length == 0:
+        return 0
+    var index: Number = 0
+    var groups: Number = 0
+    var group_length: Number = 0
+    var valid: Boolean = true
+    while index <= length and valid:
+        if index == length or text_byte(value, index) == 58:
+            if group_length == 0 or group_length > 4:
+                set valid = false
+            else:
+                set groups = groups + 1
+                set group_length = 0
+        else:
+            if url_hex_value(text_byte(value, index)) < 0:
+                set valid = false
+            else:
+                set group_length = group_length + 1
+        set index = index + 1
+    if not valid:
+        return -1
+    return groups
+
+fn url_ipv6_is_valid(value: Text) -> Boolean:
+    if text_length(value) == 0 or text_length(value) > 39:
+        return false
+    let compression: Number = text_find(value, "::")
+    if compression < 0:
+        return url_ipv6_group_count(value) == 8
+    let suffix: Text = text_slice(value, compression + 2, text_length(value) - compression - 2)
+    if text_find(suffix, "::") >= 0:
+        return false
+    let left: Text = text_slice(value, 0, compression)
+    let right: Text = suffix
+    var left_groups: Number = 0
+    var right_groups: Number = 0
+    if left != "":
+        set left_groups = url_ipv6_group_count(left)
+    if right != "":
+        set right_groups = url_ipv6_group_count(right)
+    if left_groups < 0 or right_groups < 0:
+        return false
+    return left_groups + right_groups < 8
+
+fn url_label_looks_like_ip_number(value: Text) -> Boolean:
+    let length: Number = text_length(value)
+    if length == 0:
+        return false
+    var index: Number = 0
+    var decimal: Boolean = true
+    while index < length:
+        let byte: Number = text_byte(value, index)
+        if byte < 48 or byte > 57:
+            set decimal = false
+        set index = index + 1
+    if decimal:
+        return true
+    if length < 2 or url_lower_ascii(text_byte(value, 1)) != 120 or text_byte(value, 0) != 48:
+        return false
+    if length == 2:
+        return true
+    set index = 2
+    while index < length:
+        if url_hex_value(text_byte(value, index)) < 0:
+            return false
+        set index = index + 1
+    return true
+
+fn url_dns_or_ipv4_kind(value: Text) -> Text:
+    let length: Number = text_length(value)
+    if length == 0 or length > 253:
+        return ""
+    var index: Number = 0
+    var numeric_dotted: Boolean = true
+    while index < length:
+        let byte: Number = text_byte(value, index)
+        if (byte < 48 or byte > 57) and byte != 46:
+            set numeric_dotted = false
+        set index = index + 1
+    if numeric_dotted:
+        if url_ipv4_is_valid(value):
+            return "ipv4"
+        return ""
+
+    var label_start: Number = 0
+    var label_length: Number = 0
+    var valid: Boolean = true
+    set index = 0
+    while index <= length and valid:
+        if index == length or text_byte(value, index) == 46:
+            if label_length == 0 or label_length > 63 or text_byte(value, label_start) == 45 or text_byte(value, index - 1) == 45:
+                set valid = false
+            else:
+                if index == length and url_label_looks_like_ip_number(text_slice(value, label_start, label_length)):
+                    set valid = false
+                set label_start = index + 1
+                set label_length = 0
+        else:
+            let byte: Number = text_byte(value, index)
+            let alpha: Boolean = (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122)
+            let digit: Boolean = byte >= 48 and byte <= 57
+            if not alpha and not digit and byte != 45:
+                set valid = false
+            set label_length = label_length + 1
+        set index = index + 1
+    if valid:
+        return "dns"
+    return ""
+
+fn url_port_is_valid(value: Text) -> Boolean:
+    let length: Number = text_length(value)
+    if length == 0 or length > 5:
+        return false
+    var index: Number = 0
+    while index < length:
+        let byte: Number = text_byte(value, index)
+        if byte < 48 or byte > 57:
+            return false
+        set index = index + 1
+    let port: Number = number_parse(value)
+    return port >= 1 and port <= 65535
+
+fn url_parse_authority(authority: Text) -> Result[TextList, Text]:
+    let length: Number = text_length(authority)
+    if length == 0 or text_find(authority, "@") >= 0 or text_find(authority, "%") >= 0:
+        return err("url: authority is empty or contains forbidden user information/escaping")
+    var host: Text = ""
+    var host_kind: Text = ""
+    var port: Text = ""
+    var port_seen: Boolean = false
+    if text_byte(authority, 0) == 91:
+        var closing: Number = 1
+        while closing < length and text_byte(authority, closing) != 93:
+            set closing = closing + 1
+        if closing >= length:
+            return err("url: malformed bracketed IPv6 host")
+        set host = text_slice(authority, 1, closing - 1)
+        if not url_ipv6_is_valid(host):
+            return err("url: IPv6 host is invalid or uses an unsupported form")
+        set host_kind = "ipv6"
+        if closing + 1 < length:
+            if text_byte(authority, closing + 1) != 58:
+                return err("url: unexpected text after bracketed IPv6 host")
+            set port_seen = true
+            set port = text_slice(authority, closing + 2, length - closing - 2)
+    else:
+        var separator: Number = -1
+        var index: Number = 0
+        while index < length:
+            if text_byte(authority, index) == 58:
+                if separator >= 0:
+                    return err("url: IPv6 hosts must use brackets")
+                set separator = index
+            set index = index + 1
+        if separator >= 0:
+            set port_seen = true
+            set host = text_slice(authority, 0, separator)
+            set port = text_slice(authority, separator + 1, length - separator - 1)
+        else:
+            set host = authority
+        set host_kind = url_dns_or_ipv4_kind(host)
+        if host_kind == "":
+            return err("url: DNS/IPv4 host is malformed, ambiguous, or outside the supported ASCII profile")
+    if port_seen and not url_port_is_valid(port):
+        return err("url: port must be a decimal number from 1 through 65535")
+    let parts: TextList = text_list()
+    list_push(parts, host)
+    list_push(parts, host_kind)
+    list_push(parts, port)
+    if port_seen:
+        list_push(parts, "true")
+    else:
+        list_push(parts, "false")
+    return ok(parts)
+
+fn url_component_char_is_valid(byte: Number, component: Text) -> Boolean:
+    let alpha: Boolean = (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122)
+    let digit: Boolean = byte >= 48 and byte <= 57
+    let unreserved: Boolean = alpha or digit or byte == 45 or byte == 46 or byte == 95 or byte == 126
+    let sub_delim: Boolean = byte == 33 or byte == 36 or byte == 38 or byte == 39 or byte == 40 or byte == 41 or byte == 42 or byte == 43 or byte == 44 or byte == 59 or byte == 61
+    if unreserved or sub_delim or byte == 58 or byte == 64 or byte == 47:
+        return true
+    if (component == "query" or component == "fragment") and byte == 63:
+        return true
+    return false
+
+fn url_component_is_valid(value: Text, component: Text) -> Boolean:
+    var index: Number = 0
+    let length: Number = text_length(value)
+    while index < length:
+        let byte: Number = text_byte(value, index)
+        if byte == 37:
+            if index + 2 >= length or url_hex_value(text_byte(value, index + 1)) < 0 or url_hex_value(text_byte(value, index + 2)) < 0:
+                return false
+            set index = index + 3
+        else:
+            if not url_component_char_is_valid(byte, component):
+                return false
+            set index = index + 1
+    return true
+
+fn url_parse_http(value: Text) -> Result[WebUrl, Text]:
+    let length: Number = text_length(value)
+    if length < 8 or length > 8192:
+        return err("url: input length must be between 8 bytes and 8 KiB")
+    let input: Bytes = bytes_from_text(value)
+    let byte_length: Number = bytes_length(input)
+    if byte_length != length:
+        return err("url: only ASCII URI input is supported; percent-encode non-ASCII bytes")
+    var index: Number = 0
+    while index < byte_length:
+        let byte: Number = bytes_get(input, index)
+        if byte <= 32 or byte == 127 or byte == 92 or byte > 126:
+            return err("url: spaces, controls, backslash, and raw non-ASCII bytes are not allowed")
+        if byte == 37:
+            if index + 2 >= byte_length or url_hex_value(bytes_get(input, index + 1)) < 0 or url_hex_value(bytes_get(input, index + 2)) < 0:
+                return err("url: invalid or incomplete percent escape")
+            set index = index + 3
+        else:
+            set index = index + 1
+
+    let separator: Number = text_find(value, "://")
+    if separator < 0:
+        return err("url: expected an absolute http:// or https:// URL")
+    let input_scheme: Text = text_slice(value, 0, separator)
+    var scheme: Text = ""
+    if url_ascii_equal_ignore_case(input_scheme, "https"):
+        set scheme = "https"
+    else:
+        if url_ascii_equal_ignore_case(input_scheme, "http"):
+            set scheme = "http"
+        else:
+            return err("url: only HTTP and HTTPS schemes are supported")
+
+    let authority_start: Number = separator + 3
+    var authority_end: Number = authority_start
+    while authority_end < length and text_byte(value, authority_end) != 47 and text_byte(value, authority_end) != 63 and text_byte(value, authority_end) != 35:
+        set authority_end = authority_end + 1
+    let authority_result: Result[TextList, Text] = url_parse_authority(text_slice(value, authority_start, authority_end - authority_start))
+    if not result_is_ok(authority_result):
+        return err(result_unwrap_error(authority_result))
+    let authority_parts: TextList = result_unwrap(authority_result)
+    let host: Text = list_get(authority_parts, 0)
+    let host_kind: Text = list_get(authority_parts, 1)
+    let port_text: Text = list_get(authority_parts, 2)
+    let port_seen: Boolean = list_get(authority_parts, 3) == "true"
+
+    let remainder: Text = text_slice(value, authority_end, length - authority_end)
+    let fragment_index: Number = text_find(remainder, "#")
+    var before_fragment: Text = remainder
+    var fragment: Option[Text] = none
+    if fragment_index >= 0:
+        set before_fragment = text_slice(remainder, 0, fragment_index)
+        let fragment_value: Text = text_slice(remainder, fragment_index + 1, text_length(remainder) - fragment_index - 1)
+        if text_find(fragment_value, "#") >= 0 or not url_component_is_valid(fragment_value, "fragment"):
+            return err("url: fragment contains an invalid character or repeated delimiter")
+        set fragment = some(fragment_value)
+
+    let query_index: Number = text_find(before_fragment, "?")
+    var raw_path: Text = before_fragment
+    var query: Option[Text] = none
+    if query_index >= 0:
+        set raw_path = text_slice(before_fragment, 0, query_index)
+        let query_value: Text = text_slice(before_fragment, query_index + 1, text_length(before_fragment) - query_index - 1)
+        if not url_component_is_valid(query_value, "query"):
+            return err("url: query contains an invalid character")
+        set query = some(query_value)
+
+    var path: Text = raw_path
+    if path == "":
+        set path = "/"
+    if not text_starts_with(path, "/") or not url_component_is_valid(path, "path"):
+        return err("url: authority URLs require an absolute path with valid URI characters")
+
+    var port: Option[Int32] = none
+    if port_seen:
+        set port = some(int32_from_number(number_parse(port_text)))
+    return ok(WebUrl(scheme, host, host_kind, port, path, query, fragment))

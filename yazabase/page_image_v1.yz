@@ -1,0 +1,41 @@
+# Bounded system FULL_PAGE_IMAGE codec and page-LSN-aware replay primitive.
+use "./page_v1"
+use "./storage_v1"
+use "./wal_v1"
+
+fn yaza_db_page_image_bytes_all_zero_v1(input: Bytes) -> Boolean:
+    if bytes_length(input) != yaza_db_page_size_v1(): return false
+    var index: Number = 0
+    while index < yaza_db_page_size_v1():
+        if bytes_get(input, index) != 0: return false
+        set index = index + 1
+    return true
+
+fn yaza_db_storage_redo_page_image_v1(storage: YazaDbStorageHandleV1, record: YazaDbWalRecordV1, wal_end_lsn: Number) -> Result[Boolean, Text]:
+    if record.rec_type != yaza_db_wal_type_full_page_image_v1(): return err("YDBv1 page-image redo requires a FULL_PAGE_IMAGE record")
+    if record.lsn < 1 or wal_end_lsn <= record.lsn: return err("YDBv1 page-image redo LSN is outside the recovered WAL range")
+    let record_length: Number = yaza_db_wal_header_size_v1() + bytes_length(record.payload)
+    if record.lsn > 9223372036854775807 - record_length or record.lsn + record_length > wal_end_lsn: return err("YDBv1 FULL_PAGE_IMAGE extends beyond the recovered WAL end")
+    let decoded: YazaDbWalPageImageV1 = yaza_db_wal_page_image_payload_decode_v1(record)?
+    if decoded.page_id >= storage.header.page_count: return err("YDBv1 FULL_PAGE_IMAGE page ID is outside the logical database")
+    let address: YazaDbBitmapAddressV1 = yaza_db_bitmap_address_v1(decoded.page_id)?
+    if address.is_bitmap_page or address.bitmap_page_id >= storage.header.page_count: return err("YDBv1 FULL_PAGE_IMAGE cannot target a BITMAP or unmapped page")
+    let bitmap: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, address.bitmap_page_id)?
+    let allocated: Boolean = yaza_db_bitmap_page_bit_v1(bitmap, address.bit_index, address.bitmap_page_id)?
+    if not allocated: return err("YDBv1 FULL_PAGE_IMAGE target is not allocated")
+    let offset: Number = yaza_db_storage_page_offset_v1(decoded.page_id)?
+    let current: Bytes = read_exact(storage.file, offset, yaza_db_page_size_v1())?
+    var current_lsn: Number = -1
+    if yaza_db_page_image_bytes_all_zero_v1(current): set current_lsn = 0
+    else:
+        let current_header_result: Result[YazaDbPageHeaderV1, Text] = yaza_db_page_header_decode_v1(current, decoded.page_id)
+        if result_is_ok(current_header_result):
+            let current_header: YazaDbPageHeaderV1 = result_unwrap(current_header_result)
+            set current_lsn = current_header.page_lsn
+    if current_lsn > record.lsn: return ok(true)
+    if current_lsn == record.lsn:
+        if not bytes_equal(current, decoded.image): return err("YDBv1 page LSN matches FULL_PAGE_IMAGE but the page bytes differ")
+        return ok(true)
+    let written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, decoded.image)?
+    if written != yaza_db_page_size_v1(): return err("YDBv1 FULL_PAGE_IMAGE page write was incomplete")
+    return ok(true)

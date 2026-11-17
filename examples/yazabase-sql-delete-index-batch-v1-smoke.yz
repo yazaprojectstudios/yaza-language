@@ -1,0 +1,107 @@
+use "std/fs"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/checkpoint_v1"
+use "../yazabase/index_catalog_v1"
+use "../yazabase/page_v1"
+use "../yazabase/sql_dispatch_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/wal_v1"
+
+fn yazabase_sql_delete_index_batch_count_v1(result: YazaDbSqlStatementResultV1) -> Result[Number, Text]:
+    if not option_is_some(result.query_result): return err("YDBv1 indexed DELETE batch fixture expected a COUNT result")
+    let query: YazaSqlQueryResultV1 = option_unwrap(result.query_result)
+    if list_count(query.rows) != 1 or list_count(list_get(query.rows, 0)) != 1: return err("YDBv1 indexed DELETE batch COUNT has an invalid result shape")
+    let count: YazaSqlValueV1 = list_get(list_get(query.rows, 0), 0)
+    if count.is_null or count.type_id != 4: return err("YDBv1 indexed DELETE batch COUNT did not return BIGINT")
+    return ok(count.integer_value)
+
+fn yazabase_sql_delete_index_batch_v1(root_path: Text) -> Result[Boolean, Text]:
+    let root: Number = root_open(root_path)?
+    let db_name: Text = "delete-index-batch-smoke.ydb"
+    let header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_from_text("idx-delete-uuid1"), 0, 1, 1, 0, 2, 1)
+    let empty: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, db_name, header)?
+    let empty_closed: Boolean = yaza_db_storage_close_v1(empty)?
+    if not empty_closed: return err("YDBv1 indexed DELETE batch fixture could not close its empty database")
+    let initialized: YazaDbCatalogBootstrapV1 = yaza_db_catalog_initialize_v1(root, db_name)?
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let created: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(initialized.storage, initialized.wal, "CREATE TABLE indexed_delete_rows (id BIGINT PRIMARY KEY, score BIGINT NOT NULL)", no_parameters)?
+    var current_storage: YazaDbStorageHandleV1 = created.storage
+    var current_wal: YazaDbWalLogV1 = created.wal
+    var chunk_number: Number = 0
+    while chunk_number < 3:
+        let parts_result: Result[TextList, Text] = text_list_try_new()
+        if not result_is_ok(parts_result): return err("YDBv1 indexed DELETE batch fixture could not allocate its INSERT source")
+        let parts: TextList = result_unwrap(parts_result)
+        if not list_try_reserve(parts, 161) or not list_try_push(parts, "INSERT INTO indexed_delete_rows (id, score) VALUES "):
+            return err("YDBv1 indexed DELETE batch fixture could not reserve its INSERT source")
+        var row_offset: Number = 0
+        while row_offset < 80:
+            if row_offset > 0 and not list_try_push(parts, ", "): return err("YDBv1 indexed DELETE batch fixture could not append an INSERT delimiter")
+            let row_id: Number = chunk_number * 80 + row_offset
+            let score: Number = (row_id * 37) % 240
+            if not list_try_push(parts, "(" + number_text(row_id) + ", " + number_text(score) + ")"):
+                return err("YDBv1 indexed DELETE batch fixture could not append an INSERT row")
+            set row_offset = row_offset + 1
+        let insert_source: Text = text_try_join(parts, "")?
+        let inserted: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(current_storage, current_wal, insert_source, no_parameters)?
+        if not option_is_some(inserted.write_commit): return err("YDBv1 indexed DELETE batch fixture could not commit its row chunk")
+        let insert_commit: YazaDbWriteCommitV1 = option_unwrap(inserted.write_commit)
+        set current_storage = insert_commit.storage
+        set current_wal = insert_commit.wal
+        set chunk_number = chunk_number + 1
+    let indexed: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(current_storage, current_wal, "CREATE INDEX indexed_delete_score_idx ON indexed_delete_rows(score)", no_parameters)?
+    if not option_is_some(indexed.write_commit): return err("YDBv1 indexed DELETE batch fixture did not commit its secondary index")
+    let index_commit: YazaDbWriteCommitV1 = option_unwrap(indexed.write_commit)
+    let index_rows: List[YazaDbRowV1] = yaza_db_index_catalog_rows_v1(index_commit.storage.file, index_commit.storage.header, index_commit.storage.header.next_commit_ts - 1)?
+    var index_root: Number = 0
+    var index_row: Number = 0
+    while index_row < list_count(index_rows):
+        let row: YazaDbRowV1 = list_get(index_rows, index_row)
+        if list_get(row.values, 2).text_value == "indexed_delete_score_idx": set index_root = list_get(row.values, 3).integer_value
+        set index_row = index_row + 1
+    if index_root < 2: return err("YDBv1 indexed DELETE batch fixture could not find its secondary-index root")
+    let index_root_page: Bytes = yaza_db_storage_read_page_v1(index_commit.storage.file, index_commit.storage.header, index_root)?
+    let index_root_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(index_root_page, index_root)?
+    if index_root_header.page_type != 2 or index_root_header.level < 1:
+        return err("YDBv1 indexed DELETE batch fixture expected a multi-leaf secondary index")
+
+    let empty_delete: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(index_commit.storage, index_commit.wal, "DELETE FROM indexed_delete_rows WHERE id >= 10000", no_parameters)?
+    if not option_is_some(empty_delete.write_commit) or option_unwrap(empty_delete.write_commit).affected_rows != 0:
+        return err("YDBv1 indexed DELETE batch did not accept a no-match DELETE")
+    let empty_delete_commit: YazaDbWriteCommitV1 = option_unwrap(empty_delete.write_commit)
+    let deleted: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(empty_delete_commit.storage, empty_delete_commit.wal, "DELETE FROM indexed_delete_rows WHERE id >= 0", no_parameters)?
+    if not option_is_some(deleted.write_commit) or option_unwrap(deleted.write_commit).affected_rows != 240:
+        return err("YDBv1 indexed DELETE batch did not report 240 affected rows")
+    let delete_commit: YazaDbWriteCommitV1 = option_unwrap(deleted.write_commit)
+    let historical_rows: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(delete_commit.storage, delete_commit.wal, "SELECT id FROM indexed_delete_rows", no_parameters, index_commit.commit_ts, 0, List[YazaDbTxnStatusV1]())?
+    if list_count(historical_rows.rows) != 240:
+        return err("YDBv1 batched LEAF_UPDATE history did not restore all rows at the pre-DELETE snapshot")
+    let remaining: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(delete_commit.storage, delete_commit.wal, "SELECT COUNT(*) FROM indexed_delete_rows", no_parameters)?
+    let remaining_count: Number = yazabase_sql_delete_index_batch_count_v1(remaining)?
+    if remaining_count != 0:
+        return err("YDBv1 indexed DELETE batch left clustered rows visible")
+    let indexed_miss: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(remaining.storage, remaining.wal, "SELECT id FROM indexed_delete_rows WHERE score = 37", no_parameters)?
+    if not option_is_some(indexed_miss.query_result) or list_count(option_unwrap(indexed_miss.query_result).rows) != 0:
+        return err("YDBv1 indexed DELETE batch left a secondary-index entry visible")
+    let closed_wal: Boolean = yaza_db_wal_log_close_v1(indexed_miss.wal)?
+    let closed_storage: Boolean = yaza_db_storage_close_v1(indexed_miss.storage)?
+    if not closed_wal or not closed_storage: return err("YDBv1 indexed DELETE batch fixture could not close handles before recovery")
+
+    let recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, db_name)?
+    let recovered_count: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(recovered.storage, recovered.wal, "SELECT COUNT(*) FROM indexed_delete_rows", no_parameters)?
+    let rows_after_recovery: Number = yazabase_sql_delete_index_batch_count_v1(recovered_count)?
+    if rows_after_recovery != 0:
+        return err("YDBv1 indexed DELETE batch did not survive close and recovery")
+    let recovered_index_miss: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(recovered_count.storage, recovered_count.wal, "SELECT id FROM indexed_delete_rows WHERE score = 37", no_parameters)?
+    if not option_is_some(recovered_index_miss.query_result) or list_count(option_unwrap(recovered_index_miss.query_result).rows) != 0:
+        return err("YDBv1 recovered indexed DELETE exposed an index entry")
+    let final_wal_closed: Boolean = yaza_db_wal_log_close_v1(recovered_index_miss.wal)?
+    let final_storage_closed: Boolean = yaza_db_storage_close_v1(recovered_index_miss.storage)?
+    let root_closed: Boolean = close(root)?
+    if not final_wal_closed or not final_storage_closed or not root_closed: return err("YDBv1 indexed DELETE batch fixture could not close final handles")
+    return ok(true)
+
+start:
+    let outcome: Result[Boolean, Text] = yazabase_sql_delete_index_batch_v1(arg(1))
+    if not result_is_ok(outcome): say result_unwrap_error(outcome)
+    else: say "yazabase-sql-delete-index-batch-v1-ok"

@@ -1,0 +1,174 @@
+# Crash-resumable bootstrap for the fixed YDBv1 system-catalog root pages.
+use "std/fs"
+use "./catalog_storage_v1"
+use "./catalog_schema_v1"
+use "./catalog_v1"
+use "./checkpoint_v1"
+use "./meta_free_v1"
+use "./page_image_v1"
+use "./page_v1"
+use "./storage_v1"
+use "./wal_v1"
+
+shape YazaDbCatalogBootstrapV1:
+    storage: YazaDbStorageHandleV1
+    wal: YazaDbWalLogV1
+    catalog: YazaDbCatalogRootV1
+    initialized: Boolean
+
+fn yaza_db_catalog_bootstrap_failure_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, message: Text) -> Result[YazaDbCatalogBootstrapV1, Text]:
+    let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(wal)
+    let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(storage)
+    return err(message)
+
+fn yaza_db_catalog_bootstrap_append_page_image_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, page_id: Number, page_type: Number, catalog: YazaDbCatalogRootV1) -> Result[YazaDbWalAppendV1, Text]:
+    if page_type != 1 and page_type != 4: return err("YDBv1 catalog bootstrap page type is invalid")
+    var current_wal: YazaDbWalLogV1 = wal
+    if current_wal.next_lsn == 0:
+        let seed_result: Result[YazaDbWalAppendV1, Text] = yaza_db_wal_log_append_v1(current_wal, YazaDbWalRecordV1(0, 0, 0, yaza_db_wal_type_skip_v1(), 0, bytes_from_text("")))
+        if not result_is_ok(seed_result): return err(result_unwrap_error(seed_result))
+        set current_wal = result_unwrap(seed_result).log
+    let payload_length: Number = yaza_db_wal_page_image_payload_size_v1()
+    let record_length: Number = yaza_db_wal_header_size_v1() + payload_length
+    let expected_lsn: Number = yaza_db_wal_record_lsn_for_append_v1(current_wal, record_length)?
+    var image: Bytes = bytes_from_text("")
+    if page_type == 1:
+        set image = yaza_db_catalog_seed_page_v1(page_id)?
+        if not yaza_db_write_int_le_v1(image, 0, expected_lsn, 8): return err("YDBv1 catalog seed page LSN could not be written")
+        set image = yaza_db_page_finalize_v1(image)?
+    else:
+        set image = yaza_db_catalog_root_page_encode_v1(page_id, expected_lsn, catalog)?
+    let payload: Bytes = yaza_db_wal_page_image_payload_encode_v1(page_id, expected_lsn, image)?
+    let input: YazaDbWalRecordV1 = YazaDbWalRecordV1(0, 0, 0, yaza_db_wal_type_full_page_image_v1(), 0, payload)
+    let appended_result: Result[YazaDbWalAppendV1, Text] = yaza_db_wal_log_append_v1(current_wal, input)
+    if not result_is_ok(appended_result): return err(result_unwrap_error(appended_result))
+    let appended: YazaDbWalAppendV1 = result_unwrap(appended_result)
+    if appended.record.lsn != expected_lsn:
+        let ignored_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(appended.log)
+        return err("YDBv1 catalog bootstrap WAL append changed the predicted page-image LSN")
+    let applied: Result[Boolean, Text] = yaza_db_storage_redo_page_image_v1(storage, appended.record, appended.log.next_lsn)
+    if not result_is_ok(applied):
+        let ignored_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(appended.log)
+        return err(result_unwrap_error(applied))
+    return ok(appended)
+
+fn yaza_db_catalog_bootstrap_validate_reserved_page_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, page_id: Number, expected_type: Number) -> Result[Boolean, Text]:
+    let offset: Number = yaza_db_storage_page_offset_v1(page_id)?
+    let image: Bytes = read_exact(storage.file, offset, yaza_db_page_size_v1())?
+    if yaza_db_page_image_bytes_all_zero_v1(image): return ok(true)
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(image, page_id)?
+    if header.page_type != expected_type or header.page_lsn < 1: return err("YDBv1 catalog bootstrap refuses a non-bootstrap page in its reserved range")
+    let segment_count: Number = yaza_db_wal_segment_count_for_v1(storage.root, storage.header.db_uuid)?
+    if segment_count == 0 or wal.next_lsn <= header.page_lsn: return err("YDBv1 catalog bootstrap refuses a reserved page without a bootstrap FULL_PAGE_IMAGE")
+    let step: YazaDbCheckpointWalStepV1 = yaza_db_checkpoint_read_wal_step_v1(storage.root, storage.header.db_uuid, header.page_lsn, segment_count, wal.next_lsn)?
+    if not step.has_record or step.record.lsn != header.page_lsn or step.record.rec_type != yaza_db_wal_type_full_page_image_v1(): return err("YDBv1 catalog bootstrap reserved-page LSN is not a FULL_PAGE_IMAGE record")
+    let logged_image: YazaDbWalPageImageV1 = yaza_db_wal_page_image_payload_decode_v1(step.record)?
+    if logged_image.page_id != page_id or not bytes_equal(logged_image.image, image): return err("YDBv1 catalog bootstrap reserved page differs from its FULL_PAGE_IMAGE")
+    return ok(true)
+
+fn yaza_db_catalog_initialize_opened_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1) -> Result[YazaDbCatalogBootstrapV1, Text]:
+    if storage.root != wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid): return yaza_db_catalog_bootstrap_failure_v1(storage, wal, "YDBv1 catalog bootstrap requires the matching storage and WAL")
+    if storage.header.catalog_root != 0:
+        let existing: Result[YazaDbCatalogRootV1, Text] = yaza_db_catalog_storage_read_root_v1(storage.file, storage.header)
+        if not result_is_ok(existing): return yaza_db_catalog_bootstrap_failure_v1(storage, wal, result_unwrap_error(existing))
+        return ok(YazaDbCatalogBootstrapV1(storage, wal, result_unwrap(existing), false))
+    if storage.header.page_count != yaza_db_storage_preallocated_page_count_v1() or storage.header.next_txn_id != 1 or storage.header.next_commit_ts != 1:
+        return yaza_db_catalog_bootstrap_failure_v1(storage, wal, "YDBv1 catalog bootstrap requires a fresh uninitialized database")
+    let bitmap_result: Result[Bytes, Text] = yaza_db_storage_read_page_v1(storage.file, storage.header, 2)
+    if not result_is_ok(bitmap_result): return yaza_db_catalog_bootstrap_failure_v1(storage, wal, result_unwrap_error(bitmap_result))
+    let bitmap: Bytes = result_unwrap(bitmap_result)
+    let bitmap_header_result: Result[YazaDbPageHeaderV1, Text] = yaza_db_page_header_decode_v1(bitmap, 2)
+    if not result_is_ok(bitmap_header_result): return yaza_db_catalog_bootstrap_failure_v1(storage, wal, result_unwrap_error(bitmap_header_result))
+    let bitmap_header: YazaDbPageHeaderV1 = result_unwrap(bitmap_header_result)
+    if bitmap_header.page_type != 5 or not yaza_db_bitmap_page_bit_unchecked_v1(bitmap, 0): return yaza_db_catalog_bootstrap_failure_v1(storage, wal, "YDBv1 catalog bootstrap found an invalid genesis BITMAP page")
+    var bit_index: Number = 6
+    while bit_index < storage.header.page_count - 2:
+        let allocated: Result[Boolean, Text] = yaza_db_bitmap_page_bit_v1(bitmap, bit_index, 2)
+        if not result_is_ok(allocated): return yaza_db_catalog_bootstrap_failure_v1(storage, wal, result_unwrap_error(allocated))
+        if result_unwrap(allocated): return yaza_db_catalog_bootstrap_failure_v1(storage, wal, "YDBv1 catalog bootstrap refuses a database with non-bootstrap allocated pages")
+        set bit_index = bit_index + 1
+    var reserved_root_count: Number = 0
+    var root_index: Number = 0
+    while root_index < 5:
+        let page_id: Number = root_index + 3
+        let allocated: Result[Boolean, Text] = yaza_db_bitmap_page_bit_v1(bitmap, page_id - 2, 2)
+        if not result_is_ok(allocated): return yaza_db_catalog_bootstrap_failure_v1(storage, wal, result_unwrap_error(allocated))
+        if result_unwrap(allocated): set reserved_root_count = reserved_root_count + 1
+        set root_index = root_index + 1
+    if reserved_root_count != 0 and reserved_root_count != 5: return yaza_db_catalog_bootstrap_failure_v1(storage, wal, "YDBv1 catalog bootstrap found a partially reserved root-page range")
+    if reserved_root_count == 5:
+        set root_index = 0
+        while root_index < 5:
+            let page_id: Number = root_index + 3
+            var expected_type: Number = 1
+            if page_id == 7: set expected_type = 4
+            let verified: Result[Boolean, Text] = yaza_db_catalog_bootstrap_validate_reserved_page_v1(storage, wal, page_id, expected_type)
+            if not result_is_ok(verified): return yaza_db_catalog_bootstrap_failure_v1(storage, wal, result_unwrap_error(verified))
+            set root_index = root_index + 1
+    var bitmap_changed: Boolean = false
+    set root_index = 0
+    while root_index < 5:
+        let page_id: Number = root_index + 3
+        let newly_allocated: Result[Boolean, Text] = yaza_db_bitmap_page_set_page_allocated_v1(bitmap, page_id, true, bitmap_header.page_lsn, 2)
+        if not result_is_ok(newly_allocated): return yaza_db_catalog_bootstrap_failure_v1(storage, wal, result_unwrap_error(newly_allocated))
+        if result_unwrap(newly_allocated): set bitmap_changed = true
+        set root_index = root_index + 1
+    var current_storage: YazaDbStorageHandleV1 = storage
+    if bitmap_changed:
+        let bitmap_write: Result[Number, Text] = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, bitmap)
+        if not result_is_ok(bitmap_write): return yaza_db_catalog_bootstrap_failure_v1(storage, wal, result_unwrap_error(bitmap_write))
+        if result_unwrap(bitmap_write) != yaza_db_page_size_v1(): return yaza_db_catalog_bootstrap_failure_v1(storage, wal, "YDBv1 catalog bootstrap BITMAP write was incomplete")
+    var current_wal: YazaDbWalLogV1 = wal
+    let catalog: YazaDbCatalogRootV1 = YazaDbCatalogRootV1(3, 4, 5, 6, 13, 1, 0)
+    set root_index = 0
+    while root_index < 4:
+        let page_id: Number = root_index + 3
+        let appended_result: Result[YazaDbWalAppendV1, Text] = yaza_db_catalog_bootstrap_append_page_image_v1(current_storage, current_wal, page_id, 1, catalog)
+        if not result_is_ok(appended_result): return yaza_db_catalog_bootstrap_failure_v1(current_storage, current_wal, result_unwrap_error(appended_result))
+        set current_wal = result_unwrap(appended_result).log
+        set root_index = root_index + 1
+    let descriptor_result: Result[YazaDbWalAppendV1, Text] = yaza_db_catalog_bootstrap_append_page_image_v1(current_storage, current_wal, 7, 4, catalog)
+    if not result_is_ok(descriptor_result): return yaza_db_catalog_bootstrap_failure_v1(current_storage, current_wal, result_unwrap_error(descriptor_result))
+    set current_wal = result_unwrap(descriptor_result).log
+    let target_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(storage.header.db_uuid, storage.header.checkpoint_lsn, storage.header.next_txn_id, storage.header.next_commit_ts + 1, 7, storage.header.page_count, storage.header.flags)
+    let published_result: Result[YazaDbCheckpointResultV1, Text] = yaza_db_checkpoint_publish_state_v1(current_storage, current_wal, target_header)
+    if not result_is_ok(published_result):
+        let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(current_wal)
+        let ignored_close: Result[Boolean, Text] = yaza_db_storage_close_v1(current_storage)
+        return err(result_unwrap_error(published_result))
+    let published: YazaDbCheckpointResultV1 = result_unwrap(published_result)
+    let installed_result: Result[YazaDbCatalogRootV1, Text] = yaza_db_catalog_storage_read_root_v1(published.storage.file, published.storage.header)
+    if not result_is_ok(installed_result):
+        let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(published.wal)
+        let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(published.storage)
+        return err(result_unwrap_error(installed_result))
+    return ok(YazaDbCatalogBootstrapV1(published.storage, published.wal, result_unwrap(installed_result), true))
+
+fn yaza_db_catalog_initialize_v1(root: Number, name: Text) -> Result[YazaDbCatalogBootstrapV1, Text]:
+    let recovered_result: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_open_recovered_v1(root, name)
+    if not result_is_ok(recovered_result): return err(result_unwrap_error(recovered_result))
+    let recovered: YazaDbCheckpointRecoveryV1 = result_unwrap(recovered_result)
+    return yaza_db_catalog_initialize_opened_v1(recovered.storage, recovered.wal)
+
+fn yaza_db_catalog_create_v1(root: Number, name: Text) -> Result[YazaDbCatalogBootstrapV1, Text]:
+    let existing_result: Result[Number, Text] = open_read(root, name)
+    if result_is_ok(existing_result):
+        let existing_file: Number = result_unwrap(existing_result)
+        let existing_closed: Result[Boolean, Text] = close(existing_file)
+        if not result_is_ok(existing_closed): return err("YDBv1 database create found an existing name but could not close its read-only probe: " + result_unwrap_error(existing_closed))
+        if not result_unwrap(existing_closed): return err("YDBv1 database create found an existing name but did not release its read-only probe")
+        return err("YDBv1 database name already exists")
+    let uuid_result: Result[Bytes, Text] = secure_random_bytes_try(16)
+    if not result_is_ok(uuid_result): return err("YDBv1 database creation could not obtain an operating-system random identity: " + result_unwrap_error(uuid_result))
+    let db_uuid: Bytes = result_unwrap(uuid_result)
+    if bytes_length(db_uuid) != 16: return err("YDBv1 database creation received an invalid random identity length")
+    let empty_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(db_uuid, 0, 1, 1, 0, 2, 1)
+    let created_result: Result[YazaDbStorageHandleV1, Text] = yaza_db_storage_create_empty_v1(root, name, empty_header)
+    if not result_is_ok(created_result): return err("YDBv1 database creation could not create the empty database: " + result_unwrap_error(created_result))
+    let created: YazaDbStorageHandleV1 = result_unwrap(created_result)
+    let close_result: Result[Boolean, Text] = yaza_db_storage_close_v1(created)
+    if not result_is_ok(close_result): return err("YDBv1 database creation could not close the genesis file before catalog bootstrap: " + result_unwrap_error(close_result))
+    if not result_unwrap(close_result): return err("YDBv1 database creation did not release the genesis file lock before catalog bootstrap")
+    let initialized_result: Result[YazaDbCatalogBootstrapV1, Text] = yaza_db_catalog_initialize_v1(root, name)
+    if not result_is_ok(initialized_result): return err("YDBv1 database genesis was created but catalog bootstrap did not finish; reopen through recovery before retrying: " + result_unwrap_error(initialized_result))
+    return initialized_result

@@ -1,0 +1,295 @@
+# Bounded single-statement SQL entry point for the current persisted YDBv1 profile, including joins and set operations.
+# It unifies the supported SELECT, INSERT, UPDATE, DELETE, EXPLAIN SELECT, and CREATE TABLE paths while keeping
+# their existing parser/binder/storage contracts and transaction boundaries.
+use "./catalog_snapshot_v1"
+use "./query_v1"
+use "./sql_create_table_v1"
+use "./sql_create_table_write_v1"
+use "./sql_create_index_v1"
+use "./sql_create_index_write_v1"
+use "./sql_alter_table_v1"
+use "./sql_alter_table_write_v1"
+use "./sql_delete_query_v1"
+use "./sql_drop_index_v1"
+use "./sql_drop_index_write_v1"
+use "./sql_drop_table_v1"
+use "./sql_insert_query_v1"
+use "./index_catalog_v1"
+use "./sql_lexer_v1"
+use "./sql_parser_v2"
+use "./sql_explain_v1"
+use "./sql_update_query_v1"
+use "./sql_view_v1"
+use "./sql_view_write_v1"
+use "./storage_v1"
+use "./transaction_v1"
+use "./wal_v1"
+
+shape YazaDbSqlStatementResultV1:
+    statement_kind: Number
+    query_result: Option[YazaSqlQueryResultV1]
+    write_commit: Option[YazaDbWriteCommitV1]
+    explain_text: Option[Text]
+    storage: YazaDbStorageHandleV1
+    wal: YazaDbWalLogV1
+
+fn yaza_db_sql_statement_kind_select_v1() -> Number:
+    return 1
+
+fn yaza_db_sql_statement_kind_insert_v1() -> Number:
+    return 2
+
+fn yaza_db_sql_statement_kind_create_table_v1() -> Number:
+    return 3
+
+fn yaza_db_sql_statement_kind_delete_v1() -> Number:
+    return 4
+
+fn yaza_db_sql_statement_kind_update_v1() -> Number:
+    return 5
+
+fn yaza_db_sql_statement_kind_explain_v1() -> Number:
+    return 6
+
+fn yaza_db_sql_statement_kind_drop_table_v1() -> Number:
+    return 7
+
+fn yaza_db_sql_statement_kind_alter_table_v1() -> Number:
+    return 8
+
+fn yaza_db_sql_statement_kind_create_index_v1() -> Number:
+    return 9
+
+fn yaza_db_sql_statement_kind_drop_index_v1() -> Number:
+    return 10
+
+fn yaza_db_sql_statement_kind_create_view_v1() -> Number:
+    return 11
+
+fn yaza_db_sql_statement_kind_drop_view_v1() -> Number:
+    return 12
+
+fn yaza_db_sql_explain_select_v1(storage: YazaDbStorageHandleV1, source: Text, parameters: List[YazaSqlValueV1], tokens: List[YazaSqlTokenV1]) -> Result[Text, Text]:
+    if list_count(parameters) != 0: return err("YDBv1 EXPLAIN does not consume runtime bind values")
+    let explain_token: YazaSqlTokenV1 = list_get(tokens, 0)
+    var query_start: Number = explain_token.end_byte
+    while query_start < text_length(source):
+        let next_byte: Number = text_byte(source, query_start)
+        if next_byte != 32 and next_byte != 9 and next_byte != 10 and next_byte != 13: break
+        set query_start = query_start + 1
+    let query_source: Text = text_slice(source, query_start, text_length(source) - query_start)
+    let query_tokens: List[YazaSqlTokenV1] = yaza_sql_lex_v1(query_source)?
+    if yaza_sql_v2_is_keyword(query_source, query_tokens, 0, "WITH"):
+        return yaza_db_query_explain_cte_select_v1(storage.file, storage.header, query_source, parameters)
+    let snapshot: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(storage.file, storage.header)?
+    let parsed_query: YazaSqlSelectAstV3 = yaza_sql_parse_select_tokens_v3(query_source, query_tokens)?
+    let no_virtual_relations: List[YazaDbQueryVirtualRelationV1] = List[YazaDbQueryVirtualRelationV1]()
+    let view_relations: List[YazaDbQueryVirtualRelationV1] = yaza_db_query_view_schemas_for_select_v1(query_source, parsed_query, snapshot.views, no_virtual_relations, snapshot.sql_snapshot.version)?
+    if list_count(view_relations) > 0:
+        let scoped_catalog: YazaSqlCatalogSnapshotV1 = yaza_db_query_sql_catalog_with_virtual_relations_v1(snapshot.sql_snapshot, view_relations)?
+        let logical: Text = yaza_sql_explain_select_v1(query_source, scoped_catalog)?
+        let annotation: Text = yaza_db_query_view_explain_annotation_v1(view_relations, snapshot.views)?
+        let annotated: Text = text_try_concat(annotation, logical)?
+        return text_try_concat(annotated, "Physical: persistent view materialization; inner view access paths are not expanded in this EXPLAIN profile\n")
+    return yaza_sql_explain_select_with_access_v1(storage.file, storage.header, query_source, snapshot.sql_snapshot)
+
+fn yaza_db_sql_write_allowed_during_index_build_v1(storage: YazaDbStorageHandleV1) -> Result[Boolean, Text]:
+    if storage.header.catalog_root == 0: return ok(true)
+    let visible_ts: Number = storage.header.next_commit_ts - 1
+    if visible_ts < 1: return err("YDBv1 write fence cannot read an uninitialized index catalog")
+    let building: Boolean = yaza_db_index_catalog_has_building_v1(storage.file, storage.header, visible_ts)?
+    return ok(not building)
+
+fn yaza_db_execute_statement_with_delete_checkpoint_policy_profiled_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], query_profile_ns: List[Number], defer_delete_checkpoint: Boolean) -> Result[YazaDbSqlStatementResultV1, Text]:
+    if storage.root != wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid): return err("YDBv1 SQL statement storage and WAL handles belong to different databases")
+    let lexed: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(source)
+    if not result_is_ok(lexed): return err(result_unwrap_error(lexed))
+    let tokens: List[YazaSqlTokenV1] = result_unwrap(lexed)
+    if list_count(tokens) < 2: return err("YDBv1 SQL statement has no executable tokens")
+
+    if yaza_sql_v2_is_keyword(source, tokens, 0, "EXPLAIN"):
+        let plan: Text = yaza_db_sql_explain_select_v1(storage, source, parameters, tokens)?
+        return ok(YazaDbSqlStatementResultV1(yaza_db_sql_statement_kind_explain_v1(), none, none, some(plan), storage, wal))
+
+    if yaza_sql_v2_is_keyword(source, tokens, 0, "SELECT") or yaza_sql_v2_is_keyword(source, tokens, 0, "WITH"):
+        var query_result: Result[YazaSqlQueryResultV1, Text] = err("YDBv1 SQL SELECT did not execute")
+        if list_count(query_profile_ns) >= 4:
+            set query_result = yaza_db_execute_select_with_tokens_profiled_v1(storage.file, storage.header, source, parameters, tokens, query_profile_ns)
+        else:
+            set query_result = yaza_db_execute_select_with_tokens_v1(storage.file, storage.header, source, parameters, tokens)
+        if not result_is_ok(query_result): return err(result_unwrap_error(query_result))
+        let query: YazaSqlQueryResultV1 = result_unwrap(query_result)
+        return ok(YazaDbSqlStatementResultV1(yaza_db_sql_statement_kind_select_v1(), some(query), none, none, storage, wal))
+
+    if yaza_sql_v2_is_keyword(source, tokens, 0, "INSERT"):
+        let insert_allowed: Boolean = yaza_db_sql_write_allowed_during_index_build_v1(storage)?
+        if not insert_allowed:
+            return err("YDBv1 writes are fenced while a secondary index build is incomplete")
+        let committed: YazaDbWriteCommitV1 = yaza_db_execute_insert_v1(storage, wal, source, parameters)?
+        return ok(YazaDbSqlStatementResultV1(yaza_db_sql_statement_kind_insert_v1(), none, some(committed), none, committed.storage, committed.wal))
+
+    if yaza_sql_v2_is_keyword(source, tokens, 0, "DELETE"):
+        let delete_allowed: Boolean = yaza_db_sql_write_allowed_during_index_build_v1(storage)?
+        if not delete_allowed:
+            return err("YDBv1 writes are fenced while a secondary index build is incomplete")
+        var delete_result: Result[YazaDbWriteCommitV1, Text] = err("YDBv1 DELETE execution path was not selected")
+        if list_count(query_profile_ns) >= 34:
+            set delete_result = yaza_db_execute_delete_with_checkpoint_policy_profiled_v1(storage, wal, source, parameters, defer_delete_checkpoint, query_profile_ns)
+        elif defer_delete_checkpoint:
+            set delete_result = yaza_db_execute_delete_deferred_checkpoint_v1(storage, wal, source, parameters)
+        else:
+            set delete_result = yaza_db_execute_delete_v1(storage, wal, source, parameters)
+        let committed: YazaDbWriteCommitV1 = delete_result?
+        return ok(YazaDbSqlStatementResultV1(yaza_db_sql_statement_kind_delete_v1(), none, some(committed), none, committed.storage, committed.wal))
+
+    if yaza_sql_v2_is_keyword(source, tokens, 0, "UPDATE"):
+        let update_allowed: Boolean = yaza_db_sql_write_allowed_during_index_build_v1(storage)?
+        if not update_allowed:
+            return err("YDBv1 writes are fenced while a secondary index build is incomplete")
+        let committed: YazaDbWriteCommitV1 = yaza_db_execute_update_v1(storage, wal, source, parameters)?
+        return ok(YazaDbSqlStatementResultV1(yaza_db_sql_statement_kind_update_v1(), none, some(committed), none, committed.storage, committed.wal))
+
+    if yaza_sql_v2_is_keyword(source, tokens, 0, "CREATE"):
+        var is_create_index: Boolean = yaza_sql_v2_is_keyword(source, tokens, 1, "INDEX")
+        let is_create_view: Boolean = yaza_sql_v2_is_keyword(source, tokens, 1, "VIEW")
+        if not is_create_index and list_count(tokens) > 3 and yaza_sql_v2_is_keyword(source, tokens, 1, "UNIQUE"):
+            set is_create_index = yaza_sql_v2_is_keyword(source, tokens, 2, "INDEX")
+        if list_count(parameters) != 0: return err("YDBv1 CREATE statements do not accept bind parameters")
+        let loaded: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(storage.file, storage.header)?
+        if is_create_view:
+            let create_view_allowed: Boolean = yaza_db_sql_write_allowed_during_index_build_v1(storage)?
+            if not create_view_allowed: return err("YDBv1 schema changes are fenced while a secondary index build is incomplete")
+            let parsed_view: YazaSqlCreateViewAstV1 = yaza_sql_parse_create_view_v1(source)?
+            let plan_view: YazaSqlCreateViewPlanV1 = yaza_sql_bind_create_view_v1(source, parsed_view, loaded.sql_snapshot)?
+            if yaza_sql_v2_is_keyword(source, tokens, 2, "IF"):
+                var view_exists: Boolean = false
+                var view_index: Number = 0
+                while view_index < list_count(loaded.views):
+                    if list_get(loaded.views, view_index).name == plan_view.view_name:
+                        set view_exists = true
+                        break
+                    set view_index = view_index + 1
+                if view_exists:
+                    return ok(YazaDbSqlStatementResultV1(yaza_db_sql_statement_kind_create_view_v1(), none, none, none, storage, wal))
+            let committed_view: YazaDbWriteCommitV1 = yaza_db_sql_create_view_write_v1(storage, wal, plan_view)?
+            return ok(YazaDbSqlStatementResultV1(yaza_db_sql_statement_kind_create_view_v1(), none, some(committed_view), none, committed_view.storage, committed_view.wal))
+        if is_create_index:
+            let parsed_index: YazaSqlCreateIndexAstV1 = yaza_sql_parse_create_index_v1(source)?
+            let plan_index: YazaSqlCreateIndexPlanV1 = yaza_sql_bind_create_index_v1(source, parsed_index, loaded.sql_snapshot)?
+            let create_index_if_not_exists: Boolean = yaza_sql_v2_is_keyword(source, tokens, 2, "IF") or (yaza_sql_v2_is_keyword(source, tokens, 1, "UNIQUE") and yaza_sql_v2_is_keyword(source, tokens, 3, "IF"))
+            if create_index_if_not_exists:
+                if storage.header.catalog_root == 0 or storage.header.next_commit_ts < 2:
+                    return err("YDBv1 CREATE INDEX requires an initialized committed catalog")
+                let visible_ts: Number = storage.header.next_commit_ts - 1
+                let index_rows: List[YazaDbRowV1] = yaza_db_index_catalog_rows_v1(storage.file, storage.header, visible_ts)?
+                let key_columns_text: Text = number_text(plan_index.index_column_ordinal)
+                var existing_index: Number = 0
+                while existing_index < list_count(index_rows):
+                    let existing: YazaDbRowV1 = list_get(index_rows, existing_index)
+                    if list_get(existing.values, 2).text_value == plan_index.index_name:
+                        let existing_kind: Number = list_get(existing.values, 4).integer_value
+                        if existing_kind == yaza_db_catalog_index_kind_primary_v1():
+                            return err("YDBv1 CREATE INDEX name conflicts with a primary index")
+                        if list_get(existing.values, 1).integer_value != plan_index.table_id or list_get(existing.values, 5).boolean_value != plan_index.is_unique or list_get(existing.values, 6).text_value != key_columns_text:
+                            return err("YDBv1 CREATE INDEX name already exists with a different definition")
+                        if existing_kind == yaza_db_catalog_index_kind_secondary_active_v1():
+                            return ok(YazaDbSqlStatementResultV1(yaza_db_sql_statement_kind_create_index_v1(), none, none, none, storage, wal))
+                    set existing_index = existing_index + 1
+            let committed_index: YazaDbWriteCommitV1 = yaza_db_sql_create_index_v1(storage, wal, plan_index, loaded)?
+            return ok(YazaDbSqlStatementResultV1(yaza_db_sql_statement_kind_create_index_v1(), none, some(committed_index), none, committed_index.storage, committed_index.wal))
+        let parsed: YazaSqlCreateTableAstV1 = yaza_sql_parse_create_table_v1(source)?
+        if yaza_sql_v2_is_keyword(source, tokens, 2, "IF"):
+            let normalized_table_name: Text = yaza_sql_create_table_identifier_v1(source, parsed.table_name.first_token)?
+            var table_exists: Boolean = false
+            var table_index: Number = 0
+            while table_index < list_count(loaded.sql_snapshot.tables):
+                if list_get(loaded.sql_snapshot.tables, table_index).name == normalized_table_name:
+                    set table_exists = true
+                    break
+                set table_index = table_index + 1
+            if table_exists:
+                return ok(YazaDbSqlStatementResultV1(yaza_db_sql_statement_kind_create_table_v1(), none, none, none, storage, wal))
+        let create_allowed: Boolean = yaza_db_sql_write_allowed_during_index_build_v1(storage)?
+        if not create_allowed: return err("YDBv1 schema changes are fenced while a secondary index build is incomplete")
+        let bound: Result[YazaSqlCreateTablePlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_create_table_v1(source, parsed, loaded.sql_snapshot)
+        if not result_is_ok(bound): return err(result_unwrap_error(bound).message)
+        let plan: YazaSqlCreateTablePlanV1 = result_unwrap(bound)
+        let committed: YazaDbWriteCommitV1 = yaza_db_sql_create_table_write_v1(storage, wal, plan)?
+        return ok(YazaDbSqlStatementResultV1(yaza_db_sql_statement_kind_create_table_v1(), none, some(committed), none, committed.storage, committed.wal))
+
+    if yaza_sql_v2_is_keyword(source, tokens, 0, "DROP"):
+        let drop_allowed: Boolean = yaza_db_sql_write_allowed_during_index_build_v1(storage)?
+        if not drop_allowed:
+            return err("YDBv1 schema changes are fenced while a secondary index build is incomplete")
+        if list_count(parameters) != 0: return err("YDBv1 DROP statements do not accept bind parameters")
+        if yaza_sql_v2_is_keyword(source, tokens, 1, "VIEW"):
+            let parsed_view: YazaSqlDropViewAstV1 = yaza_sql_parse_drop_view_v1(source)?
+            let loaded: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(storage.file, storage.header)?
+            var view_index: Number = 0
+            while view_index < list_count(loaded.views) and list_get(loaded.views, view_index).name != parsed_view.view_name:
+                set view_index = view_index + 1
+            if view_index >= list_count(loaded.views):
+                if parsed_view.if_exists:
+                    return ok(YazaDbSqlStatementResultV1(yaza_db_sql_statement_kind_drop_view_v1(), none, none, none, storage, wal))
+                return err("YDBv1 DROP VIEW target does not exist")
+            let committed_view: YazaDbWriteCommitV1 = yaza_db_sql_drop_view_v1(storage, wal, parsed_view.view_name)?
+            return ok(YazaDbSqlStatementResultV1(yaza_db_sql_statement_kind_drop_view_v1(), none, some(committed_view), none, committed_view.storage, committed_view.wal))
+        if yaza_sql_v2_is_keyword(source, tokens, 1, "INDEX"):
+            let index_name: Text = yaza_sql_parse_drop_index_v1(source)?
+            if yaza_sql_v2_is_keyword(source, tokens, 2, "IF"):
+                if storage.header.catalog_root == 0 or storage.header.next_commit_ts < 2:
+                    return err("YDBv1 DROP INDEX requires an initialized committed catalog")
+                let visible_ts: Number = storage.header.next_commit_ts - 1
+                let index_rows: List[YazaDbRowV1] = yaza_db_index_catalog_rows_v1(storage.file, storage.header, visible_ts)?
+                var index_exists: Boolean = false
+                var row_index: Number = 0
+                while row_index < list_count(index_rows):
+                    if list_get(list_get(index_rows, row_index).values, 2).text_value == index_name:
+                        set index_exists = true
+                        break
+                    set row_index = row_index + 1
+                if not index_exists:
+                    return ok(YazaDbSqlStatementResultV1(yaza_db_sql_statement_kind_drop_index_v1(), none, none, none, storage, wal))
+            let committed_index: YazaDbWriteCommitV1 = yaza_db_sql_drop_index_v1(storage, wal, index_name)?
+            return ok(YazaDbSqlStatementResultV1(yaza_db_sql_statement_kind_drop_index_v1(), none, some(committed_index), none, committed_index.storage, committed_index.wal))
+        if not yaza_sql_v2_is_keyword(source, tokens, 1, "TABLE"):
+            return err("YDBv1 DROP supports only TABLE, INDEX, and VIEW")
+        let table_name: Text = yaza_sql_parse_drop_table_v1(source)?
+        if yaza_sql_v2_is_keyword(source, tokens, 2, "IF"):
+            let loaded: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(storage.file, storage.header)?
+            var table_exists: Boolean = false
+            var table_index: Number = 0
+            while table_index < list_count(loaded.sql_snapshot.tables):
+                if list_get(loaded.sql_snapshot.tables, table_index).name == table_name:
+                    set table_exists = true
+                    break
+                set table_index = table_index + 1
+            if not table_exists:
+                return ok(YazaDbSqlStatementResultV1(yaza_db_sql_statement_kind_drop_table_v1(), none, none, none, storage, wal))
+        let committed: YazaDbWriteCommitV1 = yaza_db_sql_drop_table_v1(storage, wal, table_name)?
+        return ok(YazaDbSqlStatementResultV1(yaza_db_sql_statement_kind_drop_table_v1(), none, some(committed), none, committed.storage, committed.wal))
+
+    if yaza_sql_v2_is_keyword(source, tokens, 0, "ALTER"):
+        let alter_allowed: Boolean = yaza_db_sql_write_allowed_during_index_build_v1(storage)?
+        if not alter_allowed:
+            return err("YDBv1 schema changes are fenced while a secondary index build is incomplete")
+        if list_count(parameters) != 0: return err("YDBv1 ALTER TABLE does not accept bind parameters")
+        let loaded: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(storage.file, storage.header)?
+        let parsed: YazaSqlAlterTableAstV1 = yaza_sql_parse_alter_table_v1(source)?
+        let plan: YazaSqlAlterTablePlanV1 = yaza_sql_bind_alter_table_v1(source, parsed, loaded.sql_snapshot, loaded.table_schema_versions)?
+        let committed: YazaDbWriteCommitV1 = yaza_db_sql_alter_table_write_v1(storage, wal, plan)?
+        return ok(YazaDbSqlStatementResultV1(yaza_db_sql_statement_kind_alter_table_v1(), none, some(committed), none, committed.storage, committed.wal))
+
+    return err("YDBv1 SQL statement profile supports SELECT, EXPLAIN SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, CREATE INDEX, CREATE VIEW, DROP TABLE, DROP INDEX, DROP VIEW, ALTER TABLE ADD COLUMN, and ALTER TABLE ADD CHECK")
+
+fn yaza_db_execute_statement_profiled_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], query_profile_ns: List[Number]) -> Result[YazaDbSqlStatementResultV1, Text]:
+    return yaza_db_execute_statement_with_delete_checkpoint_policy_profiled_v1(storage, wal, source, parameters, query_profile_ns, false)
+
+fn yaza_db_execute_session_statement_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1]) -> Result[YazaDbSqlStatementResultV1, Text]:
+    return yaza_db_execute_statement_with_delete_checkpoint_policy_profiled_v1(storage, wal, source, parameters, List[Number](), true)
+
+fn yaza_db_execute_session_statement_profiled_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], query_profile_ns: List[Number]) -> Result[YazaDbSqlStatementResultV1, Text]:
+    return yaza_db_execute_statement_with_delete_checkpoint_policy_profiled_v1(storage, wal, source, parameters, query_profile_ns, true)
+
+fn yaza_db_execute_statement_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1]) -> Result[YazaDbSqlStatementResultV1, Text]:
+    return yaza_db_execute_statement_profiled_v1(storage, wal, source, parameters, List[Number]())

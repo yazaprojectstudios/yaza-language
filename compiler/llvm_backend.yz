@@ -1,0 +1,77 @@
+# Textual LLVM IR backend for sequential print and literal-bound range YIR.
+use "yir"
+
+fn llvm_hex_digit(value: Number) -> Text:
+    if value < 10:
+        return number_text(value)
+    if value == 10: return "A"
+    if value == 11: return "B"
+    if value == 12: return "C"
+    if value == 13: return "D"
+    if value == 14: return "E"
+    return "F"
+
+fn llvm_escape_text(value: Text) -> Text:
+    let bytes: Bytes = bytes_from_text(value)
+    let byte_count: Number = bytes_length(bytes)
+    var output: Text = ""
+    var index: Number = 0
+    while index < byte_count:
+        let byte: Number = bytes_get(bytes, index)
+        let high: Number = byte / 16
+        let low: Number = byte % 16
+        set output = output + "\\" + llvm_hex_digit(high) + llvm_hex_digit(low)
+        set index = index + 1
+    set output = output + "\\00"
+    return output
+
+fn llvm_global_line(instruction: YirPrint, index: Number) -> Text:
+    let byte_count: Number = bytes_length(bytes_from_text(instruction.text)) + 1
+    return "@.yaza.message." + number_text(index) + " = private unnamed_addr constant [" + number_text(byte_count) + " x i8] c\"" + llvm_escape_text(instruction.text) + "\", align 1\n"
+
+fn lower_yir_to_llvm(program: YirProgram) -> Text:
+    let verified: Number = verify_yir(program)
+    var output: Text = "; Generated from YAZA HIR and YIR.\n; Host target selection is delegated to Clang.\n"
+    var global_index: Number = 0
+    var index: Number = 0
+    while index < list_count(program.statements):
+        let statement: YirStatement = list_get(program.statements, index)
+        var print_index: Number = 0
+        while print_index < list_count(statement.prints):
+            let instruction: YirPrint = list_get(statement.prints, print_index)
+            set output = output + llvm_global_line(instruction, global_index)
+            set global_index = global_index + 1
+            set print_index = print_index + 1
+        set index = index + 1
+
+    set output = output + "\ndeclare i32 @puts(ptr)\n\ndefine void @yaza_std_io_println(ptr %text) {\nentry:\n  %ignored = call i32 @puts(ptr %text)\n  ret void\n}\n\ndefine i32 @main() {\nentry:\n"
+    let current_entry: Text = "entry"
+    var current_block: Text = current_entry
+    set global_index = 0
+    var loop_index: Number = 0
+    set index = 0
+    while index < list_count(program.statements):
+        let statement: YirStatement = list_get(program.statements, index)
+        if statement.kind == "say":
+            set output = output + "  call void @yaza_std_io_println(ptr @.yaza.message." + number_text(global_index) + ")\n"
+            set global_index = global_index + 1
+        else:
+            set output = output + "  br label %loop" + number_text(loop_index) + ".header\n\n"
+            set output = output + "loop" + number_text(loop_index) + ".header:\n"
+            set output = output + "  %loop" + number_text(loop_index) + ".index = phi i64 [" + number_text(statement.range_start) + ", %" + current_block + "], [%loop" + number_text(loop_index) + ".next, %loop" + number_text(loop_index) + ".body]\n"
+            set output = output + "  %loop" + number_text(loop_index) + ".condition = icmp slt i64 %loop" + number_text(loop_index) + ".index, " + number_text(statement.range_end) + "\n"
+            set output = output + "  br i1 %loop" + number_text(loop_index) + ".condition, label %loop" + number_text(loop_index) + ".body, label %loop" + number_text(loop_index) + ".exit\n\n"
+            set output = output + "loop" + number_text(loop_index) + ".body:\n"
+            var print_index: Number = 0
+            while print_index < list_count(statement.prints):
+                set output = output + "  call void @yaza_std_io_println(ptr @.yaza.message." + number_text(global_index) + ")\n"
+                set global_index = global_index + 1
+                set print_index = print_index + 1
+            set output = output + "  %loop" + number_text(loop_index) + ".next = add i64 %loop" + number_text(loop_index) + ".index, 1\n"
+            set output = output + "  br label %loop" + number_text(loop_index) + ".header\n\n"
+            set output = output + "loop" + number_text(loop_index) + ".exit:\n"
+            set current_block = "loop" + number_text(loop_index) + ".exit"
+            set loop_index = loop_index + 1
+        set index = index + 1
+    set output = output + "  ret i32 0\n}\n"
+    return output

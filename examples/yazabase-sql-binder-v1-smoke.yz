@@ -1,0 +1,355 @@
+use "../yazabase/sql_binder_v1"
+
+fn yaza_base_sql_binder_v1_test_catalog() -> YazaSqlCatalogSnapshotV1:
+    let columns: List[YazaSqlColumnSchemaV1] = List[YazaSqlColumnSchemaV1]()
+    list_push(columns, YazaSqlColumnSchemaV1("id", 4, false, 0, 0, 0, ""))
+    list_push(columns, YazaSqlColumnSchemaV1("title", 9, false, 1, 0, 0, ""))
+    list_push(columns, YazaSqlColumnSchemaV1("active", 1, false, 2, 0, 0, ""))
+    let profile_columns: List[YazaSqlColumnSchemaV1] = List[YazaSqlColumnSchemaV1]()
+    list_push(profile_columns, YazaSqlColumnSchemaV1("id", 4, false, 0, 0, 0, ""))
+    list_push(profile_columns, YazaSqlColumnSchemaV1("item_id", 4, false, 1, 0, 0, ""))
+    list_push(profile_columns, YazaSqlColumnSchemaV1("title", 9, false, 2, 0, 0, ""))
+    let audit_columns: List[YazaSqlColumnSchemaV1] = List[YazaSqlColumnSchemaV1]()
+    list_push(audit_columns, YazaSqlColumnSchemaV1("profile_id", 4, false, 0, 0, 0, ""))
+    list_push(audit_columns, YazaSqlColumnSchemaV1("event", 9, false, 1, 0, 0, ""))
+    let tables: List[YazaSqlTableSchemaV1] = List[YazaSqlTableSchemaV1]()
+    list_push(tables, YazaSqlTableSchemaV1(5, "items", columns))
+    list_push(tables, YazaSqlTableSchemaV1(6, "profiles", profile_columns))
+    list_push(tables, YazaSqlTableSchemaV1(7, "audit", audit_columns))
+    return YazaSqlCatalogSnapshotV1(7, tables, List[YazaSqlColumnDefaultV1]())
+
+fn yaza_base_sql_binder_v1_positive(catalog: YazaSqlCatalogSnapshotV1) -> Boolean:
+    let source: Text = "SELECT id AS item_id, title FROM items WHERE id = $1 ORDER BY title LIMIT 10"
+    let parsed_result: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(source)
+    if not result_is_ok(parsed_result): return false
+    let parsed: YazaSqlSelectAstV3 = result_unwrap(parsed_result)
+    let bound_result: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(source, parsed, catalog)
+    if not result_is_ok(bound_result): return false
+    let plan: YazaSqlBoundPlanV1 = result_unwrap(bound_result)
+    if plan.version != 1 or plan.catalog_version != 7 or plan.table_id != 5: return false
+    if list_count(plan.projections) != 2 or list_count(plan.order_by) != 1: return false
+    if list_get(plan.projections, 0).output_name != "item_id" or list_get(plan.projections, 1).type_id != 9: return false
+    if list_count(plan.parameters) != 1 or list_get(plan.parameters, 0).style != 2 or list_get(plan.parameters, 0).type_id != 4: return false
+    if list_count(plan.operators) != 5 or plan.root_operator != 4: return false
+    if list_get(plan.operators, 0).kind != 1 or list_get(plan.operators, 1).kind != 2 or list_get(plan.operators, 2).kind != 3: return false
+    if list_get(plan.operators, 3).kind != 5 or list_get(plan.operators, 4).kind != 6: return false
+    return true
+
+fn yaza_base_sql_binder_v1_wildcard(catalog: YazaSqlCatalogSnapshotV1) -> Boolean:
+    let source: Text = "SELECT * FROM items"
+    let parsed_result: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(source)
+    if not result_is_ok(parsed_result): return false
+    let bound_result: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(source, result_unwrap(parsed_result), catalog)
+    if not result_is_ok(bound_result): return false
+    let plan: YazaSqlBoundPlanV1 = result_unwrap(bound_result)
+    return list_count(plan.projections) == 3 and list_get(plan.projections, 2).output_name == "active" and list_count(plan.operators) == 2
+
+fn yaza_base_sql_binder_v1_qualified_names(catalog: YazaSqlCatalogSnapshotV1) -> Boolean:
+    let source: Text = "SELECT i.id AS item_id FROM items AS i WHERE i.id >= 1 ORDER BY i.id"
+    let parsed: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(source)
+    if not result_is_ok(parsed): return false
+    let query: YazaSqlSelectAstV3 = result_unwrap(parsed)
+    if not query.has_table_alias or text_slice(source, query.table_alias.start_byte, query.table_alias.end_byte - query.table_alias.start_byte) != "i": return false
+    let bound: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(source, query, catalog)
+    if not result_is_ok(bound): return false
+    let plan: YazaSqlBoundPlanV1 = result_unwrap(bound)
+    if list_count(plan.projections) != 1 or list_get(plan.projections, 0).column_ordinal != 0 or list_get(plan.projections, 0).output_name != "item_id": return false
+    if list_count(plan.expressions) != 1 or list_get(plan.expressions, 0).column_ordinal != 0: return false
+    if list_count(plan.order_by) != 1 or list_get(plan.order_by, 0).projection_ordinal != 0: return false
+
+    let wildcard_source: Text = "SELECT i.* FROM items AS i"
+    let wildcard_parse: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(wildcard_source)
+    if not result_is_ok(wildcard_parse): return false
+    let wildcard_bound: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(wildcard_source, result_unwrap(wildcard_parse), catalog)
+    if not result_is_ok(wildcard_bound) or list_count(result_unwrap(wildcard_bound).projections) != 3: return false
+    let spaced_wildcard_source: Text = "SELECT i . * FROM items AS i"
+    let spaced_wildcard_parse: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(spaced_wildcard_source)
+    if not result_is_ok(spaced_wildcard_parse): return false
+    let spaced_wildcard_bound: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(spaced_wildcard_source, result_unwrap(spaced_wildcard_parse), catalog)
+    if not result_is_ok(spaced_wildcard_bound) or list_count(result_unwrap(spaced_wildcard_bound).projections) != 3: return false
+
+    let base_qualified_source: Text = "SELECT items.title FROM items"
+    let base_qualified_parse: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(base_qualified_source)
+    if not result_is_ok(base_qualified_parse): return false
+    let base_qualified_bound: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(base_qualified_source, result_unwrap(base_qualified_parse), catalog)
+    if not result_is_ok(base_qualified_bound) or list_get(result_unwrap(base_qualified_bound).projections, 0).column_ordinal != 1: return false
+
+    let wrong_qualifier_source: Text = "SELECT other.id FROM items AS i"
+    let wrong_qualifier_parse: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(wrong_qualifier_source)
+    if not result_is_ok(wrong_qualifier_parse): return false
+    if result_is_ok(yaza_sql_bind_select_structured_v1(wrong_qualifier_source, result_unwrap(wrong_qualifier_parse), catalog)): return false
+
+    let hidden_table_name_source: Text = "SELECT items.id FROM items AS i"
+    let hidden_table_name_parse: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(hidden_table_name_source)
+    if not result_is_ok(hidden_table_name_parse): return false
+    return not result_is_ok(yaza_sql_bind_select_structured_v1(hidden_table_name_source, result_unwrap(hidden_table_name_parse), catalog))
+
+fn yaza_base_sql_binder_v1_join_plan(catalog: YazaSqlCatalogSnapshotV1) -> Boolean:
+    let source: Text = "SELECT i.id, p.title FROM items AS i INNER JOIN profiles AS p ON i.id = p.item_id WHERE p.title = 'profile' ORDER BY i.id"
+    let parsed: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(source)
+    if not result_is_ok(parsed): return false
+    let bound: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(source, result_unwrap(parsed), catalog)
+    if not result_is_ok(bound): return false
+    let plan: YazaSqlBoundPlanV1 = result_unwrap(bound)
+    if plan.table_id != 5 or plan.right_table_id != 6 or plan.left_column_count != 3: return false
+    if plan.join_left_column_ordinal != 0 or plan.join_right_column_ordinal != 1: return false
+    if list_count(plan.projections) != 2 or list_get(plan.projections, 0).column_ordinal != 0 or list_get(plan.projections, 1).column_ordinal != 5: return false
+    if list_count(plan.expressions) != 1 or list_get(plan.expressions, 0).column_ordinal != 5: return false
+    if list_count(plan.operators) != 6 or list_get(plan.operators, 2).kind != 9: return false
+    let join_operator: YazaSqlLogicalOperatorV1 = list_get(plan.operators, 2)
+    if join_operator.input_index != 0 or join_operator.expression_root != 1 or join_operator.table_id != 6 or join_operator.item_start != 0 or join_operator.item_count != 1: return false
+    if list_get(plan.operators, 3).kind != 2 or list_get(plan.operators, 3).input_index != 2: return false
+    if list_get(plan.operators, 4).kind != 3 or list_get(plan.operators, 5).kind != 5: return false
+
+    let ambiguous: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3("SELECT id FROM items AS i JOIN profiles AS p ON i.id = p.item_id")
+    if not result_is_ok(ambiguous): return false
+    if result_is_ok(yaza_sql_bind_select_structured_v1("SELECT id FROM items AS i JOIN profiles AS p ON i.id = p.item_id", result_unwrap(ambiguous), catalog)): return false
+    let wrong_key: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3("SELECT i.id FROM items AS i JOIN profiles AS p ON i.id = p.title")
+    if not result_is_ok(wrong_key): return false
+    if result_is_ok(yaza_sql_bind_select_structured_v1("SELECT i.id FROM items AS i JOIN profiles AS p ON i.id = p.title", result_unwrap(wrong_key), catalog)): return false
+    let wrong_qualifier: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3("SELECT x.id FROM items AS i JOIN profiles AS p ON i.id = p.item_id")
+    if not result_is_ok(wrong_qualifier): return false
+    if result_is_ok(yaza_sql_bind_select_structured_v1("SELECT x.id FROM items AS i JOIN profiles AS p ON i.id = p.item_id", result_unwrap(wrong_qualifier), catalog)): return false
+
+    let reversed_source: Text = "SELECT p.title FROM items AS i JOIN profiles AS p ON p.item_id = i.id"
+    let reversed_parse: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(reversed_source)
+    if not result_is_ok(reversed_parse): return false
+    let reversed_bound: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(reversed_source, result_unwrap(reversed_parse), catalog)
+    if not result_is_ok(reversed_bound): return false
+    let reversed_plan: YazaSqlBoundPlanV1 = result_unwrap(reversed_bound)
+    if reversed_plan.join_left_column_ordinal != 0 or reversed_plan.join_right_column_ordinal != 1 or list_get(reversed_plan.projections, 0).column_ordinal != 5: return false
+
+    let wildcard_source: Text = "SELECT p.* FROM items AS i JOIN profiles AS p ON i.id = p.item_id"
+    let wildcard_parse: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(wildcard_source)
+    if not result_is_ok(wildcard_parse): return false
+    let wildcard_bound: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(wildcard_source, result_unwrap(wildcard_parse), catalog)
+    if not result_is_ok(wildcard_bound) or list_count(result_unwrap(wildcard_bound).projections) != 3: return false
+    if list_get(result_unwrap(wildcard_bound).projections, 0).column_ordinal != 3 or list_get(result_unwrap(wildcard_bound).projections, 2).column_ordinal != 5: return false
+    let all_columns_source: Text = "SELECT * FROM items AS i JOIN profiles AS p ON i.id = p.item_id"
+    let all_columns_parse: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(all_columns_source)
+    if not result_is_ok(all_columns_parse): return false
+    let all_columns_bound: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(all_columns_source, result_unwrap(all_columns_parse), catalog)
+    if not result_is_ok(all_columns_bound) or list_count(result_unwrap(all_columns_bound).projections) != 6: return false
+    if list_get(result_unwrap(all_columns_bound).projections, 3).column_ordinal != 3 or list_get(result_unwrap(all_columns_bound).projections, 5).column_ordinal != 5: return false
+    let left_wildcard_source: Text = "SELECT i.* FROM items AS i JOIN profiles AS p ON i.id = p.item_id"
+    let left_wildcard_parse: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(left_wildcard_source)
+    if not result_is_ok(left_wildcard_parse): return false
+    let left_wildcard_bound: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(left_wildcard_source, result_unwrap(left_wildcard_parse), catalog)
+    return result_is_ok(left_wildcard_bound) and list_count(result_unwrap(left_wildcard_bound).projections) == 3 and list_get(result_unwrap(left_wildcard_bound).projections, 2).column_ordinal == 2
+
+fn yaza_base_sql_binder_v1_repeated_parameter(catalog: YazaSqlCatalogSnapshotV1) -> Boolean:
+    let source: Text = "SELECT id FROM items WHERE id = :item OR id = :item"
+    let parsed_result: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(source)
+    if not result_is_ok(parsed_result): return false
+    let bound_result: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(source, result_unwrap(parsed_result), catalog)
+    if not result_is_ok(bound_result): return false
+    let plan: YazaSqlBoundPlanV1 = result_unwrap(bound_result)
+    return list_count(plan.parameters) == 1 and list_get(plan.parameters, 0).occurrence_count == 2 and list_get(plan.parameters, 0).key == "item"
+
+fn yaza_base_sql_binder_v1_group_by(catalog: YazaSqlCatalogSnapshotV1) -> Boolean:
+    let source: Text = "SELECT active, COUNT(*) AS total FROM items GROUP BY active ORDER BY active"
+    let parsed: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(source)
+    if not result_is_ok(parsed): return false
+    let bound: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(source, result_unwrap(parsed), catalog)
+    if not result_is_ok(bound): return false
+    let plan: YazaSqlBoundPlanV1 = result_unwrap(bound)
+    if list_count(plan.group_by_columns) != 1 or list_get(plan.group_by_columns, 0) != 2: return false
+    if list_count(plan.operators) != 3 or list_get(plan.operators, 1).kind != 7 or list_get(plan.operators, 1).item_start != 1: return false
+    if list_get(plan.operators, 2).kind != 5 or list_count(plan.order_by) != 1: return false
+
+    let duplicate_source: Text = "SELECT active, COUNT(*) FROM items GROUP BY active, active"
+    let duplicate_parse: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(duplicate_source)
+    if not result_is_ok(duplicate_parse): return false
+    let duplicate_bound: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(duplicate_source, result_unwrap(duplicate_parse), catalog)
+    if not result_is_ok(duplicate_bound) or list_count(result_unwrap(duplicate_bound).group_by_columns) != 1: return false
+
+    let invalid_source: Text = "SELECT id, COUNT(*) FROM items GROUP BY active"
+    let invalid_parse: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(invalid_source)
+    if not result_is_ok(invalid_parse): return false
+    return not result_is_ok(yaza_sql_bind_select_structured_v1(invalid_source, result_unwrap(invalid_parse), catalog))
+
+fn yaza_base_sql_binder_v1_having(catalog: YazaSqlCatalogSnapshotV1) -> Boolean:
+    let source: Text = "SELECT active, COUNT(*) AS total FROM items WHERE id > $1 GROUP BY active HAVING total >= $2 ORDER BY active"
+    let parsed: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(source)
+    if not result_is_ok(parsed): return false
+    let bound: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(source, result_unwrap(parsed), catalog)
+    if not result_is_ok(bound): return false
+    let plan: YazaSqlBoundPlanV1 = result_unwrap(bound)
+    if plan.having_start_index != 1 or plan.having_root != 1 or list_count(plan.expressions) != 2: return false
+    if list_count(plan.parameters) != 2 or list_get(plan.parameters, 0).type_id != 4 or list_get(plan.parameters, 1).type_id != 4: return false
+    if list_count(plan.operators) != 5 or plan.root_operator != 4: return false
+    if list_get(plan.operators, 2).kind != 7 or list_get(plan.operators, 3).kind != 8 or list_get(plan.operators, 3).expression_root != plan.having_root: return false
+    if list_get(plan.expressions, plan.having_root).column_ordinal != 1: return false
+
+    let direct_aggregate_source: Text = "SELECT SUM(id) AS total FROM items HAVING SUM(id) >= :minimum"
+    let direct_aggregate_parse: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(direct_aggregate_source)
+    if not result_is_ok(direct_aggregate_parse): return false
+    let direct_aggregate_bound: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(direct_aggregate_source, result_unwrap(direct_aggregate_parse), catalog)
+    if not result_is_ok(direct_aggregate_bound): return false
+    let direct_aggregate_plan: YazaSqlBoundPlanV1 = result_unwrap(direct_aggregate_bound)
+    let direct_aggregate_node: YazaSqlBoundExpressionNodeV1 = list_get(direct_aggregate_plan.expressions, direct_aggregate_plan.having_root)
+    if direct_aggregate_node.column_ordinal != 0 or direct_aggregate_node.type_id != 4 or list_get(direct_aggregate_plan.parameters, 0).type_id != 4: return false
+
+    let direct_count_source: Text = "SELECT COUNT(*) AS n FROM items HAVING COUNT(*) > 1"
+    let direct_count_parse: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(direct_count_source)
+    if not result_is_ok(direct_count_parse): return false
+    let direct_count_bound: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(direct_count_source, result_unwrap(direct_count_parse), catalog)
+    if not result_is_ok(direct_count_bound): return false
+    if list_get(result_unwrap(direct_count_bound).expressions, result_unwrap(direct_count_bound).having_root).column_ordinal != 0: return false
+
+    let unprojected_aggregate_source: Text = "SELECT SUM(id) AS total FROM items HAVING COUNT(*) > 1"
+    let unprojected_aggregate_parse: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(unprojected_aggregate_source)
+    if not result_is_ok(unprojected_aggregate_parse): return false
+    let unprojected_aggregate_bound: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(unprojected_aggregate_source, result_unwrap(unprojected_aggregate_parse), catalog)
+    if result_is_ok(unprojected_aggregate_bound) or result_unwrap_error(unprojected_aggregate_bound).code != 3001: return false
+
+    let aggregate_where_source: Text = "SELECT id FROM items WHERE COUNT(*) > 1"
+    let aggregate_where_parse: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(aggregate_where_source)
+    if not result_is_ok(aggregate_where_parse): return false
+    let aggregate_where_bound: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(aggregate_where_source, result_unwrap(aggregate_where_parse), catalog)
+    if result_is_ok(aggregate_where_bound) or result_unwrap_error(aggregate_where_bound).code != 3001: return false
+
+    let unresolved_source: Text = "SELECT active, COUNT(*) AS total FROM items GROUP BY active HAVING missing > 1"
+    let unresolved_parse: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(unresolved_source)
+    if not result_is_ok(unresolved_parse): return false
+    let unresolved_bound: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(unresolved_source, result_unwrap(unresolved_parse), catalog)
+    if result_is_ok(unresolved_bound) or result_unwrap_error(unresolved_bound).code != 3002: return false
+
+    let non_aggregate_source: Text = "SELECT active FROM items HAVING active = TRUE"
+    let non_aggregate_parse: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(non_aggregate_source)
+    if not result_is_ok(non_aggregate_parse): return false
+    let non_aggregate_bound: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(non_aggregate_source, result_unwrap(non_aggregate_parse), catalog)
+    if result_is_ok(non_aggregate_bound) or result_unwrap_error(non_aggregate_bound).code != 3001: return false
+
+    let mismatch_source: Text = "SELECT COUNT(*) AS total FROM items HAVING total = 'one'"
+    let mismatch_parse: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(mismatch_source)
+    if not result_is_ok(mismatch_parse): return false
+    let mismatch_bound: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(mismatch_source, result_unwrap(mismatch_parse), catalog)
+    return not result_is_ok(mismatch_bound) and result_unwrap_error(mismatch_bound).code == 3003
+
+fn yaza_base_sql_binder_v1_diagnostics(catalog: YazaSqlCatalogSnapshotV1) -> Boolean:
+    let missing_source: Text = "SELECT absent FROM items"
+    let missing_parse: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(missing_source)
+    if not result_is_ok(missing_parse): return false
+    let missing: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(missing_source, result_unwrap(missing_parse), catalog)
+    if result_is_ok(missing): return false
+    let missing_diagnostic: YazaSqlDiagnosticV1 = result_unwrap_error(missing)
+    if missing_diagnostic.phase != 3 or missing_diagnostic.code != 3002 or missing_diagnostic.start_byte != 7 or missing_diagnostic.end_byte != 8: return false
+
+    let type_source: Text = "SELECT id FROM items WHERE id = 'wrong'"
+    let type_parse: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(type_source)
+    if not result_is_ok(type_parse): return false
+    let type_error: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(type_source, result_unwrap(type_parse), catalog)
+    if result_is_ok(type_error): return false
+    let type_diagnostic: YazaSqlDiagnosticV1 = result_unwrap_error(type_error)
+    if type_diagnostic.phase != 3 or type_diagnostic.code != 3003 or type_diagnostic.start_byte != 32: return false
+
+    let mixed_source: Text = "SELECT id FROM items WHERE id = ? AND active = :enabled"
+    let mixed_parse: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(mixed_source)
+    if not result_is_ok(mixed_parse): return false
+    let mixed_error: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(mixed_source, result_unwrap(mixed_parse), catalog)
+    if result_is_ok(mixed_error): return false
+    let mixed_diagnostic: YazaSqlDiagnosticV1 = result_unwrap_error(mixed_error)
+    return mixed_diagnostic.code == 3003 and mixed_diagnostic.phase == 3
+
+fn yaza_base_sql_binder_v1_accepts_null_comparison(catalog: YazaSqlCatalogSnapshotV1) -> Boolean:
+    let source: Text = "SELECT id FROM items WHERE title = NULL"
+    let parsed: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(source)
+    if not result_is_ok(parsed): return false
+    let bound: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(source, result_unwrap(parsed), catalog)
+    if not result_is_ok(bound): return false
+    let plan: YazaSqlBoundPlanV1 = result_unwrap(bound)
+    if list_count(plan.expressions) != 1: return false
+    let comparison: YazaSqlBoundExpressionNodeV1 = list_get(plan.expressions, 0)
+    return comparison.kind == 1 and comparison.value_kind == 1 and comparison.type_id == 9
+
+fn yaza_base_sql_binder_v1_correlated_exists(catalog: YazaSqlCatalogSnapshotV1) -> Boolean:
+    let source: Text = "SELECT i.id FROM items AS i WHERE EXISTS (SELECT p.item_id FROM profiles AS p WHERE p.item_id = i.id)"
+    let parsed: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(source)
+    if not result_is_ok(parsed): return false
+    let bound: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(source, result_unwrap(parsed), catalog)
+    if not result_is_ok(bound): return false
+    let plan: YazaSqlBoundPlanV1 = result_unwrap(bound)
+    if list_count(plan.subqueries) != 1 or list_get(plan.subqueries, 0) != "SELECT p.item_id FROM profiles AS p ORDER BY p.item_id": return false
+    if list_count(plan.expressions) != 1: return false
+    let exists: YazaSqlBoundExpressionNodeV1 = list_get(plan.expressions, 0)
+    if exists.kind != 7 or exists.operator != 1 or exists.value_kind != 1 or exists.column_ordinal != 0 or exists.parameter_ordinal != 0 or exists.type_id != 4: return false
+
+    let reversed_source: Text = "SELECT i.id FROM items AS i WHERE EXISTS (SELECT p.item_id FROM profiles AS p WHERE i.id = p.item_id)"
+    let reversed_parse: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(reversed_source)
+    if not result_is_ok(reversed_parse): return false
+    let reversed_bound: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(reversed_source, result_unwrap(reversed_parse), catalog)
+    if not result_is_ok(reversed_bound) or list_get(result_unwrap(reversed_bound).subqueries, 0) != "SELECT p.item_id FROM profiles AS p ORDER BY p.item_id": return false
+
+    let local_source: Text = "SELECT i.id FROM items AS i WHERE EXISTS (SELECT p.item_id FROM profiles AS p WHERE p.item_id = i.id AND p.title = 'known')"
+    let local_parse: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(local_source)
+    if not result_is_ok(local_parse): return false
+    let local_bound: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(local_source, result_unwrap(local_parse), catalog)
+    if not result_is_ok(local_bound): return false
+    if list_get(result_unwrap(local_bound).subqueries, 0) != "SELECT p.item_id FROM profiles AS p WHERE p.title = 'known' ORDER BY p.item_id": return false
+
+    let type_source: Text = "SELECT i.id FROM items AS i WHERE EXISTS (SELECT p.item_id FROM profiles AS p WHERE p.item_id = i.title)"
+    let type_parse: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(type_source)
+    if not result_is_ok(type_parse): return false
+    if result_is_ok(yaza_sql_bind_select_structured_v1(type_source, result_unwrap(type_parse), catalog)): return false
+
+    let extra_predicate_source: Text = "SELECT i.id FROM items AS i WHERE EXISTS (SELECT p.item_id FROM profiles AS p WHERE p.item_id = i.id AND p.id > 1 AND p.title = 'known')"
+    let extra_predicate_parse: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(extra_predicate_source)
+    if not result_is_ok(extra_predicate_parse): return false
+    if result_is_ok(yaza_sql_bind_select_structured_v1(extra_predicate_source, result_unwrap(extra_predicate_parse), catalog)): return false
+    let or_source: Text = "SELECT i.id FROM items AS i WHERE EXISTS (SELECT p.item_id FROM profiles AS p WHERE p.item_id = i.id OR p.id > 1)"
+    let or_parse: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(or_source)
+    if not result_is_ok(or_parse): return false
+    return not result_is_ok(yaza_sql_bind_select_structured_v1(or_source, result_unwrap(or_parse), catalog))
+
+fn yaza_base_sql_binder_v1_binds_join_chain(catalog: YazaSqlCatalogSnapshotV1) -> Boolean:
+    let source: Text = "SELECT i.id FROM items AS i INNER JOIN profiles AS p ON i.id = p.item_id INNER JOIN audit AS a ON p.id = a.profile_id"
+    let parsed: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(source)
+    if not result_is_ok(parsed) or list_count(result_unwrap(parsed).additional_joins) != 1: return false
+    let bound: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(source, result_unwrap(parsed), catalog)
+    if not result_is_ok(bound): return false
+    let plan: YazaSqlBoundPlanV1 = result_unwrap(bound)
+    if plan.table_id != 5 or plan.right_table_id != 6 or list_count(plan.join_stages) != 1: return false
+    let stage: YazaSqlBoundJoinStageV1 = list_get(plan.join_stages, 0)
+    if stage.table_id != 7 or stage.column_count != 2 or stage.join_kind != yaza_sql_operator_inner_join_v1(): return false
+    if stage.left_key_ordinal != 3 or stage.right_key_ordinal != 0 or stage.comparison_operator != 1: return false
+    if list_get(plan.projections, 0).column_ordinal != 0 or list_count(plan.operators) != 6 or plan.root_operator != 5: return false
+    if list_get(plan.operators, 3).kind != 1 or list_get(plan.operators, 3).table_id != 7: return false
+    if list_get(plan.operators, 4).kind != yaza_sql_operator_inner_join_v1() or list_get(plan.operators, 4).input_index != 2: return false
+
+    let qualified_source: Text = "SELECT a.event AS event FROM items AS i JOIN profiles AS p ON i.id = p.item_id JOIN audit AS a ON p.id = a.profile_id"
+    let qualified_parse: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(qualified_source)
+    if not result_is_ok(qualified_parse): return false
+    let qualified_bound: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(qualified_source, result_unwrap(qualified_parse), catalog)
+    if not result_is_ok(qualified_bound) or list_get(result_unwrap(qualified_bound).projections, 0).column_ordinal != 7: return false
+
+    let wildcard_source: Text = "SELECT a.* FROM items AS i JOIN profiles AS p ON i.id = p.item_id JOIN audit AS a ON p.id = a.profile_id"
+    let wildcard_parse: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(wildcard_source)
+    if not result_is_ok(wildcard_parse): return false
+    let wildcard_bound: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(wildcard_source, result_unwrap(wildcard_parse), catalog)
+    if not result_is_ok(wildcard_bound) or list_count(result_unwrap(wildcard_bound).projections) != 2: return false
+    if list_get(result_unwrap(wildcard_bound).projections, 0).column_ordinal != 6 or list_get(result_unwrap(wildcard_bound).projections, 1).column_ordinal != 7: return false
+
+    let ambiguous_source: Text = "SELECT id FROM items AS i JOIN profiles AS p ON i.id = p.item_id JOIN audit AS a ON p.id = a.profile_id"
+    let ambiguous_parse: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(ambiguous_source)
+    if not result_is_ok(ambiguous_parse): return false
+    let ambiguous_bound: Result[YazaSqlBoundPlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_select_structured_v1(ambiguous_source, result_unwrap(ambiguous_parse), catalog)
+    return not result_is_ok(ambiguous_bound) and result_unwrap_error(ambiguous_bound).code == 3002
+
+start:
+    let initial_used: Number = arena_used()
+    arena_scope 4194304:
+        let catalog: YazaSqlCatalogSnapshotV1 = yaza_base_sql_binder_v1_test_catalog()
+        assert yaza_base_sql_binder_v1_positive(catalog)
+        assert yaza_base_sql_binder_v1_wildcard(catalog)
+        assert yaza_base_sql_binder_v1_qualified_names(catalog)
+        assert yaza_base_sql_binder_v1_join_plan(catalog)
+        assert yaza_base_sql_binder_v1_repeated_parameter(catalog)
+        assert yaza_base_sql_binder_v1_group_by(catalog)
+        assert yaza_base_sql_binder_v1_having(catalog)
+        assert yaza_base_sql_binder_v1_diagnostics(catalog)
+        assert yaza_base_sql_binder_v1_accepts_null_comparison(catalog)
+        assert yaza_base_sql_binder_v1_correlated_exists(catalog)
+        assert yaza_base_sql_binder_v1_binds_join_chain(catalog)
+    assert arena_used() == initial_used
+    say "yazabase-sql-binder-v1-ok"

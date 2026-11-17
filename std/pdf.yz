@@ -1,0 +1,64 @@
+# Deterministic, bounded PDF text-page generation written in YAZA.
+# This first profile supports one printable ASCII line and no embedded actions.
+
+fn pdf_xref_line(offset: Number) -> Result[Text, Text]:
+    if offset < 0:
+        return err("pdf: cross-reference offset cannot be negative")
+    var digits: Text = number_text(offset)
+    if text_length(digits) > 10:
+        return err("pdf: document exceeds the 10-digit cross-reference limit")
+    while text_length(digits) < 10:
+        set digits = "0" + digits
+    return ok(digits + " 00000 n \r\n")
+
+fn pdf_text_page(text: Text) -> Result[Bytes, Text]:
+    let text_length_bytes: Number = text_length(text)
+    if text_length_bytes > 80:
+        return err("pdf: one-line text is limited to 80 ASCII bytes")
+    var literal_parts: TextList = text_list()
+    var index: Number = 0
+    while index < text_length_bytes:
+        let byte: Number = text_byte(text, index)
+        if byte < 32 or byte > 126:
+            return err("pdf: text page accepts printable ASCII only")
+        if byte == 40 or byte == 41 or byte == 92:
+            list_push(literal_parts, "\\")
+        list_push(literal_parts, text_slice(text, index, 1))
+        set index = index + 1
+    let escaped_text: Text = text_join(literal_parts, "")
+    let content_stream: Text = "BT\n/F1 10 Tf\n50 790 Td\n(" + escaped_text + ") Tj\nET\n"
+    let stream_length: Number = bytes_length(bytes_from_text(content_stream))
+
+    var output: Bytes = bytes_from_text("%PDF-1.7\n")
+    var offsets: TextList = text_list()
+    list_push(offsets, number_text(bytes_length(output)))
+    set output = bytes_concat(output, bytes_from_text("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"))
+
+    list_push(offsets, number_text(bytes_length(output)))
+    set output = bytes_concat(output, bytes_from_text("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"))
+
+    list_push(offsets, number_text(bytes_length(output)))
+    set output = bytes_concat(output, bytes_from_text("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n"))
+
+    list_push(offsets, number_text(bytes_length(output)))
+    set output = bytes_concat(output, bytes_from_text("4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>\nendobj\n"))
+
+    list_push(offsets, number_text(bytes_length(output)))
+    let stream_object: Text = "5 0 obj\n<< /Length " + number_text(stream_length) + " >>\nstream\n" + content_stream + "endstream\nendobj\n"
+    set output = bytes_concat(output, bytes_from_text(stream_object))
+
+    let xref_offset: Number = bytes_length(output)
+    var xref_entries: TextList = text_list()
+    list_push(xref_entries, "0000000000 65535 f \r\n")
+    set index = 0
+    while index < list_count(offsets):
+        let parsed_offset: Number = number_parse(list_get(offsets, index))
+        let entry: Result[Text, Text] = pdf_xref_line(parsed_offset)
+        if not result_is_ok(entry):
+            return err(result_unwrap_error(entry))
+        list_push(xref_entries, result_unwrap(entry))
+        set index = index + 1
+    let xref: Text = "xref\n0 6\n" + text_join(xref_entries, "")
+    let trailer: Text = "trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n" + number_text(xref_offset) + "\n%%EOF\n"
+    set output = bytes_concat(output, bytes_from_text(xref + trailer))
+    return ok(output)

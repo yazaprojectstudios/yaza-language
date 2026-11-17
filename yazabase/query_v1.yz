@@ -1,0 +1,2135 @@
+# Bounded read-only SELECT over committed YDBv1 rows.
+# This bridge materializes bounded left-deep joins and top-level set operations for the executor.
+# SQL NULL is preserved; general MVCC visibility and in-progress versions
+# remain outside this read-only profile.
+use "./btree_scan_v1"
+use "./catalog_schema_v1"
+use "./catalog_snapshot_v1"
+use "./catalog_storage_v1"
+use "./catalog_v1"
+use "./index_catalog_v1"
+use "./key_codec_v1"
+use "./mvcc_history_v1"
+use "./row_v1"
+use "./sql_binder_v1"
+use "./sql_executor_v1"
+use "./sql_create_index_v1"
+use "./secondary_index_v1"
+use "./sql_join_v1"
+use "./sql_literal_v1"
+use "./sql_parser_v3"
+use "./sql_set_v1"
+use "./sql_cte_v1"
+use "./sql_explain_v1"
+use "./sql_lexer_v1"
+use "./storage_v1"
+use "./wal_v1"
+
+shape YazaDbQueryVirtualRelationV1:
+    schema: YazaSqlTableSchemaV1
+    memory: YazaSqlMemoryTableV1
+
+shape YazaDbQueryCteExplainV1:
+    columns: List[YazaSqlBoundProjectionV1]
+    plan_text: Text
+
+shape YazaDbQueryCteBudgetV1:
+    rows: Number
+    cells: Number
+    text_bytes: Number
+    work_units: Number
+
+shape YazaDbQueryViewExpansionV1:
+    relations: List[YazaDbQueryVirtualRelationV1]
+    rows: Number
+    cells: Number
+    text_bytes: Number
+    work_units: Number
+
+shape YazaDbQueryViewBudgetV1:
+    rows: Number
+    cells: Number
+    text_bytes: Number
+    work_units: Number
+
+shape YazaDbQueryMaterializedViewV1:
+    relation: YazaDbQueryVirtualRelationV1
+    budget: YazaDbQueryViewBudgetV1
+
+shape YazaDbQueryIntegerKeyRangeEndV1:
+    key: Bytes
+    inclusive: Boolean
+
+shape YazaDbQueryIntegerKeyRangeAccumulatorV1:
+    has_start_after: Boolean
+    start_after_value: Number
+    has_end: Boolean
+    end_value: Number
+    end_inclusive: Boolean
+
+shape YazaDbQueryIntegerKeyRangeBoundsV1:
+    start_after: Option[Bytes]
+    end: Option[YazaDbQueryIntegerKeyRangeEndV1]
+
+fn yaza_db_query_parse_key_ordinals_v1(encoded: Text, column_count: Number) -> Result[List[Number], Text]:
+    let encoded_length: Number = text_length(encoded)
+    if encoded_length == 0 or encoded_length > 4096: return err("YDBv1 clustered index key-column list is empty or exceeds its limit")
+    let ordinals_created: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(ordinals_created): return err(result_unwrap_error(ordinals_created))
+    let ordinals: List[Number] = result_unwrap(ordinals_created)
+    if not list_try_reserve(ordinals, 1024): return err("YDBv1 query could not reserve clustered key metadata")
+    var token_start: Number = 0
+    var cursor: Number = 0
+    while cursor <= encoded_length:
+        var at_end: Boolean = cursor == encoded_length
+        if not at_end and text_byte(encoded, cursor) == 44: set at_end = true
+        if at_end:
+            let token_length: Number = cursor - token_start
+            if token_length < 1 or token_length > 4: return err("YDBv1 clustered index contains a malformed key-column ordinal")
+            var digit_index: Number = token_start
+            while digit_index < cursor:
+                let digit: Number = text_byte(encoded, digit_index)
+                if digit < 48 or digit > 57: return err("YDBv1 clustered index key-column ordinals must use canonical decimal digits")
+                set digit_index = digit_index + 1
+            let parsed: Result[Number, Text] = number_try_parse(text_slice(encoded, token_start, token_length))
+            if not result_is_ok(parsed): return err("YDBv1 clustered index key-column ordinal is out of range")
+            let ordinal: Number = result_unwrap(parsed)
+            if ordinal < 0 or ordinal >= column_count or list_count(ordinals) >= 1024: return err("YDBv1 clustered index key-column ordinal is outside its table schema")
+            var prior_index: Number = 0
+            while prior_index < list_count(ordinals):
+                if list_get(ordinals, prior_index) == ordinal: return err("YDBv1 clustered index repeats a key-column ordinal")
+                set prior_index = prior_index + 1
+            if not list_try_push(ordinals, ordinal): return err("YDBv1 query could not append clustered key metadata")
+            set token_start = cursor + 1
+        set cursor = cursor + 1
+    return ok(ordinals)
+
+fn yaza_db_query_clustered_index_rows_v1(file: Number, file_header: YazaDbFileHeaderV1, catalog: YazaDbCatalogRootV1, visible_ts: Number) -> Result[List[YazaDbRowV1], Text]:
+    let index_columns: List[YazaSqlColumnSchemaV1] = yaza_db_catalog_table_schema_v1(3)?
+    let index_key_ordinals: List[Number] = [0]
+    return yaza_db_btree_read_rows_v1(file, file_header, catalog.sys_indexes_root, index_columns, index_key_ordinals, visible_ts, 1024)
+
+fn yaza_db_query_clustered_key_ordinals_from_rows_v1(index_rows: List[YazaDbRowV1], table_id: Number, table_root_page_id: Number, table_column_count: Number) -> Result[List[Number], Text]:
+    var found: Boolean = false
+    var found_key_columns: Text = ""
+    var row_index: Number = 0
+    while row_index < list_count(index_rows):
+        let row: YazaDbRowV1 = list_get(index_rows, row_index)
+        if list_count(row.values) != 7 or list_count(row.nulls) != 7: return err("YDBv1 sys_indexes row width is invalid")
+        var field_index: Number = 0
+        while field_index < 7:
+            if list_get(row.nulls, field_index): return err("YDBv1 sys_indexes contains NULL in a required field")
+            set field_index = field_index + 1
+        if list_get(row.values, 1).integer_value == table_id:
+            if list_get(row.values, 4).integer_value == 1 and list_get(row.values, 5).boolean_value:
+                if found: return err("YDBv1 table has multiple clustered unique indexes in the current SELECT profile")
+                if list_get(row.values, 3).integer_value != table_root_page_id: return err("YDBv1 clustered index root does not match its table catalog root")
+                set found = true
+                set found_key_columns = list_get(row.values, 6).text_value
+        set row_index = row_index + 1
+    if not found: return err("YDBv1 table has no committed clustered unique index for bounded SELECT")
+    return yaza_db_query_parse_key_ordinals_v1(found_key_columns, table_column_count)
+
+fn yaza_db_query_clustered_key_ordinals_v1(file: Number, file_header: YazaDbFileHeaderV1, catalog: YazaDbCatalogRootV1, table_id: Number, table_root_page_id: Number, visible_ts: Number, table_column_count: Number) -> Result[List[Number], Text]:
+    let index_rows: List[YazaDbRowV1] = yaza_db_query_clustered_index_rows_v1(file, file_header, catalog, visible_ts)?
+    return yaza_db_query_clustered_key_ordinals_from_rows_v1(index_rows, table_id, table_root_page_id, table_column_count)
+
+fn yaza_db_query_memory_table_v1(table_id: Number, catalog_version: Number, columns: List[YazaSqlColumnSchemaV1], stored_rows: List[YazaDbRowV1]) -> Result[YazaSqlMemoryTableV1, Text]:
+    if list_count(columns) == 0 or list_count(columns) > 1024: return err("YDBv1 persistent SELECT table schema is outside its bounded profile")
+    if list_count(stored_rows) > 65536 or list_count(stored_rows) * list_count(columns) > 1048576: return err("YDBv1 persistent SELECT exceeds the bounded executor cell budget")
+    let types_created: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(types_created): return err(result_unwrap_error(types_created))
+    let column_type_ids: List[Number] = result_unwrap(types_created)
+    if not list_try_reserve(column_type_ids, list_count(columns)): return err("YDBv1 persistent SELECT could not reserve column types")
+    var column_index: Number = 0
+    while column_index < list_count(columns):
+        if not list_try_push(column_type_ids, list_get(columns, column_index).type_id): return err("YDBv1 persistent SELECT could not append column types")
+        set column_index = column_index + 1
+
+    let rows_created: Result[List[List[YazaSqlValueV1]], Text] = list_try_new()
+    if not result_is_ok(rows_created): return err(result_unwrap_error(rows_created))
+    let rows: List[List[YazaSqlValueV1]] = result_unwrap(rows_created)
+    if not list_try_reserve(rows, list_count(stored_rows)): return err("YDBv1 persistent SELECT could not reserve its row set")
+    var row_index: Number = 0
+    while row_index < list_count(stored_rows):
+        let stored_row: YazaDbRowV1 = list_get(stored_rows, row_index)
+        if list_count(stored_row.values) != list_count(columns) or list_count(stored_row.nulls) != list_count(columns): return err("YDBv1 stored row width does not match its persisted schema")
+        var value_index: Number = 0
+        while value_index < list_count(columns):
+            let value: YazaSqlValueV1 = list_get(stored_row.values, value_index)
+            let column: YazaSqlColumnSchemaV1 = list_get(columns, value_index)
+            if value.type_id != column.type_id or value.source_literal or value.is_null != list_get(stored_row.nulls, value_index): return err("YDBv1 stored row value and NULL metadata are inconsistent")
+            set value_index = value_index + 1
+        # Reuse the decoded row's immutable value vector instead of allocating
+        # and copying a second vector solely to materialize SQL NULL values.
+        if not list_try_push(rows, stored_row.values): return err("YDBv1 persistent SELECT could not append a stored row")
+        set row_index = row_index + 1
+    return ok(YazaSqlMemoryTableV1(table_id, catalog_version, column_type_ids, rows, 0))
+
+fn yaza_db_query_virtual_relation_index_v1(relations: List[YazaDbQueryVirtualRelationV1], table_id: Number) -> Number:
+    var index: Number = 0
+    while index < list_count(relations):
+        if list_get(relations, index).schema.table_id == table_id: return index
+        set index = index + 1
+    return -1
+
+fn yaza_db_query_virtual_identifier_v1(source: Text, token: YazaSqlTokenV1) -> Result[Text, Text]:
+    if (token.kind != 1 and token.kind != 2) or token.start_byte < 0 or token.end_byte <= token.start_byte or token.end_byte > text_length(source):
+        return err("SQL CTE identifier span is invalid")
+    let quoted: Boolean = token.kind == 2
+    if quoted and (token.end_byte - token.start_byte < 2 or text_byte(source, token.start_byte) != 34 or text_byte(source, token.end_byte - 1) != 34):
+        return err("SQL CTE quoted identifier is malformed")
+    var source_index: Number = token.start_byte
+    var source_end: Number = token.end_byte
+    if quoted:
+        set source_index = source_index + 1
+        set source_end = source_end - 1
+    var decoded_length: Number = 0
+    var scan_index: Number = source_index
+    while scan_index < source_end:
+        if quoted and text_byte(source, scan_index) == 34 and scan_index + 1 < source_end and text_byte(source, scan_index + 1) == 34:
+            set scan_index = scan_index + 1
+        set decoded_length = decoded_length + 1
+        set scan_index = scan_index + 1
+    if decoded_length < 1 or decoded_length > 128: return err("SQL CTE identifier is empty or exceeds 128 bytes")
+    let bytes_result: Result[Bytes, Text] = bytes_try_new_zeroed(decoded_length)
+    if not result_is_ok(bytes_result): return err("SQL CTE identifier could not allocate its bounded normalized bytes")
+    let bytes: Bytes = result_unwrap(bytes_result)
+    var output_index: Number = 0
+    while source_index < source_end:
+        var byte: Number = text_byte(source, source_index)
+        if quoted and byte == 34 and source_index + 1 < source_end and text_byte(source, source_index + 1) == 34:
+            set source_index = source_index + 1
+        elif not quoted and byte >= 65 and byte <= 90:
+            set byte = byte + 32
+        if not bytes_try_set(bytes, output_index, byte): return err("SQL CTE identifier normalization failed")
+        set output_index = output_index + 1
+        set source_index = source_index + 1
+    return bytes_try_to_text(bytes)
+
+fn yaza_db_query_virtual_relation_from_result_v1(source: Text, definition: YazaSqlCteDefinitionV1, result: YazaSqlQueryResultV1, table_id: Number, catalog_version: Number) -> Result[YazaDbQueryVirtualRelationV1, Text]:
+    let name_result: Result[Text, Text] = yaza_db_query_virtual_identifier_v1(source, definition.name_token)
+    if not result_is_ok(name_result): return err(result_unwrap_error(name_result))
+    let name: Text = result_unwrap(name_result)
+    let column_count: Number = list_count(result.columns)
+    if column_count < 1 or column_count > 1024 or list_count(definition.column_names) > 0 and list_count(definition.column_names) != column_count:
+        return err("SQL CTE output width does not match its declared column aliases")
+    if list_count(result.rows) > 65536 or list_count(result.rows) * column_count > 1048576:
+        return err("SQL CTE result exceeds the bounded in-memory relation profile")
+    let columns_created: Result[List[YazaSqlColumnSchemaV1], Text] = list_try_new()
+    let types_created: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(columns_created) or not result_is_ok(types_created): return err("SQL CTE could not allocate its result schema")
+    let columns: List[YazaSqlColumnSchemaV1] = result_unwrap(columns_created)
+    let column_types: List[Number] = result_unwrap(types_created)
+    if not list_try_reserve(columns, column_count) or not list_try_reserve(column_types, column_count): return err("SQL CTE could not reserve its result schema")
+    var column_index: Number = 0
+    while column_index < column_count:
+        let projection: YazaSqlBoundProjectionV1 = list_get(result.columns, column_index)
+        var column_name: Text = projection.output_name
+        if list_count(definition.column_names) > 0:
+            let alias_result: Result[Text, Text] = yaza_db_query_virtual_identifier_v1(source, list_get(definition.column_names, column_index))
+            if not result_is_ok(alias_result): return err(result_unwrap_error(alias_result))
+            set column_name = result_unwrap(alias_result)
+        if text_length(column_name) == 0 or projection.type_id <= 0: return err("SQL CTE result contains an unnamed or untyped output column")
+        var prior_column: Number = 0
+        while prior_column < list_count(columns):
+            if list_get(columns, prior_column).name == column_name: return err("SQL CTE output column names must be unique")
+            set prior_column = prior_column + 1
+        if not list_try_push(columns, YazaSqlColumnSchemaV1(column_name, projection.type_id, projection.nullable, column_index, 0, 0, "")) or not list_try_push(column_types, projection.type_id):
+            return err("SQL CTE could not append its result schema")
+        set column_index = column_index + 1
+    let schema: YazaSqlTableSchemaV1 = YazaSqlTableSchemaV1(table_id, name, columns)
+    let memory: YazaSqlMemoryTableV1 = YazaSqlMemoryTableV1(table_id, catalog_version, column_types, result.rows, 0)
+    return ok(YazaDbQueryVirtualRelationV1(schema, memory))
+
+fn yaza_db_query_view_index_for_name_v1(source: Text, name: YazaSqlNameV2, views: List[YazaDbCatalogViewV1]) -> Number:
+    if name.part_count != 1: return -1
+    var index: Number = 0
+    while index < list_count(views):
+        if yaza_sql_bind_v1_identifier_matches(source, name.first_token, list_get(views, index).name): return index
+        set index = index + 1
+    return -1
+
+fn yaza_db_query_relation_name_shadowed_v1(source: Text, name: YazaSqlNameV2, relations: List[YazaDbQueryVirtualRelationV1]) -> Boolean:
+    if name.part_count != 1: return false
+    var index: Number = 0
+    while index < list_count(relations):
+        if yaza_sql_bind_v1_identifier_matches(source, name.first_token, list_get(relations, index).schema.name): return true
+        set index = index + 1
+    return false
+
+fn yaza_db_query_view_relation_from_result_v1(view: YazaDbCatalogViewV1, result: YazaSqlQueryResultV1, catalog_version: Number) -> Result[YazaDbQueryVirtualRelationV1, Text]:
+    let column_count: Number = list_count(view.output_columns)
+    if view.view_id <= 4 or view.view_id > yaza_db_catalog_max_object_id_v1() or text_length(view.name) < 1 or column_count < 1 or column_count > 898:
+        return err("YDBv1 persistent view has invalid identity or output schema")
+    if list_count(result.columns) != column_count or list_count(result.rows) > 65536 or list_count(result.rows) * column_count > yaza_sql_executor_max_input_cells_v1():
+        return err("YDBv1 view result exceeds its persisted output schema or materialization bound")
+    let columns_created: Result[List[YazaSqlColumnSchemaV1], Text] = list_try_new()
+    let types_created: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(columns_created) or not result_is_ok(types_created): return err("YDBv1 view expansion could not allocate its output schema")
+    let columns: List[YazaSqlColumnSchemaV1] = result_unwrap(columns_created)
+    let column_types: List[Number] = result_unwrap(types_created)
+    if not list_try_reserve(columns, column_count) or not list_try_reserve(column_types, column_count): return err("YDBv1 view expansion could not reserve its output schema")
+    var column_index: Number = 0
+    while column_index < column_count:
+        let stored_column: YazaSqlColumnSchemaV1 = list_get(view.output_columns, column_index)
+        let projection: YazaSqlBoundProjectionV1 = list_get(result.columns, column_index)
+        if stored_column.ordinal != column_index or projection.output_name != stored_column.name or projection.type_id != stored_column.type_id or projection.nullable != stored_column.nullable or projection.precision != stored_column.precision or projection.scale != stored_column.scale:
+            return err("YDBv1 materialized view output no longer matches its persisted schema")
+        if not list_try_push(columns, stored_column) or not list_try_push(column_types, stored_column.type_id): return err("YDBv1 view expansion could not append its output schema")
+        set column_index = column_index + 1
+    var row_index: Number = 0
+    while row_index < list_count(result.rows):
+        let row: List[YazaSqlValueV1] = list_get(result.rows, row_index)
+        if list_count(row) != column_count: return err("YDBv1 materialized view returned a malformed row width")
+        set column_index = 0
+        while column_index < column_count:
+            let column: YazaSqlColumnSchemaV1 = list_get(view.output_columns, column_index)
+            let value: YazaSqlValueV1 = list_get(row, column_index)
+            if value.type_id != column.type_id or value.source_literal or value.is_null and not column.nullable:
+                return err("YDBv1 materialized view returned a value inconsistent with its persisted type/nullability")
+            if value.type_id == 10 and not value.is_null and (yaza_sql_value_decimal_precision_v1(value) != column.precision or yaza_sql_value_decimal_scale_v1(value) != column.scale):
+                return err("YDBv1 materialized view DECIMAL value metadata differs from its persisted output schema")
+            set column_index = column_index + 1
+        set row_index = row_index + 1
+    let virtual_id: Number = 2000000 + view.view_id
+    let schema: YazaSqlTableSchemaV1 = YazaSqlTableSchemaV1(virtual_id, view.name, columns)
+    let memory: YazaSqlMemoryTableV1 = YazaSqlMemoryTableV1(virtual_id, catalog_version, column_types, result.rows, 0)
+    return ok(YazaDbQueryVirtualRelationV1(schema, memory))
+
+fn yaza_db_query_materialize_persistent_view_v1(file: Number, file_header: YazaDbFileHeaderV1, view: YazaDbCatalogViewV1, base_loaded: YazaDbCatalogSnapshotWithRootsV1, prior_rows: Number, prior_cells: Number, prior_text_bytes: Number, prior_work_units: Number) -> Result[YazaDbQueryMaterializedViewV1, Text]:
+    if prior_work_units < 0 or prior_work_units > yaza_sql_executor_max_work_units_v1(): return err("YDBv1 view expansion prior work is outside its bound")
+    let definition_tokens: List[YazaSqlTokenV1] = yaza_sql_lex_v1(view.definition)?
+    let empty_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let empty_relations: List[YazaDbQueryVirtualRelationV1] = List[YazaDbQueryVirtualRelationV1]()
+    let empty_profile: List[Number] = List[Number]()
+    let view_result: YazaSqlQueryResultV1 = yaza_db_execute_single_select_with_loaded_catalog_and_index_rows_profiled_v1(file, file_header, view.definition, definition_tokens, empty_parameters, empty_relations, prior_work_units, base_loaded, none, empty_profile)?
+    let budget: YazaDbQueryCteBudgetV1 = yaza_db_query_validate_cte_result_budget_v1(view_result, prior_rows, prior_cells, prior_text_bytes, prior_work_units)?
+    let relation: YazaDbQueryVirtualRelationV1 = yaza_db_query_view_relation_from_result_v1(view, view_result, base_loaded.sql_snapshot.version)?
+    return ok(YazaDbQueryMaterializedViewV1(relation, YazaDbQueryViewBudgetV1(budget.rows, budget.cells, budget.text_bytes, budget.work_units)))
+
+fn yaza_db_query_expand_one_persistent_view_v1(file: Number, file_header: YazaDbFileHeaderV1, source: Text, name: YazaSqlNameV2, base_loaded: YazaDbCatalogSnapshotWithRootsV1, relations: List[YazaDbQueryVirtualRelationV1], initial: YazaDbQueryViewBudgetV1, statement_prior_work_units: Number) -> Result[YazaDbQueryViewBudgetV1, Text]:
+    if name.part_count != 1 or yaza_db_query_relation_name_shadowed_v1(source, name, relations): return ok(initial)
+    let view_index: Number = yaza_db_query_view_index_for_name_v1(source, name, base_loaded.views)
+    if view_index < 0: return ok(initial)
+    if list_count(relations) >= 24: return err("YDBv1 SELECT exceeds the bounded virtual relation count after view expansion")
+    if statement_prior_work_units > yaza_sql_executor_max_work_units_v1() - initial.work_units: return err("YDBv1 view expansion exceeds the statement-wide work budget")
+    let view: YazaDbCatalogViewV1 = list_get(base_loaded.views, view_index)
+    let materialized: YazaDbQueryMaterializedViewV1 = yaza_db_query_materialize_persistent_view_v1(file, file_header, view, base_loaded, initial.rows, initial.cells, initial.text_bytes, statement_prior_work_units + initial.work_units)?
+    if not list_try_push(relations, materialized.relation): return err("YDBv1 SELECT could not append a materialized view relation")
+    return ok(YazaDbQueryViewBudgetV1(materialized.budget.rows, materialized.budget.cells, materialized.budget.text_bytes, initial.work_units + materialized.budget.work_units))
+
+fn yaza_db_query_expand_persistent_views_v1(file: Number, file_header: YazaDbFileHeaderV1, source: Text, parsed: YazaSqlSelectAstV3, base_loaded: YazaDbCatalogSnapshotWithRootsV1, virtual_relations: List[YazaDbQueryVirtualRelationV1], statement_prior_work_units: Number) -> Result[YazaDbQueryViewExpansionV1, Text]:
+    let relations_created: Result[List[YazaDbQueryVirtualRelationV1], Text] = list_try_new()
+    if not result_is_ok(relations_created): return err("YDBv1 SELECT could not allocate view-expanded relation metadata")
+    let relations: List[YazaDbQueryVirtualRelationV1] = result_unwrap(relations_created)
+    if list_count(virtual_relations) > 16 or not list_try_reserve(relations, list_count(virtual_relations) + 8): return err("YDBv1 SELECT could not reserve its bounded view-expanded relation set")
+    var relation_index: Number = 0
+    while relation_index < list_count(virtual_relations):
+        if not list_try_push(relations, list_get(virtual_relations, relation_index)): return err("YDBv1 SELECT could not copy its existing virtual relations")
+        set relation_index = relation_index + 1
+    var budget: YazaDbQueryViewBudgetV1 = YazaDbQueryViewBudgetV1(0, 0, 0, 0)
+    set budget = yaza_db_query_expand_one_persistent_view_v1(file, file_header, source, parsed.table_name, base_loaded, relations, budget, statement_prior_work_units)?
+    if parsed.join_type != 0:
+        set budget = yaza_db_query_expand_one_persistent_view_v1(file, file_header, source, parsed.join_table_name, base_loaded, relations, budget, statement_prior_work_units)?
+    var join_index: Number = 0
+    while join_index < list_count(parsed.additional_joins):
+        set budget = yaza_db_query_expand_one_persistent_view_v1(file, file_header, source, list_get(parsed.additional_joins, join_index).table_name, base_loaded, relations, budget, statement_prior_work_units)?
+        set join_index = join_index + 1
+    return ok(YazaDbQueryViewExpansionV1(relations, budget.rows, budget.cells, budget.text_bytes, budget.work_units))
+
+fn yaza_db_query_name_references_unshadowed_view_v1(source: Text, name: YazaSqlNameV2, views: List[YazaDbCatalogViewV1], relations: List[YazaDbQueryVirtualRelationV1]) -> Boolean:
+    if yaza_db_query_relation_name_shadowed_v1(source, name, relations): return false
+    return yaza_db_query_view_index_for_name_v1(source, name, views) >= 0
+
+fn yaza_db_query_select_references_unshadowed_view_v1(source: Text, parsed: YazaSqlSelectAstV3, views: List[YazaDbCatalogViewV1], relations: List[YazaDbQueryVirtualRelationV1]) -> Boolean:
+    if yaza_db_query_name_references_unshadowed_view_v1(source, parsed.table_name, views, relations): return true
+    if parsed.join_type != 0 and yaza_db_query_name_references_unshadowed_view_v1(source, parsed.join_table_name, views, relations): return true
+    var join_index: Number = 0
+    while join_index < list_count(parsed.additional_joins):
+        if yaza_db_query_name_references_unshadowed_view_v1(source, list_get(parsed.additional_joins, join_index).table_name, views, relations): return true
+        set join_index = join_index + 1
+    return false
+
+fn yaza_db_query_empty_view_relation_v1(view: YazaDbCatalogViewV1, catalog_version: Number) -> Result[YazaDbQueryVirtualRelationV1, Text]:
+    if view.view_id <= 4 or view.view_id > yaza_db_catalog_max_object_id_v1() or list_count(view.output_columns) < 1 or list_count(view.output_columns) > 898:
+        return err("YDBv1 EXPLAIN view schema has an invalid identity or output width")
+    let columns_created: Result[List[YazaSqlColumnSchemaV1], Text] = list_try_new()
+    let types_created: Result[List[Number], Text] = list_try_new()
+    let rows_created: Result[List[List[YazaSqlValueV1]], Text] = list_try_new()
+    if not result_is_ok(columns_created) or not result_is_ok(types_created) or not result_is_ok(rows_created): return err("YDBv1 EXPLAIN could not allocate a view schema")
+    let columns: List[YazaSqlColumnSchemaV1] = result_unwrap(columns_created)
+    let types: List[Number] = result_unwrap(types_created)
+    let rows: List[List[YazaSqlValueV1]] = result_unwrap(rows_created)
+    if not list_try_reserve(columns, list_count(view.output_columns)) or not list_try_reserve(types, list_count(view.output_columns)):
+        return err("YDBv1 EXPLAIN could not reserve a view schema")
+    var index: Number = 0
+    while index < list_count(view.output_columns):
+        let column: YazaSqlColumnSchemaV1 = list_get(view.output_columns, index)
+        if column.ordinal != index or not list_try_push(columns, column) or not list_try_push(types, column.type_id):
+            return err("YDBv1 EXPLAIN view output metadata is inconsistent")
+        set index = index + 1
+    let virtual_id: Number = 2000000 + view.view_id
+    let schema: YazaSqlTableSchemaV1 = YazaSqlTableSchemaV1(virtual_id, view.name, columns)
+    let memory: YazaSqlMemoryTableV1 = YazaSqlMemoryTableV1(virtual_id, catalog_version, types, rows, 0)
+    return ok(YazaDbQueryVirtualRelationV1(schema, memory))
+
+fn yaza_db_query_append_view_schema_v1(source: Text, name: YazaSqlNameV2, views: List[YazaDbCatalogViewV1], existing_relations: List[YazaDbQueryVirtualRelationV1], view_relations: List[YazaDbQueryVirtualRelationV1], catalog_version: Number) -> Result[Boolean, Text]:
+    if name.part_count != 1 or yaza_db_query_relation_name_shadowed_v1(source, name, existing_relations) or yaza_db_query_relation_name_shadowed_v1(source, name, view_relations): return ok(false)
+    let view_index: Number = yaza_db_query_view_index_for_name_v1(source, name, views)
+    if view_index < 0: return ok(false)
+    if list_count(existing_relations) + list_count(view_relations) >= 24: return err("YDBv1 EXPLAIN exceeds the bounded virtual relation count")
+    let relation: YazaDbQueryVirtualRelationV1 = yaza_db_query_empty_view_relation_v1(list_get(views, view_index), catalog_version)?
+    if not list_try_push(view_relations, relation): return err("YDBv1 EXPLAIN could not append a view scan schema")
+    return ok(true)
+
+fn yaza_db_query_view_schemas_for_select_v1(source: Text, parsed: YazaSqlSelectAstV3, views: List[YazaDbCatalogViewV1], existing_relations: List[YazaDbQueryVirtualRelationV1], catalog_version: Number) -> Result[List[YazaDbQueryVirtualRelationV1], Text]:
+    let created: Result[List[YazaDbQueryVirtualRelationV1], Text] = list_try_new()
+    if not result_is_ok(created): return err("YDBv1 EXPLAIN could not allocate view scan schemas")
+    let relations: List[YazaDbQueryVirtualRelationV1] = result_unwrap(created)
+    if not list_try_reserve(relations, 8): return err("YDBv1 EXPLAIN could not reserve view scan schemas")
+    let base_added: Boolean = yaza_db_query_append_view_schema_v1(source, parsed.table_name, views, existing_relations, relations, catalog_version)?
+    if parsed.join_type != 0:
+        let joined_added: Boolean = yaza_db_query_append_view_schema_v1(source, parsed.join_table_name, views, existing_relations, relations, catalog_version)?
+    var join_index: Number = 0
+    while join_index < list_count(parsed.additional_joins):
+        let stage_added: Boolean = yaza_db_query_append_view_schema_v1(source, list_get(parsed.additional_joins, join_index).table_name, views, existing_relations, relations, catalog_version)?
+        set join_index = join_index + 1
+    return ok(relations)
+
+fn yaza_db_query_sql_catalog_with_virtual_relations_v1(catalog: YazaSqlCatalogSnapshotV1, relations: List[YazaDbQueryVirtualRelationV1]) -> Result[YazaSqlCatalogSnapshotV1, Text]:
+    let tables_created: Result[List[YazaSqlTableSchemaV1], Text] = list_try_new()
+    if not result_is_ok(tables_created): return err("YDBv1 EXPLAIN could not allocate its scoped SQL catalog")
+    let tables: List[YazaSqlTableSchemaV1] = result_unwrap(tables_created)
+    if not list_try_reserve(tables, list_count(catalog.tables) + list_count(relations)): return err("YDBv1 EXPLAIN could not reserve its scoped SQL catalog")
+    var table_index: Number = 0
+    while table_index < list_count(catalog.tables):
+        let persistent: YazaSqlTableSchemaV1 = list_get(catalog.tables, table_index)
+        var shadowed: Boolean = false
+        var relation_index: Number = 0
+        while relation_index < list_count(relations):
+            if list_get(relations, relation_index).schema.name == persistent.name: set shadowed = true
+            set relation_index = relation_index + 1
+        if not shadowed and not list_try_push(tables, persistent): return err("YDBv1 EXPLAIN could not copy a catalog table")
+        set table_index = table_index + 1
+    var relation_index: Number = 0
+    while relation_index < list_count(relations):
+        let relation: YazaDbQueryVirtualRelationV1 = list_get(relations, relation_index)
+        if relation.schema.table_id <= 3072 or relation.memory.table_id != relation.schema.table_id or list_count(relation.schema.columns) != list_count(relation.memory.column_type_ids):
+            return err("YDBv1 EXPLAIN virtual relation metadata is invalid")
+        var prior_relation: Number = 0
+        while prior_relation < relation_index:
+            let prior: YazaDbQueryVirtualRelationV1 = list_get(relations, prior_relation)
+            if prior.schema.name == relation.schema.name or prior.schema.table_id == relation.schema.table_id:
+                return err("YDBv1 EXPLAIN contains duplicate virtual relation metadata")
+            set prior_relation = prior_relation + 1
+        if not list_try_push(tables, relation.schema): return err("YDBv1 EXPLAIN could not append a virtual relation schema")
+        set relation_index = relation_index + 1
+    if list_count(tables) > 1024: return err("YDBv1 EXPLAIN scoped SQL catalog exceeds the binder table bound")
+    return ok(YazaSqlCatalogSnapshotV1(catalog.version, tables, catalog.column_defaults))
+
+fn yaza_db_query_view_explain_annotation_v1(relations: List[YazaDbQueryVirtualRelationV1], views: List[YazaDbCatalogViewV1]) -> Result[Text, Text]:
+    var output: Text = ""
+    var relation_index: Number = 0
+    while relation_index < list_count(relations):
+        let relation: YazaDbQueryVirtualRelationV1 = list_get(relations, relation_index)
+        var view_index: Number = 0
+        while view_index < list_count(views) and list_get(views, view_index).name != relation.schema.name:
+            set view_index = view_index + 1
+        if view_index >= list_count(views): return err("YDBv1 EXPLAIN virtual view has no persistent definition")
+        let view: YazaDbCatalogViewV1 = list_get(views, view_index)
+        let header: Text = text_try_concat("View expansion: ", view.name)?
+        let header_line: Text = text_try_concat(header, "\nScan boundary: statement-scoped materialized virtual relation\nDefinition: ")?
+        let definition_line: Text = text_try_concat(header_line, view.definition)?
+        let completed: Text = text_try_concat(definition_line, "\n")?
+        set output = text_try_concat(output, completed)?
+        set relation_index = relation_index + 1
+    return ok(output)
+
+fn yaza_db_query_catalog_with_virtual_relations_v1(loaded: YazaDbCatalogSnapshotWithRootsV1, relations: List[YazaDbQueryVirtualRelationV1]) -> Result[YazaDbCatalogSnapshotWithRootsV1, Text]:
+    if list_count(loaded.sql_snapshot.tables) != list_count(loaded.root_page_ids) or list_count(loaded.sql_snapshot.tables) != list_count(loaded.table_schema_versions):
+        return err("SQL CTE base catalog and persistent root metadata are misaligned")
+    let tables_created: Result[List[YazaSqlTableSchemaV1], Text] = list_try_new()
+    let roots_created: Result[List[Number], Text] = list_try_new()
+    let versions_created: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(tables_created) or not result_is_ok(roots_created) or not result_is_ok(versions_created):
+        return err("SQL CTE could not allocate its scoped catalog snapshot")
+    let tables: List[YazaSqlTableSchemaV1] = result_unwrap(tables_created)
+    let roots: List[Number] = result_unwrap(roots_created)
+    let versions: List[Number] = result_unwrap(versions_created)
+    if not list_try_reserve(tables, list_count(loaded.sql_snapshot.tables) + list_count(relations)) or not list_try_reserve(roots, list_count(loaded.root_page_ids)) or not list_try_reserve(versions, list_count(loaded.table_schema_versions)):
+        return err("SQL CTE could not reserve its scoped catalog snapshot")
+    var index: Number = 0
+    while index < list_count(loaded.sql_snapshot.tables):
+        let persistent_table: YazaSqlTableSchemaV1 = list_get(loaded.sql_snapshot.tables, index)
+        var shadowed: Boolean = false
+        var relation_probe: Number = 0
+        while relation_probe < list_count(relations):
+            if list_get(relations, relation_probe).schema.name == persistent_table.name: set shadowed = true
+            set relation_probe = relation_probe + 1
+        if not shadowed:
+            if not list_try_push(tables, persistent_table) or not list_try_push(roots, list_get(loaded.root_page_ids, index)) or not list_try_push(versions, list_get(loaded.table_schema_versions, index)):
+                return err("SQL CTE could not copy a visible persistent table and its root metadata")
+        set index = index + 1
+    var relation_index: Number = 0
+    while relation_index < list_count(relations):
+        let relation: YazaDbQueryVirtualRelationV1 = list_get(relations, relation_index)
+        var table_index: Number = 0
+        while table_index < list_count(tables):
+            if list_get(tables, table_index).name == relation.schema.name: return err("SQL CTE name conflicts with an earlier CTE")
+            if list_get(tables, table_index).table_id == relation.schema.table_id: return err("SQL CTE virtual relation reuses another table ID")
+            set table_index = table_index + 1
+        if relation.schema.table_id <= 3072 or relation.memory.table_id != relation.schema.table_id or list_count(relation.schema.columns) < 1 or list_count(relation.schema.columns) != list_count(relation.memory.column_type_ids):
+            return err("SQL CTE virtual relation metadata is inconsistent")
+        if not list_try_push(tables, relation.schema): return err("SQL CTE could not append its scoped virtual table")
+        set relation_index = relation_index + 1
+    if list_count(tables) > 1024: return err("SQL CTE catalog exceeds the 1024-table binder limit")
+    return ok(YazaDbCatalogSnapshotWithRootsV1(loaded.catalog, YazaSqlCatalogSnapshotV1(loaded.sql_snapshot.version, tables, loaded.sql_snapshot.column_defaults), roots, versions, loaded.views))
+
+fn yaza_db_query_prepare_filter_v1(plan: YazaSqlBoundPlanV1, catalog_version: Number, columns: List[YazaSqlColumnSchemaV1], parameters: List[YazaSqlValueV1]) -> Result[List[YazaSqlValueV1], Text]:
+    let seed_table: YazaSqlMemoryTableV1 = yaza_db_query_memory_table_v1(plan.table_id, catalog_version, columns, List[YazaDbRowV1]())?
+    let verified: YazaSqlExecutorInputProfileV1 = yaza_sql_executor_validate_plan_v1(plan, seed_table)?
+    let prepared: List[YazaSqlValueV1] = yaza_sql_executor_prepare_values_v1(plan, seed_table, parameters)?
+    let budgeted: Number = yaza_sql_executor_validate_work_budget_v1(plan, seed_table, prepared, parameters, verified)?
+    return ok(prepared)
+
+# The predicates used to derive these cursor bounds are a subset of the WHERE
+# expression. Keep evaluating the full predicate after the seek; these bounds
+# only skip keys that the primary-key ordering proves cannot match.
+fn yaza_db_query_integer_minimum_v1(type_id: Number) -> Number:
+    if type_id == 2: return -32768
+    if type_id == 3: return -2147483648
+    return -9223372036854775807 - 1
+
+fn yaza_db_query_primary_integer_range_collect_v1(plan: YazaSqlBoundPlanV1, prepared: List[YazaSqlValueV1], key_ordinal: Number, key_type_id: Number, expression_index: Number, accumulated: YazaDbQueryIntegerKeyRangeAccumulatorV1) -> Result[YazaDbQueryIntegerKeyRangeAccumulatorV1, Text]:
+    if expression_index < 0 or expression_index >= plan.having_start_index or expression_index >= list_count(plan.expressions): return ok(accumulated)
+    let node: YazaSqlBoundExpressionNodeV1 = list_get(plan.expressions, expression_index)
+    if node.kind == 2:
+        let left: YazaDbQueryIntegerKeyRangeAccumulatorV1 = yaza_db_query_primary_integer_range_collect_v1(plan, prepared, key_ordinal, key_type_id, node.left_index, accumulated)?
+        return yaza_db_query_primary_integer_range_collect_v1(plan, prepared, key_ordinal, key_type_id, node.right_index, left)
+    if node.kind != 1 or node.column_ordinal != key_ordinal or node.type_id != key_type_id or node.operator < 3 or node.operator > 6 or (node.value_kind != 3 and node.value_kind != 5):
+        return ok(accumulated)
+    if expression_index >= list_count(prepared): return ok(accumulated)
+    let bound: YazaSqlValueV1 = list_get(prepared, expression_index)
+    if not yaza_sql_executor_value_matches_v1(bound, key_type_id) or bound.is_null: return ok(accumulated)
+    var next: YazaDbQueryIntegerKeyRangeAccumulatorV1 = accumulated
+    if node.operator == 5 or node.operator == 6:
+        var candidate_start_after: Number = bound.integer_value
+        if node.operator == 6:
+            if bound.integer_value <= yaza_db_query_integer_minimum_v1(key_type_id): return ok(accumulated)
+            set candidate_start_after = bound.integer_value - 1
+        if not next.has_start_after or candidate_start_after > next.start_after_value:
+            set next.has_start_after = true
+            set next.start_after_value = candidate_start_after
+    else:
+        let candidate_end_inclusive: Boolean = node.operator == 4
+        if not next.has_end or bound.integer_value < next.end_value or (bound.integer_value == next.end_value and not candidate_end_inclusive and next.end_inclusive):
+            set next.has_end = true
+            set next.end_value = bound.integer_value
+            set next.end_inclusive = candidate_end_inclusive
+    return ok(next)
+
+fn yaza_db_query_primary_integer_range_bounds_v1(plan: YazaSqlBoundPlanV1, prepared: List[YazaSqlValueV1], columns: List[YazaSqlColumnSchemaV1], key_ordinals: List[Number]) -> Result[YazaDbQueryIntegerKeyRangeBoundsV1, Text]:
+    if plan.right_table_id != 0 or list_count(plan.join_stages) != 0 or list_count(plan.subqueries) != 0 or plan.where_root < 0 or plan.where_root >= list_count(plan.expressions) or list_count(key_ordinals) != 1:
+        return ok(YazaDbQueryIntegerKeyRangeBoundsV1(none, none))
+    let key_ordinal: Number = list_get(key_ordinals, 0)
+    if key_ordinal < 0 or key_ordinal >= list_count(columns): return ok(YazaDbQueryIntegerKeyRangeBoundsV1(none, none))
+    let key_column: YazaSqlColumnSchemaV1 = list_get(columns, key_ordinal)
+    if key_column.type_id != 2 and key_column.type_id != 3 and key_column.type_id != 4: return ok(YazaDbQueryIntegerKeyRangeBoundsV1(none, none))
+    let empty: YazaDbQueryIntegerKeyRangeAccumulatorV1 = YazaDbQueryIntegerKeyRangeAccumulatorV1(false, 0, false, 0, false)
+    let collected: YazaDbQueryIntegerKeyRangeAccumulatorV1 = yaza_db_query_primary_integer_range_collect_v1(plan, prepared, key_ordinal, key_column.type_id, plan.where_root, empty)?
+    var start_after: Option[Bytes] = none
+    var end: Option[YazaDbQueryIntegerKeyRangeEndV1] = none
+    if collected.has_start_after:
+        let start_key: Bytes = yaza_db_key_encode_integer_component_v1(key_column.type_id, collected.start_after_value)?
+        set start_after = some(start_key)
+    if collected.has_end:
+        let end_key: Bytes = yaza_db_key_encode_integer_component_v1(key_column.type_id, collected.end_value)?
+        set end = some(YazaDbQueryIntegerKeyRangeEndV1(end_key, collected.end_inclusive))
+    return ok(YazaDbQueryIntegerKeyRangeBoundsV1(start_after, end))
+
+fn yaza_db_query_table_exists_at_snapshot_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, table_id: Number, snapshot_ts: Number, own_txn_id: Number, transactions: List[YazaDbTxnStatusV1]) -> Result[Boolean, Text]:
+    if table_id < 1 or snapshot_ts < 1: return err("YDBv1 historical catalog lookup identity is outside its bound")
+    let catalog: YazaDbCatalogRootV1 = yaza_db_catalog_storage_read_root_v1(storage.file, storage.header)?
+    let table_schema: List[YazaSqlColumnSchemaV1] = yaza_db_catalog_table_schema_v1(1)?
+    let key_ordinals: List[Number] = [0]
+    let rows: List[YazaDbRowV1] = yaza_db_btree_read_rows_at_snapshot_v1(storage.root, wal.db_uuid, wal.next_lsn, storage.file, storage.header, catalog.sys_tables_root, table_schema, key_ordinals, snapshot_ts, yaza_db_catalog_max_table_records_v1(), own_txn_id, transactions)?
+    var row_index: Number = 0
+    while row_index < list_count(rows):
+        let row: YazaDbRowV1 = list_get(rows, row_index)
+        if list_count(row.values) != 7 or list_count(row.nulls) != 7: return err("YDBv1 historical sys_tables row width is invalid")
+        if not list_get(row.nulls, 0) and list_get(row.values, 0).integer_value == table_id: return ok(true)
+        set row_index = row_index + 1
+    return ok(false)
+
+fn yaza_db_query_join_stage_current_v1(file: Number, file_header: YazaDbFileHeaderV1, catalog: YazaDbCatalogRootV1, loaded: YazaDbCatalogSnapshotWithRootsV1, plan: YazaSqlBoundPlanV1, stage: YazaSqlBoundJoinStageV1, accumulated: YazaSqlMemoryTableV1) -> Result[YazaSqlMemoryTableV1, Text]:
+    let tables: List[YazaSqlTableSchemaV1] = loaded.sql_snapshot.tables
+    let table_index: Number = yaza_db_catalog_snapshot_table_index_v1(tables, stage.table_id)
+    if table_index < 0 or table_index >= list_count(loaded.root_page_ids) or table_index >= list_count(loaded.table_schema_versions):
+        return err("YDBv1 additional JOIN table has no persisted root page or schema version")
+    let root_page_id: Number = list_get(loaded.root_page_ids, table_index)
+    let table_schema: YazaSqlTableSchemaV1 = list_get(tables, table_index)
+    let schema_version: Number = list_get(loaded.table_schema_versions, table_index)
+    if list_count(table_schema.columns) != stage.column_count: return err("YDBv1 additional JOIN table schema changed after binding")
+    let key_ordinals: List[Number] = yaza_db_query_clustered_key_ordinals_v1(file, file_header, catalog, stage.table_id, root_page_id, plan.catalog_version, stage.column_count)?
+    let stored_rows: List[YazaDbRowV1] = yaza_db_btree_read_rows_for_schema_v1(file, file_header, root_page_id, table_schema.columns, schema_version, key_ordinals, plan.catalog_version, 65536)?
+    let right_table: YazaSqlMemoryTableV1 = yaza_db_query_memory_table_v1(stage.table_id, plan.catalog_version, table_schema.columns, stored_rows)?
+    return yaza_sql_join_additional_memory_v1(plan, stage, accumulated, right_table)
+
+fn yaza_db_query_join_stage_at_snapshot_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, catalog: YazaDbCatalogRootV1, loaded: YazaDbCatalogSnapshotWithRootsV1, plan: YazaSqlBoundPlanV1, stage: YazaSqlBoundJoinStageV1, snapshot_ts: Number, own_txn_id: Number, transactions: List[YazaDbTxnStatusV1], accumulated: YazaSqlMemoryTableV1) -> Result[YazaSqlMemoryTableV1, Text]:
+    let tables: List[YazaSqlTableSchemaV1] = loaded.sql_snapshot.tables
+    let table_index: Number = yaza_db_catalog_snapshot_table_index_v1(tables, stage.table_id)
+    if table_index < 0 or table_index >= list_count(loaded.root_page_ids) or table_index >= list_count(loaded.table_schema_versions):
+        return err("YDBv1 historical additional JOIN table is absent from the current catalog")
+    let exists_at_snapshot: Boolean = yaza_db_query_table_exists_at_snapshot_v1(storage, wal, stage.table_id, snapshot_ts, own_txn_id, transactions)?
+    if not exists_at_snapshot:
+        return err("YDBv1 historical additional JOIN table did not exist at the requested snapshot")
+    let root_page_id: Number = list_get(loaded.root_page_ids, table_index)
+    let table_schema: YazaSqlTableSchemaV1 = list_get(tables, table_index)
+    let schema_version: Number = list_get(loaded.table_schema_versions, table_index)
+    if list_count(table_schema.columns) != stage.column_count: return err("YDBv1 historical additional JOIN table schema changed after binding")
+    let key_ordinals: List[Number] = yaza_db_query_clustered_key_ordinals_v1(storage.file, storage.header, catalog, stage.table_id, root_page_id, plan.catalog_version, stage.column_count)?
+    let stored_rows: List[YazaDbRowV1] = yaza_db_btree_read_rows_at_snapshot_for_schema_v1(storage.root, wal.db_uuid, wal.next_lsn, storage.file, storage.header, root_page_id, table_schema.columns, schema_version, key_ordinals, snapshot_ts, 65536, own_txn_id, transactions)?
+    let right_table: YazaSqlMemoryTableV1 = yaza_db_query_memory_table_v1(stage.table_id, plan.catalog_version, table_schema.columns, stored_rows)?
+    return yaza_sql_join_additional_memory_v1(plan, stage, accumulated, right_table)
+
+fn yaza_db_query_join_relation_current_v1(file: Number, file_header: YazaDbFileHeaderV1, catalog: YazaDbCatalogRootV1, loaded: YazaDbCatalogSnapshotWithRootsV1, table_id: Number, virtual_relations: List[YazaDbQueryVirtualRelationV1]) -> Result[YazaSqlMemoryTableV1, Text]:
+    let virtual_index: Number = yaza_db_query_virtual_relation_index_v1(virtual_relations, table_id)
+    if virtual_index >= 0: return ok(list_get(virtual_relations, virtual_index).memory)
+    let tables: List[YazaSqlTableSchemaV1] = loaded.sql_snapshot.tables
+    let table_index: Number = yaza_db_catalog_snapshot_table_index_v1(tables, table_id)
+    if table_index < 0 or table_index >= list_count(loaded.root_page_ids) or table_index >= list_count(loaded.table_schema_versions):
+        return err("YDBv1 JOIN relation has no persistent root page or schema version")
+    let root_page_id: Number = list_get(loaded.root_page_ids, table_index)
+    let table_schema: YazaSqlTableSchemaV1 = list_get(tables, table_index)
+    let schema_version: Number = list_get(loaded.table_schema_versions, table_index)
+    let key_ordinals: List[Number] = yaza_db_query_clustered_key_ordinals_v1(file, file_header, catalog, table_id, root_page_id, loaded.sql_snapshot.version, list_count(table_schema.columns))?
+    let rows: List[YazaDbRowV1] = yaza_db_btree_read_rows_for_schema_v1(file, file_header, root_page_id, table_schema.columns, schema_version, key_ordinals, loaded.sql_snapshot.version, 65536)?
+    return yaza_db_query_memory_table_v1(table_id, loaded.sql_snapshot.version, table_schema.columns, rows)
+
+fn yaza_db_query_join_relation_at_snapshot_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, catalog: YazaDbCatalogRootV1, loaded: YazaDbCatalogSnapshotWithRootsV1, table_id: Number, snapshot_ts: Number, own_txn_id: Number, transactions: List[YazaDbTxnStatusV1], virtual_relations: List[YazaDbQueryVirtualRelationV1]) -> Result[YazaSqlMemoryTableV1, Text]:
+    let virtual_index: Number = yaza_db_query_virtual_relation_index_v1(virtual_relations, table_id)
+    if virtual_index >= 0: return ok(list_get(virtual_relations, virtual_index).memory)
+    let tables: List[YazaSqlTableSchemaV1] = loaded.sql_snapshot.tables
+    let table_index: Number = yaza_db_catalog_snapshot_table_index_v1(tables, table_id)
+    if table_index < 0 or table_index >= list_count(loaded.root_page_ids) or table_index >= list_count(loaded.table_schema_versions):
+        return err("YDBv1 historical JOIN relation has no persistent root page or schema version")
+    let exists_at_snapshot: Boolean = yaza_db_query_table_exists_at_snapshot_v1(storage, wal, table_id, snapshot_ts, own_txn_id, transactions)?
+    if not exists_at_snapshot: return err("YDBv1 historical JOIN relation did not exist at the requested snapshot")
+    let root_page_id: Number = list_get(loaded.root_page_ids, table_index)
+    let table_schema: YazaSqlTableSchemaV1 = list_get(tables, table_index)
+    let schema_version: Number = list_get(loaded.table_schema_versions, table_index)
+    let key_ordinals: List[Number] = yaza_db_query_clustered_key_ordinals_v1(storage.file, storage.header, catalog, table_id, root_page_id, loaded.sql_snapshot.version, list_count(table_schema.columns))?
+    let rows: List[YazaDbRowV1] = yaza_db_btree_read_rows_at_snapshot_for_schema_v1(storage.root, wal.db_uuid, wal.next_lsn, storage.file, storage.header, root_page_id, table_schema.columns, schema_version, key_ordinals, snapshot_ts, 65536, own_txn_id, transactions)?
+    return yaza_db_query_memory_table_v1(table_id, loaded.sql_snapshot.version, table_schema.columns, rows)
+
+fn yaza_db_query_join_stage_current_with_virtual_relations_v1(file: Number, file_header: YazaDbFileHeaderV1, catalog: YazaDbCatalogRootV1, loaded: YazaDbCatalogSnapshotWithRootsV1, plan: YazaSqlBoundPlanV1, stage: YazaSqlBoundJoinStageV1, accumulated: YazaSqlMemoryTableV1, virtual_relations: List[YazaDbQueryVirtualRelationV1]) -> Result[YazaSqlMemoryTableV1, Text]:
+    let virtual_index: Number = yaza_db_query_virtual_relation_index_v1(virtual_relations, stage.table_id)
+    if virtual_index < 0: return yaza_db_query_join_stage_current_v1(file, file_header, catalog, loaded, plan, stage, accumulated)
+    let relation: YazaSqlMemoryTableV1 = list_get(virtual_relations, virtual_index).memory
+    return yaza_sql_join_additional_memory_v1(plan, stage, accumulated, relation)
+
+fn yaza_db_query_join_stage_at_snapshot_with_virtual_relations_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, catalog: YazaDbCatalogRootV1, loaded: YazaDbCatalogSnapshotWithRootsV1, plan: YazaSqlBoundPlanV1, stage: YazaSqlBoundJoinStageV1, snapshot_ts: Number, own_txn_id: Number, transactions: List[YazaDbTxnStatusV1], accumulated: YazaSqlMemoryTableV1, virtual_relations: List[YazaDbQueryVirtualRelationV1]) -> Result[YazaSqlMemoryTableV1, Text]:
+    let virtual_index: Number = yaza_db_query_virtual_relation_index_v1(virtual_relations, stage.table_id)
+    if virtual_index < 0: return yaza_db_query_join_stage_at_snapshot_v1(storage, wal, catalog, loaded, plan, stage, snapshot_ts, own_txn_id, transactions, accumulated)
+    let relation: YazaSqlMemoryTableV1 = list_get(virtual_relations, virtual_index).memory
+    return yaza_sql_join_additional_memory_v1(plan, stage, accumulated, relation)
+
+fn yaza_db_query_collect_key_equality_v1(plan: YazaSqlBoundPlanV1, prepared: List[YazaSqlValueV1], key_ordinals: List[Number], values: List[YazaSqlValueV1], nulls: List[Boolean], seen: List[Boolean], node_index: Number, depth: Number) -> Number:
+    if depth > 64 or node_index < 0 or node_index >= list_count(plan.expressions): return 1
+    let node: YazaSqlBoundExpressionNodeV1 = list_get(plan.expressions, node_index)
+    if node.kind == 1:
+        if node.operator != 1 or node.column_ordinal < 0 or node.column_ordinal >= list_count(values): return 1
+        var is_key_column: Boolean = false
+        var key_index: Number = 0
+        while key_index < list_count(key_ordinals):
+            if list_get(key_ordinals, key_index) == node.column_ordinal: set is_key_column = true
+            set key_index = key_index + 1
+        if not is_key_column or list_get(seen, node.column_ordinal): return 1
+        var value: YazaSqlValueV1 = list_get(prepared, node_index)
+        if value.source_literal:
+            if value.type_id != 9: return 1
+            let decoded: Result[Text, Text] = yaza_sql_decode_text_literal_v1(plan.source, value.source_start_byte, value.source_end_byte)
+            if not result_is_ok(decoded): return 1
+            set value = yaza_sql_value_text_v1(result_unwrap(decoded))
+        if value.type_id != node.type_id: return 1
+        if not list_try_set(values, node.column_ordinal, value) or not list_try_set(nulls, node.column_ordinal, value.is_null) or not list_try_set(seen, node.column_ordinal, true): return 1
+        if value.is_null: return 2
+        return 0
+    if node.kind != 2: return 1
+    let left_state: Number = yaza_db_query_collect_key_equality_v1(plan, prepared, key_ordinals, values, nulls, seen, node.left_index, depth + 1)
+    let right_state: Number = yaza_db_query_collect_key_equality_v1(plan, prepared, key_ordinals, values, nulls, seen, node.right_index, depth + 1)
+    if left_state == 1 or right_state == 1: return 1
+    if left_state == 2 or right_state == 2: return 2
+    return 0
+
+fn yaza_db_query_clustered_equality_lookup_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, plan: YazaSqlBoundPlanV1, table_schema: YazaSqlTableSchemaV1, schema_version: Number, key_ordinals: List[Number], visible_ts: Number, parameters: List[YazaSqlValueV1], profile_ns: List[Number]) -> Result[Option[List[YazaDbRowV1]], Text]:
+    if plan.where_root < 0 or plan.where_root >= list_count(plan.expressions) or list_count(key_ordinals) < 1: return ok(none)
+    let point_profile_enabled: Boolean = list_count(profile_ns) >= 18
+    var point_stage_started_ns: Number = 0
+    if point_profile_enabled: set point_stage_started_ns = monotonic_ns()
+
+    if list_count(key_ordinals) == 1 and plan.where_root < list_count(plan.expressions):
+        let root_expr: YazaSqlBoundExpressionNodeV1 = list_get(plan.expressions, plan.where_root)
+        let single_pk_ordinal: Number = list_get(key_ordinals, 0)
+        if root_expr.kind == 1 and root_expr.operator == 1 and root_expr.column_ordinal == single_pk_ordinal and single_pk_ordinal >= 0 and single_pk_ordinal < list_count(table_schema.columns):
+            let pk_col: YazaSqlColumnSchemaV1 = list_get(table_schema.columns, single_pk_ordinal)
+            if pk_col.type_id == 2 or pk_col.type_id == 3 or pk_col.type_id == 4:
+                var target_integer: Number = 0
+                var has_target_integer: Boolean = false
+                if root_expr.value_kind == 3:
+                    let lit_slice: Result[Text, Text] = text_try_slice(plan.source, root_expr.value_start_byte, root_expr.value_end_byte - root_expr.value_start_byte)
+                    if result_is_ok(lit_slice):
+                        let parsed_num: Result[Number, Text] = number_try_parse(result_unwrap(lit_slice))
+                        if result_is_ok(parsed_num):
+                            set target_integer = result_unwrap(parsed_num)
+                            set has_target_integer = true
+                elif root_expr.value_kind == 5 and root_expr.parameter_ordinal >= 0 and root_expr.parameter_ordinal < list_count(parameters):
+                    let param_val: YazaSqlValueV1 = list_get(parameters, root_expr.parameter_ordinal)
+                    if not param_val.is_null and param_val.type_id == pk_col.type_id:
+                        set target_integer = param_val.integer_value
+                        set has_target_integer = true
+                if has_target_integer:
+                    let search_key_result: Result[Bytes, Text] = yaza_db_key_encode_integer_component_v1(pk_col.type_id, target_integer)
+                    if result_is_ok(search_key_result):
+                        let search_key: Bytes = result_unwrap(search_key_result)
+                        if point_profile_enabled: set point_stage_started_ns = yaza_db_query_profile_record_ns_v1(profile_ns, 14, point_stage_started_ns, monotonic_ns())
+                        if point_profile_enabled: set point_stage_started_ns = yaza_db_query_profile_record_ns_v1(profile_ns, 15, point_stage_started_ns, monotonic_ns())
+                        if point_profile_enabled: set point_stage_started_ns = monotonic_ns()
+                        let seek: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_profiled_v1(file, file_header, root_page_id, search_key, profile_ns)?
+                        if point_profile_enabled: set point_stage_started_ns = yaza_db_query_profile_record_ns_v1(profile_ns, 16, point_stage_started_ns, monotonic_ns())
+                        if point_profile_enabled: set point_stage_started_ns = monotonic_ns()
+                        let rows: List[YazaDbRowV1] = yaza_db_btree_read_rows_from_seek_for_schema_v1(file, file_header, table_schema.columns, schema_version, key_ordinals, visible_ts, search_key, seek)?
+                        if point_profile_enabled: let ignored_row_profile: Number = yaza_db_query_profile_record_ns_v1(profile_ns, 17, point_stage_started_ns, monotonic_ns())
+                        return ok(some(rows))
+
+    let type_ids_result: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(type_ids_result): return err(result_unwrap_error(type_ids_result))
+    let type_ids: List[Number] = result_unwrap(type_ids_result)
+    if not list_try_reserve(type_ids, list_count(table_schema.columns)): return err("YDBv1 point lookup could not reserve the empty-table type vector")
+    var column_index: Number = 0
+    while column_index < list_count(table_schema.columns):
+        if not list_try_push(type_ids, list_get(table_schema.columns, column_index).type_id): return err("YDBv1 point lookup could not build the empty-table type vector")
+        set column_index = column_index + 1
+    let empty_table: YazaSqlMemoryTableV1 = YazaSqlMemoryTableV1(plan.table_id, plan.catalog_version, type_ids, List[List[YazaSqlValueV1]](), 0)
+    let prepared: List[YazaSqlValueV1] = yaza_sql_executor_prepare_values_v1(plan, empty_table, parameters)?
+
+    let values_result: Result[List[YazaSqlValueV1], Text] = list_try_new()
+    let nulls_result: Result[List[Boolean], Text] = list_try_new()
+    let seen_result: Result[List[Boolean], Text] = list_try_new()
+    if not result_is_ok(values_result) or not result_is_ok(nulls_result) or not result_is_ok(seen_result): return err("YDBv1 point lookup could not allocate its synthetic key tuple")
+    let values: List[YazaSqlValueV1] = result_unwrap(values_result)
+    let nulls: List[Boolean] = result_unwrap(nulls_result)
+    let seen: List[Boolean] = result_unwrap(seen_result)
+    if not list_try_reserve(values, list_count(table_schema.columns)) or not list_try_reserve(nulls, list_count(table_schema.columns)) or not list_try_reserve(seen, list_count(table_schema.columns)): return err("YDBv1 point lookup could not reserve its synthetic key tuple")
+    set column_index = 0
+    while column_index < list_count(table_schema.columns):
+        let null_value: YazaSqlValueV1 = yaza_sql_value_null_v1(list_get(table_schema.columns, column_index).type_id)?
+        if not list_try_push(values, null_value) or not list_try_push(nulls, true) or not list_try_push(seen, false): return err("YDBv1 point lookup could not initialize its synthetic key tuple")
+        set column_index = column_index + 1
+
+    let predicate_state: Number = yaza_db_query_collect_key_equality_v1(plan, prepared, key_ordinals, values, nulls, seen, plan.where_root, 0)
+    if point_profile_enabled: set point_stage_started_ns = yaza_db_query_profile_record_ns_v1(profile_ns, 14, point_stage_started_ns, monotonic_ns())
+    if predicate_state == 1: return ok(none)
+    var key_index: Number = 0
+    while key_index < list_count(key_ordinals):
+        let ordinal: Number = list_get(key_ordinals, key_index)
+        if ordinal < 0 or ordinal >= list_count(seen) or not list_get(seen, ordinal): return ok(none)
+        set key_index = key_index + 1
+    if predicate_state == 2:
+        let empty_rows_result: Result[List[YazaDbRowV1], Text] = list_try_new()
+        if not result_is_ok(empty_rows_result): return err(result_unwrap_error(empty_rows_result))
+        return ok(some(result_unwrap(empty_rows_result)))
+
+    if point_profile_enabled: set point_stage_started_ns = monotonic_ns()
+    let search_key: Bytes = yaza_db_key_encode_composite_v1(values, nulls, table_schema.columns, key_ordinals)?
+    if point_profile_enabled: set point_stage_started_ns = yaza_db_query_profile_record_ns_v1(profile_ns, 15, point_stage_started_ns, monotonic_ns())
+    if point_profile_enabled: set point_stage_started_ns = monotonic_ns()
+    let seek: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_profiled_v1(file, file_header, root_page_id, search_key, profile_ns)?
+    if point_profile_enabled: set point_stage_started_ns = yaza_db_query_profile_record_ns_v1(profile_ns, 16, point_stage_started_ns, monotonic_ns())
+    if point_profile_enabled: set point_stage_started_ns = monotonic_ns()
+    let rows: List[YazaDbRowV1] = yaza_db_btree_read_rows_from_seek_for_schema_v1(file, file_header, table_schema.columns, schema_version, key_ordinals, visible_ts, search_key, seek)?
+    if point_profile_enabled: let ignored_row_profile: Number = yaza_db_query_profile_record_ns_v1(profile_ns, 17, point_stage_started_ns, monotonic_ns())
+    return ok(some(rows))
+
+shape YazaDbSecondaryIndexMatchV1:
+    root_page_id: Number
+    name: Text
+    is_unique: Boolean
+
+fn yaza_db_query_find_secondary_index_v1(index_rows: List[YazaDbRowV1], table_id: Number, column_ordinal: Number) -> Option[YazaDbSecondaryIndexMatchV1]:
+    let indexed_column_key: Text = number_text(column_ordinal)
+    var index_row_index: Number = 0
+    while index_row_index < list_count(index_rows):
+        let index_row: YazaDbRowV1 = list_get(index_rows, index_row_index)
+        if list_count(index_row.values) == 8 and list_get(index_row.values, 1).integer_value == table_id and list_get(index_row.values, 4).integer_value == yaza_db_catalog_index_kind_secondary_active_v1() and list_get(index_row.values, 6).text_value == indexed_column_key:
+            return some(YazaDbSecondaryIndexMatchV1(list_get(index_row.values, 3).integer_value, list_get(index_row.values, 2).text_value, list_get(index_row.values, 5).boolean_value))
+        set index_row_index = index_row_index + 1
+    return none
+
+fn yaza_db_query_secondary_equality_lookup_v1(file: Number, file_header: YazaDbFileHeaderV1, table_root_page_id: Number, plan: YazaSqlBoundPlanV1, table_schema: YazaSqlTableSchemaV1, schema_version: Number, clustered_key_ordinals: List[Number], visible_ts: Number, parameters: List[YazaSqlValueV1], cached_index_rows: Option[List[YazaDbRowV1]]) -> Result[Option[List[YazaDbRowV1]], Text]:
+    if plan.right_table_id != 0 or plan.where_root < 0 or plan.where_root >= list_count(plan.expressions): return ok(none)
+    let predicate: YazaSqlBoundExpressionNodeV1 = list_get(plan.expressions, plan.where_root)
+    if predicate.kind != 1 or predicate.operator != 1 or predicate.column_ordinal < 0 or predicate.column_ordinal >= list_count(table_schema.columns): return ok(none)
+    var key_check_index: Number = 0
+    while key_check_index < list_count(clustered_key_ordinals):
+        if list_get(clustered_key_ordinals, key_check_index) == predicate.column_ordinal: return ok(none)
+        set key_check_index = key_check_index + 1
+
+    var index_root_page_id: Number = 0
+    var index_name: Text = ""
+    var index_is_unique: Boolean = false
+    if option_is_some(cached_index_rows):
+        let matched_opt: Option[YazaDbSecondaryIndexMatchV1] = yaza_db_query_find_secondary_index_v1(option_unwrap(cached_index_rows), plan.table_id, predicate.column_ordinal)
+        if not option_is_some(matched_opt): return ok(none)
+        let matched: YazaDbSecondaryIndexMatchV1 = option_unwrap(matched_opt)
+        set index_root_page_id = matched.root_page_id
+        set index_name = matched.name
+        set index_is_unique = matched.is_unique
+    else:
+        let index_rows: List[YazaDbRowV1] = yaza_db_index_catalog_rows_v1(file, file_header, visible_ts)?
+        let matched_opt: Option[YazaDbSecondaryIndexMatchV1] = yaza_db_query_find_secondary_index_v1(index_rows, plan.table_id, predicate.column_ordinal)
+        if not option_is_some(matched_opt): return ok(none)
+        let matched: YazaDbSecondaryIndexMatchV1 = option_unwrap(matched_opt)
+        set index_root_page_id = matched.root_page_id
+        set index_name = matched.name
+        set index_is_unique = matched.is_unique
+    if index_root_page_id == 0: return ok(none)
+    if index_root_page_id == table_root_page_id: return err("YDBv1 secondary-index root aliases the clustered table root")
+
+    let empty_table: YazaSqlMemoryTableV1 = yaza_db_query_memory_table_v1(plan.table_id, plan.catalog_version, table_schema.columns, List[YazaDbRowV1]())?
+    let prepared: List[YazaSqlValueV1] = yaza_sql_executor_prepare_values_v1(plan, empty_table, parameters)?
+    if list_count(prepared) != list_count(plan.expressions): return err("YDBv1 secondary-index lookup prepared-value width is invalid")
+    var target: YazaSqlValueV1 = list_get(prepared, plan.where_root)
+    if target.source_literal:
+        if target.type_id != 9: return ok(none)
+        let decoded: Result[Text, Text] = yaza_sql_decode_text_literal_v1(plan.source, target.source_start_byte, target.source_end_byte)
+        if not result_is_ok(decoded): return err("YDBv1 secondary-index lookup could not decode its text literal")
+        set target = yaza_sql_value_text_v1(result_unwrap(decoded))
+    if target.type_id != predicate.type_id: return ok(none)
+    if target.is_null:
+        let empty_result: Result[List[YazaDbRowV1], Text] = list_try_new()
+        if not result_is_ok(empty_result): return err(result_unwrap_error(empty_result))
+        return ok(some(result_unwrap(empty_result)))
+
+    let index_plan: YazaSqlCreateIndexPlanV1 = YazaSqlCreateIndexPlanV1(1, plan.catalog_version, index_name, plan.table_id, table_schema.name, index_is_unique, predicate.column_ordinal, table_schema.columns)
+    let entry_columns: List[YazaSqlColumnSchemaV1] = yaza_db_sql_create_index_entry_schema_v1(index_plan, clustered_key_ordinals)?
+    let entry_key_ordinals: List[Number] = yaza_db_sql_create_index_entry_key_ordinals_v1(entry_columns)?
+    let prefix_values_result: Result[List[YazaSqlValueV1], Text] = list_try_new()
+    let prefix_nulls_result: Result[List[Boolean], Text] = list_try_new()
+    if not result_is_ok(prefix_values_result) or not result_is_ok(prefix_nulls_result): return err("YDBv1 secondary-index lookup could not allocate its prefix tuple")
+    let prefix_values: List[YazaSqlValueV1] = result_unwrap(prefix_values_result)
+    let prefix_nulls: List[Boolean] = result_unwrap(prefix_nulls_result)
+    if not list_try_reserve(prefix_values, list_count(entry_columns)) or not list_try_reserve(prefix_nulls, list_count(entry_columns)):
+        return err("YDBv1 secondary-index lookup could not reserve its prefix tuple")
+    var prefix_column: Number = 0
+    while prefix_column < list_count(entry_columns):
+        if prefix_column == 0:
+            if not list_try_push(prefix_values, target) or not list_try_push(prefix_nulls, false): return err("YDBv1 secondary-index lookup could not set its prefix value")
+        else:
+            let null_suffix: YazaSqlValueV1 = yaza_sql_value_null_v1(list_get(entry_columns, prefix_column).type_id)?
+            if not list_try_push(prefix_values, null_suffix) or not list_try_push(prefix_nulls, true): return err("YDBv1 secondary-index lookup could not pad its prefix tuple")
+        set prefix_column = prefix_column + 1
+    let prefix_key: Bytes = yaza_db_key_encode_composite_v1(prefix_values, prefix_nulls, entry_columns, [0])?
+    let matching_entries: List[YazaDbRowV1] = yaza_db_btree_read_rows_with_key_prefix_v1(file, file_header, index_root_page_id, entry_columns, 1, entry_key_ordinals, visible_ts, prefix_key, 65536)?
+    let output_result: Result[List[YazaDbRowV1], Text] = list_try_new()
+    if not result_is_ok(output_result): return err(result_unwrap_error(output_result))
+    let output: List[YazaDbRowV1] = result_unwrap(output_result)
+    if not list_try_reserve(output, list_count(matching_entries)): return err("YDBv1 secondary-index lookup could not reserve matching rows")
+
+    var entry_index: Number = 0
+    while entry_index < list_count(matching_entries):
+        let entry: YazaDbRowV1 = list_get(matching_entries, entry_index)
+        if entry.deleted or list_count(entry.values) != list_count(entry_columns) or list_count(entry.nulls) != list_count(entry_columns):
+            return err("YDBv1 secondary-index range returned a malformed entry")
+        if list_get(entry.nulls, 0) or yaza_sql_executor_compare_values_v1(plan.source, list_get(entry.values, 0), target) != 0:
+            return err("YDBv1 secondary-index range entry does not match its equality prefix")
+        let source_values_result: Result[List[YazaSqlValueV1], Text] = list_try_new()
+        let source_nulls_result: Result[List[Boolean], Text] = list_try_new()
+        if not result_is_ok(source_values_result) or not result_is_ok(source_nulls_result): return err("YDBv1 secondary-index lookup could not allocate a clustered key tuple")
+        let source_values: List[YazaSqlValueV1] = result_unwrap(source_values_result)
+        let source_nulls: List[Boolean] = result_unwrap(source_nulls_result)
+        if not list_try_reserve(source_values, list_count(table_schema.columns)) or not list_try_reserve(source_nulls, list_count(table_schema.columns)):
+            return err("YDBv1 secondary-index lookup could not reserve a clustered key tuple")
+        var source_column_index: Number = 0
+        while source_column_index < list_count(table_schema.columns):
+            let null_value: YazaSqlValueV1 = yaza_sql_value_null_v1(list_get(table_schema.columns, source_column_index).type_id)?
+            if not list_try_push(source_values, null_value) or not list_try_push(source_nulls, true): return err("YDBv1 secondary-index lookup could not initialize a clustered key tuple")
+            set source_column_index = source_column_index + 1
+        if not list_try_set(source_values, predicate.column_ordinal, target) or not list_try_set(source_nulls, predicate.column_ordinal, false):
+            return err("YDBv1 secondary-index lookup could not add its indexed predicate value")
+        var key_index: Number = 0
+        while key_index < list_count(clustered_key_ordinals):
+            let table_ordinal: Number = list_get(clustered_key_ordinals, key_index)
+            let entry_ordinal: Number = key_index + 1
+            if entry_ordinal >= list_count(entry.values) or table_ordinal < 0 or table_ordinal >= list_count(source_values) or list_get(entry.nulls, entry_ordinal):
+                return err("YDBv1 secondary-index entry has an invalid primary-key suffix")
+            let key_value: YazaSqlValueV1 = list_get(entry.values, entry_ordinal)
+            if table_ordinal == predicate.column_ordinal and yaza_sql_executor_compare_values_v1(plan.source, key_value, target) != 0:
+                return err("YDBv1 secondary-index indexed value disagrees with its primary-key suffix")
+            if not list_try_set(source_values, table_ordinal, key_value) or not list_try_set(source_nulls, table_ordinal, false):
+                return err("YDBv1 secondary-index lookup could not construct its clustered key")
+            set key_index = key_index + 1
+        let clustered_key: Bytes = yaza_db_key_encode_composite_v1(source_values, source_nulls, table_schema.columns, clustered_key_ordinals)?
+        let source_rows: List[YazaDbRowV1] = yaza_db_btree_read_rows_by_key_for_schema_v1(file, file_header, table_root_page_id, table_schema.columns, schema_version, clustered_key_ordinals, visible_ts, clustered_key)?
+        if list_count(source_rows) != 1: return err("YDBv1 ACTIVE secondary index has a missing or duplicate clustered row")
+        let source_row: YazaDbRowV1 = list_get(source_rows, 0)
+        if list_get(source_row.nulls, predicate.column_ordinal) or yaza_sql_executor_compare_values_v1(plan.source, list_get(source_row.values, predicate.column_ordinal), target) != 0:
+            return err("YDBv1 ACTIVE secondary index entry disagrees with its clustered row")
+        set key_index = 0
+        while key_index < list_count(clustered_key_ordinals):
+            let table_ordinal: Number = list_get(clustered_key_ordinals, key_index)
+            if list_get(source_row.nulls, table_ordinal) or yaza_sql_executor_compare_values_v1(plan.source, list_get(source_row.values, table_ordinal), list_get(entry.values, key_index + 1)) != 0:
+                return err("YDBv1 ACTIVE secondary-index primary-key suffix disagrees with its clustered row")
+            set key_index = key_index + 1
+        if not list_try_push(output, source_row): return err("YDBv1 secondary-index lookup could not append its clustered row")
+        set entry_index = entry_index + 1
+    return ok(some(output))
+
+fn yaza_db_query_secondary_index_prefix_successor_v1(prefix: Bytes) -> Result[Bytes, Text]:
+    let prefix_length: Number = bytes_length(prefix)
+    if prefix_length < 1 or prefix_length > 2048: return err("YDBv1 secondary-index value prefix is outside its bound")
+    var last_non_max: Number = prefix_length - 1
+    while last_non_max >= 0 and bytes_get(prefix, last_non_max) == 255:
+        set last_non_max = last_non_max - 1
+    if last_non_max < 0: return err("YDBv1 secondary-index prefix has no lexicographic successor")
+    let successor_created: Result[Bytes, Text] = bytes_try_new_zeroed(last_non_max + 1)
+    if not result_is_ok(successor_created): return err(result_unwrap_error(successor_created))
+    let successor: Bytes = result_unwrap(successor_created)
+    var offset: Number = 0
+    while offset <= last_non_max:
+        var byte_value: Number = bytes_get(prefix, offset)
+        if offset == last_non_max: set byte_value = byte_value + 1
+        if not bytes_try_set(successor, offset, byte_value): return err("YDBv1 secondary-index successor byte could not be written")
+        set offset = offset + 1
+    return ok(successor)
+
+fn yaza_db_query_secondary_index_value_prefix_v1(target: YazaSqlValueV1, entry_columns: List[YazaSqlColumnSchemaV1]) -> Result[Bytes, Text]:
+    let value_created: Result[List[YazaSqlValueV1], Text] = list_try_new()
+    let null_created: Result[List[Boolean], Text] = list_try_new()
+    if not result_is_ok(value_created) or not result_is_ok(null_created): return err("YDBv1 secondary-index range could not allocate its prefix tuple")
+    let values: List[YazaSqlValueV1] = result_unwrap(value_created)
+    let nulls: List[Boolean] = result_unwrap(null_created)
+    if not list_try_reserve(values, list_count(entry_columns)) or not list_try_reserve(nulls, list_count(entry_columns)):
+        return err("YDBv1 secondary-index range could not reserve its prefix tuple")
+    var column_index: Number = 0
+    while column_index < list_count(entry_columns):
+        if column_index == 0:
+            if not list_try_push(values, target) or not list_try_push(nulls, false): return err("YDBv1 secondary-index range could not set its prefix value")
+        else:
+            let null_value: YazaSqlValueV1 = yaza_sql_value_null_v1(list_get(entry_columns, column_index).type_id)?
+            if not list_try_push(values, null_value) or not list_try_push(nulls, true): return err("YDBv1 secondary-index range could not pad its primary-key suffix")
+        set column_index = column_index + 1
+    return yaza_db_key_encode_composite_v1(values, nulls, entry_columns, [0])
+
+fn yaza_db_query_secondary_range_lookup_v1(file: Number, file_header: YazaDbFileHeaderV1, table_root_page_id: Number, plan: YazaSqlBoundPlanV1, table_schema: YazaSqlTableSchemaV1, schema_version: Number, clustered_key_ordinals: List[Number], visible_ts: Number, parameters: List[YazaSqlValueV1], cached_index_rows: Option[List[YazaDbRowV1]]) -> Result[Option[List[YazaDbRowV1]], Text]:
+    if plan.right_table_id != 0 or plan.where_root < 0 or plan.where_root >= list_count(plan.expressions): return ok(none)
+    let predicate: YazaSqlBoundExpressionNodeV1 = list_get(plan.expressions, plan.where_root)
+    if predicate.kind != 1 or predicate.operator < 3 or predicate.operator > 6 or predicate.column_ordinal < 0 or predicate.column_ordinal >= list_count(table_schema.columns): return ok(none)
+    if predicate.value_kind != 1 and predicate.value_kind != 3 and predicate.value_kind != 4 and predicate.value_kind != 5 and predicate.value_kind != 8: return ok(none)
+    var key_check_index: Number = 0
+    while key_check_index < list_count(clustered_key_ordinals):
+        if list_get(clustered_key_ordinals, key_check_index) == predicate.column_ordinal: return ok(none)
+        set key_check_index = key_check_index + 1
+
+    var index_root_page_id: Number = 0
+    var index_name: Text = ""
+    var index_is_unique: Boolean = false
+    if option_is_some(cached_index_rows):
+        let matched_opt: Option[YazaDbSecondaryIndexMatchV1] = yaza_db_query_find_secondary_index_v1(option_unwrap(cached_index_rows), plan.table_id, predicate.column_ordinal)
+        if not option_is_some(matched_opt): return ok(none)
+        let matched: YazaDbSecondaryIndexMatchV1 = option_unwrap(matched_opt)
+        set index_root_page_id = matched.root_page_id
+        set index_name = matched.name
+        set index_is_unique = matched.is_unique
+    else:
+        let index_rows: List[YazaDbRowV1] = yaza_db_index_catalog_rows_v1(file, file_header, visible_ts)?
+        let matched_opt: Option[YazaDbSecondaryIndexMatchV1] = yaza_db_query_find_secondary_index_v1(index_rows, plan.table_id, predicate.column_ordinal)
+        if not option_is_some(matched_opt): return ok(none)
+        let matched: YazaDbSecondaryIndexMatchV1 = option_unwrap(matched_opt)
+        set index_root_page_id = matched.root_page_id
+        set index_name = matched.name
+        set index_is_unique = matched.is_unique
+    if index_root_page_id == 0: return ok(none)
+    if index_root_page_id == table_root_page_id: return err("YDBv1 secondary-index range root aliases the clustered table root")
+
+    let empty_table: YazaSqlMemoryTableV1 = yaza_db_query_memory_table_v1(plan.table_id, plan.catalog_version, table_schema.columns, List[YazaDbRowV1]())?
+    let prepared: List[YazaSqlValueV1] = yaza_sql_executor_prepare_values_v1(plan, empty_table, parameters)?
+    if list_count(prepared) != list_count(plan.expressions): return err("YDBv1 secondary-index range prepared-value width is invalid")
+    var target: YazaSqlValueV1 = list_get(prepared, plan.where_root)
+    if target.source_literal:
+        if target.type_id != 9: return ok(none)
+        let decoded: Result[Text, Text] = yaza_sql_decode_text_literal_v1(plan.source, target.source_start_byte, target.source_end_byte)
+        if not result_is_ok(decoded): return err("YDBv1 secondary-index range could not decode its text literal")
+        set target = yaza_sql_value_text_v1(result_unwrap(decoded))
+    if target.type_id != predicate.type_id or not yaza_sql_executor_value_matches_v1(target, predicate.type_id): return ok(none)
+    if target.is_null:
+        let empty_result: Result[List[YazaDbRowV1], Text] = list_try_new()
+        if not result_is_ok(empty_result): return err(result_unwrap_error(empty_result))
+        return ok(some(result_unwrap(empty_result)))
+
+    let index_plan: YazaSqlCreateIndexPlanV1 = YazaSqlCreateIndexPlanV1(1, plan.catalog_version, index_name, plan.table_id, table_schema.name, index_is_unique, predicate.column_ordinal, table_schema.columns)
+    let entry_columns: List[YazaSqlColumnSchemaV1] = yaza_db_sql_create_index_entry_schema_v1(index_plan, clustered_key_ordinals)?
+    let entry_key_ordinals: List[Number] = yaza_db_sql_create_index_entry_key_ordinals_v1(entry_columns)?
+    let prefix_key: Bytes = yaza_db_query_secondary_index_value_prefix_v1(target, entry_columns)?
+    let successor_key: Bytes = yaza_db_query_secondary_index_prefix_successor_v1(prefix_key)?
+    var start_after_key: Bytes = bytes_from_text("")
+    var end_key: Bytes = bytes_from_text("")
+    var end_key_inclusive: Boolean = false
+    if predicate.operator == 5: set start_after_key = successor_key
+    elif predicate.operator == 6: set start_after_key = prefix_key
+    if predicate.operator == 3: set end_key = prefix_key
+    elif predicate.operator == 4: set end_key = successor_key
+
+    let matching_entries: List[YazaDbRowV1] = yaza_db_btree_read_rows_unfiltered_range_for_schema_v1(file, file_header, index_root_page_id, entry_columns, 1, entry_key_ordinals, visible_ts, start_after_key, end_key, end_key_inclusive)?
+    let output_created: Result[List[YazaDbRowV1], Text] = list_try_new()
+    if not result_is_ok(output_created): return err(result_unwrap_error(output_created))
+    let output: List[YazaDbRowV1] = result_unwrap(output_created)
+    if not list_try_reserve(output, list_count(matching_entries)): return err("YDBv1 secondary-index range could not reserve clustered rows")
+    var entry_index: Number = 0
+    while entry_index < list_count(matching_entries):
+        let entry: YazaDbRowV1 = list_get(matching_entries, entry_index)
+        if entry.deleted or list_count(entry.values) != list_count(entry_columns) or list_count(entry.nulls) != list_count(entry_columns):
+            return err("YDBv1 secondary-index range returned a malformed entry")
+        if not list_get(entry.nulls, 0):
+            let indexed_value: YazaSqlValueV1 = list_get(entry.values, 0)
+            if not yaza_sql_executor_value_matches_v1(indexed_value, predicate.type_id): return err("YDBv1 secondary-index range value does not match its schema")
+            let bound_comparison: Number = yaza_sql_executor_compare_values_v1(plan.source, indexed_value, target)
+            if not yaza_sql_executor_apply_comparison_v1(bound_comparison, predicate.operator): return err("YDBv1 secondary-index range returned a value outside its SQL bound")
+            let source_values_created: Result[List[YazaSqlValueV1], Text] = list_try_new()
+            let source_nulls_created: Result[List[Boolean], Text] = list_try_new()
+            if not result_is_ok(source_values_created) or not result_is_ok(source_nulls_created): return err("YDBv1 secondary-index range could not allocate a clustered key tuple")
+            let source_values: List[YazaSqlValueV1] = result_unwrap(source_values_created)
+            let source_nulls: List[Boolean] = result_unwrap(source_nulls_created)
+            if not list_try_reserve(source_values, list_count(table_schema.columns)) or not list_try_reserve(source_nulls, list_count(table_schema.columns)):
+                return err("YDBv1 secondary-index range could not reserve a clustered key tuple")
+            var source_column_index: Number = 0
+            while source_column_index < list_count(table_schema.columns):
+                let null_value: YazaSqlValueV1 = yaza_sql_value_null_v1(list_get(table_schema.columns, source_column_index).type_id)?
+                if not list_try_push(source_values, null_value) or not list_try_push(source_nulls, true): return err("YDBv1 secondary-index range could not initialize a clustered key tuple")
+                set source_column_index = source_column_index + 1
+            if not list_try_set(source_values, predicate.column_ordinal, indexed_value) or not list_try_set(source_nulls, predicate.column_ordinal, false):
+                return err("YDBv1 secondary-index range could not add its indexed value")
+            var key_index: Number = 0
+            while key_index < list_count(clustered_key_ordinals):
+                let table_ordinal: Number = list_get(clustered_key_ordinals, key_index)
+                let entry_ordinal: Number = key_index + 1
+                if entry_ordinal >= list_count(entry.values) or table_ordinal < 0 or table_ordinal >= list_count(source_values) or list_get(entry.nulls, entry_ordinal):
+                    return err("YDBv1 secondary-index range has an invalid primary-key suffix")
+                let key_value: YazaSqlValueV1 = list_get(entry.values, entry_ordinal)
+                if table_ordinal == predicate.column_ordinal and yaza_sql_executor_compare_values_v1(plan.source, key_value, indexed_value) != 0:
+                    return err("YDBv1 secondary-index value disagrees with its primary-key suffix")
+                if not list_try_set(source_values, table_ordinal, key_value) or not list_try_set(source_nulls, table_ordinal, false):
+                    return err("YDBv1 secondary-index range could not construct its clustered key")
+                set key_index = key_index + 1
+            let clustered_key: Bytes = yaza_db_key_encode_composite_v1(source_values, source_nulls, table_schema.columns, clustered_key_ordinals)?
+            let source_rows: List[YazaDbRowV1] = yaza_db_btree_read_rows_by_key_for_schema_v1(file, file_header, table_root_page_id, table_schema.columns, schema_version, clustered_key_ordinals, visible_ts, clustered_key)?
+            if list_count(source_rows) != 1: return err("YDBv1 ACTIVE secondary index range has a missing or duplicate clustered row")
+            let source_row: YazaDbRowV1 = list_get(source_rows, 0)
+            if list_get(source_row.nulls, predicate.column_ordinal) or yaza_sql_executor_compare_values_v1(plan.source, list_get(source_row.values, predicate.column_ordinal), indexed_value) != 0:
+                return err("YDBv1 ACTIVE secondary-index range entry disagrees with its clustered row")
+            set key_index = 0
+            while key_index < list_count(clustered_key_ordinals):
+                let table_ordinal: Number = list_get(clustered_key_ordinals, key_index)
+                if list_get(source_row.nulls, table_ordinal) or yaza_sql_executor_compare_values_v1(plan.source, list_get(source_row.values, table_ordinal), list_get(entry.values, key_index + 1)) != 0:
+                    return err("YDBv1 ACTIVE secondary-index range suffix disagrees with its clustered row")
+                set key_index = key_index + 1
+            if not list_try_push(output, source_row): return err("YDBv1 secondary-index range could not append a clustered row")
+        set entry_index = entry_index + 1
+    return ok(some(output))
+
+fn yaza_db_query_prefix_limit_eligible_v1(plan: YazaSqlBoundPlanV1) -> Boolean:
+    if not plan.has_limit or plan.limit > yaza_db_btree_max_rows_v1() or plan.where_root >= 0 or plan.having_root >= 0 or plan.distinct: return false
+    if list_count(plan.group_by_columns) != 0 or list_count(plan.order_by) != 0: return false
+    var projection_index: Number = 0
+    while projection_index < list_count(plan.projections):
+        if list_get(plan.projections, projection_index).aggregate_kind != 0: return false
+        set projection_index = projection_index + 1
+    return true
+
+fn yaza_db_query_stream_aggregate_eligible_v1(plan: YazaSqlBoundPlanV1, virtual_relations: List[YazaDbQueryVirtualRelationV1], statement_prior_work_units: Number) -> Boolean:
+    if statement_prior_work_units != 0 or list_count(virtual_relations) != 0 or plan.right_table_id != 0 or list_count(plan.join_stages) != 0 or list_count(plan.subqueries) != 0:
+        return false
+    if list_count(plan.group_by_columns) != 0 or plan.having_root >= 0 or plan.distinct or list_count(plan.order_by) != 0 or plan.has_limit:
+        return false
+    if list_count(plan.projections) == 0: return false
+    var projection_index: Number = 0
+    while projection_index < list_count(plan.projections):
+        let projection: YazaSqlBoundProjectionV1 = list_get(plan.projections, projection_index)
+        if projection.aggregate_kind < 1 or projection.aggregate_kind > 5: return false
+        set projection_index = projection_index + 1
+    return true
+
+fn yaza_db_query_subquery_is_exists_v1(plan: YazaSqlBoundPlanV1, subquery_index: Number) -> Boolean:
+    var expression_index: Number = 0
+    while expression_index < list_count(plan.expressions):
+        let node: YazaSqlBoundExpressionNodeV1 = list_get(plan.expressions, expression_index)
+        if node.kind == 7 and node.parameter_ordinal == subquery_index: return true
+        set expression_index = expression_index + 1
+    return false
+
+fn yaza_db_query_subquery_is_correlated_exists_v1(plan: YazaSqlBoundPlanV1, subquery_index: Number) -> Boolean:
+    var expression_index: Number = 0
+    while expression_index < list_count(plan.expressions):
+        let node: YazaSqlBoundExpressionNodeV1 = list_get(plan.expressions, expression_index)
+        if node.kind == 7 and node.value_kind == 1 and node.parameter_ordinal == subquery_index: return true
+        set expression_index = expression_index + 1
+    return false
+
+fn yaza_db_query_subquery_is_correlated_in_v1(plan: YazaSqlBoundPlanV1, subquery_index: Number) -> Boolean:
+    var expression_index: Number = 0
+    while expression_index < list_count(plan.expressions):
+        let node: YazaSqlBoundExpressionNodeV1 = list_get(plan.expressions, expression_index)
+        if node.kind == 6 and node.value_kind == 1 and node.parameter_ordinal == subquery_index: return true
+        set expression_index = expression_index + 1
+    return false
+
+fn yaza_db_query_has_correlated_subquery_v1(plan: YazaSqlBoundPlanV1) -> Boolean:
+    var expression_index: Number = 0
+    while expression_index < list_count(plan.expressions):
+        let node: YazaSqlBoundExpressionNodeV1 = list_get(plan.expressions, expression_index)
+        if (node.kind == 7 or node.kind == 6) and node.value_kind == 1: return true
+        set expression_index = expression_index + 1
+    return false
+
+fn yaza_db_query_exists_limit_source_v1(source: Text) -> Result[Text, Text]:
+    let parsed: YazaSqlSelectAstV3 = yaza_sql_parse_select_v3(source)?
+    if parsed.has_limit: return ok(source)
+    return text_try_concat(source, " LIMIT 1")
+
+fn yaza_db_query_result_text_bytes_v1(result: YazaSqlQueryResultV1) -> Result[Number, Text]:
+    if list_count(result.columns) < 1 or list_count(result.columns) > 1024: return err("YDBv1 query result has an invalid projection width")
+    var total_text_bytes: Number = 0
+    var row_index: Number = 0
+    while row_index < list_count(result.rows):
+        let row: List[YazaSqlValueV1] = list_get(result.rows, row_index)
+        if list_count(row) != list_count(result.columns): return err("YDBv1 query result row width does not match its projections")
+        var column_index: Number = 0
+        while column_index < list_count(row):
+            let value: YazaSqlValueV1 = list_get(row, column_index)
+            if (value.type_id == 9 or value.type_id == 16) and not value.is_null:
+                let byte_count: Number = yaza_sql_value_variable_length_v1(value)?
+                if byte_count > yaza_sql_executor_max_input_text_bytes_v1() - total_text_bytes:
+                    return err("YDBv1 query result exceeds its bounded variable-width byte profile")
+                set total_text_bytes = total_text_bytes + byte_count
+            set column_index = column_index + 1
+        set row_index = row_index + 1
+    return ok(total_text_bytes)
+
+fn yaza_db_query_subquery_materialization_v1(result: YazaSqlQueryResultV1, values: List[YazaSqlValueV1], pairs: List[List[YazaSqlValueV1]]) -> Result[YazaSqlSubqueryValuesV1, Text]:
+    let output_text_bytes: Number = yaza_db_query_result_text_bytes_v1(result)?
+    var value_text_bytes: Number = 0
+    var value_index: Number = 0
+    while value_index < list_count(values):
+        let value: YazaSqlValueV1 = list_get(values, value_index)
+        if (value.type_id == 9 or value.type_id == 16) and not value.is_null:
+            let byte_count: Number = yaza_sql_value_variable_length_v1(value)?
+            if byte_count > yaza_sql_executor_max_input_text_bytes_v1() - value_text_bytes:
+                return err("YDBv1 subquery value list exceeds its bounded variable-width byte profile")
+            set value_text_bytes = value_text_bytes + byte_count
+        set value_index = value_index + 1
+    var pair_index: Number = 0
+    while pair_index < list_count(pairs):
+        let pair: List[YazaSqlValueV1] = list_get(pairs, pair_index)
+        if list_count(pair) != 2: return err("YDBv1 correlated IN pair has an invalid width")
+        var pair_value_index: Number = 0
+        while pair_value_index < 2:
+            let pair_value: YazaSqlValueV1 = list_get(pair, pair_value_index)
+            if (pair_value.type_id == 9 or pair_value.type_id == 16) and not pair_value.is_null:
+                let pair_byte_count: Number = yaza_sql_value_variable_length_v1(pair_value)?
+                if pair_byte_count > yaza_sql_executor_max_input_text_bytes_v1() - value_text_bytes:
+                    return err("YDBv1 correlated IN pair values exceed their bounded variable-width byte profile")
+                set value_text_bytes = value_text_bytes + pair_byte_count
+            set pair_value_index = pair_value_index + 1
+        set pair_index = pair_index + 1
+    let output_cells: Number = list_count(result.rows) * list_count(result.columns)
+    let materialized_rows: Number = list_count(values) + list_count(pairs)
+    let pair_cells: Number = list_count(pairs) * 2
+    if result.auxiliary_rows < 0 or list_count(result.rows) + materialized_rows > 65536 or result.auxiliary_rows > 65536 - list_count(result.rows) - materialized_rows:
+        return err("YDBv1 nested subquery result rows exceed their bounded materialization profile")
+    if result.auxiliary_cells < 0 or result.auxiliary_cells > yaza_sql_executor_max_input_cells_v1() - output_cells - list_count(values) - pair_cells:
+        return err("YDBv1 nested subquery result cells exceed their bounded materialization profile")
+    let retained_text_without_values: Number = result.auxiliary_text_bytes + output_text_bytes
+    if result.auxiliary_text_bytes < 0 or retained_text_without_values < result.auxiliary_text_bytes or retained_text_without_values > yaza_sql_executor_max_input_text_bytes_v1() - value_text_bytes:
+        return err("YDBv1 nested subquery Text exceeds its bounded materialization profile")
+    let retained_rows: Number = result.auxiliary_rows + list_count(result.rows) + materialized_rows
+    let retained_cells: Number = result.auxiliary_cells + output_cells + list_count(values) + pair_cells
+    let retained_text: Number = retained_text_without_values + value_text_bytes
+    return ok(YazaSqlSubqueryValuesV1(values, pairs, list_count(result.rows) > 0, result.work_units, retained_rows, retained_cells, retained_text))
+
+fn yaza_db_query_subquery_parameters_v1(plan: YazaSqlBoundPlanV1, parameters: List[YazaSqlValueV1], subquery_index: Number) -> Result[List[YazaSqlValueV1], Text]:
+    if subquery_index < 0 or subquery_index >= list_count(plan.subqueries) or subquery_index >= list_count(plan.subquery_parameter_ordinals):
+        return err("YDBv1 subquery parameter mapping index is invalid")
+    let ordinals: List[Number] = list_get(plan.subquery_parameter_ordinals, subquery_index)
+    let nested_created: Result[List[YazaSqlValueV1], Text] = list_try_new()
+    if not result_is_ok(nested_created): return err("YDBv1 could not allocate subquery bind values")
+    let nested_parameters: List[YazaSqlValueV1] = result_unwrap(nested_created)
+    if not list_try_reserve(nested_parameters, list_count(ordinals)): return err("YDBv1 could not reserve subquery bind values")
+    var ordinal_index: Number = 0
+    while ordinal_index < list_count(ordinals):
+        let global_ordinal: Number = list_get(ordinals, ordinal_index)
+        if global_ordinal < 0 or global_ordinal >= list_count(parameters): return err("YDBv1 subquery parameter map references a missing bind value")
+        if not list_try_push(nested_parameters, list_get(parameters, global_ordinal)): return err("YDBv1 could not map a subquery bind value")
+        set ordinal_index = ordinal_index + 1
+    return ok(nested_parameters)
+
+fn yaza_db_query_materialize_subqueries_with_virtual_relations_and_prior_v1(file: Number, file_header: YazaDbFileHeaderV1, plan: YazaSqlBoundPlanV1, parameters: List[YazaSqlValueV1], virtual_relations: List[YazaDbQueryVirtualRelationV1], statement_prior_work_units: Number) -> Result[List[YazaSqlSubqueryValuesV1], Text]:
+    if statement_prior_work_units < 0 or statement_prior_work_units > yaza_sql_executor_max_work_units_v1(): return err("YDBv1 SELECT prior statement work is outside its bound")
+    if list_count(plan.subqueries) > 16: return err("YDBv1 SELECT exceeds the 16-subquery materialization bound")
+    let results_created: Result[List[YazaSqlSubqueryValuesV1], Text] = list_try_new()
+    if not result_is_ok(results_created): return err("YDBv1 SELECT could not allocate subquery materialization")
+    let results: List[YazaSqlSubqueryValuesV1] = result_unwrap(results_created)
+    if not list_try_reserve(results, list_count(plan.subqueries)): return err("YDBv1 SELECT could not reserve subquery materialization")
+    var total_in_rows: Number = 0
+    var total_rows: Number = 0
+    var total_cells: Number = 0
+    var total_text_bytes: Number = 0
+    var total_work_units: Number = 0
+    var query_index: Number = 0
+    while query_index < list_count(plan.subqueries):
+        var nested_source: Text = list_get(plan.subqueries, query_index)
+        let is_exists: Boolean = yaza_db_query_subquery_is_exists_v1(plan, query_index)
+        let is_correlated_exists: Boolean = yaza_db_query_subquery_is_correlated_exists_v1(plan, query_index)
+        let is_correlated_in: Boolean = yaza_db_query_subquery_is_correlated_in_v1(plan, query_index)
+        if is_exists and not is_correlated_exists: set nested_source = yaza_db_query_exists_limit_source_v1(nested_source)?
+        if total_work_units > yaza_sql_executor_max_work_units_v1() - statement_prior_work_units: return err("YDBv1 SELECT subqueries exceed the statement-wide work budget")
+        let nested_prior_work_units: Number = statement_prior_work_units + total_work_units
+        let nested_parameters: List[YazaSqlValueV1] = yaza_db_query_subquery_parameters_v1(plan, parameters, query_index)?
+        let query_result: YazaSqlQueryResultV1 = yaza_db_execute_select_with_virtual_relations_and_prior_v1(file, file_header, nested_source, nested_parameters, virtual_relations, nested_prior_work_units)?
+        if is_correlated_in and list_count(query_result.columns) != 2: return err("YDBv1 correlated IN pair scan must return exactly two columns")
+        if (not is_exists or is_correlated_exists) and not is_correlated_in and list_count(query_result.columns) != 1: return err("YDBv1 membership subquery must return exactly one column")
+        if not is_exists and list_count(query_result.rows) > 65536 - total_in_rows: return err("YDBv1 IN subquery results exceed the aggregate 65536-row bound")
+        let values_created: Result[List[YazaSqlValueV1], Text] = list_try_new()
+        if not result_is_ok(values_created): return err("YDBv1 SELECT could not allocate one subquery result set")
+        let values: List[YazaSqlValueV1] = result_unwrap(values_created)
+        let pairs_created: Result[List[List[YazaSqlValueV1]], Text] = list_try_new()
+        if not result_is_ok(pairs_created): return err("YDBv1 SELECT could not allocate correlated IN pair materialization")
+        let pairs: List[List[YazaSqlValueV1]] = result_unwrap(pairs_created)
+        var reserve_count: Number = 0
+        if (not is_exists and not is_correlated_in) or is_correlated_exists: set reserve_count = list_count(query_result.rows)
+        if not list_try_reserve(values, reserve_count): return err("YDBv1 SELECT could not reserve one subquery result set")
+        if is_correlated_in and not list_try_reserve(pairs, list_count(query_result.rows)): return err("YDBv1 SELECT could not reserve correlated IN pairs")
+        var value_text_bytes: Number = 0
+        var row_index: Number = 0
+        while (not is_exists or is_correlated_exists) and row_index < list_count(query_result.rows):
+            let row: List[YazaSqlValueV1] = list_get(query_result.rows, row_index)
+            if is_correlated_in:
+                if list_count(row) != 2: return err("YDBv1 correlated IN subquery returned a malformed pair row")
+                let pair_key: YazaSqlValueV1 = list_get(row, 0)
+                let pair_value: YazaSqlValueV1 = list_get(row, 1)
+                if pair_key.type_id != list_get(query_result.columns, 0).type_id or pair_value.type_id != list_get(query_result.columns, 1).type_id: return err("YDBv1 correlated IN pair types do not match their projections")
+                if not list_try_push(pairs, row): return err("YDBv1 SELECT could not append a correlated IN pair")
+            else:
+                if list_count(row) != 1: return err("YDBv1 membership subquery returned a malformed result row")
+                let value: YazaSqlValueV1 = list_get(row, 0)
+                if value.type_id != list_get(query_result.columns, 0).type_id: return err("YDBv1 membership subquery result type does not match its projection")
+                if (value.type_id == 9 or value.type_id == 16) and not value.is_null:
+                    let byte_count: Number = yaza_sql_value_variable_length_v1(value)?
+                    if byte_count > 67108864 - value_text_bytes: return err("YDBv1 IN subquery text results exceed the 64 MiB materialization bound")
+                    set value_text_bytes = value_text_bytes + byte_count
+                if not list_try_push(values, value): return err("YDBv1 SELECT could not append a subquery result value")
+            set row_index = row_index + 1
+        if not is_exists: set total_in_rows = total_in_rows + list_count(values) + list_count(pairs)
+        let materialization: YazaSqlSubqueryValuesV1 = yaza_db_query_subquery_materialization_v1(query_result, values, pairs)?
+        if materialization.retained_rows > 65536 - total_rows: return err("YDBv1 SELECT subquery outputs exceed the statement-wide row budget")
+        if materialization.retained_cells > yaza_sql_executor_max_input_cells_v1() - total_cells: return err("YDBv1 SELECT subquery outputs exceed the statement-wide cell budget")
+        if materialization.retained_text_bytes > yaza_sql_executor_max_input_text_bytes_v1() - total_text_bytes: return err("YDBv1 SELECT subquery outputs exceed the statement-wide Text budget")
+        if materialization.work_units > yaza_sql_executor_max_work_units_v1() - total_work_units: return err("YDBv1 SELECT subqueries exceed the statement-wide work budget")
+        set total_rows = total_rows + materialization.retained_rows
+        set total_cells = total_cells + materialization.retained_cells
+        set total_text_bytes = total_text_bytes + materialization.retained_text_bytes
+        set total_work_units = total_work_units + materialization.work_units
+        if not list_try_push(results, materialization): return err("YDBv1 SELECT could not append a subquery result set")
+        set query_index = query_index + 1
+    return ok(results)
+
+fn yaza_db_query_materialize_subqueries_with_virtual_relations_v1(file: Number, file_header: YazaDbFileHeaderV1, plan: YazaSqlBoundPlanV1, parameters: List[YazaSqlValueV1], virtual_relations: List[YazaDbQueryVirtualRelationV1]) -> Result[List[YazaSqlSubqueryValuesV1], Text]:
+    return yaza_db_query_materialize_subqueries_with_virtual_relations_and_prior_v1(file, file_header, plan, parameters, virtual_relations, 0)
+
+fn yaza_db_query_materialize_subqueries_v1(file: Number, file_header: YazaDbFileHeaderV1, plan: YazaSqlBoundPlanV1, parameters: List[YazaSqlValueV1]) -> Result[List[YazaSqlSubqueryValuesV1], Text]:
+    return yaza_db_query_materialize_subqueries_with_virtual_relations_v1(file, file_header, plan, parameters, List[YazaDbQueryVirtualRelationV1]())
+
+fn yaza_db_query_materialize_subqueries_at_snapshot_with_virtual_relations_and_prior_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, plan: YazaSqlBoundPlanV1, parameters: List[YazaSqlValueV1], snapshot_ts: Number, own_txn_id: Number, transactions: List[YazaDbTxnStatusV1], virtual_relations: List[YazaDbQueryVirtualRelationV1], statement_prior_work_units: Number) -> Result[List[YazaSqlSubqueryValuesV1], Text]:
+    if statement_prior_work_units < 0 or statement_prior_work_units > yaza_sql_executor_max_work_units_v1(): return err("YDBv1 historical SELECT prior statement work is outside its bound")
+    if list_count(plan.subqueries) > 16: return err("YDBv1 historical SELECT exceeds the 16-subquery materialization bound")
+    let results_created: Result[List[YazaSqlSubqueryValuesV1], Text] = list_try_new()
+    if not result_is_ok(results_created): return err("YDBv1 historical SELECT could not allocate subquery materialization")
+    let results: List[YazaSqlSubqueryValuesV1] = result_unwrap(results_created)
+    if not list_try_reserve(results, list_count(plan.subqueries)): return err("YDBv1 historical SELECT could not reserve subquery materialization")
+    var total_in_rows: Number = 0
+    var total_rows: Number = 0
+    var total_cells: Number = 0
+    var total_text_bytes: Number = 0
+    var total_work_units: Number = 0
+    var query_index: Number = 0
+    while query_index < list_count(plan.subqueries):
+        var nested_source: Text = list_get(plan.subqueries, query_index)
+        let is_exists: Boolean = yaza_db_query_subquery_is_exists_v1(plan, query_index)
+        let is_correlated_exists: Boolean = yaza_db_query_subquery_is_correlated_exists_v1(plan, query_index)
+        let is_correlated_in: Boolean = yaza_db_query_subquery_is_correlated_in_v1(plan, query_index)
+        if is_exists and not is_correlated_exists: set nested_source = yaza_db_query_exists_limit_source_v1(nested_source)?
+        if total_work_units > yaza_sql_executor_max_work_units_v1() - statement_prior_work_units: return err("YDBv1 historical SELECT subqueries exceed the statement-wide work budget")
+        let nested_prior_work_units: Number = statement_prior_work_units + total_work_units
+        let nested_parameters: List[YazaSqlValueV1] = yaza_db_query_subquery_parameters_v1(plan, parameters, query_index)?
+        let query_result: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_with_virtual_relations_and_prior_v1(storage, wal, nested_source, nested_parameters, snapshot_ts, own_txn_id, transactions, virtual_relations, nested_prior_work_units)?
+        if is_correlated_in and list_count(query_result.columns) != 2: return err("YDBv1 historical correlated IN pair scan must return exactly two columns")
+        if (not is_exists or is_correlated_exists) and not is_correlated_in and list_count(query_result.columns) != 1: return err("YDBv1 historical membership subquery must return exactly one column")
+        if not is_exists and list_count(query_result.rows) > 65536 - total_in_rows: return err("YDBv1 historical IN subquery results exceed the aggregate 65536-row bound")
+        let values_created: Result[List[YazaSqlValueV1], Text] = list_try_new()
+        if not result_is_ok(values_created): return err("YDBv1 historical SELECT could not allocate one subquery result set")
+        let values: List[YazaSqlValueV1] = result_unwrap(values_created)
+        let pairs_created: Result[List[List[YazaSqlValueV1]], Text] = list_try_new()
+        if not result_is_ok(pairs_created): return err("YDBv1 historical SELECT could not allocate correlated IN pair materialization")
+        let pairs: List[List[YazaSqlValueV1]] = result_unwrap(pairs_created)
+        var reserve_count: Number = 0
+        if (not is_exists and not is_correlated_in) or is_correlated_exists: set reserve_count = list_count(query_result.rows)
+        if not list_try_reserve(values, reserve_count): return err("YDBv1 historical SELECT could not reserve one subquery result set")
+        if is_correlated_in and not list_try_reserve(pairs, list_count(query_result.rows)): return err("YDBv1 historical SELECT could not reserve correlated IN pairs")
+        var value_text_bytes: Number = 0
+        var row_index: Number = 0
+        while (not is_exists or is_correlated_exists) and row_index < list_count(query_result.rows):
+            let row: List[YazaSqlValueV1] = list_get(query_result.rows, row_index)
+            if is_correlated_in:
+                if list_count(row) != 2: return err("YDBv1 historical correlated IN subquery returned a malformed pair row")
+                let pair_key: YazaSqlValueV1 = list_get(row, 0)
+                let pair_value: YazaSqlValueV1 = list_get(row, 1)
+                if pair_key.type_id != list_get(query_result.columns, 0).type_id or pair_value.type_id != list_get(query_result.columns, 1).type_id: return err("YDBv1 historical correlated IN pair types do not match their projections")
+                if not list_try_push(pairs, row): return err("YDBv1 historical SELECT could not append a correlated IN pair")
+            else:
+                if list_count(row) != 1: return err("YDBv1 historical membership subquery returned a malformed result row")
+                let value: YazaSqlValueV1 = list_get(row, 0)
+                if value.type_id != list_get(query_result.columns, 0).type_id: return err("YDBv1 historical membership subquery result type does not match its projection")
+                if (value.type_id == 9 or value.type_id == 16) and not value.is_null:
+                    let byte_count: Number = yaza_sql_value_variable_length_v1(value)?
+                    if byte_count > 67108864 - value_text_bytes: return err("YDBv1 historical IN subquery text results exceed the 64 MiB materialization bound")
+                    set value_text_bytes = value_text_bytes + byte_count
+                if not list_try_push(values, value): return err("YDBv1 historical SELECT could not append a subquery result value")
+            set row_index = row_index + 1
+        if not is_exists: set total_in_rows = total_in_rows + list_count(values) + list_count(pairs)
+        let materialization: YazaSqlSubqueryValuesV1 = yaza_db_query_subquery_materialization_v1(query_result, values, pairs)?
+        if materialization.retained_rows > 65536 - total_rows: return err("YDBv1 historical SELECT subquery outputs exceed the statement-wide row budget")
+        if materialization.retained_cells > yaza_sql_executor_max_input_cells_v1() - total_cells: return err("YDBv1 historical SELECT subquery outputs exceed the statement-wide cell budget")
+        if materialization.retained_text_bytes > yaza_sql_executor_max_input_text_bytes_v1() - total_text_bytes: return err("YDBv1 historical SELECT subquery outputs exceed the statement-wide Text budget")
+        if materialization.work_units > yaza_sql_executor_max_work_units_v1() - total_work_units: return err("YDBv1 historical SELECT subqueries exceed the statement-wide work budget")
+        set total_rows = total_rows + materialization.retained_rows
+        set total_cells = total_cells + materialization.retained_cells
+        set total_text_bytes = total_text_bytes + materialization.retained_text_bytes
+        set total_work_units = total_work_units + materialization.work_units
+        if not list_try_push(results, materialization): return err("YDBv1 historical SELECT could not append a subquery result set")
+        set query_index = query_index + 1
+    return ok(results)
+
+fn yaza_db_query_materialize_subqueries_at_snapshot_with_virtual_relations_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, plan: YazaSqlBoundPlanV1, parameters: List[YazaSqlValueV1], snapshot_ts: Number, own_txn_id: Number, transactions: List[YazaDbTxnStatusV1], virtual_relations: List[YazaDbQueryVirtualRelationV1]) -> Result[List[YazaSqlSubqueryValuesV1], Text]:
+    return yaza_db_query_materialize_subqueries_at_snapshot_with_virtual_relations_and_prior_v1(storage, wal, plan, parameters, snapshot_ts, own_txn_id, transactions, virtual_relations, 0)
+
+fn yaza_db_query_materialize_subqueries_at_snapshot_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, plan: YazaSqlBoundPlanV1, parameters: List[YazaSqlValueV1], snapshot_ts: Number, own_txn_id: Number, transactions: List[YazaDbTxnStatusV1]) -> Result[List[YazaSqlSubqueryValuesV1], Text]:
+    return yaza_db_query_materialize_subqueries_at_snapshot_with_virtual_relations_v1(storage, wal, plan, parameters, snapshot_ts, own_txn_id, transactions, List[YazaDbQueryVirtualRelationV1]())
+
+fn yaza_db_query_profile_record_ns_v1(profile_ns: List[Number], slot: Number, started_ns: Number, finished_ns: Number) -> Number:
+    if slot < 0 or slot >= list_count(profile_ns) or started_ns <= 0 or finished_ns < started_ns: return finished_ns
+    let previous: Number = list_get(profile_ns, slot)
+    let ignored: Boolean = list_try_set(profile_ns, slot, previous + finished_ns - started_ns)
+    return finished_ns
+
+fn yaza_db_execute_single_select_with_loaded_catalog_profiled_v1(file: Number, file_header: YazaDbFileHeaderV1, source: Text, tokens: List[YazaSqlTokenV1], parameters: List[YazaSqlValueV1], virtual_relations: List[YazaDbQueryVirtualRelationV1], statement_prior_work_units: Number, base_loaded: YazaDbCatalogSnapshotWithRootsV1, profile_ns: List[Number]) -> Result[YazaSqlQueryResultV1, Text]:
+    if list_count(base_loaded.views) == 0:
+        return yaza_db_execute_single_select_with_loaded_catalog_and_index_rows_profiled_v1(file, file_header, source, tokens, parameters, virtual_relations, statement_prior_work_units, base_loaded, none, profile_ns)
+    let parsed: YazaSqlSelectAstV3 = yaza_sql_parse_select_tokens_v3(source, tokens)?
+    let expanded: YazaDbQueryViewExpansionV1 = yaza_db_query_expand_persistent_views_v1(file, file_header, source, parsed, base_loaded, virtual_relations, statement_prior_work_units)?
+    if list_count(expanded.relations) == list_count(virtual_relations):
+        return yaza_db_execute_single_select_with_loaded_catalog_and_index_rows_profiled_v1(file, file_header, source, tokens, parameters, virtual_relations, statement_prior_work_units, base_loaded, none, profile_ns)
+    if statement_prior_work_units > yaza_sql_executor_max_work_units_v1() - expanded.work_units:
+        return err("YDBv1 view expansion exceeds the remaining statement-wide work budget")
+    let expanded_result: YazaSqlQueryResultV1 = yaza_db_execute_single_select_with_loaded_catalog_and_index_rows_profiled_v1(file, file_header, source, tokens, parameters, expanded.relations, statement_prior_work_units + expanded.work_units, base_loaded, none, profile_ns)?
+    if expanded_result.work_units < 0 or expanded_result.work_units > yaza_sql_executor_max_work_units_v1() - expanded.work_units:
+        return err("YDBv1 SELECT and expanded views exceed the statement-wide work budget")
+    if expanded_result.auxiliary_rows < 0 or expanded_result.auxiliary_rows > 65536 - expanded.rows:
+        return err("YDBv1 SELECT and expanded views exceed the statement-wide row budget")
+    if expanded_result.auxiliary_cells < 0 or expanded_result.auxiliary_cells > yaza_sql_executor_max_input_cells_v1() - expanded.cells:
+        return err("YDBv1 SELECT and expanded views exceed the statement-wide cell budget")
+    if expanded_result.auxiliary_text_bytes < 0 or expanded_result.auxiliary_text_bytes > yaza_sql_executor_max_input_text_bytes_v1() - expanded.text_bytes:
+        return err("YDBv1 SELECT and expanded views exceed the statement-wide variable-width byte budget")
+    let combined: YazaSqlQueryResultV1 = YazaSqlQueryResultV1(expanded_result.columns, expanded_result.rows, expanded_result.work_units + expanded.work_units, expanded_result.auxiliary_rows + expanded.rows, expanded_result.auxiliary_cells + expanded.cells, expanded_result.auxiliary_text_bytes + expanded.text_bytes)
+    let combined_budget: YazaDbQueryCteBudgetV1 = yaza_db_query_validate_cte_result_budget_v1(combined, 0, 0, 0, statement_prior_work_units)?
+    return ok(combined)
+
+fn yaza_db_execute_single_select_with_loaded_catalog_and_index_rows_profiled_v1(file: Number, file_header: YazaDbFileHeaderV1, source: Text, tokens: List[YazaSqlTokenV1], parameters: List[YazaSqlValueV1], virtual_relations: List[YazaDbQueryVirtualRelationV1], statement_prior_work_units: Number, base_loaded: YazaDbCatalogSnapshotWithRootsV1, cached_index_rows: Option[List[YazaDbRowV1]], profile_ns: List[Number]) -> Result[YazaSqlQueryResultV1, Text]:
+    if statement_prior_work_units < 0 or statement_prior_work_units > yaza_sql_executor_max_work_units_v1(): return err("YDBv1 SELECT prior statement work is outside its bound")
+    let profile_enabled: Boolean = list_count(profile_ns) >= 4
+    var profile_started_ns: Number = 0
+    var loaded: YazaDbCatalogSnapshotWithRootsV1 = base_loaded
+    if list_count(virtual_relations) > 0:
+        set loaded = yaza_db_query_catalog_with_virtual_relations_v1(base_loaded, virtual_relations)?
+    let catalog_snapshot: YazaSqlCatalogSnapshotV1 = loaded.sql_snapshot
+    if profile_enabled: set profile_started_ns = monotonic_ns()
+    let parsed: YazaSqlSelectAstV3 = yaza_sql_parse_select_tokens_v3(source, tokens)?
+    let plan: YazaSqlBoundPlanV1 = yaza_sql_bind_select_v1(source, parsed, catalog_snapshot)?
+    if profile_enabled: set profile_started_ns = yaza_db_query_profile_record_ns_v1(profile_ns, 1, profile_started_ns, monotonic_ns())
+    let virtual_index: Number = yaza_db_query_virtual_relation_index_v1(virtual_relations, plan.table_id)
+    var uses_virtual_relation: Boolean = virtual_index >= 0 or yaza_db_query_virtual_relation_index_v1(virtual_relations, plan.right_table_id) >= 0
+    var stage_probe: Number = 0
+    while stage_probe < list_count(plan.join_stages):
+        if yaza_db_query_virtual_relation_index_v1(virtual_relations, list_get(plan.join_stages, stage_probe).table_id) >= 0:
+            set uses_virtual_relation = true
+        set stage_probe = stage_probe + 1
+    if uses_virtual_relation:
+        let scoped_subqueries: List[YazaSqlSubqueryValuesV1] = yaza_db_query_materialize_subqueries_with_virtual_relations_and_prior_v1(file, file_header, plan, parameters, virtual_relations, statement_prior_work_units)?
+        if plan.right_table_id > 0:
+            let catalog: YazaDbCatalogRootV1 = loaded.catalog
+            let left_memory: YazaSqlMemoryTableV1 = yaza_db_query_join_relation_current_v1(file, file_header, catalog, loaded, plan.table_id, virtual_relations)?
+            let right_memory: YazaSqlMemoryTableV1 = yaza_db_query_join_relation_current_v1(file, file_header, catalog, loaded, plan.right_table_id, virtual_relations)?
+            var joined_table: YazaSqlMemoryTableV1 = yaza_sql_join_dispatch_memory_v1(plan, left_memory, right_memory)?
+            var stage_index: Number = 0
+            while stage_index < list_count(plan.join_stages):
+                let stage: YazaSqlBoundJoinStageV1 = list_get(plan.join_stages, stage_index)
+                set joined_table = yaza_db_query_join_stage_current_with_virtual_relations_v1(file, file_header, catalog, loaded, plan, stage, joined_table, virtual_relations)?
+                set stage_index = stage_index + 1
+            return yaza_sql_execute_memory_with_subqueries_and_prior_v1(plan, joined_table, parameters, scoped_subqueries, statement_prior_work_units)
+        if virtual_index >= 0:
+            return yaza_sql_execute_memory_with_subqueries_and_prior_v1(plan, list_get(virtual_relations, virtual_index).memory, parameters, scoped_subqueries, statement_prior_work_units)
+    let subquery_values: List[YazaSqlSubqueryValuesV1] = yaza_db_query_materialize_subqueries_with_virtual_relations_and_prior_v1(file, file_header, plan, parameters, virtual_relations, statement_prior_work_units)?
+    let table_index: Number = yaza_db_catalog_snapshot_table_index_v1(catalog_snapshot.tables, plan.table_id)
+    if table_index < 0 or table_index >= list_count(loaded.root_page_ids) or table_index >= list_count(loaded.table_schema_versions): return err("YDBv1 bound table has no persisted root page or schema version")
+    let table_root_page_id: Number = list_get(loaded.root_page_ids, table_index)
+    let table_schema: YazaSqlTableSchemaV1 = list_get(catalog_snapshot.tables, table_index)
+    let table_schema_version: Number = list_get(loaded.table_schema_versions, table_index)
+    if profile_enabled: set profile_started_ns = monotonic_ns()
+    let catalog: YazaDbCatalogRootV1 = loaded.catalog
+    if plan.right_table_id > 0:
+        let right_table_index: Number = yaza_db_catalog_snapshot_table_index_v1(catalog_snapshot.tables, plan.right_table_id)
+        if right_table_index < 0 or right_table_index >= list_count(loaded.root_page_ids) or right_table_index >= list_count(loaded.table_schema_versions): return err("YDBv1 joined table has no persisted root page or schema version")
+        let right_table_root_page_id: Number = list_get(loaded.root_page_ids, right_table_index)
+        let right_table_schema: YazaSqlTableSchemaV1 = list_get(catalog_snapshot.tables, right_table_index)
+        let right_table_schema_version: Number = list_get(loaded.table_schema_versions, right_table_index)
+        let left_key_ordinals: List[Number] = yaza_db_query_clustered_key_ordinals_v1(file, file_header, catalog, plan.table_id, table_root_page_id, catalog_snapshot.version, list_count(table_schema.columns))?
+        let right_key_ordinals: List[Number] = yaza_db_query_clustered_key_ordinals_v1(file, file_header, catalog, plan.right_table_id, right_table_root_page_id, catalog_snapshot.version, list_count(right_table_schema.columns))?
+        let left_stored_rows: List[YazaDbRowV1] = yaza_db_btree_read_rows_for_schema_v1(file, file_header, table_root_page_id, table_schema.columns, table_schema_version, left_key_ordinals, catalog_snapshot.version, 65536)?
+        let right_stored_rows: List[YazaDbRowV1] = yaza_db_btree_read_rows_for_schema_v1(file, file_header, right_table_root_page_id, right_table_schema.columns, right_table_schema_version, right_key_ordinals, catalog_snapshot.version, 65536)?
+        let left_memory_table: YazaSqlMemoryTableV1 = yaza_db_query_memory_table_v1(plan.table_id, catalog_snapshot.version, table_schema.columns, left_stored_rows)?
+        let right_memory_table: YazaSqlMemoryTableV1 = yaza_db_query_memory_table_v1(plan.right_table_id, catalog_snapshot.version, right_table_schema.columns, right_stored_rows)?
+        var joined_table: YazaSqlMemoryTableV1 = yaza_sql_join_dispatch_memory_v1(plan, left_memory_table, right_memory_table)?
+        var stage_index: Number = 0
+        while stage_index < list_count(plan.join_stages):
+            let stage: YazaSqlBoundJoinStageV1 = list_get(plan.join_stages, stage_index)
+            set joined_table = yaza_db_query_join_stage_current_v1(file, file_header, catalog, loaded, plan, stage, joined_table)?
+            set stage_index = stage_index + 1
+        return yaza_sql_execute_memory_with_subqueries_v1(plan, joined_table, parameters, subquery_values)
+    var access_component_started_ns: Number = 0
+    if list_count(profile_ns) >= 7: set access_component_started_ns = monotonic_ns()
+    var key_ordinals_result: Result[List[Number], Text] = err("YDBv1 clustered key metadata was not loaded")
+    if option_is_some(cached_index_rows):
+        set key_ordinals_result = yaza_db_query_clustered_key_ordinals_from_rows_v1(option_unwrap(cached_index_rows), plan.table_id, table_root_page_id, list_count(table_schema.columns))
+    else:
+        set key_ordinals_result = yaza_db_query_clustered_key_ordinals_v1(file, file_header, catalog, plan.table_id, table_root_page_id, catalog_snapshot.version, list_count(table_schema.columns))
+    let key_ordinals: List[Number] = key_ordinals_result?
+    if list_count(profile_ns) >= 7 and access_component_started_ns > 0:
+        let ignored_key_metadata_profile: Number = yaza_db_query_profile_record_ns_v1(profile_ns, 4, access_component_started_ns, monotonic_ns())
+        set access_component_started_ns = monotonic_ns()
+    let point_lookup: Option[List[YazaDbRowV1]] = yaza_db_query_clustered_equality_lookup_v1(file, file_header, table_root_page_id, plan, table_schema, table_schema_version, key_ordinals, catalog_snapshot.version, parameters, profile_ns)?
+    if list_count(profile_ns) >= 7 and access_component_started_ns > 0:
+        let ignored_primary_lookup_profile: Number = yaza_db_query_profile_record_ns_v1(profile_ns, 5, access_component_started_ns, monotonic_ns())
+    var secondary_lookup: Option[List[YazaDbRowV1]] = none
+    if not option_is_some(point_lookup) and plan.where_root >= 0:
+        if list_count(profile_ns) >= 7: set access_component_started_ns = monotonic_ns()
+        set secondary_lookup = yaza_db_query_secondary_equality_lookup_v1(file, file_header, table_root_page_id, plan, table_schema, table_schema_version, key_ordinals, catalog_snapshot.version, parameters, cached_index_rows)?
+        if not option_is_some(secondary_lookup):
+            set secondary_lookup = yaza_db_query_secondary_range_lookup_v1(file, file_header, table_root_page_id, plan, table_schema, table_schema_version, key_ordinals, catalog_snapshot.version, parameters, cached_index_rows)?
+        if list_count(profile_ns) >= 7 and access_component_started_ns > 0:
+            let ignored_secondary_lookup_profile: Number = yaza_db_query_profile_record_ns_v1(profile_ns, 6, access_component_started_ns, monotonic_ns())
+    if yaza_db_query_stream_aggregate_eligible_v1(plan, virtual_relations, statement_prior_work_units) and not option_is_some(point_lookup) and not option_is_some(secondary_lookup):
+        let prepared_aggregate: List[YazaSqlValueV1] = yaza_db_query_prepare_filter_v1(plan, catalog_snapshot.version, table_schema.columns, parameters)?
+        let range_bounds: YazaDbQueryIntegerKeyRangeBoundsV1 = yaza_db_query_primary_integer_range_bounds_v1(plan, prepared_aggregate, table_schema.columns, key_ordinals)?
+        var start_after_key: Bytes = bytes_from_text("")
+        var end_key: Bytes = bytes_from_text("")
+        var end_key_inclusive: Boolean = false
+        if option_is_some(range_bounds.start_after): set start_after_key = option_unwrap(range_bounds.start_after)
+        if option_is_some(range_bounds.end):
+            set end_key = option_unwrap(range_bounds.end).key
+            set end_key_inclusive = option_unwrap(range_bounds.end).inclusive
+        let aggregate_scan: YazaDbBtreeScanResultV1 = yaza_db_btree_read_stream_aggregate_for_schema_v1(file, file_header, table_root_page_id, table_schema.columns, table_schema_version, key_ordinals, catalog_snapshot.version, start_after_key, end_key, end_key_inclusive, plan, prepared_aggregate, subquery_values, profile_ns)?
+        if not option_is_some(aggregate_scan.aggregate_row): return err("YDBv1 streaming aggregate scan returned no aggregate row")
+        if profile_enabled: set profile_started_ns = yaza_db_query_profile_record_ns_v1(profile_ns, 2, profile_started_ns, monotonic_ns())
+        if profile_enabled: set profile_started_ns = monotonic_ns()
+        let output_rows_result: Result[List[List[YazaSqlValueV1]], Text] = list_try_new()
+        if not result_is_ok(output_rows_result): return err("SQL executor could not allocate streaming aggregate output")
+        var output_rows: List[List[YazaSqlValueV1]] = result_unwrap(output_rows_result)
+        if not list_try_reserve(output_rows, 1) or not list_try_push(output_rows, option_unwrap(aggregate_scan.aggregate_row)): return err("SQL executor could not store streaming aggregate output")
+        let streamed_result: YazaSqlQueryResultV1 = YazaSqlQueryResultV1(plan.projections, output_rows, aggregate_scan.work_units, 0, 0, 0)
+        if profile_enabled: let ignored_profile_end: Number = yaza_db_query_profile_record_ns_v1(profile_ns, 3, profile_started_ns, monotonic_ns())
+        return ok(streamed_result)
+    var stored_rows: List[YazaDbRowV1] = List[YazaDbRowV1]()
+    var filter_was_pushed: Boolean = false
+    var prior_scan_work_units: Number = 0
+    if option_is_some(point_lookup): set stored_rows = option_unwrap(point_lookup)
+    elif option_is_some(secondary_lookup): set stored_rows = option_unwrap(secondary_lookup)
+    elif yaza_db_query_prefix_limit_eligible_v1(plan):
+        set stored_rows = yaza_db_btree_read_rows_prefix_for_schema_v1(file, file_header, table_root_page_id, table_schema.columns, table_schema_version, key_ordinals, catalog_snapshot.version, plan.limit)?
+    elif plan.where_root >= 0 and not yaza_db_query_has_correlated_subquery_v1(plan):
+        let prepared_filter: List[YazaSqlValueV1] = yaza_db_query_prepare_filter_v1(plan, catalog_snapshot.version, table_schema.columns, parameters)?
+        let range_bounds: YazaDbQueryIntegerKeyRangeBoundsV1 = yaza_db_query_primary_integer_range_bounds_v1(plan, prepared_filter, table_schema.columns, key_ordinals)?
+        var start_after_key: Bytes = bytes_from_text("")
+        var end_key: Bytes = bytes_from_text("")
+        var end_key_inclusive: Boolean = false
+        if option_is_some(range_bounds.start_after): set start_after_key = option_unwrap(range_bounds.start_after)
+        if option_is_some(range_bounds.end):
+            set end_key = option_unwrap(range_bounds.end).key
+            set end_key_inclusive = option_unwrap(range_bounds.end).inclusive
+        var filter_scan_result: Result[YazaDbBtreeScanResultV1, Text] = err("YDBv1 filtered scan was not selected")
+        if list_count(profile_ns) >= 14:
+            set filter_scan_result = yaza_db_btree_read_rows_where_range_profiled_with_stats_for_schema_v1(file, file_header, table_root_page_id, table_schema.columns, table_schema_version, key_ordinals, catalog_snapshot.version, start_after_key, end_key, end_key_inclusive, plan, prepared_filter, subquery_values, profile_ns)
+        else:
+            set filter_scan_result = yaza_db_btree_read_rows_where_range_with_stats_for_schema_v1(file, file_header, table_root_page_id, table_schema.columns, table_schema_version, key_ordinals, catalog_snapshot.version, start_after_key, end_key, end_key_inclusive, plan, prepared_filter, subquery_values)
+        let filter_scan: YazaDbBtreeScanResultV1 = filter_scan_result?
+        set stored_rows = filter_scan.rows
+        set prior_scan_work_units = filter_scan.work_units
+        set filter_was_pushed = true
+    else:
+        if list_count(profile_ns) >= 14:
+            set stored_rows = yaza_db_btree_read_rows_profiled_for_schema_v1(file, file_header, table_root_page_id, table_schema.columns, table_schema_version, key_ordinals, catalog_snapshot.version, 65536, profile_ns)?
+        else:
+            set stored_rows = yaza_db_btree_read_rows_for_schema_v1(file, file_header, table_root_page_id, table_schema.columns, table_schema_version, key_ordinals, catalog_snapshot.version, 65536)?
+    if profile_enabled: set profile_started_ns = yaza_db_query_profile_record_ns_v1(profile_ns, 2, profile_started_ns, monotonic_ns())
+    if profile_enabled: set profile_started_ns = monotonic_ns()
+    let memory_table: YazaSqlMemoryTableV1 = yaza_db_query_memory_table_v1(plan.table_id, catalog_snapshot.version, table_schema.columns, stored_rows)?
+    var result: Result[YazaSqlQueryResultV1, Text] = err("YDBv1 query execution did not run")
+    if filter_was_pushed: set result = yaza_sql_execute_memory_with_scan_v1(plan, memory_table, parameters, subquery_values, prior_scan_work_units, statement_prior_work_units, true)
+    else: set result = yaza_sql_execute_memory_with_subqueries_and_prior_v1(plan, memory_table, parameters, subquery_values, statement_prior_work_units)
+    if profile_enabled: let ignored_profile_end: Number = yaza_db_query_profile_record_ns_v1(profile_ns, 3, profile_started_ns, monotonic_ns())
+    return result
+
+fn yaza_db_execute_single_select_with_tokens_and_virtual_relations_and_prior_profiled_v1(file: Number, file_header: YazaDbFileHeaderV1, source: Text, tokens: List[YazaSqlTokenV1], parameters: List[YazaSqlValueV1], virtual_relations: List[YazaDbQueryVirtualRelationV1], statement_prior_work_units: Number, profile_ns: List[Number]) -> Result[YazaSqlQueryResultV1, Text]:
+    if statement_prior_work_units < 0 or statement_prior_work_units > yaza_sql_executor_max_work_units_v1(): return err("YDBv1 SELECT prior statement work is outside its bound")
+    let profile_enabled: Boolean = list_count(profile_ns) >= 4
+    var profile_started_ns: Number = 0
+    if profile_enabled: set profile_started_ns = monotonic_ns()
+    let base_loaded: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(file, file_header)?
+    if profile_enabled: set profile_started_ns = yaza_db_query_profile_record_ns_v1(profile_ns, 0, profile_started_ns, monotonic_ns())
+    return yaza_db_execute_single_select_with_loaded_catalog_profiled_v1(file, file_header, source, tokens, parameters, virtual_relations, statement_prior_work_units, base_loaded, profile_ns)
+
+fn yaza_db_execute_single_select_with_cached_catalog_profiled_v1(file: Number, file_header: YazaDbFileHeaderV1, source: Text, tokens: List[YazaSqlTokenV1], parameters: List[YazaSqlValueV1], catalog: YazaDbCatalogSnapshotWithRootsV1, profile_ns: List[Number]) -> Result[YazaSqlQueryResultV1, Text]:
+    return yaza_db_execute_single_select_with_loaded_catalog_profiled_v1(file, file_header, source, tokens, parameters, List[YazaDbQueryVirtualRelationV1](), 0, catalog, profile_ns)
+
+fn yaza_db_execute_single_select_with_cached_catalog_and_index_rows_profiled_v1(file: Number, file_header: YazaDbFileHeaderV1, source: Text, tokens: List[YazaSqlTokenV1], parameters: List[YazaSqlValueV1], catalog: YazaDbCatalogSnapshotWithRootsV1, index_rows: List[YazaDbRowV1], profile_ns: List[Number]) -> Result[YazaSqlQueryResultV1, Text]:
+    return yaza_db_execute_single_select_with_loaded_catalog_and_index_rows_profiled_v1(file, file_header, source, tokens, parameters, List[YazaDbQueryVirtualRelationV1](), 0, catalog, some(index_rows), profile_ns)
+
+fn yaza_db_execute_single_select_with_cached_catalog_v1(file: Number, file_header: YazaDbFileHeaderV1, source: Text, tokens: List[YazaSqlTokenV1], parameters: List[YazaSqlValueV1], catalog: YazaDbCatalogSnapshotWithRootsV1) -> Result[YazaSqlQueryResultV1, Text]:
+    return yaza_db_execute_single_select_with_cached_catalog_profiled_v1(file, file_header, source, tokens, parameters, catalog, List[Number]())
+
+fn yaza_db_execute_single_select_with_tokens_and_virtual_relations_and_prior_v1(file: Number, file_header: YazaDbFileHeaderV1, source: Text, tokens: List[YazaSqlTokenV1], parameters: List[YazaSqlValueV1], virtual_relations: List[YazaDbQueryVirtualRelationV1], statement_prior_work_units: Number) -> Result[YazaSqlQueryResultV1, Text]:
+    return yaza_db_execute_single_select_with_tokens_and_virtual_relations_and_prior_profiled_v1(file, file_header, source, tokens, parameters, virtual_relations, statement_prior_work_units, List[Number]())
+
+fn yaza_db_execute_single_select_with_virtual_relations_and_prior_v1(file: Number, file_header: YazaDbFileHeaderV1, source: Text, parameters: List[YazaSqlValueV1], virtual_relations: List[YazaDbQueryVirtualRelationV1], statement_prior_work_units: Number) -> Result[YazaSqlQueryResultV1, Text]:
+    let tokens: List[YazaSqlTokenV1] = yaza_sql_lex_v1(source)?
+    return yaza_db_execute_single_select_with_tokens_and_virtual_relations_and_prior_v1(file, file_header, source, tokens, parameters, virtual_relations, statement_prior_work_units)
+
+fn yaza_db_execute_single_select_with_virtual_relations_v1(file: Number, file_header: YazaDbFileHeaderV1, source: Text, parameters: List[YazaSqlValueV1], virtual_relations: List[YazaDbQueryVirtualRelationV1]) -> Result[YazaSqlQueryResultV1, Text]:
+    return yaza_db_execute_single_select_with_virtual_relations_and_prior_v1(file, file_header, source, parameters, virtual_relations, 0)
+
+fn yaza_db_execute_single_select_v1(file: Number, file_header: YazaDbFileHeaderV1, source: Text, parameters: List[YazaSqlValueV1]) -> Result[YazaSqlQueryResultV1, Text]:
+    return yaza_db_execute_single_select_with_virtual_relations_v1(file, file_header, source, parameters, List[YazaDbQueryVirtualRelationV1]())
+
+fn yaza_db_execute_single_select_at_snapshot_with_virtual_relations_and_prior_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], snapshot_ts: Number, own_txn_id: Number, transactions: List[YazaDbTxnStatusV1], virtual_relations: List[YazaDbQueryVirtualRelationV1], statement_prior_work_units: Number) -> Result[YazaSqlQueryResultV1, Text]:
+    if statement_prior_work_units < 0 or statement_prior_work_units > yaza_sql_executor_max_work_units_v1(): return err("YDBv1 historical SELECT prior statement work is outside its bound")
+    if storage.root != wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid): return err("YDBv1 historical SELECT storage and WAL handles belong to different databases")
+    if snapshot_ts < 1 or snapshot_ts > storage.header.next_commit_ts - 1 or own_txn_id < 0: return err("YDBv1 historical SELECT snapshot or transaction identity is outside the committed range")
+    let base_loaded: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(storage.file, storage.header)?
+    var loaded: YazaDbCatalogSnapshotWithRootsV1 = base_loaded
+    if list_count(virtual_relations) > 0:
+        set loaded = yaza_db_query_catalog_with_virtual_relations_v1(base_loaded, virtual_relations)?
+    let catalog_snapshot: YazaSqlCatalogSnapshotV1 = loaded.sql_snapshot
+    let parsed: YazaSqlSelectAstV3 = yaza_sql_parse_select_v3(source)?
+    if yaza_db_query_select_references_unshadowed_view_v1(source, parsed, base_loaded.views, virtual_relations):
+        if snapshot_ts != base_loaded.sql_snapshot.version:
+            return err("YDBv1 historical SELECT through a persistent view is not supported until view metadata is loaded at the requested catalog snapshot")
+        if own_txn_id != 0:
+            return err("YDBv1 SELECT through a persistent view does not support an uncommitted transaction snapshot")
+        return yaza_db_execute_single_select_with_virtual_relations_and_prior_v1(storage.file, storage.header, source, parameters, virtual_relations, statement_prior_work_units)
+    let plan: YazaSqlBoundPlanV1 = yaza_sql_bind_select_v1(source, parsed, catalog_snapshot)?
+    let virtual_index: Number = yaza_db_query_virtual_relation_index_v1(virtual_relations, plan.table_id)
+    var uses_virtual_relation: Boolean = virtual_index >= 0 or yaza_db_query_virtual_relation_index_v1(virtual_relations, plan.right_table_id) >= 0
+    var stage_probe: Number = 0
+    while stage_probe < list_count(plan.join_stages):
+        if yaza_db_query_virtual_relation_index_v1(virtual_relations, list_get(plan.join_stages, stage_probe).table_id) >= 0:
+            set uses_virtual_relation = true
+        set stage_probe = stage_probe + 1
+    if uses_virtual_relation:
+        let scoped_subqueries: List[YazaSqlSubqueryValuesV1] = yaza_db_query_materialize_subqueries_at_snapshot_with_virtual_relations_and_prior_v1(storage, wal, plan, parameters, snapshot_ts, own_txn_id, transactions, virtual_relations, statement_prior_work_units)?
+        if plan.right_table_id > 0:
+            let catalog: YazaDbCatalogRootV1 = yaza_db_catalog_storage_read_root_v1(storage.file, storage.header)?
+            let left_memory: YazaSqlMemoryTableV1 = yaza_db_query_join_relation_at_snapshot_v1(storage, wal, catalog, loaded, plan.table_id, snapshot_ts, own_txn_id, transactions, virtual_relations)?
+            let right_memory: YazaSqlMemoryTableV1 = yaza_db_query_join_relation_at_snapshot_v1(storage, wal, catalog, loaded, plan.right_table_id, snapshot_ts, own_txn_id, transactions, virtual_relations)?
+            var joined_table: YazaSqlMemoryTableV1 = yaza_sql_join_dispatch_memory_v1(plan, left_memory, right_memory)?
+            var stage_index: Number = 0
+            while stage_index < list_count(plan.join_stages):
+                let stage: YazaSqlBoundJoinStageV1 = list_get(plan.join_stages, stage_index)
+                set joined_table = yaza_db_query_join_stage_at_snapshot_with_virtual_relations_v1(storage, wal, catalog, loaded, plan, stage, snapshot_ts, own_txn_id, transactions, joined_table, virtual_relations)?
+                set stage_index = stage_index + 1
+            return yaza_sql_execute_memory_with_subqueries_and_prior_v1(plan, joined_table, parameters, scoped_subqueries, statement_prior_work_units)
+        if virtual_index >= 0:
+            return yaza_sql_execute_memory_with_subqueries_and_prior_v1(plan, list_get(virtual_relations, virtual_index).memory, parameters, scoped_subqueries, statement_prior_work_units)
+    let subquery_values: List[YazaSqlSubqueryValuesV1] = yaza_db_query_materialize_subqueries_at_snapshot_with_virtual_relations_and_prior_v1(storage, wal, plan, parameters, snapshot_ts, own_txn_id, transactions, virtual_relations, statement_prior_work_units)?
+    let table_index: Number = yaza_db_catalog_snapshot_table_index_v1(catalog_snapshot.tables, plan.table_id)
+    if table_index < 0 or table_index >= list_count(loaded.root_page_ids) or table_index >= list_count(loaded.table_schema_versions): return err("YDBv1 historical SELECT bound table is absent from the current catalog")
+    let table_existed: Boolean = yaza_db_query_table_exists_at_snapshot_v1(storage, wal, plan.table_id, snapshot_ts, own_txn_id, transactions)?
+    if not table_existed: return err("YDBv1 historical SELECT table did not exist at the requested snapshot")
+    let table_root_page_id: Number = list_get(loaded.root_page_ids, table_index)
+    let table_schema: YazaSqlTableSchemaV1 = list_get(catalog_snapshot.tables, table_index)
+    let table_schema_version: Number = list_get(loaded.table_schema_versions, table_index)
+    let catalog: YazaDbCatalogRootV1 = yaza_db_catalog_storage_read_root_v1(storage.file, storage.header)?
+    if plan.right_table_id > 0:
+        let right_table_index: Number = yaza_db_catalog_snapshot_table_index_v1(catalog_snapshot.tables, plan.right_table_id)
+        if right_table_index < 0 or right_table_index >= list_count(loaded.root_page_ids) or right_table_index >= list_count(loaded.table_schema_versions): return err("YDBv1 historical SELECT joined table is absent from the current catalog")
+        let right_table_existed: Boolean = yaza_db_query_table_exists_at_snapshot_v1(storage, wal, plan.right_table_id, snapshot_ts, own_txn_id, transactions)?
+        if not right_table_existed: return err("YDBv1 historical SELECT joined table did not exist at the requested snapshot")
+        let right_table_root_page_id: Number = list_get(loaded.root_page_ids, right_table_index)
+        let right_table_schema: YazaSqlTableSchemaV1 = list_get(catalog_snapshot.tables, right_table_index)
+        let right_table_schema_version: Number = list_get(loaded.table_schema_versions, right_table_index)
+        let left_key_ordinals: List[Number] = yaza_db_query_clustered_key_ordinals_v1(storage.file, storage.header, catalog, plan.table_id, table_root_page_id, catalog_snapshot.version, list_count(table_schema.columns))?
+        let right_key_ordinals: List[Number] = yaza_db_query_clustered_key_ordinals_v1(storage.file, storage.header, catalog, plan.right_table_id, right_table_root_page_id, catalog_snapshot.version, list_count(right_table_schema.columns))?
+        let left_stored_rows: List[YazaDbRowV1] = yaza_db_btree_read_rows_at_snapshot_for_schema_v1(storage.root, wal.db_uuid, wal.next_lsn, storage.file, storage.header, table_root_page_id, table_schema.columns, table_schema_version, left_key_ordinals, snapshot_ts, 65536, own_txn_id, transactions)?
+        let right_stored_rows: List[YazaDbRowV1] = yaza_db_btree_read_rows_at_snapshot_for_schema_v1(storage.root, wal.db_uuid, wal.next_lsn, storage.file, storage.header, right_table_root_page_id, right_table_schema.columns, right_table_schema_version, right_key_ordinals, snapshot_ts, 65536, own_txn_id, transactions)?
+        let left_memory_table: YazaSqlMemoryTableV1 = yaza_db_query_memory_table_v1(plan.table_id, catalog_snapshot.version, table_schema.columns, left_stored_rows)?
+        let right_memory_table: YazaSqlMemoryTableV1 = yaza_db_query_memory_table_v1(plan.right_table_id, catalog_snapshot.version, right_table_schema.columns, right_stored_rows)?
+        var joined_table: YazaSqlMemoryTableV1 = yaza_sql_join_dispatch_memory_v1(plan, left_memory_table, right_memory_table)?
+        var stage_index: Number = 0
+        while stage_index < list_count(plan.join_stages):
+            let stage: YazaSqlBoundJoinStageV1 = list_get(plan.join_stages, stage_index)
+            set joined_table = yaza_db_query_join_stage_at_snapshot_v1(storage, wal, catalog, loaded, plan, stage, snapshot_ts, own_txn_id, transactions, joined_table)?
+            set stage_index = stage_index + 1
+        return yaza_sql_execute_memory_with_subqueries_v1(plan, joined_table, parameters, subquery_values)
+    let key_ordinals: List[Number] = yaza_db_query_clustered_key_ordinals_v1(storage.file, storage.header, catalog, plan.table_id, table_root_page_id, catalog_snapshot.version, list_count(table_schema.columns))?
+    var stored_rows: List[YazaDbRowV1] = List[YazaDbRowV1]()
+    var filter_was_pushed: Boolean = false
+    var prior_scan_work_units: Number = 0
+    if yaza_db_query_prefix_limit_eligible_v1(plan):
+        set stored_rows = yaza_db_btree_read_rows_at_snapshot_prefix_for_schema_v1(storage.root, wal.db_uuid, wal.next_lsn, storage.file, storage.header, table_root_page_id, table_schema.columns, table_schema_version, key_ordinals, snapshot_ts, plan.limit, own_txn_id, transactions)?
+    elif plan.where_root >= 0 and not yaza_db_query_has_correlated_subquery_v1(plan):
+        let prepared_filter: List[YazaSqlValueV1] = yaza_db_query_prepare_filter_v1(plan, catalog_snapshot.version, table_schema.columns, parameters)?
+        let filter_scan: YazaDbBtreeScanResultV1 = yaza_db_btree_read_rows_where_at_snapshot_with_stats_for_schema_v1(storage.root, wal.db_uuid, wal.next_lsn, storage.file, storage.header, table_root_page_id, table_schema.columns, table_schema_version, key_ordinals, snapshot_ts, own_txn_id, transactions, plan, prepared_filter, subquery_values)?
+        set stored_rows = filter_scan.rows
+        set prior_scan_work_units = filter_scan.work_units
+        set filter_was_pushed = true
+    else:
+        set stored_rows = yaza_db_btree_read_rows_at_snapshot_for_schema_v1(storage.root, wal.db_uuid, wal.next_lsn, storage.file, storage.header, table_root_page_id, table_schema.columns, table_schema_version, key_ordinals, snapshot_ts, 65536, own_txn_id, transactions)?
+    let memory_table: YazaSqlMemoryTableV1 = yaza_db_query_memory_table_v1(plan.table_id, catalog_snapshot.version, table_schema.columns, stored_rows)?
+    if filter_was_pushed: return yaza_sql_execute_memory_with_scan_v1(plan, memory_table, parameters, subquery_values, prior_scan_work_units, statement_prior_work_units, true)
+    return yaza_sql_execute_memory_with_subqueries_and_prior_v1(plan, memory_table, parameters, subquery_values, statement_prior_work_units)
+
+fn yaza_db_execute_single_select_at_snapshot_with_virtual_relations_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], snapshot_ts: Number, own_txn_id: Number, transactions: List[YazaDbTxnStatusV1], virtual_relations: List[YazaDbQueryVirtualRelationV1]) -> Result[YazaSqlQueryResultV1, Text]:
+    return yaza_db_execute_single_select_at_snapshot_with_virtual_relations_and_prior_v1(storage, wal, source, parameters, snapshot_ts, own_txn_id, transactions, virtual_relations, 0)
+
+fn yaza_db_execute_single_select_at_snapshot_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], snapshot_ts: Number, own_txn_id: Number, transactions: List[YazaDbTxnStatusV1]) -> Result[YazaSqlQueryResultV1, Text]:
+    return yaza_db_execute_single_select_at_snapshot_with_virtual_relations_v1(storage, wal, source, parameters, snapshot_ts, own_txn_id, transactions, List[YazaDbQueryVirtualRelationV1]())
+
+fn yaza_db_query_prepare_cte_branches_v1(parsed: YazaSqlCteQueryV1, parameters: List[YazaSqlValueV1]) -> Result[List[YazaSqlSetPreparedBranchV1], Text]:
+    let branch_count: Number = list_count(parsed.definitions) + 1
+    let branches_created: Result[List[Text], Text] = list_try_new()
+    let operators_created: Result[List[YazaSqlSetOperatorV1], Text] = list_try_new()
+    let order_created: Result[List[YazaSqlSetOrderTermV1], Text] = list_try_new()
+    if not result_is_ok(branches_created) or not result_is_ok(operators_created) or not result_is_ok(order_created):
+        return err("SQL CTE could not allocate statement-wide bind metadata")
+    let branches: List[Text] = result_unwrap(branches_created)
+    let operators: List[YazaSqlSetOperatorV1] = result_unwrap(operators_created)
+    if not list_try_reserve(branches, branch_count) or not list_try_reserve(operators, branch_count - 1):
+        return err("SQL CTE could not reserve statement-wide bind metadata")
+    var index: Number = 0
+    while index < list_count(parsed.definitions):
+        if not list_try_push(branches, list_get(parsed.definitions, index).query): return err("SQL CTE could not append a definition query for bind validation")
+        if index > 0 and not list_try_push(operators, YazaSqlSetOperatorV1(1, false)): return err("SQL CTE could not append bounded bind metadata")
+        set index = index + 1
+    if not list_try_push(branches, parsed.main_query): return err("SQL CTE could not append its final query for bind validation")
+    if list_count(operators) + 1 != list_count(branches):
+        if not list_try_push(operators, YazaSqlSetOperatorV1(1, false)): return err("SQL CTE could not complete statement-wide bind metadata")
+    return yaza_sql_set_prepare_branches_v1(YazaSqlSetQueryPartsV1(branches, List[Number](), operators, false, result_unwrap(order_created), false, 0), parameters)
+
+fn yaza_db_query_source_byte_marker_v1() -> Text:
+    return "__YAZA_SQL_SOURCE_BYTE__:"
+
+fn yaza_db_query_error_local_byte_v1(error: Text) -> Number:
+    let internal_marker: Text = yaza_db_query_source_byte_marker_v1()
+    var digit_offset: Number = -1
+    var delimiter: Number = -1
+    if text_starts_with(error, internal_marker):
+        set digit_offset = text_length(internal_marker)
+        set delimiter = 58
+    else:
+        let location_marker: Text = " at byte "
+        let marker_offset: Number = text_find(error, location_marker)
+        if marker_offset < 0: return -1
+        set digit_offset = marker_offset + text_length(location_marker)
+    var value: Number = 0
+    var digit_count: Number = 0
+    while digit_offset < text_length(error):
+        let byte: Number = text_byte(error, digit_offset)
+        if byte < 48 or byte > 57: break
+        if value > 65536: return -1
+        set value = value * 10 + byte - 48
+        if value > 1048576: return -1
+        set digit_count = digit_count + 1
+        set digit_offset = digit_offset + 1
+    if digit_count == 0: return -1
+    if delimiter == 58 and (digit_offset >= text_length(error) or text_byte(error, digit_offset) != delimiter): return -1
+    return value
+
+fn yaza_db_query_error_reason_v1(error: Text) -> Text:
+    var raw_error: Text = error
+    let internal_marker: Text = yaza_db_query_source_byte_marker_v1()
+    if text_starts_with(error, internal_marker):
+        var digit_offset: Number = text_length(internal_marker)
+        while digit_offset < text_length(error) and text_byte(error, digit_offset) >= 48 and text_byte(error, digit_offset) <= 57:
+            set digit_offset = digit_offset + 1
+        if digit_offset >= text_length(error) or text_byte(error, digit_offset) != 58: return error
+        let tail_result: Result[Text, Text] = text_try_slice(error, digit_offset + 1, text_length(error) - digit_offset - 1)
+        if not result_is_ok(tail_result): return error
+        set raw_error = result_unwrap(tail_result)
+    let location_marker: Text = " at byte "
+    let marker_offset: Number = text_find(raw_error, location_marker)
+    if marker_offset < 0: return raw_error
+    let reason_result: Result[Text, Text] = text_try_slice(raw_error, 0, marker_offset)
+    if not result_is_ok(reason_result): return raw_error
+    return result_unwrap(reason_result)
+
+fn yaza_db_query_map_prepared_source_byte_v1(original_source: Text, prepared_source: Text, prepared_byte: Number) -> Number:
+    if prepared_byte < 0 or prepared_byte > text_length(prepared_source): return -1
+    if text_compare(original_source, prepared_source) == 0: return prepared_byte
+    let original_tokens_result: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(original_source)
+    let prepared_tokens_result: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(prepared_source)
+    if not result_is_ok(original_tokens_result) or not result_is_ok(prepared_tokens_result): return -1
+    let original_tokens: List[YazaSqlTokenV1] = result_unwrap(original_tokens_result)
+    let prepared_tokens: List[YazaSqlTokenV1] = result_unwrap(prepared_tokens_result)
+    if list_count(original_tokens) != list_count(prepared_tokens): return -1
+    var original_cursor: Number = 0
+    var prepared_cursor: Number = 0
+    var token_index: Number = 0
+    while token_index < list_count(original_tokens):
+        let original_token: YazaSqlTokenV1 = list_get(original_tokens, token_index)
+        let prepared_token: YazaSqlTokenV1 = list_get(prepared_tokens, token_index)
+        if original_token.kind != prepared_token.kind: return -1
+        let original_gap: Number = original_token.start_byte - original_cursor
+        let prepared_gap: Number = prepared_token.start_byte - prepared_cursor
+        if original_gap < 0 or prepared_gap != original_gap: return -1
+        if text_compare(text_slice(original_source, original_cursor, original_gap), text_slice(prepared_source, prepared_cursor, prepared_gap)) != 0: return -1
+        if prepared_byte < prepared_token.start_byte: return original_cursor + prepared_byte - prepared_cursor
+        if prepared_token.kind == 0:
+            if text_length(original_source) - original_cursor != text_length(prepared_source) - prepared_cursor: return -1
+            if text_compare(text_slice(original_source, original_cursor, text_length(original_source) - original_cursor), text_slice(prepared_source, prepared_cursor, text_length(prepared_source) - prepared_cursor)) != 0: return -1
+            return original_cursor + prepared_byte - prepared_cursor
+        let original_token_length: Number = original_token.end_byte - original_token.start_byte
+        let prepared_token_length: Number = prepared_token.end_byte - prepared_token.start_byte
+        if prepared_byte < prepared_token.end_byte:
+            if original_token.kind == 5 and prepared_token.kind == 5 and original_token_length != prepared_token_length: return original_token.start_byte
+            if original_token_length != prepared_token_length: return -1
+            if text_compare(text_slice(original_source, original_token.start_byte, original_token_length), text_slice(prepared_source, prepared_token.start_byte, prepared_token_length)) != 0 and original_token.kind != 5: return -1
+            return original_token.start_byte + prepared_byte - prepared_token.start_byte
+        if original_token_length != prepared_token_length and (original_token.kind != 5 or prepared_token.kind != 5): return -1
+        if original_token.kind != 5 and text_compare(text_slice(original_source, original_token.start_byte, original_token_length), text_slice(prepared_source, prepared_token.start_byte, prepared_token_length)) != 0: return -1
+        if prepared_byte == prepared_token.end_byte and original_token_length != prepared_token_length: return original_token.end_byte
+        set original_cursor = original_token.end_byte
+        set prepared_cursor = prepared_token.end_byte
+        set token_index = token_index + 1
+    return -1
+
+fn yaza_db_query_set_branch_source_error_v1(original_branch: Text, branch_start_byte: Number, prepared_branch: Text, original_error: Text) -> Text:
+    let local_error_byte: Number = yaza_db_query_error_local_byte_v1(original_error)
+    var mapped_byte: Number = 0
+    if local_error_byte >= 0:
+        let candidate: Number = yaza_db_query_map_prepared_source_byte_v1(original_branch, prepared_branch, local_error_byte)
+        if candidate >= 0: set mapped_byte = candidate
+    if mapped_byte > text_length(original_branch): set mapped_byte = 0
+    var safe_branch_start_byte: Number = branch_start_byte
+    if safe_branch_start_byte < 0: set safe_branch_start_byte = 0
+    let absolute_byte: Number = safe_branch_start_byte + mapped_byte
+    let absolute_text: Result[Text, Text] = number_try_text(absolute_byte)
+    if not result_is_ok(absolute_text): return original_error
+    return yaza_db_query_source_byte_marker_v1() + result_unwrap(absolute_text) + ":" + yaza_db_query_error_reason_v1(original_error)
+
+fn yaza_db_query_cte_source_error_v1(source: Text, original_fragment: Text, fragment_start_byte: Number, fallback_byte: Number, executed_fragment: Text, context: Text, original_error: Text) -> Text:
+    var absolute_byte: Number = fallback_byte
+    let local_error_byte: Number = yaza_db_query_error_local_byte_v1(original_error)
+    if local_error_byte >= 0:
+        let mapped_byte: Number = yaza_db_query_map_prepared_source_byte_v1(original_fragment, executed_fragment, local_error_byte)
+        if mapped_byte >= 0 and fragment_start_byte >= 0 and fragment_start_byte <= text_length(source) - mapped_byte:
+            set absolute_byte = fragment_start_byte + mapped_byte
+    let reason: Text = yaza_db_query_error_reason_v1(original_error)
+    if absolute_byte < 0 or absolute_byte > text_length(source): return original_error
+    let location_result: Result[YazaSqlSourceLocationV1, Text] = yaza_sql_v1_location(source, absolute_byte)
+    if not result_is_ok(location_result): return original_error
+    let location: YazaSqlSourceLocationV1 = result_unwrap(location_result)
+    let byte_text: Result[Text, Text] = number_try_text(absolute_byte)
+    let line_text: Result[Text, Text] = number_try_text(location.line)
+    let column_text: Result[Text, Text] = number_try_text(location.column)
+    if not result_is_ok(byte_text) or not result_is_ok(line_text) or not result_is_ok(column_text): return original_error
+    var output: Result[Text, Text] = text_try_concat("SQL ", context)
+    if not result_is_ok(output): return original_error
+    set output = text_try_concat(result_unwrap(output), " failed at byte ")
+    if not result_is_ok(output): return original_error
+    set output = text_try_concat(result_unwrap(output), result_unwrap(byte_text))
+    if not result_is_ok(output): return original_error
+    set output = text_try_concat(result_unwrap(output), " (line ")
+    if not result_is_ok(output): return original_error
+    set output = text_try_concat(result_unwrap(output), result_unwrap(line_text))
+    if not result_is_ok(output): return original_error
+    set output = text_try_concat(result_unwrap(output), ", column ")
+    if not result_is_ok(output): return original_error
+    set output = text_try_concat(result_unwrap(output), result_unwrap(column_text))
+    if not result_is_ok(output): return original_error
+    set output = text_try_concat(result_unwrap(output), "): ")
+    if not result_is_ok(output): return original_error
+    set output = text_try_concat(result_unwrap(output), reason)
+    if not result_is_ok(output): return original_error
+    return result_unwrap(output)
+
+fn yaza_db_query_public_sql_error_v1(source: Text, original_error: Text) -> Text:
+    if not text_starts_with(original_error, yaza_db_query_source_byte_marker_v1()): return original_error
+    return yaza_db_query_cte_source_error_v1(source, source, 0, 0, source, "query", original_error)
+
+fn yaza_db_query_validate_cte_result_budget_v1(result: YazaSqlQueryResultV1, prior_rows: Number, prior_cells: Number, prior_text_bytes: Number, prior_work_units: Number) -> Result[YazaDbQueryCteBudgetV1, Text]:
+    if prior_rows < 0 or prior_rows > 65536 or prior_cells < 0 or prior_cells > yaza_sql_executor_max_input_cells_v1() or prior_text_bytes < 0 or prior_text_bytes > yaza_sql_executor_max_input_text_bytes_v1():
+        return err("SQL CTE statement-wide materialization counters are outside their bounds")
+    if prior_work_units < 0 or prior_work_units > yaza_sql_executor_max_work_units_v1(): return err("SQL CTE statement-wide work counter is outside its bound")
+    let column_count: Number = list_count(result.columns)
+    if column_count < 1 or column_count > 1024 or list_count(result.rows) > 65536:
+        return err("SQL CTE output exceeds its bounded relation dimensions")
+    if result.auxiliary_rows < 0 or result.auxiliary_rows > 65536 - list_count(result.rows):
+        return err("SQL CTE nested materialization exceeds its bounded row profile")
+    let added_rows: Number = list_count(result.rows) + result.auxiliary_rows
+    if added_rows > 65536 - prior_rows:
+        return err("SQL CTE materialization exceeds the statement-wide row budget")
+    let cell_count: Number = list_count(result.rows) * column_count
+    if result.auxiliary_cells < 0 or result.auxiliary_cells > yaza_sql_executor_max_input_cells_v1() - cell_count:
+        return err("SQL CTE nested materialization exceeds its bounded cell profile")
+    let added_cells: Number = cell_count + result.auxiliary_cells
+    if added_cells > yaza_sql_executor_max_input_cells_v1() - prior_cells:
+        return err("SQL CTE materialization exceeds the statement-wide cell budget")
+    var text_bytes: Number = 0
+    var row_index: Number = 0
+    while row_index < list_count(result.rows):
+        let row: List[YazaSqlValueV1] = list_get(result.rows, row_index)
+        if list_count(row) != column_count: return err("SQL CTE result row width does not match its output schema")
+        var column_index: Number = 0
+        while column_index < column_count:
+            let value: YazaSqlValueV1 = list_get(row, column_index)
+            let projection: YazaSqlBoundProjectionV1 = list_get(result.columns, column_index)
+            if value.type_id != projection.type_id or value.source_literal:
+                return err("SQL CTE result row value does not match its bound output type")
+            if (value.type_id == 9 or value.type_id == 16) and not value.is_null:
+                let length: Number = yaza_sql_value_variable_length_v1(value)?
+                if length > yaza_sql_executor_max_input_text_bytes_v1() - prior_text_bytes - text_bytes:
+                    return err("SQL CTE materialization exceeds the statement-wide variable-width byte budget")
+                set text_bytes = text_bytes + length
+            set column_index = column_index + 1
+        set row_index = row_index + 1
+    if result.auxiliary_text_bytes < 0 or result.auxiliary_text_bytes > yaza_sql_executor_max_input_text_bytes_v1() - text_bytes:
+        return err("SQL CTE nested materialization exceeds its bounded Text profile")
+    let added_text_bytes: Number = text_bytes + result.auxiliary_text_bytes
+    if added_text_bytes > yaza_sql_executor_max_input_text_bytes_v1() - prior_text_bytes:
+        return err("SQL CTE materialization exceeds the statement-wide text-byte budget")
+    if result.work_units < 0 or result.work_units > yaza_sql_executor_max_work_units_v1() - prior_work_units:
+        return err("SQL CTE definitions and subqueries exceed the statement-wide work budget")
+    return ok(YazaDbQueryCteBudgetV1(added_rows, added_cells, added_text_bytes, result.work_units))
+
+fn yaza_db_query_explain_append_v1(output: Text, heading: Text, plan_text: Text) -> Result[Text, Text]:
+    let with_heading: Text = text_try_concat(output, heading)?
+    return text_try_concat(with_heading, plan_text)
+
+fn yaza_db_query_explain_select_or_set_v1(source: Text, catalog: YazaSqlCatalogSnapshotV1, views: List[YazaDbCatalogViewV1], existing_relations: List[YazaDbQueryVirtualRelationV1]) -> Result[YazaDbQueryCteExplainV1, Text]:
+    let parts: YazaSqlSetQueryPartsV1 = yaza_sql_set_split_v1(source)?
+    var branch_count: Number = 1
+    if list_count(parts.operators) > 0: set branch_count = list_count(parts.branches)
+    if branch_count < 1 or list_count(parts.operators) > 0 and list_count(parts.operators) + 1 != branch_count:
+        return err("SQL CTE EXPLAIN received inconsistent SELECT/set-operation branches")
+    var output: Text = ""
+    var first_result: YazaSqlQueryResultV1 = YazaSqlQueryResultV1(List[YazaSqlBoundProjectionV1](), List[List[YazaSqlValueV1]](), 0, 0, 0, 0)
+    var branch_index: Number = 0
+    while branch_index < branch_count:
+        var branch_source: Text = source
+        if list_count(parts.operators) > 0: set branch_source = list_get(parts.branches, branch_index)
+        let parsed: YazaSqlSelectAstV3 = yaza_sql_parse_select_v3(branch_source)?
+        let view_relations: List[YazaDbQueryVirtualRelationV1] = yaza_db_query_view_schemas_for_select_v1(branch_source, parsed, views, existing_relations, catalog.version)?
+        let plan_catalog: YazaSqlCatalogSnapshotV1 = yaza_db_query_sql_catalog_with_virtual_relations_v1(catalog, view_relations)?
+        let plan: YazaSqlBoundPlanV1 = yaza_sql_bind_select_v1(branch_source, parsed, plan_catalog)?
+        let branch_result: YazaSqlQueryResultV1 = YazaSqlQueryResultV1(plan.projections, List[List[YazaSqlValueV1]](), 0, 0, 0, 0)
+        if branch_index == 0:
+            set first_result = branch_result
+        else:
+            let schema_matches: Boolean = yaza_sql_set_validate_results_v1(first_result, branch_result)?
+            if not schema_matches: return err("SQL CTE EXPLAIN set-operation branches have incompatible schemas")
+        let branch_number: Text = number_try_text(branch_index + 1)?
+        let heading: Text = text_try_concat("SELECT branch ", branch_number)?
+        let heading_line: Text = text_try_concat(heading, "\n")?
+        let branch_plan: Text = yaza_sql_explain_bound_select_v1(plan)?
+        let annotation: Text = yaza_db_query_view_explain_annotation_v1(view_relations, views)?
+        let annotated_plan: Text = text_try_concat(annotation, branch_plan)?
+        set output = yaza_db_query_explain_append_v1(output, heading_line, annotated_plan)?
+        if branch_index < list_count(parts.operators):
+            let operation: YazaSqlSetOperatorV1 = list_get(parts.operators, branch_index)
+            var operation_name: Text = "Set combine: "
+            if operation.kind == 1: set operation_name = "Set combine: UNION"
+            elif operation.kind == 2: set operation_name = "Set combine: INTERSECT"
+            elif operation.kind == 3: set operation_name = "Set combine: EXCEPT"
+            if operation.all: set operation_name = text_try_concat(operation_name, " ALL")?
+            set operation_name = text_try_concat(operation_name, "\n")?
+            set output = text_try_concat(output, operation_name)?
+        set branch_index = branch_index + 1
+    if list_count(parts.operators) > 0:
+        let validated_modifiers: YazaSqlQueryResultV1 = yaza_sql_set_apply_final_modifiers_v1(first_result, parts, source)?
+    return ok(YazaDbQueryCteExplainV1(first_result.columns, output))
+
+fn yaza_db_query_explain_cte_select_v1(file: Number, file_header: YazaDbFileHeaderV1, source: Text, parameters: List[YazaSqlValueV1]) -> Result[Text, Text]:
+    if list_count(parameters) != 0: return err("YDBv1 EXPLAIN does not consume runtime bind values")
+    let parsed: YazaSqlCteQueryV1 = yaza_sql_cte_parse_v1(source)?
+    if parsed.recursive: return err("SQL WITH RECURSIVE is not supported in this YazaBase profile")
+    let prepared: List[YazaSqlSetPreparedBranchV1] = yaza_db_query_prepare_cte_branches_v1(parsed, parameters)?
+    if list_count(prepared) != list_count(parsed.definitions) + 1:
+        return err("SQL CTE EXPLAIN statement-wide preparation returned inconsistent branch metadata")
+    let base_loaded: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(file, file_header)?
+    let relations_created: Result[List[YazaDbQueryVirtualRelationV1], Text] = list_try_new()
+    if not result_is_ok(relations_created): return err("SQL CTE EXPLAIN could not allocate its scoped relation metadata")
+    let relations: List[YazaDbQueryVirtualRelationV1] = result_unwrap(relations_created)
+    if not list_try_reserve(relations, list_count(parsed.definitions)):
+        return err("SQL CTE EXPLAIN could not reserve its scoped relation metadata")
+    var output: Text = "YazaBase CTE logical plan v1 (ordered materialization; physical access path not shown)\n"
+    var output_index: Number = 0
+    while output_index < list_count(parsed.definitions):
+        let definition: YazaSqlCteDefinitionV1 = list_get(parsed.definitions, output_index)
+        let scoped_catalog: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_query_catalog_with_virtual_relations_v1(base_loaded, relations)?
+        let definition_plan_result: Result[YazaDbQueryCteExplainV1, Text] = yaza_db_query_explain_select_or_set_v1(definition.query, scoped_catalog.sql_snapshot, base_loaded.views, relations)
+        if not result_is_ok(definition_plan_result):
+            let context: Text = "CTE definition query"
+            return err(yaza_db_query_cte_source_error_v1(source, definition.query, definition.query_start_byte, definition.name_token.start_byte, "", context, result_unwrap_error(definition_plan_result)))
+        let definition_plan: YazaDbQueryCteExplainV1 = result_unwrap(definition_plan_result)
+        let name: Text = yaza_db_query_virtual_identifier_v1(source, definition.name_token)?
+        let number_text: Text = number_try_text(output_index + 1)?
+        let prefix: Text = text_try_concat("CTE[", number_text)?
+        let named: Text = text_try_concat(prefix, "] ")?
+        let named_relation: Text = text_try_concat(named, name)?
+        let materialize: Text = text_try_concat(named_relation, " Materialize(rows<=65536,cells<=1048576,text_bytes<=67108864)\n")?
+        set output = yaza_db_query_explain_append_v1(output, materialize, definition_plan.plan_text)?
+        let empty_result: YazaSqlQueryResultV1 = YazaSqlQueryResultV1(definition_plan.columns, List[List[YazaSqlValueV1]](), 0, 0, 0, 0)
+        let relation: YazaDbQueryVirtualRelationV1 = yaza_db_query_virtual_relation_from_result_v1(source, definition, empty_result, 1000000 + output_index, base_loaded.sql_snapshot.version)?
+        if not list_try_push(relations, relation): return err("SQL CTE EXPLAIN could not append a virtual relation schema")
+        set output_index = output_index + 1
+    let final_branch: YazaSqlSetPreparedBranchV1 = list_get(prepared, list_count(prepared) - 1)
+    let final_catalog: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_query_catalog_with_virtual_relations_v1(base_loaded, relations)?
+    let final_plan_result: Result[YazaDbQueryCteExplainV1, Text] = yaza_db_query_explain_select_or_set_v1(final_branch.source, final_catalog.sql_snapshot, base_loaded.views, relations)
+    if not result_is_ok(final_plan_result):
+        return err(yaza_db_query_cte_source_error_v1(source, parsed.main_query, parsed.main_start_byte, parsed.main_start_byte, final_branch.source, "final CTE query", result_unwrap_error(final_plan_result)))
+    let final_plan: YazaDbQueryCteExplainV1 = result_unwrap(final_plan_result)
+    set output = yaza_db_query_explain_append_v1(output, "Final query\n", final_plan.plan_text)?
+    return ok(output)
+
+fn yaza_db_execute_select_with_tokens_and_virtual_relations_and_prior_v1(file: Number, file_header: YazaDbFileHeaderV1, source: Text, tokens: List[YazaSqlTokenV1], parameters: List[YazaSqlValueV1], virtual_relations: List[YazaDbQueryVirtualRelationV1], statement_prior_work_units: Number) -> Result[YazaSqlQueryResultV1, Text]:
+    if statement_prior_work_units < 0 or statement_prior_work_units > yaza_sql_executor_max_work_units_v1(): return err("SQL query prior statement work is outside its bound")
+    let initial: Result[YazaSqlQueryResultV1, Text] = yaza_db_execute_single_select_with_tokens_and_virtual_relations_and_prior_v1(file, file_header, source, tokens, parameters, virtual_relations, statement_prior_work_units)
+    if result_is_ok(initial): return initial
+    let parts_result: Result[YazaSqlSetQueryPartsV1, Text] = yaza_sql_set_split_v1(source)
+    if not result_is_ok(parts_result): return err(result_unwrap_error(parts_result))
+    let parts: YazaSqlSetQueryPartsV1 = result_unwrap(parts_result)
+    if list_count(parts.operators) == 0: return err(result_unwrap_error(initial))
+    let prepared: List[YazaSqlSetPreparedBranchV1] = yaza_sql_set_prepare_branches_v1(parts, parameters)?
+    let results_created: Result[List[YazaSqlQueryResultV1], Text] = list_try_new()
+    if not result_is_ok(results_created): return err("SQL CTE set query could not allocate branch results")
+    let results: List[YazaSqlQueryResultV1] = result_unwrap(results_created)
+    if not list_try_reserve(results, list_count(prepared)): return err("SQL CTE set query could not reserve branch results")
+    var branch_work_units: Number = 0
+    var index: Number = 0
+    while index < list_count(prepared):
+        let branch: YazaSqlSetPreparedBranchV1 = list_get(prepared, index)
+        if branch_work_units > yaza_sql_executor_max_work_units_v1() - statement_prior_work_units: return err("SQL set branches exceed the statement-wide work budget")
+        let branch_prior_work_units: Number = statement_prior_work_units + branch_work_units
+        let result_result: Result[YazaSqlQueryResultV1, Text] = yaza_db_execute_single_select_with_virtual_relations_and_prior_v1(file, file_header, branch.source, branch.parameters, virtual_relations, branch_prior_work_units)
+        if not result_is_ok(result_result):
+            let branch_start_byte: Number = list_get(parts.branch_start_bytes, index)
+            return err(yaza_db_query_set_branch_source_error_v1(list_get(parts.branches, index), branch_start_byte, branch.source, result_unwrap_error(result_result)))
+        let result: YazaSqlQueryResultV1 = result_unwrap(result_result)
+        if result.work_units < 0 or result.work_units > yaza_sql_executor_max_work_units_v1() - branch_work_units - statement_prior_work_units: return err("SQL set branch exceeds the remaining statement work budget")
+        set branch_work_units = branch_work_units + result.work_units
+        if not list_try_push(results, result): return err("SQL CTE set query could not append a branch result")
+        set index = index + 1
+    let combined: YazaSqlQueryResultV1 = yaza_sql_set_evaluate_with_prior_v1(results, parts.operators, statement_prior_work_units)?
+    if not parts.has_limit and list_count(parts.order_terms) == 0: return ok(combined)
+    return yaza_sql_set_apply_final_modifiers_with_prior_v1(combined, parts, source, statement_prior_work_units)
+
+fn yaza_db_execute_select_with_virtual_relations_and_prior_v1(file: Number, file_header: YazaDbFileHeaderV1, source: Text, parameters: List[YazaSqlValueV1], virtual_relations: List[YazaDbQueryVirtualRelationV1], statement_prior_work_units: Number) -> Result[YazaSqlQueryResultV1, Text]:
+    let tokens: List[YazaSqlTokenV1] = yaza_sql_lex_v1(source)?
+    return yaza_db_execute_select_with_tokens_and_virtual_relations_and_prior_v1(file, file_header, source, tokens, parameters, virtual_relations, statement_prior_work_units)
+
+fn yaza_db_execute_select_with_virtual_relations_v1(file: Number, file_header: YazaDbFileHeaderV1, source: Text, parameters: List[YazaSqlValueV1], virtual_relations: List[YazaDbQueryVirtualRelationV1]) -> Result[YazaSqlQueryResultV1, Text]:
+    return yaza_db_execute_select_with_virtual_relations_and_prior_v1(file, file_header, source, parameters, virtual_relations, 0)
+
+fn yaza_db_execute_select_at_snapshot_with_virtual_relations_and_prior_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], snapshot_ts: Number, own_txn_id: Number, transactions: List[YazaDbTxnStatusV1], virtual_relations: List[YazaDbQueryVirtualRelationV1], statement_prior_work_units: Number) -> Result[YazaSqlQueryResultV1, Text]:
+    if statement_prior_work_units < 0 or statement_prior_work_units > yaza_sql_executor_max_work_units_v1(): return err("YDBv1 historical query prior statement work is outside its bound")
+    let initial: Result[YazaSqlQueryResultV1, Text] = yaza_db_execute_single_select_at_snapshot_with_virtual_relations_and_prior_v1(storage, wal, source, parameters, snapshot_ts, own_txn_id, transactions, virtual_relations, statement_prior_work_units)
+    if result_is_ok(initial): return initial
+    let parts_result: Result[YazaSqlSetQueryPartsV1, Text] = yaza_sql_set_split_v1(source)
+    if not result_is_ok(parts_result): return err(result_unwrap_error(parts_result))
+    let parts: YazaSqlSetQueryPartsV1 = result_unwrap(parts_result)
+    if list_count(parts.operators) == 0: return err(result_unwrap_error(initial))
+    let prepared: List[YazaSqlSetPreparedBranchV1] = yaza_sql_set_prepare_branches_v1(parts, parameters)?
+    let results_created: Result[List[YazaSqlQueryResultV1], Text] = list_try_new()
+    if not result_is_ok(results_created): return err("YDBv1 historical CTE set query could not allocate branch results")
+    let results: List[YazaSqlQueryResultV1] = result_unwrap(results_created)
+    if not list_try_reserve(results, list_count(prepared)): return err("YDBv1 historical CTE set query could not reserve branch results")
+    var branch_work_units: Number = 0
+    var index: Number = 0
+    while index < list_count(prepared):
+        let branch: YazaSqlSetPreparedBranchV1 = list_get(prepared, index)
+        if branch_work_units > yaza_sql_executor_max_work_units_v1() - statement_prior_work_units: return err("YDBv1 historical set branches exceed the statement-wide work budget")
+        let branch_prior_work_units: Number = statement_prior_work_units + branch_work_units
+        let result_result: Result[YazaSqlQueryResultV1, Text] = yaza_db_execute_single_select_at_snapshot_with_virtual_relations_and_prior_v1(storage, wal, branch.source, branch.parameters, snapshot_ts, own_txn_id, transactions, virtual_relations, branch_prior_work_units)
+        if not result_is_ok(result_result):
+            let branch_start_byte: Number = list_get(parts.branch_start_bytes, index)
+            return err(yaza_db_query_set_branch_source_error_v1(list_get(parts.branches, index), branch_start_byte, branch.source, result_unwrap_error(result_result)))
+        let result: YazaSqlQueryResultV1 = result_unwrap(result_result)
+        if result.work_units < 0 or result.work_units > yaza_sql_executor_max_work_units_v1() - branch_work_units - statement_prior_work_units: return err("YDBv1 historical set branch exceeds the remaining statement work budget")
+        set branch_work_units = branch_work_units + result.work_units
+        if not list_try_push(results, result): return err("YDBv1 historical CTE set query could not append a branch result")
+        set index = index + 1
+    let combined: YazaSqlQueryResultV1 = yaza_sql_set_evaluate_with_prior_v1(results, parts.operators, statement_prior_work_units)?
+    if not parts.has_limit and list_count(parts.order_terms) == 0: return ok(combined)
+    return yaza_sql_set_apply_final_modifiers_with_prior_v1(combined, parts, source, statement_prior_work_units)
+
+fn yaza_db_execute_select_at_snapshot_with_virtual_relations_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], snapshot_ts: Number, own_txn_id: Number, transactions: List[YazaDbTxnStatusV1], virtual_relations: List[YazaDbQueryVirtualRelationV1]) -> Result[YazaSqlQueryResultV1, Text]:
+    return yaza_db_execute_select_at_snapshot_with_virtual_relations_and_prior_v1(storage, wal, source, parameters, snapshot_ts, own_txn_id, transactions, virtual_relations, 0)
+
+fn yaza_db_execute_cte_select_v1(file: Number, file_header: YazaDbFileHeaderV1, source: Text, parameters: List[YazaSqlValueV1]) -> Result[YazaSqlQueryResultV1, Text]:
+    let parsed: YazaSqlCteQueryV1 = yaza_sql_cte_parse_v1(source)?
+    if parsed.recursive: return err("SQL WITH RECURSIVE is not supported in this YazaBase profile")
+    let prepared: List[YazaSqlSetPreparedBranchV1] = yaza_db_query_prepare_cte_branches_v1(parsed, parameters)?
+    if list_count(prepared) != list_count(parsed.definitions) + 1: return err("SQL CTE statement-wide bind preparation returned inconsistent branch metadata")
+    let catalog: YazaSqlCatalogSnapshotV1 = yaza_db_catalog_snapshot_load_v1(file, file_header)?
+    let relations_created: Result[List[YazaDbQueryVirtualRelationV1], Text] = list_try_new()
+    if not result_is_ok(relations_created): return err("SQL CTE could not allocate its scoped relation set")
+    let relations: List[YazaDbQueryVirtualRelationV1] = result_unwrap(relations_created)
+    if not list_try_reserve(relations, list_count(parsed.definitions)): return err("SQL CTE could not reserve its scoped relation set")
+    var total_rows: Number = 0
+    var total_cells: Number = 0
+    var total_text_bytes: Number = 0
+    var total_work_units: Number = 0
+    var index: Number = 0
+    while index < list_count(parsed.definitions):
+        let definition: YazaSqlCteDefinitionV1 = list_get(parsed.definitions, index)
+        let prepared_branch: YazaSqlSetPreparedBranchV1 = list_get(prepared, index)
+        let query_result_result: Result[YazaSqlQueryResultV1, Text] = yaza_db_execute_select_with_virtual_relations_and_prior_v1(file, file_header, prepared_branch.source, prepared_branch.parameters, relations, total_work_units)
+        if not result_is_ok(query_result_result):
+            let context: Text = "CTE definition query"
+            return err(yaza_db_query_cte_source_error_v1(source, definition.query, definition.query_start_byte, definition.name_token.start_byte, prepared_branch.source, context, result_unwrap_error(query_result_result)))
+        let query_result: YazaSqlQueryResultV1 = result_unwrap(query_result_result)
+        let usage_result: Result[YazaDbQueryCteBudgetV1, Text] = yaza_db_query_validate_cte_result_budget_v1(query_result, total_rows, total_cells, total_text_bytes, total_work_units)
+        if not result_is_ok(usage_result):
+            let context: Text = "CTE definition materialization"
+            return err(yaza_db_query_cte_source_error_v1(source, definition.query, definition.query_start_byte, definition.name_token.start_byte, definition.query, context, result_unwrap_error(usage_result)))
+        let usage: YazaDbQueryCteBudgetV1 = result_unwrap(usage_result)
+        set total_rows = total_rows + usage.rows
+        set total_cells = total_cells + usage.cells
+        set total_text_bytes = total_text_bytes + usage.text_bytes
+        set total_work_units = total_work_units + usage.work_units
+        let relation_result: Result[YazaDbQueryVirtualRelationV1, Text] = yaza_db_query_virtual_relation_from_result_v1(source, definition, query_result, 1000000 + index, catalog.version)
+        if not result_is_ok(relation_result):
+            let context: Text = "CTE definition output schema"
+            return err(yaza_db_query_cte_source_error_v1(source, definition.query, definition.query_start_byte, definition.name_token.start_byte, definition.query, context, result_unwrap_error(relation_result)))
+        let relation: YazaDbQueryVirtualRelationV1 = result_unwrap(relation_result)
+        if not list_try_push(relations, relation):
+            let context: Text = "CTE definition materialization"
+            return err(yaza_db_query_cte_source_error_v1(source, definition.query, definition.query_start_byte, definition.name_token.start_byte, definition.query, context, "SQL CTE could not append a materialized relation"))
+        set index = index + 1
+    let final_branch: YazaSqlSetPreparedBranchV1 = list_get(prepared, list_count(prepared) - 1)
+    let final_result_result: Result[YazaSqlQueryResultV1, Text] = yaza_db_execute_select_with_virtual_relations_and_prior_v1(file, file_header, final_branch.source, final_branch.parameters, relations, total_work_units)
+    if not result_is_ok(final_result_result):
+        return err(yaza_db_query_cte_source_error_v1(source, parsed.main_query, parsed.main_start_byte, parsed.main_start_byte, final_branch.source, "final CTE query", result_unwrap_error(final_result_result)))
+    let final_result: YazaSqlQueryResultV1 = result_unwrap(final_result_result)
+    let final_usage_result: Result[YazaDbQueryCteBudgetV1, Text] = yaza_db_query_validate_cte_result_budget_v1(final_result, total_rows, total_cells, total_text_bytes, total_work_units)
+    if not result_is_ok(final_usage_result):
+        return err(yaza_db_query_cte_source_error_v1(source, parsed.main_query, parsed.main_start_byte, parsed.main_start_byte, parsed.main_query, "final CTE result", result_unwrap_error(final_usage_result)))
+    return ok(final_result)
+
+fn yaza_db_execute_cte_select_at_snapshot_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], snapshot_ts: Number, own_txn_id: Number, transactions: List[YazaDbTxnStatusV1]) -> Result[YazaSqlQueryResultV1, Text]:
+    let parsed: YazaSqlCteQueryV1 = yaza_sql_cte_parse_v1(source)?
+    if parsed.recursive: return err("SQL WITH RECURSIVE is not supported in this YazaBase profile")
+    let prepared: List[YazaSqlSetPreparedBranchV1] = yaza_db_query_prepare_cte_branches_v1(parsed, parameters)?
+    if list_count(prepared) != list_count(parsed.definitions) + 1: return err("SQL CTE statement-wide bind preparation returned inconsistent branch metadata")
+    let catalog: YazaSqlCatalogSnapshotV1 = yaza_db_catalog_snapshot_load_v1(storage.file, storage.header)?
+    let relations_created: Result[List[YazaDbQueryVirtualRelationV1], Text] = list_try_new()
+    if not result_is_ok(relations_created): return err("SQL CTE could not allocate its historical scoped relation set")
+    let relations: List[YazaDbQueryVirtualRelationV1] = result_unwrap(relations_created)
+    if not list_try_reserve(relations, list_count(parsed.definitions)): return err("SQL CTE could not reserve its historical scoped relation set")
+    var total_rows: Number = 0
+    var total_cells: Number = 0
+    var total_text_bytes: Number = 0
+    var total_work_units: Number = 0
+    var index: Number = 0
+    while index < list_count(parsed.definitions):
+        let definition: YazaSqlCteDefinitionV1 = list_get(parsed.definitions, index)
+        let prepared_branch: YazaSqlSetPreparedBranchV1 = list_get(prepared, index)
+        let query_result_result: Result[YazaSqlQueryResultV1, Text] = yaza_db_execute_select_at_snapshot_with_virtual_relations_and_prior_v1(storage, wal, prepared_branch.source, prepared_branch.parameters, snapshot_ts, own_txn_id, transactions, relations, total_work_units)
+        if not result_is_ok(query_result_result):
+            let context: Text = "CTE definition query"
+            return err(yaza_db_query_cte_source_error_v1(source, definition.query, definition.query_start_byte, definition.name_token.start_byte, prepared_branch.source, context, result_unwrap_error(query_result_result)))
+        let query_result: YazaSqlQueryResultV1 = result_unwrap(query_result_result)
+        let usage_result: Result[YazaDbQueryCteBudgetV1, Text] = yaza_db_query_validate_cte_result_budget_v1(query_result, total_rows, total_cells, total_text_bytes, total_work_units)
+        if not result_is_ok(usage_result):
+            let context: Text = "CTE definition materialization"
+            return err(yaza_db_query_cte_source_error_v1(source, definition.query, definition.query_start_byte, definition.name_token.start_byte, definition.query, context, result_unwrap_error(usage_result)))
+        let usage: YazaDbQueryCteBudgetV1 = result_unwrap(usage_result)
+        set total_rows = total_rows + usage.rows
+        set total_cells = total_cells + usage.cells
+        set total_text_bytes = total_text_bytes + usage.text_bytes
+        set total_work_units = total_work_units + usage.work_units
+        let relation_result: Result[YazaDbQueryVirtualRelationV1, Text] = yaza_db_query_virtual_relation_from_result_v1(source, definition, query_result, 1000000 + index, catalog.version)
+        if not result_is_ok(relation_result):
+            let context: Text = "CTE definition output schema"
+            return err(yaza_db_query_cte_source_error_v1(source, definition.query, definition.query_start_byte, definition.name_token.start_byte, definition.query, context, result_unwrap_error(relation_result)))
+        let relation: YazaDbQueryVirtualRelationV1 = result_unwrap(relation_result)
+        if not list_try_push(relations, relation):
+            let context: Text = "CTE definition materialization"
+            return err(yaza_db_query_cte_source_error_v1(source, definition.query, definition.query_start_byte, definition.name_token.start_byte, definition.query, context, "SQL CTE could not append a historical materialized relation"))
+        set index = index + 1
+    let final_branch: YazaSqlSetPreparedBranchV1 = list_get(prepared, list_count(prepared) - 1)
+    let final_result_result: Result[YazaSqlQueryResultV1, Text] = yaza_db_execute_select_at_snapshot_with_virtual_relations_and_prior_v1(storage, wal, final_branch.source, final_branch.parameters, snapshot_ts, own_txn_id, transactions, relations, total_work_units)
+    if not result_is_ok(final_result_result):
+        return err(yaza_db_query_cte_source_error_v1(source, parsed.main_query, parsed.main_start_byte, parsed.main_start_byte, final_branch.source, "final CTE query", result_unwrap_error(final_result_result)))
+    let final_result: YazaSqlQueryResultV1 = result_unwrap(final_result_result)
+    let final_usage_result: Result[YazaDbQueryCteBudgetV1, Text] = yaza_db_query_validate_cte_result_budget_v1(final_result, total_rows, total_cells, total_text_bytes, total_work_units)
+    if not result_is_ok(final_usage_result):
+        return err(yaza_db_query_cte_source_error_v1(source, parsed.main_query, parsed.main_start_byte, parsed.main_start_byte, parsed.main_query, "final CTE result", result_unwrap_error(final_usage_result)))
+    return ok(final_result)
+
+fn yaza_db_execute_select_with_tokens_profiled_v1(file: Number, file_header: YazaDbFileHeaderV1, source: Text, parameters: List[YazaSqlValueV1], tokens: List[YazaSqlTokenV1], profile_ns: List[Number]) -> Result[YazaSqlQueryResultV1, Text]:
+    if yaza_sql_v2_is_keyword(source, tokens, 0, "WITH"):
+        return yaza_db_execute_cte_select_v1(file, file_header, source, parameters)
+    if list_count(profile_ns) < 4:
+        let result: Result[YazaSqlQueryResultV1, Text] = yaza_db_execute_select_with_tokens_v1(file, file_header, source, parameters, tokens)
+        if not result_is_ok(result): return err(yaza_db_query_public_sql_error_v1(source, result_unwrap_error(result)))
+        return result
+    var profile_index: Number = 0
+    while profile_index < list_count(profile_ns):
+        let ignored_reset: Boolean = list_try_set(profile_ns, profile_index, 0)
+        set profile_index = profile_index + 1
+    let single: Result[YazaSqlQueryResultV1, Text] = yaza_db_execute_single_select_with_tokens_and_virtual_relations_and_prior_profiled_v1(file, file_header, source, tokens, parameters, List[YazaDbQueryVirtualRelationV1](), 0, profile_ns)
+    if result_is_ok(single): return single
+    let result: Result[YazaSqlQueryResultV1, Text] = yaza_db_execute_select_with_tokens_v1(file, file_header, source, parameters, tokens)
+    if not result_is_ok(result): return err(yaza_db_query_public_sql_error_v1(source, result_unwrap_error(result)))
+    return result
+
+fn yaza_db_execute_select_with_tokens_v1(file: Number, file_header: YazaDbFileHeaderV1, source: Text, parameters: List[YazaSqlValueV1], tokens: List[YazaSqlTokenV1]) -> Result[YazaSqlQueryResultV1, Text]:
+    if yaza_sql_v2_is_keyword(source, tokens, 0, "WITH"):
+        return yaza_db_execute_cte_select_v1(file, file_header, source, parameters)
+    let result: Result[YazaSqlQueryResultV1, Text] = yaza_db_execute_select_with_tokens_and_virtual_relations_and_prior_v1(file, file_header, source, tokens, parameters, List[YazaDbQueryVirtualRelationV1](), 0)
+    if not result_is_ok(result): return err(yaza_db_query_public_sql_error_v1(source, result_unwrap_error(result)))
+    return result
+
+fn yaza_db_execute_select_v1(file: Number, file_header: YazaDbFileHeaderV1, source: Text, parameters: List[YazaSqlValueV1]) -> Result[YazaSqlQueryResultV1, Text]:
+    let tokens_result: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(source)
+    if not result_is_ok(tokens_result): return err(result_unwrap_error(tokens_result))
+    let tokens: List[YazaSqlTokenV1] = result_unwrap(tokens_result)
+    return yaza_db_execute_select_with_tokens_v1(file, file_header, source, parameters, tokens)
+
+fn yaza_db_execute_select_at_snapshot_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], snapshot_ts: Number, own_txn_id: Number, transactions: List[YazaDbTxnStatusV1]) -> Result[YazaSqlQueryResultV1, Text]:
+    let tokens_result: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(source)
+    if not result_is_ok(tokens_result): return err(result_unwrap_error(tokens_result))
+    let tokens: List[YazaSqlTokenV1] = result_unwrap(tokens_result)
+    if yaza_sql_v2_is_keyword(source, tokens, 0, "WITH"):
+        return yaza_db_execute_cte_select_at_snapshot_v1(storage, wal, source, parameters, snapshot_ts, own_txn_id, transactions)
+    let result: Result[YazaSqlQueryResultV1, Text] = yaza_db_execute_select_at_snapshot_with_virtual_relations_and_prior_v1(storage, wal, source, parameters, snapshot_ts, own_txn_id, transactions, List[YazaDbQueryVirtualRelationV1](), 0)
+    if not result_is_ok(result): return err(yaza_db_query_public_sql_error_v1(source, result_unwrap_error(result)))
+    return result

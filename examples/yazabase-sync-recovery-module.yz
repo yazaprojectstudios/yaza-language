@@ -1,0 +1,930 @@
+use "std/fs"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/catalog_migration_v1"
+use "../yazabase/allocator_v1"
+use "../yazabase/btree_reclaim_v1"
+use "../yazabase/catalog_snapshot_v1"
+use "../yazabase/catalog_storage_v1"
+use "../yazabase/checkpoint_v1"
+use "../yazabase/btree_scan_v1"
+use "../yazabase/key_codec_v1"
+use "../yazabase/index_catalog_v1"
+use "../yazabase/overflow_reclaim_v1"
+use "../yazabase/page_v1"
+use "../yazabase/query_v1"
+use "../yazabase/sql_dispatch_v1"
+use "../yazabase/sql_executor_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/transaction_v1"
+use "../yazabase/wal_v1"
+
+fn yazabase_sync_recovery_close_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1) -> Number:
+    let wal_closed: Result[Boolean, Text] = yaza_db_wal_log_close_v1(wal)
+    let storage_closed: Result[Boolean, Text] = yaza_db_storage_close_v1(storage)
+    if not result_is_ok(wal_closed) or not result_is_ok(storage_closed): return 1
+    if not result_unwrap(wal_closed) or not result_unwrap(storage_closed): return 2
+    return 0
+
+fn yazabase_sync_recovery_initialize_v1(root: Number) -> Number:
+    let header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_from_text("fault-test-ydb01"), 0, 1, 1, 0, 2, 1)
+    let empty_result: Result[YazaDbStorageHandleV1, Text] = yaza_db_storage_create_empty_v1(root, "sync-recovery.ydb", header)
+    if not result_is_ok(empty_result): return 10
+    let empty_closed: Result[Boolean, Text] = yaza_db_storage_close_v1(result_unwrap(empty_result))
+    if not result_is_ok(empty_closed) or not result_unwrap(empty_closed): return 11
+
+    let initialized_result: Result[YazaDbCatalogBootstrapV1, Text] = yaza_db_catalog_initialize_v1(root, "sync-recovery.ydb")
+    if not result_is_ok(initialized_result): return 12
+    let initialized: YazaDbCatalogBootstrapV1 = result_unwrap(initialized_result)
+    return yazabase_sync_recovery_close_v1(initialized.storage, initialized.wal)
+
+fn yazabase_sync_recovery_catalog_migration_v1(root: Number) -> Number:
+    let recovered_result: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_open_recovered_v1(root, "sync-recovery.ydb")
+    if not result_is_ok(recovered_result): return 130
+    let recovered: YazaDbCheckpointRecoveryV1 = result_unwrap(recovered_result)
+    let migrated_result: Result[YazaDbCatalogMigrationV1, Text] = yaza_db_catalog_migrate_views_opened_v1(recovered.storage, recovered.wal)
+    if not result_is_ok(migrated_result): return 131
+    let migrated: YazaDbCatalogMigrationV1 = result_unwrap(migrated_result)
+    return yazabase_sync_recovery_close_v1(migrated.storage, migrated.wal)
+
+fn yazabase_sync_recovery_catalog_migration_verify_v1(root: Number) -> Number:
+    let recovered_result: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_open_recovered_v1(root, "sync-recovery.ydb")
+    if not result_is_ok(recovered_result):
+        say "catalog migration recovery failed: " + result_unwrap_error(recovered_result)
+        return 132
+    let recovered: YazaDbCheckpointRecoveryV1 = result_unwrap(recovered_result)
+    let catalog_result: Result[YazaDbCatalogRootV1, Text] = yaza_db_catalog_storage_read_root_v1(recovered.storage.file, recovered.storage.header)
+    if not result_is_ok(catalog_result):
+        say "catalog migration root validation failed: " + result_unwrap_error(catalog_result)
+        let ignored_close: Number = yazabase_sync_recovery_close_v1(recovered.storage, recovered.wal)
+        return 133
+    let catalog: YazaDbCatalogRootV1 = result_unwrap(catalog_result)
+    if catalog.sys_views_root != 0:
+        let view_root_result: Result[Bytes, Text] = yaza_db_storage_read_page_v1(recovered.storage.file, recovered.storage.header, catalog.sys_views_root)
+        if not result_is_ok(view_root_result):
+            let ignored_close: Number = yazabase_sync_recovery_close_v1(recovered.storage, recovered.wal)
+            return 134
+        let view_header_result: Result[YazaDbPageHeaderV1, Text] = yaza_db_page_header_decode_v1(result_unwrap(view_root_result), catalog.sys_views_root)
+        if not result_is_ok(view_header_result):
+            let ignored_close: Number = yazabase_sync_recovery_close_v1(recovered.storage, recovered.wal)
+            return 134
+        if result_unwrap(view_header_result).page_type != 1 or catalog.generation < 2:
+            let ignored_close: Number = yazabase_sync_recovery_close_v1(recovered.storage, recovered.wal)
+            return 134
+    return yazabase_sync_recovery_close_v1(recovered.storage, recovered.wal)
+
+fn yazabase_sync_recovery_fk_child_name_v1(value: Number) -> Text:
+    return "crash_fk_child_" + number_text(value)
+
+fn yazabase_sync_recovery_fk_prepare_v1(root: Number) -> Number:
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let parent_create: Number = yazabase_sync_recovery_execute_v1(root, "CREATE TABLE crash_fk_parent (id BIGINT PRIMARY KEY)", no_parameters, false)
+    if parent_create != 0: return 160
+    return yazabase_sync_recovery_execute_v1(root, "INSERT INTO crash_fk_parent (id) VALUES (1)", no_parameters, false)
+
+fn yazabase_sync_recovery_fk_create_v1(root: Number, value: Number) -> Number:
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let child_name: Text = yazabase_sync_recovery_fk_child_name_v1(value)
+    let source: Text = "CREATE TABLE " + child_name + " (id BIGINT PRIMARY KEY, parent_id BIGINT, FOREIGN KEY (parent_id) REFERENCES crash_fk_parent(id))"
+    return yazabase_sync_recovery_execute_v1(root, source, no_parameters, false)
+
+fn yazabase_sync_recovery_fk_verify_v1(root: Number, value: Number) -> Number:
+    let recovered_result: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_open_recovered_v1(root, "sync-recovery.ydb")
+    if not result_is_ok(recovered_result): return 161
+    let recovered: YazaDbCheckpointRecoveryV1 = result_unwrap(recovered_result)
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let child_name: Text = yazabase_sync_recovery_fk_child_name_v1(value)
+    let select_source: Text = "SELECT id FROM " + child_name + " LIMIT 1"
+    let selected: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(recovered.storage, recovered.wal, select_source, no_parameters)
+    if not result_is_ok(selected):
+        let diagnostic: Text = result_unwrap_error(selected)
+        let close_status: Number = yazabase_sync_recovery_close_v1(recovered.storage, recovered.wal)
+        if close_status != 0: return 162
+        if not text_starts_with(diagnostic, "SQL binder could not resolve table"): return 163
+        let parent_delete_when_child_absent: Number = yazabase_sync_recovery_execute_v1(root, "DELETE FROM crash_fk_parent WHERE id = 1", no_parameters, false)
+        if parent_delete_when_child_absent != 0: return 164
+        return 0
+    let select_statement: YazaDbSqlStatementResultV1 = result_unwrap(selected)
+    if not option_is_some(select_statement.query_result):
+        let ignored_close: Number = yazabase_sync_recovery_close_v1(select_statement.storage, select_statement.wal)
+        return 165
+    let child_query: YazaSqlQueryResultV1 = option_unwrap(select_statement.query_result)
+    if list_count(child_query.rows) != 0:
+        let ignored_close: Number = yazabase_sync_recovery_close_v1(select_statement.storage, select_statement.wal)
+        return 166
+    if yazabase_sync_recovery_close_v1(select_statement.storage, select_statement.wal) != 0: return 167
+    let invalid_child_insert: Number = yazabase_sync_recovery_execute_v1(root, "INSERT INTO " + child_name + " (id, parent_id) VALUES (9101, 999999)", no_parameters, false)
+    if invalid_child_insert == 0: return 168
+    let valid_child_insert: Number = yazabase_sync_recovery_execute_v1(root, "INSERT INTO " + child_name + " (id, parent_id) VALUES (1, 1)", no_parameters, false)
+    if valid_child_insert != 0: return 169
+    let blocked_parent_delete: Number = yazabase_sync_recovery_execute_v1(root, "DELETE FROM crash_fk_parent WHERE id = 1", no_parameters, false)
+    if blocked_parent_delete == 0: return 170
+    let child_delete: Number = yazabase_sync_recovery_execute_v1(root, "DELETE FROM " + child_name + " WHERE id = 1", no_parameters, false)
+    if child_delete != 0: return 171
+    let parent_delete_after_child: Number = yazabase_sync_recovery_execute_v1(root, "DELETE FROM crash_fk_parent WHERE id = 1", no_parameters, false)
+    if parent_delete_after_child != 0: return 172
+    return 1
+
+fn yazabase_sync_recovery_execute_v1(root: Number, source: Text, parameters: List[YazaSqlValueV1], select_result: Boolean) -> Number:
+    let recovered_result: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_open_recovered_v1(root, "sync-recovery.ydb")
+    if not result_is_ok(recovered_result):
+        say result_unwrap_error(recovered_result)
+        return 20
+    let recovered: YazaDbCheckpointRecoveryV1 = result_unwrap(recovered_result)
+    let statement_result: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(recovered.storage, recovered.wal, source, parameters)
+    if not result_is_ok(statement_result):
+        let ignored_close: Number = yazabase_sync_recovery_close_v1(recovered.storage, recovered.wal)
+        return 21
+    let statement: YazaDbSqlStatementResultV1 = result_unwrap(statement_result)
+    if select_result:
+        if not option_is_some(statement.query_result):
+            let ignored_close: Number = yazabase_sync_recovery_close_v1(statement.storage, statement.wal)
+            return 22
+        let query: YazaSqlQueryResultV1 = option_unwrap(statement.query_result)
+        let row_count: Number = list_count(query.rows)
+        let closed: Number = yazabase_sync_recovery_close_v1(statement.storage, statement.wal)
+        if closed != 0: return 23
+        return row_count
+    if not option_is_some(statement.write_commit):
+        let ignored_close: Number = yazabase_sync_recovery_close_v1(statement.storage, statement.wal)
+        return 24
+    let committed: YazaDbWriteCommitV1 = option_unwrap(statement.write_commit)
+    return yazabase_sync_recovery_close_v1(committed.storage, committed.wal)
+
+fn yazabase_sync_recovery_capacity_setup_v1(root: Number) -> Number:
+    let created_result: Result[YazaDbCatalogBootstrapV1, Text] = yaza_db_catalog_create_v1(root, "capacity-fault.ydb")
+    if not result_is_ok(created_result): return 60
+    let created: YazaDbCatalogBootstrapV1 = result_unwrap(created_result)
+    return yazabase_sync_recovery_close_v1(created.storage, created.wal)
+
+fn yazabase_sync_recovery_capacity_grow_v1(root: Number) -> Number:
+    let recovered_result: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_open_recovered_v1(root, "capacity-fault.ydb")
+    if not result_is_ok(recovered_result): return 61
+    let recovered: YazaDbCheckpointRecoveryV1 = result_unwrap(recovered_result)
+    let begun_result: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_begin_with_reserve_v1(recovered.storage, recovered.wal, yaza_db_storage_preallocated_page_count_v1())
+    if not result_is_ok(begun_result):
+        let ignored_close: Number = yazabase_sync_recovery_close_v1(recovered.storage, recovered.wal)
+        return 62
+    let committed_result: Result[YazaDbWriteCommitV1, Text] = yaza_db_write_transaction_commit_v1(result_unwrap(begun_result))
+    if not result_is_ok(committed_result): return 63
+    let committed: YazaDbWriteCommitV1 = result_unwrap(committed_result)
+    return yazabase_sync_recovery_close_v1(committed.storage, committed.wal)
+
+fn yazabase_sync_recovery_capacity_verify_v1(root: Number) -> Number:
+    let recovered_result: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_open_recovered_v1(root, "capacity-fault.ydb")
+    if not result_is_ok(recovered_result): return 64
+    let recovered: YazaDbCheckpointRecoveryV1 = result_unwrap(recovered_result)
+    let initial_pages: Number = yaza_db_storage_preallocated_page_count_v1()
+    if recovered.storage.header.page_count != initial_pages and recovered.storage.header.page_count != initial_pages * 2:
+        let ignored_close: Number = yazabase_sync_recovery_close_v1(recovered.storage, recovered.wal)
+        return 65
+    if recovered.storage.header.page_count == initial_pages * 2:
+        let free_pages: Result[Number, Text] = yaza_db_allocator_count_free_pages_v1(recovered.storage, initial_pages)
+        if not result_is_ok(free_pages) or result_unwrap(free_pages) < initial_pages:
+            let ignored_close: Number = yazabase_sync_recovery_close_v1(recovered.storage, recovered.wal)
+            return 66
+    let begun_result: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_begin_v1(recovered.storage, recovered.wal)
+    if not result_is_ok(begun_result): return 67
+    let committed_result: Result[YazaDbWriteCommitV1, Text] = yaza_db_write_transaction_commit_v1(result_unwrap(begun_result))
+    if not result_is_ok(committed_result): return 68
+    let committed: YazaDbWriteCommitV1 = result_unwrap(committed_result)
+    return yazabase_sync_recovery_close_v1(committed.storage, committed.wal)
+
+fn yazabase_sync_recovery_index_name_v1(index_id: Number) -> Text:
+    return "crash_idx_" + number_text(index_id)
+
+fn yazabase_sync_recovery_index_state_v1(root: Number, index_id: Number) -> Number:
+    let recovered_result: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_open_recovered_v1(root, "sync-recovery.ydb")
+    if not result_is_ok(recovered_result):
+        say "index-state recovery error: " + result_unwrap_error(recovered_result)
+        return -1
+    let recovered: YazaDbCheckpointRecoveryV1 = result_unwrap(recovered_result)
+    let rows_result: Result[List[YazaDbRowV1], Text] = yaza_db_index_catalog_rows_v1(recovered.storage.file, recovered.storage.header, recovered.storage.header.next_commit_ts - 1)
+    if not result_is_ok(rows_result):
+        let ignored_close: Number = yazabase_sync_recovery_close_v1(recovered.storage, recovered.wal)
+        return -2
+    let rows: List[YazaDbRowV1] = result_unwrap(rows_result)
+    let expected_name: Text = yazabase_sync_recovery_index_name_v1(index_id)
+    var state: Number = 0
+    var index: Number = 0
+    while index < list_count(rows):
+        let row: YazaDbRowV1 = list_get(rows, index)
+        if list_get(row.values, 2).text_value == expected_name:
+            set state = list_get(row.values, 4).integer_value
+            set index = list_count(rows)
+        else: set index = index + 1
+    let closed: Number = yazabase_sync_recovery_close_v1(recovered.storage, recovered.wal)
+    if closed != 0: return -3
+    return state
+
+fn yazabase_sync_recovery_index_create_v1(root: Number, index_id: Number) -> Number:
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let name: Text = yazabase_sync_recovery_index_name_v1(index_id)
+    return yazabase_sync_recovery_execute_v1(root, "CREATE INDEX " + name + " ON crash_rows(value)", no_parameters, false)
+
+fn yazabase_sync_recovery_index_verify_active_v1(root: Number, index_id: Number) -> Number:
+    let prior_state: Number = yazabase_sync_recovery_index_state_v1(root, index_id)
+    if prior_state < 0: return 70
+    if prior_state != 2:
+        let created: Number = yazabase_sync_recovery_index_create_v1(root, index_id)
+        if created != 0: return 71
+    if yazabase_sync_recovery_index_state_v1(root, index_id) != 2: return 72
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let matching_rows: Number = yazabase_sync_recovery_execute_v1(root, "SELECT id FROM crash_rows WHERE value = 9000000", no_parameters, true)
+    if matching_rows != 1: return 73
+    return 0
+
+fn yazabase_sync_recovery_unique_index_name_v1(index_id: Number) -> Text:
+    return "crash_unique_idx_" + number_text(index_id)
+
+fn yazabase_sync_recovery_unique_index_state_v1(root: Number, index_id: Number) -> Number:
+    let recovered_result: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_open_recovered_v1(root, "sync-recovery.ydb")
+    if not result_is_ok(recovered_result): return -1
+    let recovered: YazaDbCheckpointRecoveryV1 = result_unwrap(recovered_result)
+    let rows_result: Result[List[YazaDbRowV1], Text] = yaza_db_index_catalog_rows_v1(recovered.storage.file, recovered.storage.header, recovered.storage.header.next_commit_ts - 1)
+    if not result_is_ok(rows_result):
+        let ignored_close: Number = yazabase_sync_recovery_close_v1(recovered.storage, recovered.wal)
+        return -2
+    let rows: List[YazaDbRowV1] = result_unwrap(rows_result)
+    let expected_name: Text = yazabase_sync_recovery_unique_index_name_v1(index_id)
+    var state: Number = 0
+    var index: Number = 0
+    while index < list_count(rows):
+        let row: YazaDbRowV1 = list_get(rows, index)
+        if list_get(row.values, 2).text_value == expected_name:
+            set state = list_get(row.values, 4).integer_value
+            set index = list_count(rows)
+        else: set index = index + 1
+    let closed: Number = yazabase_sync_recovery_close_v1(recovered.storage, recovered.wal)
+    if closed != 0: return -3
+    return state
+
+fn yazabase_sync_recovery_unique_index_create_v1(root: Number, index_id: Number) -> Number:
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let name: Text = yazabase_sync_recovery_unique_index_name_v1(index_id)
+    return yazabase_sync_recovery_execute_v1(root, "CREATE UNIQUE INDEX " + name + " ON crash_rows(value)", no_parameters, false)
+
+fn yazabase_sync_recovery_unique_index_verify_active_v1(root: Number, index_id: Number) -> Number:
+    let prior_state: Number = yazabase_sync_recovery_unique_index_state_v1(root, index_id)
+    if prior_state < 0: return 110
+    if prior_state != 2:
+        let created: Number = yazabase_sync_recovery_unique_index_create_v1(root, index_id)
+        if created != 0: return 111
+    if yazabase_sync_recovery_unique_index_state_v1(root, index_id) != 2: return 112
+    let duplicate_id: Number = 5000000 + index_id
+    let duplicate_source: Text = "INSERT INTO crash_rows (id, value) VALUES (" + number_text(duplicate_id) + ", 9000000)"
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    if yazabase_sync_recovery_execute_v1(root, duplicate_source, no_parameters, false) == 0: return 113
+    let matching_rows: Number = yazabase_sync_recovery_query_count_v1(root, "SELECT id FROM crash_rows WHERE value = 9000000")
+    if matching_rows != 1: return 114
+    return 0
+
+fn yazabase_sync_recovery_unique_index_drop_v1(root: Number, index_id: Number) -> Number:
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let name: Text = yazabase_sync_recovery_unique_index_name_v1(index_id)
+    return yazabase_sync_recovery_execute_v1(root, "DROP INDEX " + name, no_parameters, false)
+
+fn yazabase_sync_recovery_index_drop_v1(root: Number, index_id: Number) -> Number:
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let name: Text = yazabase_sync_recovery_index_name_v1(index_id)
+    return yazabase_sync_recovery_execute_v1(root, "DROP INDEX " + name, no_parameters, false)
+
+fn yazabase_sync_recovery_index_verify_drop_v1(root: Number, index_id: Number) -> Number:
+    let state: Number = yazabase_sync_recovery_index_state_v1(root, index_id)
+    if state == -1: return 101
+    if state == -2: return 102
+    if state == -3: return 103
+    if state != 0 and state != 2: return 75
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let matching_rows: Number = yazabase_sync_recovery_execute_v1(root, "SELECT id FROM crash_rows WHERE value = 9000000", no_parameters, true)
+    if matching_rows != 1: return 76
+    return 0
+
+fn yazabase_sync_recovery_query_count_v1(root: Number, source: Text) -> Number:
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    return yazabase_sync_recovery_execute_v1(root, source, no_parameters, true)
+
+fn yazabase_sync_recovery_row_value_v1(root: Number, row_id: Number) -> Number:
+    let recovered_result: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_open_recovered_v1(root, "sync-recovery.ydb")
+    if not result_is_ok(recovered_result): return -1
+    let recovered: YazaDbCheckpointRecoveryV1 = result_unwrap(recovered_result)
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let source: Text = "SELECT value FROM crash_rows WHERE id = " + number_text(row_id)
+    let selected: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(recovered.storage, recovered.wal, source, no_parameters)
+    if not result_is_ok(selected):
+        let ignored_close: Number = yazabase_sync_recovery_close_v1(recovered.storage, recovered.wal)
+        return -2
+    let statement: YazaDbSqlStatementResultV1 = result_unwrap(selected)
+    if not option_is_some(statement.query_result):
+        let ignored_close: Number = yazabase_sync_recovery_close_v1(statement.storage, statement.wal)
+        return -3
+    let query: YazaSqlQueryResultV1 = option_unwrap(statement.query_result)
+    if list_count(query.rows) != 1 or list_count(list_get(query.rows, 0)) != 1:
+        let ignored_close: Number = yazabase_sync_recovery_close_v1(statement.storage, statement.wal)
+        return -4
+    let actual: YazaSqlValueV1 = list_get(list_get(query.rows, 0), 0)
+    let closed: Number = yazabase_sync_recovery_close_v1(statement.storage, statement.wal)
+    if closed != 0 or actual.is_null or actual.type_id != 4: return -5
+    return actual.integer_value
+
+fn yazabase_sync_recovery_indexed_insert_v1(root: Number, row_id: Number) -> Number:
+    let indexed_value: Number = row_id + 1000000
+    let source: Text = "INSERT INTO crash_rows (id, value) VALUES (" + number_text(row_id) + ", " + number_text(indexed_value) + ")"
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    return yazabase_sync_recovery_execute_v1(root, source, no_parameters, false)
+
+fn yazabase_sync_recovery_indexed_insert_verify_v1(root: Number, row_id: Number) -> Number:
+    let indexed_value: Number = row_id + 1000000
+    let id_count: Number = yazabase_sync_recovery_query_count_v1(root, "SELECT id FROM crash_rows WHERE id = " + number_text(row_id))
+    let value_count: Number = yazabase_sync_recovery_query_count_v1(root, "SELECT id FROM crash_rows WHERE value = " + number_text(indexed_value))
+    if (id_count != 0 and id_count != 1) or value_count != id_count: return 77
+    return 0
+
+fn yazabase_sync_recovery_indexed_batch_insert_v1(root: Number, first_id: Number) -> Number:
+    let first: Text = number_text(first_id)
+    let second: Text = number_text(first_id + 1)
+    let third: Text = number_text(first_id + 2)
+    let fourth: Text = number_text(first_id + 3)
+    let source: Text = "INSERT INTO crash_rows (id, value) VALUES (" + first + ", " + number_text(first_id + 1000) + "), (" + second + ", " + number_text(first_id + 1001) + "), (" + third + ", " + number_text(first_id + 1002) + "), (" + fourth + ", " + number_text(first_id + 1003) + ")"
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    return yazabase_sync_recovery_execute_v1(root, source, no_parameters, false)
+
+fn yazabase_sync_recovery_indexed_batch_insert_verify_v1(root: Number, first_id: Number) -> Number:
+    let id_count: Number = yazabase_sync_recovery_query_count_v1(root, "SELECT id FROM crash_rows WHERE id >= " + number_text(first_id) + " AND id <= " + number_text(first_id + 3))
+    let index_count: Number = yazabase_sync_recovery_query_count_v1(root, "SELECT id FROM crash_rows WHERE value >= " + number_text(first_id + 1000) + " AND value <= " + number_text(first_id + 1003))
+    if (id_count != 0 and id_count != 4) or index_count != id_count: return 120
+    return 0
+
+fn yazabase_sync_recovery_indexed_batch_delete_v1(root: Number, first_id: Number) -> Number:
+    let source: Text = "DELETE FROM crash_rows WHERE id >= " + number_text(first_id) + " AND id <= " + number_text(first_id + 3)
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    return yazabase_sync_recovery_execute_v1(root, source, no_parameters, false)
+
+fn yazabase_sync_recovery_indexed_batch_delete_verify_v1(root: Number, first_id: Number) -> Number:
+    let id_count: Number = yazabase_sync_recovery_query_count_v1(root, "SELECT id FROM crash_rows WHERE id >= " + number_text(first_id) + " AND id <= " + number_text(first_id + 3))
+    let index_count: Number = yazabase_sync_recovery_query_count_v1(root, "SELECT id FROM crash_rows WHERE value >= " + number_text(first_id + 1000) + " AND value <= " + number_text(first_id + 1003))
+    if (id_count != 0 and id_count != 4) or index_count != id_count: return 121
+    return 0
+
+fn yazabase_sync_recovery_indexed_update_v1(root: Number, row_id: Number) -> Number:
+    let source: Text = "UPDATE crash_rows SET value = " + number_text(row_id + 2000000) + " WHERE id = " + number_text(row_id)
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    return yazabase_sync_recovery_execute_v1(root, source, no_parameters, false)
+
+fn yazabase_sync_recovery_indexed_update_verify_v1(root: Number, row_id: Number) -> Number:
+    let old_value: Number = row_id + 1000000
+    let new_value: Number = row_id + 2000000
+    let actual: Number = yazabase_sync_recovery_row_value_v1(root, row_id)
+    let old_count: Number = yazabase_sync_recovery_query_count_v1(root, "SELECT id FROM crash_rows WHERE value = " + number_text(old_value))
+    let new_count: Number = yazabase_sync_recovery_query_count_v1(root, "SELECT id FROM crash_rows WHERE value = " + number_text(new_value))
+    if actual == old_value and old_count == 1 and new_count == 0: return 0
+    if actual == new_value and old_count == 0 and new_count == 1: return 0
+    return 78
+
+fn yazabase_sync_recovery_indexed_delete_v1(root: Number, row_id: Number) -> Number:
+    let source: Text = "DELETE FROM crash_rows WHERE id = " + number_text(row_id)
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    return yazabase_sync_recovery_execute_v1(root, source, no_parameters, false)
+
+fn yazabase_sync_recovery_indexed_delete_verify_v1(root: Number, row_id: Number) -> Number:
+    let indexed_value: Number = row_id + 1000000
+    let id_count: Number = yazabase_sync_recovery_query_count_v1(root, "SELECT id FROM crash_rows WHERE id = " + number_text(row_id))
+    let value_count: Number = yazabase_sync_recovery_query_count_v1(root, "SELECT id FROM crash_rows WHERE value = " + number_text(indexed_value))
+    if (id_count != 0 and id_count != 1) or value_count != id_count: return 79
+    return 0
+
+fn yazabase_sync_recovery_overflow_insert_v1(root: Number, row_id: Number) -> Number:
+    let body_result: Result[Text, Text] = text_try_repeat("x", 5000)
+    let id_result: Result[YazaSqlValueV1, Text] = yaza_sql_value_integer_v1(4, row_id)
+    if not result_is_ok(body_result) or not result_is_ok(id_result): return 120
+    let parameters: List[YazaSqlValueV1] = [result_unwrap(id_result), yaza_sql_value_text_v1(result_unwrap(body_result))]
+    return yazabase_sync_recovery_execute_v1(root, "INSERT INTO crash_overflow (id, body) VALUES ($1, $2)", parameters, false)
+
+fn yazabase_sync_recovery_overflow_update_v1(root: Number, row_id: Number) -> Number:
+    let body_result: Result[Text, Text] = text_try_repeat("y", 9000)
+    if not result_is_ok(body_result): return 128
+    let parameters: List[YazaSqlValueV1] = [yaza_sql_value_text_v1(result_unwrap(body_result))]
+    return yazabase_sync_recovery_execute_v1(root, "UPDATE crash_overflow SET body = $1 WHERE id = " + number_text(row_id), parameters, false)
+
+fn yazabase_sync_recovery_overflow_update_verify_v1(root: Number, row_id: Number) -> Number:
+    let recovered_result: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_open_recovered_v1(root, "sync-recovery.ydb")
+    if not result_is_ok(recovered_result): return 129
+    let recovered: YazaDbCheckpointRecoveryV1 = result_unwrap(recovered_result)
+    let select_result: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(recovered.storage, recovered.wal, "SELECT body FROM crash_overflow WHERE id = " + number_text(row_id), List[YazaSqlValueV1]())
+    if not result_is_ok(select_result):
+        let ignored_close: Number = yazabase_sync_recovery_close_v1(recovered.storage, recovered.wal)
+        return 130
+    let statement: YazaDbSqlStatementResultV1 = result_unwrap(select_result)
+    if not option_is_some(statement.query_result):
+        let ignored_close: Number = yazabase_sync_recovery_close_v1(statement.storage, statement.wal)
+        return 131
+    let query: YazaSqlQueryResultV1 = option_unwrap(statement.query_result)
+    if list_count(query.rows) != 1 or list_count(list_get(query.rows, 0)) != 1:
+        let ignored_close: Number = yazabase_sync_recovery_close_v1(statement.storage, statement.wal)
+        return 132
+    let actual: YazaSqlValueV1 = list_get(list_get(query.rows, 0), 0)
+    let old_body: Result[Text, Text] = text_try_repeat("x", 5000)
+    let new_body: Result[Text, Text] = text_try_repeat("y", 9000)
+    if not result_is_ok(old_body) or not result_is_ok(new_body):
+        let ignored_close: Number = yazabase_sync_recovery_close_v1(statement.storage, statement.wal)
+        return 133
+    let is_complete: Boolean = actual.type_id == 9 and not actual.is_null and (actual.text_value == result_unwrap(old_body) or actual.text_value == result_unwrap(new_body))
+    let closed: Number = yazabase_sync_recovery_close_v1(statement.storage, statement.wal)
+    if closed != 0: return 134
+    if not is_complete: return 135
+    return 0
+
+fn yazabase_sync_recovery_overflow_verify_v1(root: Number, row_id: Number) -> Number:
+    let recovered_result: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_open_recovered_v1(root, "sync-recovery.ydb")
+    if not result_is_ok(recovered_result): return 121
+    let recovered: YazaDbCheckpointRecoveryV1 = result_unwrap(recovered_result)
+    let id: YazaSqlValueV1 = yaza_sql_executor_value_v1(4, row_id, 0.0, false, "")
+    let parameters: List[YazaSqlValueV1] = [id]
+    let select_result: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(recovered.storage, recovered.wal, "SELECT body FROM crash_overflow WHERE id = $1", parameters)
+    if not result_is_ok(select_result):
+        let ignored_close: Number = yazabase_sync_recovery_close_v1(recovered.storage, recovered.wal)
+        return 122
+    let statement: YazaDbSqlStatementResultV1 = result_unwrap(select_result)
+    if not option_is_some(statement.query_result):
+        let ignored_close: Number = yazabase_sync_recovery_close_v1(statement.storage, statement.wal)
+        return 123
+    let query: YazaSqlQueryResultV1 = option_unwrap(statement.query_result)
+    let row_count: Number = list_count(query.rows)
+    if row_count == 0:
+        let ignored_close: Number = yazabase_sync_recovery_close_v1(statement.storage, statement.wal)
+        return 0
+    if row_count != 1 or list_count(list_get(query.rows, 0)) != 1:
+        let ignored_close: Number = yazabase_sync_recovery_close_v1(statement.storage, statement.wal)
+        return 124
+    let actual: YazaSqlValueV1 = list_get(list_get(query.rows, 0), 0)
+    let expected_result: Result[Text, Text] = text_try_repeat("x", 5000)
+    if not result_is_ok(expected_result):
+        let ignored_close: Number = yazabase_sync_recovery_close_v1(statement.storage, statement.wal)
+        return 125
+    let is_complete: Boolean = actual.type_id == 9 and not actual.is_null and actual.text_value == result_unwrap(expected_result)
+    let closed: Number = yazabase_sync_recovery_close_v1(statement.storage, statement.wal)
+    if closed != 0: return 126
+    if not is_complete: return 127
+    return 1
+
+fn yazabase_sync_recovery_overflow_drop_name_v1(test_id: Number) -> Text:
+    return "crash_overflow_drop_" + number_text(test_id)
+
+fn yazabase_sync_recovery_overflow_drop_control_create_v1(root: Number) -> Number:
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    return yazabase_sync_recovery_execute_v1(root, "CREATE TABLE crash_drop_control (id BIGINT PRIMARY KEY, free_before BIGINT NOT NULL, reclaimed_pages BIGINT NOT NULL)", no_parameters, false)
+
+fn yazabase_sync_recovery_overflow_drop_update_v1(root: Number, test_id: Number) -> Number:
+    let body_result: Result[Text, Text] = text_try_repeat("y", 9000)
+    if not result_is_ok(body_result): return 136
+    let body: YazaSqlValueV1 = yaza_sql_value_text_v1(result_unwrap(body_result))
+    let parameters: List[YazaSqlValueV1] = [body]
+    let table_name: Text = yazabase_sync_recovery_overflow_drop_name_v1(test_id)
+    return yazabase_sync_recovery_execute_v1(root, "UPDATE " + table_name + " SET body = $1 WHERE id = 1", parameters, false)
+
+fn yazabase_sync_recovery_overflow_drop_reclaim_count_v1(root: Number, recovered: YazaDbCheckpointRecoveryV1, table_name: Text) -> Result[Number, Text]:
+    let loaded: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(recovered.storage.file, recovered.storage.header)?
+    var table_index: Number = 0
+    while table_index < list_count(loaded.sql_snapshot.tables) and list_get(loaded.sql_snapshot.tables, table_index).name != table_name:
+        set table_index = table_index + 1
+    if table_index >= list_count(loaded.sql_snapshot.tables): return err("overflow DROP crash fixture could not resolve its target table")
+    let table: YazaSqlTableSchemaV1 = list_get(loaded.sql_snapshot.tables, table_index)
+    let table_root: Number = list_get(loaded.root_page_ids, table_index)
+    let catalog: YazaDbCatalogRootV1 = yaza_db_catalog_storage_read_root_v1(recovered.storage.file, recovered.storage.header)?
+    let key_ordinals: List[Number] = yaza_db_query_clustered_key_ordinals_v1(recovered.storage.file, recovered.storage.header, catalog, table.table_id, table_root, loaded.sql_snapshot.version, list_count(table.columns))?
+    let primary_plan: YazaDbBtreeReclaimPlanV1 = yaza_db_btree_reclaim_plan_v1(recovered.storage.file, recovered.storage.header, table_root)?
+    let overflow_plan: YazaDbOverflowReclaimPlanV1 = yaza_db_overflow_reclaim_plan_table_v1(root, recovered.wal.db_uuid, recovered.wal.next_lsn, recovered.storage.file, recovered.storage.header, primary_plan, table.columns, list_get(loaded.table_schema_versions, table_index), key_ordinals)?
+    if list_count(overflow_plan.page_ids) != 2: return err("overflow DROP crash fixture did not discover its two historical/current overflow chains")
+    return ok(list_count(primary_plan.page_ids) + list_count(overflow_plan.page_ids))
+
+fn yazabase_sync_recovery_overflow_drop_prepare_v1(root: Number, test_id: Number) -> Number:
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let control_parameters: List[YazaSqlValueV1] = [yaza_sql_executor_value_v1(4, test_id, 0.0, false, ""), yaza_sql_executor_value_v1(4, 0, 0.0, false, ""), yaza_sql_executor_value_v1(4, 0, 0.0, false, "")]
+    let control_insert: Number = yazabase_sync_recovery_execute_v1(root, "INSERT INTO crash_drop_control (id, free_before, reclaimed_pages) VALUES ($1, $2, $3)", control_parameters, false)
+    if control_insert != 0: return 137
+    let table_name: Text = yazabase_sync_recovery_overflow_drop_name_v1(test_id)
+    if yazabase_sync_recovery_execute_v1(root, "CREATE TABLE " + table_name + " (id BIGINT PRIMARY KEY, body TEXT NOT NULL)", no_parameters, false) != 0: return 138
+
+    let old_body_result: Result[Text, Text] = text_try_repeat("x", 5000)
+    if not result_is_ok(old_body_result): return 139
+    let old_body: YazaSqlValueV1 = yaza_sql_value_text_v1(result_unwrap(old_body_result))
+    let old_parameters: List[YazaSqlValueV1] = [yaza_sql_executor_value_v1(4, 1, 0.0, false, ""), old_body]
+    if yazabase_sync_recovery_execute_v1(root, "INSERT INTO " + table_name + " (id, body) VALUES ($1, $2)", old_parameters, false) != 0: return 140
+    if yazabase_sync_recovery_overflow_drop_update_v1(root, test_id) != 0: return 141
+
+    let recovered_result: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_open_recovered_v1(root, "sync-recovery.ydb")
+    if not result_is_ok(recovered_result): return 142
+    let recovered: YazaDbCheckpointRecoveryV1 = result_unwrap(recovered_result)
+    let reclaim_result: Result[Number, Text] = yazabase_sync_recovery_overflow_drop_reclaim_count_v1(root, recovered, table_name)
+    if not result_is_ok(reclaim_result):
+        let ignored_close: Number = yazabase_sync_recovery_close_v1(recovered.storage, recovered.wal)
+        return 143
+    let free_result: Result[Number, Text] = yaza_db_allocator_count_free_pages_v1(recovered.storage, yaza_db_storage_preallocated_page_count_v1())
+    if not result_is_ok(free_result):
+        let ignored_close: Number = yazabase_sync_recovery_close_v1(recovered.storage, recovered.wal)
+        return 146
+    let free_before: Number = result_unwrap(free_result)
+    let reclaimed_pages: Number = result_unwrap(reclaim_result)
+    let closed: Number = yazabase_sync_recovery_close_v1(recovered.storage, recovered.wal)
+    if closed != 0: return 147
+    let control_update: Text = "UPDATE crash_drop_control SET free_before = " + number_text(free_before) + ", reclaimed_pages = " + number_text(reclaimed_pages) + " WHERE id = " + number_text(test_id)
+    if yazabase_sync_recovery_execute_v1(root, control_update, no_parameters, false) != 0: return 148
+
+    let checked_result: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_open_recovered_v1(root, "sync-recovery.ydb")
+    if not result_is_ok(checked_result): return 149
+    let checked: YazaDbCheckpointRecoveryV1 = result_unwrap(checked_result)
+    let checked_free: Result[Number, Text] = yaza_db_allocator_count_free_pages_v1(checked.storage, yaza_db_storage_preallocated_page_count_v1())
+    if not result_is_ok(checked_free) or result_unwrap(checked_free) != free_before:
+        let ignored_close: Number = yazabase_sync_recovery_close_v1(checked.storage, checked.wal)
+        return 150
+    let final_close: Number = yazabase_sync_recovery_close_v1(checked.storage, checked.wal)
+    if final_close != 0: return 151
+    return 0
+
+fn yazabase_sync_recovery_overflow_drop_verify_v1(root: Number, test_id: Number) -> Number:
+    let recovered_result: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_open_recovered_v1(root, "sync-recovery.ydb")
+    if not result_is_ok(recovered_result): return 152
+    let recovered: YazaDbCheckpointRecoveryV1 = result_unwrap(recovered_result)
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let control_query: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(recovered.storage, recovered.wal, "SELECT free_before, reclaimed_pages FROM crash_drop_control WHERE id = " + number_text(test_id), no_parameters)
+    if not result_is_ok(control_query):
+        let ignored_close: Number = yazabase_sync_recovery_close_v1(recovered.storage, recovered.wal)
+        return 153
+    let control_statement: YazaDbSqlStatementResultV1 = result_unwrap(control_query)
+    if not option_is_some(control_statement.query_result):
+        let ignored_close: Number = yazabase_sync_recovery_close_v1(control_statement.storage, control_statement.wal)
+        return 154
+    let control_rows: List[List[YazaSqlValueV1]] = option_unwrap(control_statement.query_result).rows
+    if list_count(control_rows) != 1 or list_count(list_get(control_rows, 0)) != 2:
+        let ignored_close: Number = yazabase_sync_recovery_close_v1(control_statement.storage, control_statement.wal)
+        return 155
+    let free_before: Number = list_get(list_get(control_rows, 0), 0).integer_value
+    let reclaimed_pages: Number = list_get(list_get(control_rows, 0), 1).integer_value
+    if free_before < 0 or reclaimed_pages < 1 or reclaimed_pages > 16:
+        let ignored_close: Number = yazabase_sync_recovery_close_v1(control_statement.storage, control_statement.wal)
+        return 156
+
+    let table_name: Text = yazabase_sync_recovery_overflow_drop_name_v1(test_id)
+    let table_query: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(control_statement.storage, control_statement.wal, "SELECT body FROM " + table_name + " WHERE id = 1", no_parameters)
+    var table_exists: Boolean = false
+    if result_is_ok(table_query):
+        let table_statement: YazaDbSqlStatementResultV1 = result_unwrap(table_query)
+        if not option_is_some(table_statement.query_result):
+            let ignored_close: Number = yazabase_sync_recovery_close_v1(table_statement.storage, table_statement.wal)
+            return 157
+        let rows: List[List[YazaSqlValueV1]] = option_unwrap(table_statement.query_result).rows
+        if list_count(rows) != 1 or list_count(list_get(rows, 0)) != 1:
+            let ignored_close: Number = yazabase_sync_recovery_close_v1(table_statement.storage, table_statement.wal)
+            return 158
+        let actual: YazaSqlValueV1 = list_get(list_get(rows, 0), 0)
+        let expected: Result[Text, Text] = text_try_repeat("y", 9000)
+        if not result_is_ok(expected) or actual.is_null or actual.type_id != 9 or actual.text_value != result_unwrap(expected):
+            let ignored_close: Number = yazabase_sync_recovery_close_v1(table_statement.storage, table_statement.wal)
+            return 159
+        set table_exists = true
+    else:
+        let diagnostic: Text = result_unwrap_error(table_query)
+        if not text_starts_with(diagnostic, "SQL binder could not resolve table"):
+            let ignored_close: Number = yazabase_sync_recovery_close_v1(control_statement.storage, control_statement.wal)
+            return 160
+
+    let free_result: Result[Number, Text] = yaza_db_allocator_count_free_pages_v1(control_statement.storage, yaza_db_storage_preallocated_page_count_v1())
+    if not result_is_ok(free_result):
+        let ignored_close: Number = yazabase_sync_recovery_close_v1(control_statement.storage, control_statement.wal)
+        return 161
+    let free_after: Number = result_unwrap(free_result)
+    var expected_free: Number = free_before
+    if not table_exists: set expected_free = free_before + reclaimed_pages
+    let closed: Number = yazabase_sync_recovery_close_v1(control_statement.storage, control_statement.wal)
+    if closed != 0: return 162
+    if free_after != expected_free: return 163
+    return 0
+
+fn yazabase_sync_recovery_bulk_insert_v1(root: Number, first_id: Number) -> Number:
+    var source: Text = "INSERT INTO crash_rows (id, value) VALUES "
+    var index: Number = 0
+    while index < 100:
+        if index > 0: set source = source + ", "
+        let row_id: Text = number_text(first_id + index)
+        set source = source + "(" + row_id + ", " + row_id + ")"
+        set index = index + 1
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    return yazabase_sync_recovery_execute_v1(root, source, no_parameters, false)
+
+fn yazabase_sync_recovery_seed_many_leaves_v1(root: Number) -> Number:
+    var batch_start: Number = 1
+    while batch_start <= 600:
+        var source: Text = "INSERT INTO crash_rows (id, value) VALUES "
+        var offset: Number = 0
+        while offset < 100:
+            if offset > 0: set source = source + ", "
+            let row_id: Text = number_text((batch_start + offset) * 10000)
+            set source = source + "(" + row_id + ", " + row_id + ")"
+            set offset = offset + 1
+        let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+        let inserted: Number = yazabase_sync_recovery_execute_v1(root, source, no_parameters, false)
+        if inserted != 0: return inserted
+        set batch_start = batch_start + 100
+    return 0
+
+fn yazabase_sync_recovery_multi_leaf_insert_v1(root: Number, batch_id: Number) -> Number:
+    let first_id: Text = number_text(10500 + batch_id * 10)
+    let first_next: Text = number_text(10501 + batch_id * 10)
+    let middle_id: Text = number_text(3000500 + batch_id * 10)
+    let middle_next: Text = number_text(3000501 + batch_id * 10)
+    let last_id: Text = number_text(6000500 + batch_id * 10)
+    let last_next: Text = number_text(6000501 + batch_id * 10)
+    let source: Text = "INSERT INTO crash_rows (id, value) VALUES (" + first_id + ", 101), (" + first_next + ", 102), (" + middle_id + ", 201), (" + middle_next + ", 202), (" + last_id + ", 301), (" + last_next + ", 302)"
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    return yazabase_sync_recovery_execute_v1(root, source, no_parameters, false)
+
+fn yazabase_sync_recovery_multi_leaf_insert_verify_v1(root: Number, batch_id: Number) -> Number:
+    let first: YazaSqlValueV1 = yaza_sql_executor_value_v1(4, 10500 + batch_id * 10, 0.0, false, "")
+    let first_next: YazaSqlValueV1 = yaza_sql_executor_value_v1(4, 10501 + batch_id * 10, 0.0, false, "")
+    let middle: YazaSqlValueV1 = yaza_sql_executor_value_v1(4, 3000500 + batch_id * 10, 0.0, false, "")
+    let middle_next: YazaSqlValueV1 = yaza_sql_executor_value_v1(4, 3000501 + batch_id * 10, 0.0, false, "")
+    let last: YazaSqlValueV1 = yaza_sql_executor_value_v1(4, 6000500 + batch_id * 10, 0.0, false, "")
+    let last_next: YazaSqlValueV1 = yaza_sql_executor_value_v1(4, 6000501 + batch_id * 10, 0.0, false, "")
+    let parameters: List[YazaSqlValueV1] = [first, first_next, middle, middle_next, last, last_next]
+    let source: Text = "SELECT id FROM crash_rows WHERE id IN ($1, $2, $3, $4, $5, $6)"
+    let selected: Number = yazabase_sync_recovery_execute_v1(root, source, parameters, true)
+    if selected != 0 and selected != 6: return 90
+    return selected
+
+fn yazabase_sync_recovery_multi_leaf_route_v1(storage: YazaDbStorageHandleV1, table: YazaSqlTableSchemaV1, root_page_id: Number, row_id: Number) -> Result[Number, Text]:
+    let values: List[YazaSqlValueV1] = [yaza_sql_executor_value_v1(4, row_id, 0.0, false, ""), yaza_sql_executor_value_v1(4, row_id, 0.0, false, "")]
+    let nulls: List[Boolean] = [false, false]
+    let key_ordinals: List[Number] = [0]
+    let key: Bytes = yaza_db_key_encode_composite_v1(values, nulls, table.columns, key_ordinals)?
+    let seek: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(storage.file, storage.header, root_page_id, key)?
+    return ok(seek.leaf_page_id)
+
+fn yazabase_sync_recovery_verify_multi_leaf_targets_v1(root: Number, batch_id: Number) -> Number:
+    let recovered_result: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_open_recovered_v1(root, "sync-recovery.ydb")
+    if not result_is_ok(recovered_result): return 91
+    let recovered: YazaDbCheckpointRecoveryV1 = result_unwrap(recovered_result)
+    let loaded_result: Result[YazaDbCatalogSnapshotWithRootsV1, Text] = yaza_db_catalog_snapshot_load_with_roots_v1(recovered.storage.file, recovered.storage.header)
+    if not result_is_ok(loaded_result):
+        let ignored_close: Number = yazabase_sync_recovery_close_v1(recovered.storage, recovered.wal)
+        return 92
+    let loaded: YazaDbCatalogSnapshotWithRootsV1 = result_unwrap(loaded_result)
+    var table_index: Number = 0
+    while table_index < list_count(loaded.sql_snapshot.tables) and list_get(loaded.sql_snapshot.tables, table_index).name != "crash_rows":
+        set table_index = table_index + 1
+    if table_index >= list_count(loaded.sql_snapshot.tables) or table_index >= list_count(loaded.root_page_ids):
+        let ignored_close: Number = yazabase_sync_recovery_close_v1(recovered.storage, recovered.wal)
+        return 93
+    let table: YazaSqlTableSchemaV1 = list_get(loaded.sql_snapshot.tables, table_index)
+    let root_page_id: Number = list_get(loaded.root_page_ids, table_index)
+    let first_result: Result[Number, Text] = yazabase_sync_recovery_multi_leaf_route_v1(recovered.storage, table, root_page_id, 10500 + batch_id * 10)
+    let middle_result: Result[Number, Text] = yazabase_sync_recovery_multi_leaf_route_v1(recovered.storage, table, root_page_id, 3000500 + batch_id * 10)
+    let last_result: Result[Number, Text] = yazabase_sync_recovery_multi_leaf_route_v1(recovered.storage, table, root_page_id, 6000500 + batch_id * 10)
+    let closed: Number = yazabase_sync_recovery_close_v1(recovered.storage, recovered.wal)
+    if closed != 0 or not result_is_ok(first_result) or not result_is_ok(middle_result) or not result_is_ok(last_result): return 94
+    let first_page_id: Number = result_unwrap(first_result)
+    let middle_page_id: Number = result_unwrap(middle_result)
+    let last_page_id: Number = result_unwrap(last_result)
+    if first_page_id == middle_page_id or first_page_id == last_page_id or middle_page_id == last_page_id: return 95
+    return 0
+
+fn yazabase_sync_recovery_bulk_delete_v1(root: Number, first_id: Number, select_rows: Boolean) -> Number:
+    let lower: YazaSqlValueV1 = yaza_sql_executor_value_v1(4, first_id, 0.0, false, "")
+    let upper: YazaSqlValueV1 = yaza_sql_executor_value_v1(4, first_id + 99, 0.0, false, "")
+    let parameters: List[YazaSqlValueV1] = [lower, upper]
+    if select_rows:
+        return yazabase_sync_recovery_execute_v1(root, "SELECT id FROM crash_rows WHERE id >= $1 AND id <= $2", parameters, true)
+    return yazabase_sync_recovery_execute_v1(root, "DELETE FROM crash_rows WHERE id >= $1 AND id <= $2", parameters, false)
+
+fn yazabase_sync_recovery_operation_v1(root: Number, action: Number, value: Number) -> Number:
+    if action == 0: return yazabase_sync_recovery_initialize_v1(root)
+    if action == 1:
+        let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+        return yazabase_sync_recovery_execute_v1(root, "CREATE TABLE crash_rows (id BIGINT PRIMARY KEY, value BIGINT NOT NULL)", no_parameters, false)
+    if action == 2:
+        let value_parameter: YazaSqlValueV1 = yaza_sql_executor_value_v1(4, value, 0.0, false, "")
+        let parameters: List[YazaSqlValueV1] = [value_parameter]
+        return yazabase_sync_recovery_execute_v1(root, "INSERT INTO crash_rows (id, value) VALUES ($1, $1)", parameters, false)
+    if action == 3:
+        let value_parameter: YazaSqlValueV1 = yaza_sql_executor_value_v1(4, value, 0.0, false, "")
+        let parameters: List[YazaSqlValueV1] = [value_parameter]
+        return yazabase_sync_recovery_execute_v1(root, "SELECT id FROM crash_rows WHERE id = $1", parameters, true)
+    if action == 4:
+        let value_parameter: YazaSqlValueV1 = yaza_sql_executor_value_v1(4, value, 0.0, false, "")
+        let parameters: List[YazaSqlValueV1] = [value_parameter]
+        return yazabase_sync_recovery_execute_v1(root, "UPDATE crash_rows SET value = $1 WHERE id = 1", parameters, false)
+    if action == 5:
+        let recovered_result: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_open_recovered_v1(root, "sync-recovery.ydb")
+        if not result_is_ok(recovered_result): return 30
+        let recovered: YazaDbCheckpointRecoveryV1 = result_unwrap(recovered_result)
+        let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+        let select_result: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(recovered.storage, recovered.wal, "SELECT value FROM crash_rows WHERE id = 1", no_parameters)
+        if not result_is_ok(select_result):
+            let ignored_close: Number = yazabase_sync_recovery_close_v1(recovered.storage, recovered.wal)
+            return 31
+        let statement: YazaDbSqlStatementResultV1 = result_unwrap(select_result)
+        if not option_is_some(statement.query_result):
+            let ignored_close: Number = yazabase_sync_recovery_close_v1(statement.storage, statement.wal)
+            return 32
+        let query: YazaSqlQueryResultV1 = option_unwrap(statement.query_result)
+        if list_count(query.rows) != 1 or list_count(list_get(query.rows, 0)) != 1:
+            let ignored_close: Number = yazabase_sync_recovery_close_v1(statement.storage, statement.wal)
+            return 33
+        let observed: YazaSqlValueV1 = list_get(list_get(query.rows, 0), 0)
+        let closed: Number = yazabase_sync_recovery_close_v1(statement.storage, statement.wal)
+        if closed != 0: return 34
+        if observed.is_null or observed.type_id != 4: return 35
+        if observed.integer_value == value: return 0
+        return 1
+    if action == 6:
+        let value_parameter: YazaSqlValueV1 = yaza_sql_executor_value_v1(4, value, 0.0, false, "")
+        let parameters: List[YazaSqlValueV1] = [value_parameter]
+        return yazabase_sync_recovery_execute_v1(root, "DELETE FROM crash_rows WHERE id = $1", parameters, false)
+    if action == 7:
+        let value_parameter: YazaSqlValueV1 = yaza_sql_executor_value_v1(4, value, 0.0, false, "")
+        let parameters: List[YazaSqlValueV1] = [value_parameter]
+        return yazabase_sync_recovery_execute_v1(root, "SELECT id FROM crash_rows WHERE id = $1", parameters, true)
+    if action == 8:
+        let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+        let table_name: Text = "crash_ddl_" + number_text(value)
+        let source: Text = "CREATE TABLE " + table_name + " (id BIGINT PRIMARY KEY)"
+        return yazabase_sync_recovery_execute_v1(root, source, no_parameters, false)
+    if action == 9:
+        let recovered_result: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_open_recovered_v1(root, "sync-recovery.ydb")
+        if not result_is_ok(recovered_result): return 40
+        let recovered: YazaDbCheckpointRecoveryV1 = result_unwrap(recovered_result)
+        let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+        let table_name: Text = "crash_ddl_" + number_text(value)
+        let source: Text = "SELECT id FROM " + table_name + " LIMIT 1"
+        let select_result: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(recovered.storage, recovered.wal, source, no_parameters)
+        if not result_is_ok(select_result):
+            let diagnostic: Text = result_unwrap_error(select_result)
+            let closed: Number = yazabase_sync_recovery_close_v1(recovered.storage, recovered.wal)
+            if closed != 0: return 41
+            if text_starts_with(diagnostic, "SQL binder could not resolve table"): return 1
+            return 42
+        let statement: YazaDbSqlStatementResultV1 = result_unwrap(select_result)
+        if not option_is_some(statement.query_result):
+            let ignored_close: Number = yazabase_sync_recovery_close_v1(statement.storage, statement.wal)
+            return 43
+        let query: YazaSqlQueryResultV1 = option_unwrap(statement.query_result)
+        let row_count: Number = list_count(query.rows)
+        let close_status: Number = yazabase_sync_recovery_close_v1(statement.storage, statement.wal)
+        if close_status != 0: return 44
+        if row_count != 0: return 45
+        return 0
+    if action == 10:
+        let first_id: Text = number_text(value)
+        let second_id: Text = number_text(value + 1)
+        let third_id: Text = number_text(value + 2)
+        let first_value: Text = number_text(value + 100)
+        let second_value: Text = number_text(value + 101)
+        let third_value: Text = number_text(value + 102)
+        let source: Text = "INSERT INTO crash_rows (id, value) VALUES (" + first_id + ", " + first_value + "), (" + second_id + ", " + second_value + "), (" + third_id + ", " + third_value + ")"
+        let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+        return yazabase_sync_recovery_execute_v1(root, source, no_parameters, false)
+    if action == 11:
+        let lower: YazaSqlValueV1 = yaza_sql_executor_value_v1(4, value, 0.0, false, "")
+        let upper: YazaSqlValueV1 = yaza_sql_executor_value_v1(4, value + 2, 0.0, false, "")
+        let parameters: List[YazaSqlValueV1] = [lower, upper]
+        return yazabase_sync_recovery_execute_v1(root, "SELECT id FROM crash_rows WHERE id >= $1 AND id <= $2", parameters, true)
+    if action == 12: return yazabase_sync_recovery_capacity_setup_v1(root)
+    if action == 13: return yazabase_sync_recovery_capacity_grow_v1(root)
+    if action == 14: return yazabase_sync_recovery_capacity_verify_v1(root)
+    if action == 15:
+        let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+        let table_name: Text = "crash_ddl_" + number_text(value)
+        return yazabase_sync_recovery_execute_v1(root, "DROP TABLE " + table_name, no_parameters, false)
+    if action == 16:
+        let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+        let table_name: Text = "crash_alter_default_" + number_text(value)
+        return yazabase_sync_recovery_execute_v1(root, "ALTER TABLE " + table_name + " ADD COLUMN extra BIGINT NOT NULL DEFAULT 7", no_parameters, false)
+    if action == 17:
+        let recovered_result: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_open_recovered_v1(root, "sync-recovery.ydb")
+        if not result_is_ok(recovered_result): return 50
+        let recovered: YazaDbCheckpointRecoveryV1 = result_unwrap(recovered_result)
+        let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+        let table_name: Text = "crash_alter_default_" + number_text(value)
+        let source: Text = "SELECT id, extra FROM " + table_name + " LIMIT 1"
+        let select_result: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(recovered.storage, recovered.wal, source, no_parameters)
+        if not result_is_ok(select_result):
+            let diagnostic: Text = result_unwrap_error(select_result)
+            let closed: Number = yazabase_sync_recovery_close_v1(recovered.storage, recovered.wal)
+            if closed != 0: return 51
+            if text_starts_with(diagnostic, "SQL binder could not resolve column") or text_starts_with(diagnostic, "SQL binder could not resolve multi-table column"): return 1
+            say "ALTER recovery probe unexpected diagnostic: " + diagnostic
+            return 52
+        let statement: YazaDbSqlStatementResultV1 = result_unwrap(select_result)
+        if not option_is_some(statement.query_result):
+            let ignored_close: Number = yazabase_sync_recovery_close_v1(statement.storage, statement.wal)
+            return 53
+        let query: YazaSqlQueryResultV1 = option_unwrap(statement.query_result)
+        let row_count: Number = list_count(query.rows)
+        var default_valid: Boolean = false
+        if row_count == 1 and list_count(list_get(query.rows, 0)) == 2:
+            let row: List[YazaSqlValueV1] = list_get(query.rows, 0)
+            set default_valid = list_get(row, 0).integer_value == 1 and not list_get(row, 1).is_null and list_get(row, 1).integer_value == 7
+        let close_status: Number = yazabase_sync_recovery_close_v1(statement.storage, statement.wal)
+        if close_status != 0: return 54
+        if row_count != 1 or not default_valid: return 55
+        return 0
+    if action == 18: return yazabase_sync_recovery_index_create_v1(root, value)
+    if action == 19: return yazabase_sync_recovery_index_verify_active_v1(root, value)
+    if action == 20: return yazabase_sync_recovery_index_drop_v1(root, value)
+    if action == 21: return yazabase_sync_recovery_index_verify_drop_v1(root, value)
+    if action == 22:
+        let state: Number = yazabase_sync_recovery_index_state_v1(root, 999999)
+        if state == 2: return 0
+        if state != 0: return 81
+        return yazabase_sync_recovery_index_create_v1(root, 999999)
+    if action == 23: return yazabase_sync_recovery_indexed_insert_v1(root, value)
+    if action == 24: return yazabase_sync_recovery_indexed_insert_verify_v1(root, value)
+    if action == 25: return yazabase_sync_recovery_indexed_update_v1(root, value)
+    if action == 26: return yazabase_sync_recovery_indexed_update_verify_v1(root, value)
+    if action == 27: return yazabase_sync_recovery_indexed_delete_v1(root, value)
+    if action == 28: return yazabase_sync_recovery_indexed_delete_verify_v1(root, value)
+    if action == 29:
+        let state: Number = yazabase_sync_recovery_index_state_v1(root, value)
+        if state < 0: return 82
+        if state == 0: return 0
+        if state != 2: return 83
+        return yazabase_sync_recovery_index_drop_v1(root, value)
+    if action == 30: return yazabase_sync_recovery_unique_index_create_v1(root, value)
+    if action == 31: return yazabase_sync_recovery_unique_index_verify_active_v1(root, value)
+    if action == 32:
+        let state: Number = yazabase_sync_recovery_unique_index_state_v1(root, value)
+        if state < 0: return 115
+        if state == 0: return 0
+        if state != 2: return 116
+        return yazabase_sync_recovery_unique_index_drop_v1(root, value)
+    if action == 33:
+        let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+        return yazabase_sync_recovery_execute_v1(root, "CREATE TABLE crash_overflow (id BIGINT PRIMARY KEY, body TEXT NOT NULL)", no_parameters, false)
+    if action == 34: return yazabase_sync_recovery_overflow_insert_v1(root, value)
+    if action == 35: return yazabase_sync_recovery_overflow_verify_v1(root, value)
+    if action == 36: return yazabase_sync_recovery_overflow_update_v1(root, value)
+    if action == 37: return yazabase_sync_recovery_overflow_update_verify_v1(root, value)
+    if action == 38: return yazabase_sync_recovery_overflow_drop_control_create_v1(root)
+    if action == 39: return yazabase_sync_recovery_overflow_drop_prepare_v1(root, value)
+    if action == 40:
+        let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+        return yazabase_sync_recovery_execute_v1(root, "DROP TABLE " + yazabase_sync_recovery_overflow_drop_name_v1(value), no_parameters, false)
+    if action == 41: return yazabase_sync_recovery_overflow_drop_verify_v1(root, value)
+    if action == 42: return yazabase_sync_recovery_bulk_insert_v1(root, value)
+    if action == 43: return yazabase_sync_recovery_bulk_delete_v1(root, value, false)
+    if action == 44: return yazabase_sync_recovery_bulk_delete_v1(root, value, true)
+    if action == 45: return yazabase_sync_recovery_seed_many_leaves_v1(root)
+    if action == 46: return yazabase_sync_recovery_multi_leaf_insert_v1(root, value)
+    if action == 47: return yazabase_sync_recovery_multi_leaf_insert_verify_v1(root, value)
+    if action == 48: return yazabase_sync_recovery_verify_multi_leaf_targets_v1(root, value)
+    if action == 49: return yazabase_sync_recovery_indexed_batch_insert_v1(root, value)
+    if action == 50: return yazabase_sync_recovery_indexed_batch_insert_verify_v1(root, value)
+    if action == 51: return yazabase_sync_recovery_indexed_batch_delete_v1(root, value)
+    if action == 52: return yazabase_sync_recovery_indexed_batch_delete_verify_v1(root, value)
+    if action == 53: return yazabase_sync_recovery_catalog_migration_v1(root)
+    if action == 54: return yazabase_sync_recovery_catalog_migration_verify_v1(root)
+    if action == 55:
+        let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+        let view_name: Text = "crash_view_" + number_text(value)
+        let source: Text = "CREATE VIEW " + view_name + " AS SELECT id FROM crash_rows"
+        return yazabase_sync_recovery_execute_v1(root, source, no_parameters, false)
+    if action == 56:
+        let recovered_result: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_open_recovered_v1(root, "sync-recovery.ydb")
+        if not result_is_ok(recovered_result): return 140
+        let recovered: YazaDbCheckpointRecoveryV1 = result_unwrap(recovered_result)
+        let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+        let view_name: Text = "crash_view_" + number_text(value)
+        let source: Text = "SELECT id FROM " + view_name + " LIMIT 1"
+        let selected: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(recovered.storage, recovered.wal, source, no_parameters)
+        if not result_is_ok(selected):
+            let diagnostic: Text = result_unwrap_error(selected)
+            let closed: Number = yazabase_sync_recovery_close_v1(recovered.storage, recovered.wal)
+            if closed != 0: return 141
+            if text_starts_with(diagnostic, "SQL binder could not resolve table"): return 1
+            say "view recovery probe unexpected diagnostic: " + diagnostic
+            return 142
+        let statement: YazaDbSqlStatementResultV1 = result_unwrap(selected)
+        if not option_is_some(statement.query_result):
+            let ignored_close: Number = yazabase_sync_recovery_close_v1(statement.storage, statement.wal)
+            return 143
+        let query: YazaSqlQueryResultV1 = option_unwrap(statement.query_result)
+        let row_count: Number = list_count(query.rows)
+        let close_status: Number = yazabase_sync_recovery_close_v1(statement.storage, statement.wal)
+        if close_status != 0: return 144
+        if row_count != 0: return 145
+        return 0
+    if action == 57:
+        let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+        let view_name: Text = "crash_view_" + number_text(value)
+        return yazabase_sync_recovery_execute_v1(root, "DROP VIEW " + view_name, no_parameters, false)
+    if action == 58:
+        let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+        let table_name: Text = "crash_alter_default_" + number_text(value)
+        let created: Number = yazabase_sync_recovery_execute_v1(root, "CREATE TABLE " + table_name + " (id BIGINT PRIMARY KEY)", no_parameters, false)
+        if created != 0: return created
+        return yazabase_sync_recovery_execute_v1(root, "INSERT INTO " + table_name + " (id) VALUES (1)", no_parameters, false)
+    if action == 62: return yazabase_sync_recovery_fk_prepare_v1(root)
+    if action == 63: return yazabase_sync_recovery_fk_create_v1(root, value)
+    if action == 64: return yazabase_sync_recovery_fk_verify_v1(root, value)
+    return 99
+
+start:
+    say "YazaBase sync-recovery export module"

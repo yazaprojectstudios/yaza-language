@@ -1,0 +1,107 @@
+# Bounded INSERT ... VALUES parser for the YDBv1 SQL entry profile.
+# This module parses literals and bound parameters; catalog binding and execution
+# remain separate stages.
+use "sql_parser_v3"
+
+shape YazaSqlInsertAstV1:
+    version: Number
+    start_byte: Number
+    end_byte: Number
+    table_name: YazaSqlNameV2
+    has_column_list: Boolean
+    columns: List[YazaSqlNameV2]
+    rows: List[List[YazaSqlTokenV1]]
+    values_per_row: Number
+
+fn yaza_sql_insert_v1_value_keyword(source: Text, tokens: List[YazaSqlTokenV1], cursor: Number) -> Boolean:
+    return yaza_sql_v2_is_keyword(source, tokens, cursor, "NULL") or yaza_sql_v2_is_keyword(source, tokens, cursor, "TRUE") or yaza_sql_v2_is_keyword(source, tokens, cursor, "FALSE") or yaza_sql_v2_is_keyword(source, tokens, cursor, "DEFAULT")
+
+fn yaza_sql_parse_insert_v1(source: Text) -> Result[YazaSqlInsertAstV1, Text]:
+    let lexed: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(source)
+    if not result_is_ok(lexed): return err(result_unwrap_error(lexed))
+    let tokens: List[YazaSqlTokenV1] = result_unwrap(lexed)
+    let token_count: Number = list_count(tokens)
+    if token_count < 2: return err("SQL parser received an invalid token stream")
+    if not yaza_sql_v2_is_keyword(source, tokens, 0, "INSERT"): return err(yaza_sql_v2_parse_error(source, tokens, 0, "SQL parser expected INSERT at byte "))
+    if not yaza_sql_v2_is_keyword(source, tokens, 1, "INTO"): return err(yaza_sql_v2_parse_error(source, tokens, 1, "SQL parser expected INTO after INSERT at byte "))
+
+    let table_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, 2, false)
+    if not result_is_ok(table_result): return err(result_unwrap_error(table_result))
+    let table_name: YazaSqlNameV2 = result_unwrap(table_result)
+    var cursor: Number = 2 + table_name.consumed_tokens
+    let columns_created: Result[List[YazaSqlNameV2], Text] = list_try_new()
+    if not result_is_ok(columns_created): return err("SQL parser could not allocate the INSERT column list")
+    let columns: List[YazaSqlNameV2] = result_unwrap(columns_created)
+    var has_column_list: Boolean = false
+    if yaza_sql_v2_is_symbol(source, tokens, cursor, 40):
+        set has_column_list = true
+        set cursor = cursor + 1
+        if yaza_sql_v2_is_symbol(source, tokens, cursor, 41): return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser INSERT column list cannot be empty at byte "))
+        var columns_done: Boolean = false
+        while not columns_done:
+            let column_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, cursor, false)
+            if not result_is_ok(column_result): return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected an INSERT column name at byte "))
+            let column: YazaSqlNameV2 = result_unwrap(column_result)
+            if list_count(columns) >= 1024 or not list_try_push(columns, column): return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser INSERT column limit or allocation failure at byte "))
+            set cursor = cursor + column.consumed_tokens
+            if yaza_sql_v2_is_symbol(source, tokens, cursor, 44):
+                set cursor = cursor + 1
+            elif yaza_sql_v2_is_symbol(source, tokens, cursor, 41):
+                set cursor = cursor + 1
+                set columns_done = true
+            else:
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected ',' or ')' in INSERT column list at byte "))
+
+    if not yaza_sql_v2_is_keyword(source, tokens, cursor, "VALUES"): return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected VALUES after INSERT target at byte "))
+    set cursor = cursor + 1
+    let rows_created: Result[List[List[YazaSqlTokenV1]], Text] = list_try_new()
+    if not result_is_ok(rows_created): return err("SQL parser could not allocate the INSERT row list")
+    let rows: List[List[YazaSqlTokenV1]] = result_unwrap(rows_created)
+    var values_per_row: Number = -1
+    var total_values: Number = 0
+    var rows_done: Boolean = false
+    while not rows_done:
+        if not yaza_sql_v2_is_symbol(source, tokens, cursor, 40): return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected '(' before INSERT values at byte "))
+        set cursor = cursor + 1
+        let row_created: Result[List[YazaSqlTokenV1], Text] = list_try_new()
+        if not result_is_ok(row_created): return err("SQL parser could not allocate an INSERT value row")
+        let row: List[YazaSqlTokenV1] = result_unwrap(row_created)
+        var row_done: Boolean = false
+        while not row_done:
+            if cursor >= token_count - 1: return err("SQL parser expected an INSERT value at end of input")
+            let token: YazaSqlTokenV1 = list_get(tokens, cursor)
+            var value_token: YazaSqlTokenV1 = token
+            var token_advance: Number = 1
+            var valid_value: Boolean = token.kind == 3 or token.kind == 4 or token.kind == 5 or token.kind == 8 or yaza_sql_insert_v1_value_keyword(source, tokens, cursor)
+            if yaza_sql_v2_is_symbol(source, tokens, cursor, 45) and cursor + 1 < token_count:
+                let magnitude: YazaSqlTokenV1 = list_get(tokens, cursor + 1)
+                if magnitude.kind == 3:
+                    set value_token = YazaSqlTokenV1(3, token.start_byte, magnitude.end_byte)
+                    set token_advance = 2
+                    set valid_value = true
+            if not valid_value: return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser INSERT VALUES accepts only a literal or bound parameter at byte "))
+            if total_values >= 4095 or not list_try_push(row, value_token): return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser INSERT value limit or allocation failure at byte "))
+            set total_values = total_values + 1
+            set cursor = cursor + token_advance
+            if yaza_sql_v2_is_symbol(source, tokens, cursor, 44):
+                set cursor = cursor + 1
+            elif yaza_sql_v2_is_symbol(source, tokens, cursor, 41):
+                set cursor = cursor + 1
+                set row_done = true
+            else:
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected ',' or ')' after INSERT value at byte "))
+        if list_count(row) == 0: return err("SQL parser INSERT rows cannot be empty")
+        if values_per_row < 0: set values_per_row = list_count(row)
+        elif values_per_row != list_count(row): return err(yaza_sql_v2_parse_error(source, tokens, cursor - 1, "SQL parser INSERT rows must have equal value counts at byte "))
+        if has_column_list and values_per_row != list_count(columns): return err(yaza_sql_v2_parse_error(source, tokens, cursor - 1, "SQL parser INSERT value count does not match its column list at byte "))
+        if list_count(rows) >= 1024 or not list_try_push(rows, row): return err(yaza_sql_v2_parse_error(source, tokens, cursor - 1, "SQL parser INSERT row limit or allocation failure at byte "))
+        if yaza_sql_v2_is_symbol(source, tokens, cursor, 44): set cursor = cursor + 1
+        else: set rows_done = true
+
+    var statement_end: Number = list_get(tokens, cursor - 1).end_byte
+    if yaza_sql_v2_is_symbol(source, tokens, cursor, 59):
+        set statement_end = list_get(tokens, cursor).end_byte
+        set cursor = cursor + 1
+    if cursor >= token_count or list_get(tokens, cursor).kind != 0: return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser supports one statement; unexpected token at byte "))
+    let first_token: YazaSqlTokenV1 = list_get(tokens, 0)
+    return ok(YazaSqlInsertAstV1(1, first_token.start_byte, statement_end, table_name, has_column_list, columns, rows, values_per_row))

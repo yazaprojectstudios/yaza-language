@@ -1,0 +1,147 @@
+# Microsoft SQL Server connection URI parser and configuration validator.
+# Accepts mssql:// or sqlserver:// schemes.
+
+shape MssqlConnectionConfig:
+    host: Text
+    port: Number
+    user: Text
+    password: Option[Text]
+    database: Option[Text]
+    encrypt: Boolean
+    trust_server_certificate: Boolean
+    connect_timeout_seconds: Number
+
+fn mssql_uri_hex_val(byte: Number) -> Number:
+    if byte >= 48 and byte <= 57: return byte - 48
+    if byte >= 65 and byte <= 70: return byte - 65 + 10
+    if byte >= 97 and byte <= 102: return byte - 97 + 10
+    return -1
+
+fn mssql_uri_decode(value: Text) -> Result[Text, Text]:
+    if text_length(value) > 2048: return err("MSSQL URI component exceeds 2048 bytes")
+    var decoded_bytes: Bytes = bytes_empty()
+    var index: Number = 0
+    let len: Number = text_length(value)
+    while index < len:
+        var byte: Number = text_byte(value, index)
+        if byte == 37:
+            if index + 2 >= len: return err("MSSQL URI incomplete percent escape")
+            let high: Number = mssql_uri_hex_val(text_byte(value, index + 1))
+            let low: Number = mssql_uri_hex_val(text_byte(value, index + 2))
+            if high < 0 or low < 0: return err("MSSQL URI invalid percent escape")
+            set byte = high * 16 + low
+            set index = index + 3
+        else:
+            set index = index + 1
+        if byte == 0 or byte < 32 or byte == 127: return err("MSSQL URI control character rejected")
+        set decoded_bytes = bytes_concat(decoded_bytes, bytes_from_number(byte))
+    let opt: Option[Text] = bytes_to_text_checked(decoded_bytes)
+    if not option_is_some(opt): return err("MSSQL URI invalid UTF-8")
+    return ok(option_unwrap(opt))
+
+fn mssql_uri_find_from(value: Text, start: Number, needle: Text) -> Number:
+    if start < 0 or start >= text_length(value): return -1
+    let suffix: Text = text_slice(value, start, text_length(value) - start)
+    let found: Number = text_find(suffix, needle)
+    if found < 0: return -1
+    return start + found
+
+fn mssql_parse_uri(uri: Text) -> Result[MssqlConnectionConfig, Text]:
+    var cursor: Number = 0
+    if text_starts_with(uri, "mssql://"):
+        set cursor = 8
+    else:
+        if text_starts_with(uri, "sqlserver://"):
+            set cursor = 12
+        else:
+            return err("MSSQL URI must begin with mssql:// or sqlserver:// scheme")
+
+    let total_len: Number = text_length(uri)
+    var user: Text = "sa"
+    var password_opt: Option[Text] = none
+    let at_pos: Number = mssql_uri_find_from(uri, cursor, "@")
+    if at_pos >= 0:
+        let userinfo: Text = text_slice(uri, cursor, at_pos - cursor)
+        set cursor = at_pos + 1
+        let colon_pos: Number = text_find(userinfo, ":")
+        if colon_pos >= 0:
+            let u_raw: Text = text_slice(userinfo, 0, colon_pos)
+            let p_raw: Text = text_slice(userinfo, colon_pos + 1, text_length(userinfo) - colon_pos - 1)
+            let u_dec: Result[Text, Text] = mssql_uri_decode(u_raw)
+            if not result_is_ok(u_dec): return err(result_unwrap_error(u_dec))
+            let p_dec: Result[Text, Text] = mssql_uri_decode(p_raw)
+            if not result_is_ok(p_dec): return err(result_unwrap_error(p_dec))
+            set user = result_unwrap(u_dec)
+            set password_opt = some(result_unwrap(p_dec))
+        else:
+            let u_dec: Result[Text, Text] = mssql_uri_decode(userinfo)
+            if not result_is_ok(u_dec): return err(result_unwrap_error(u_dec))
+            set user = result_unwrap(u_dec)
+
+    var host_and_port: Text = ""
+    var database_opt: Option[Text] = none
+    var query_string: Text = ""
+    let slash_pos: Number = mssql_uri_find_from(uri, cursor, "/")
+    let qmark_pos: Number = mssql_uri_find_from(uri, cursor, "?")
+    if slash_pos >= 0:
+        set host_and_port = text_slice(uri, cursor, slash_pos - cursor)
+        set cursor = slash_pos + 1
+        let q_pos2: Number = mssql_uri_find_from(uri, cursor, "?")
+        if q_pos2 >= 0:
+            let db_raw: Text = text_slice(uri, cursor, q_pos2 - cursor)
+            if text_length(db_raw) > 0:
+                let db_dec: Result[Text, Text] = mssql_uri_decode(db_raw)
+                if not result_is_ok(db_dec): return err(result_unwrap_error(db_dec))
+                set database_opt = some(result_unwrap(db_dec))
+            set query_string = text_slice(uri, q_pos2 + 1, total_len - q_pos2 - 1)
+        else:
+            let db_raw: Text = text_slice(uri, cursor, total_len - cursor)
+            if text_length(db_raw) > 0:
+                let db_dec: Result[Text, Text] = mssql_uri_decode(db_raw)
+                if not result_is_ok(db_dec): return err(result_unwrap_error(db_dec))
+                set database_opt = some(result_unwrap(db_dec))
+    else:
+        if qmark_pos >= 0:
+            set host_and_port = text_slice(uri, cursor, qmark_pos - cursor)
+            set query_string = text_slice(uri, qmark_pos + 1, total_len - qmark_pos - 1)
+        else:
+            set host_and_port = text_slice(uri, cursor, total_len - cursor)
+
+    var host: Text = "127.0.0.1"
+    var port: Number = 1433
+    if text_length(host_and_port) > 0:
+        let colon_idx: Number = text_find(host_and_port, ":")
+        if colon_idx >= 0:
+            let h_raw: Text = text_slice(host_and_port, 0, colon_idx)
+            let p_raw: Text = text_slice(host_and_port, colon_idx + 1, text_length(host_and_port) - colon_idx - 1)
+            let p_parsed: Result[Number, Text] = number_try_parse(p_raw)
+            if not result_is_ok(p_parsed): return err("MSSQL port must be an integer between 1 and 65535")
+            let p_val: Number = result_unwrap(p_parsed)
+            if p_val < 1 or p_val > 65535: return err("MSSQL port out of range")
+            set host = h_raw
+            set port = p_val
+        else:
+            set host = host_and_port
+
+    var encrypt: Boolean = true
+    var trust_server_certificate: Boolean = false
+    var timeout_sec: Number = 30
+    if text_length(query_string) > 0:
+        let pairs: TextList = text_split(query_string, "&")
+        var p_idx: Number = 0
+        while p_idx < list_count(pairs):
+            let pair: Text = list_get(pairs, p_idx)
+            let eq_pos: Number = text_find(pair, "=")
+            if eq_pos >= 0:
+                let k: Text = text_slice(pair, 0, eq_pos)
+                let v: Text = text_slice(pair, eq_pos + 1, text_length(pair) - eq_pos - 1)
+                if k == "encrypt":
+                    set encrypt = (v == "true" or v == "yes" or v == "1")
+                if k == "trustServerCertificate":
+                    set trust_server_certificate = (v == "true" or v == "yes" or v == "1")
+                if k == "connectionTimeout":
+                    let t_parsed: Result[Number, Text] = number_try_parse(v)
+                    if result_is_ok(t_parsed): set timeout_sec = result_unwrap(t_parsed)
+            set p_idx = p_idx + 1
+
+    return ok(MssqlConnectionConfig(host, port, user, password_opt, database_opt, encrypt, trust_server_certificate, timeout_sec))

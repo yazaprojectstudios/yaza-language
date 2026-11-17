@@ -1,0 +1,121 @@
+# Bounded parser and binder for the first YDBv1 secondary-index syntax.
+# Execution is kept separate so unsupported index shapes fail before WAL writes.
+use "./catalog_schema_v1"
+use "./sql_binder_v1"
+use "./sql_create_table_v1"
+use "./sql_lexer_v1"
+use "./sql_parser_v2"
+
+shape YazaSqlCreateIndexAstV1:
+    version: Number
+    start_byte: Number
+    end_byte: Number
+    is_unique: Boolean
+    index_name: YazaSqlNameV2
+    table_name: YazaSqlNameV2
+    column_name: YazaSqlNameV2
+
+shape YazaSqlCreateIndexPlanV1:
+    version: Number
+    catalog_version: Number
+    index_name: Text
+    table_id: Number
+    table_name: Text
+    is_unique: Boolean
+    index_column_ordinal: Number
+    table_columns: List[YazaSqlColumnSchemaV1]
+
+fn yaza_sql_parse_create_index_v1(source: Text) -> Result[YazaSqlCreateIndexAstV1, Text]:
+    let lexed: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(source)
+    if not result_is_ok(lexed): return err(result_unwrap_error(lexed))
+    let tokens: List[YazaSqlTokenV1] = result_unwrap(lexed)
+    let token_count: Number = list_count(tokens)
+    if token_count < 2: return err("SQL CREATE INDEX parser received an invalid token stream")
+    if not yaza_sql_v2_is_keyword(source, tokens, 0, "CREATE"):
+        return err(yaza_sql_v2_parse_error(source, tokens, 0, "SQL parser expected CREATE at byte "))
+    var is_unique: Boolean = false
+    var index_keyword: Number = 1
+    if yaza_sql_v2_is_keyword(source, tokens, index_keyword, "UNIQUE"):
+        set is_unique = true
+        set index_keyword = index_keyword + 1
+    if not yaza_sql_v2_is_keyword(source, tokens, index_keyword, "INDEX"):
+        return err(yaza_sql_v2_parse_error(source, tokens, index_keyword, "SQL parser expected INDEX after CREATE [UNIQUE] at byte "))
+    var name_token_index: Number = index_keyword + 1
+    if yaza_sql_v2_is_keyword(source, tokens, name_token_index, "IF"):
+        if not yaza_sql_v2_is_keyword(source, tokens, name_token_index + 1, "NOT"):
+            return err(yaza_sql_v2_parse_error(source, tokens, name_token_index + 1, "SQL CREATE INDEX expected NOT after IF at byte "))
+        if not yaza_sql_v2_is_keyword(source, tokens, name_token_index + 2, "EXISTS"):
+            return err(yaza_sql_v2_parse_error(source, tokens, name_token_index + 2, "SQL CREATE INDEX expected EXISTS after IF NOT at byte "))
+        set name_token_index = name_token_index + 3
+    let index_name_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, name_token_index, false)
+    if not result_is_ok(index_name_result): return err(yaza_sql_v2_parse_error(source, tokens, name_token_index, "SQL CREATE INDEX expected an index name at byte "))
+    let index_name: YazaSqlNameV2 = result_unwrap(index_name_result)
+    if index_name.part_count != 1: return err(yaza_sql_v2_parse_error(source, tokens, name_token_index, "SQL CREATE INDEX supports one-part index names only at byte "))
+    var cursor: Number = name_token_index + index_name.consumed_tokens
+    if not yaza_sql_v2_is_keyword(source, tokens, cursor, "ON"):
+        return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE INDEX expected ON after its name at byte "))
+    set cursor = cursor + 1
+    let table_name_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, cursor, false)
+    if not result_is_ok(table_name_result): return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE INDEX expected a table name after ON at byte "))
+    let table_name: YazaSqlNameV2 = result_unwrap(table_name_result)
+    if table_name.part_count != 1: return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE INDEX supports one-part table names only at byte "))
+    set cursor = cursor + table_name.consumed_tokens
+    if not yaza_sql_v2_is_symbol(source, tokens, cursor, 40):
+        return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE INDEX expected '(' before its indexed column at byte "))
+    set cursor = cursor + 1
+    let column_name_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, cursor, false)
+    if not result_is_ok(column_name_result): return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE INDEX expected one indexed column at byte "))
+    let column_name: YazaSqlNameV2 = result_unwrap(column_name_result)
+    if column_name.part_count != 1: return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE INDEX column names must be unqualified at byte "))
+    set cursor = cursor + column_name.consumed_tokens
+    if not yaza_sql_v2_is_symbol(source, tokens, cursor, 41):
+        return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE INDEX supports exactly one column; expected ')' at byte "))
+    set cursor = cursor + 1
+    var statement_end: Number = list_get(tokens, cursor - 1).end_byte
+    if yaza_sql_v2_is_symbol(source, tokens, cursor, 59):
+        set statement_end = list_get(tokens, cursor).end_byte
+        set cursor = cursor + 1
+    if cursor >= token_count or list_get(tokens, cursor).kind != 0:
+        return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser supports one statement; unexpected token at byte "))
+    let first_token: YazaSqlTokenV1 = list_get(tokens, 0)
+    return ok(YazaSqlCreateIndexAstV1(1, first_token.start_byte, statement_end, is_unique, index_name, table_name, column_name))
+
+fn yaza_sql_bind_create_index_v1(source: Text, create: YazaSqlCreateIndexAstV1, catalog: YazaSqlCatalogSnapshotV1) -> Result[YazaSqlCreateIndexPlanV1, Text]:
+    if create.version != 1 or create.start_byte < 0 or create.end_byte <= create.start_byte or create.end_byte > text_length(source):
+        return err("SQL CREATE INDEX binder received an invalid AST version or source span")
+    if catalog.version < 1 or list_count(catalog.tables) > yaza_db_catalog_max_table_records_v1():
+        return err("SQL CREATE INDEX catalog snapshot is outside its bounded profile")
+    if not yaza_sql_bind_v1_name_valid(source, create.index_name) or create.index_name.part_count != 1:
+        return err("SQL CREATE INDEX supports one-part index names only")
+    if not yaza_sql_bind_v1_name_valid(source, create.table_name) or create.table_name.part_count != 1:
+        return err("SQL CREATE INDEX supports one-part table names only")
+    if not yaza_sql_bind_v1_name_valid(source, create.column_name) or create.column_name.part_count != 1:
+        return err("SQL CREATE INDEX supports one unqualified column name only")
+    let index_name_result: Result[Text, Text] = yaza_sql_create_table_identifier_v1(source, create.index_name.first_token)
+    let table_name_result: Result[Text, Text] = yaza_sql_create_table_identifier_v1(source, create.table_name.first_token)
+    let column_name_result: Result[Text, Text] = yaza_sql_create_table_identifier_v1(source, create.column_name.first_token)
+    if not result_is_ok(index_name_result): return err(result_unwrap_error(index_name_result))
+    if not result_is_ok(table_name_result): return err(result_unwrap_error(table_name_result))
+    if not result_is_ok(column_name_result): return err(result_unwrap_error(column_name_result))
+    let index_name: Text = result_unwrap(index_name_result)
+    let table_name: Text = result_unwrap(table_name_result)
+    let column_name: Text = result_unwrap(column_name_result)
+    var table_index: Number = 0
+    while table_index < list_count(catalog.tables) and list_get(catalog.tables, table_index).name != table_name:
+        set table_index = table_index + 1
+    if table_index >= list_count(catalog.tables): return err("SQL CREATE INDEX target table does not exist")
+    let table: YazaSqlTableSchemaV1 = list_get(catalog.tables, table_index)
+    if table.table_id <= yaza_db_catalog_system_table_id_max_v1(): return err("SQL CREATE INDEX cannot target a system catalog")
+    if list_count(table.columns) < 1 or list_count(table.columns) > 1024: return err("SQL CREATE INDEX target schema is outside its column bound")
+    var column_ordinal: Number = 0
+    while column_ordinal < list_count(table.columns) and list_get(table.columns, column_ordinal).name != column_name:
+        set column_ordinal = column_ordinal + 1
+    if column_ordinal >= list_count(table.columns): return err("SQL CREATE INDEX target column does not exist")
+    return ok(YazaSqlCreateIndexPlanV1(1, catalog.version, index_name, table.table_id, table.name, create.is_unique, column_ordinal, table.columns))
+
+fn yaza_sql_create_index_plan_valid_v1(plan: YazaSqlCreateIndexPlanV1) -> Boolean:
+    if plan.version != 1 or plan.catalog_version < 1 or plan.table_id <= yaza_db_catalog_system_table_id_max_v1(): return false
+    if text_length(plan.index_name) < 1 or text_length(plan.index_name) > 128 or text_length(plan.table_name) < 1 or list_count(plan.table_columns) < 1 or list_count(plan.table_columns) > 1024: return false
+    if plan.index_column_ordinal < 0 or plan.index_column_ordinal >= list_count(plan.table_columns): return false
+    let index_column: YazaSqlColumnSchemaV1 = list_get(plan.table_columns, plan.index_column_ordinal)
+    return index_column.ordinal == plan.index_column_ordinal

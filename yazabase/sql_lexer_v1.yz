@@ -1,0 +1,390 @@
+# Phase 0 SQL text lexer. Byte spans are zero-based and half-open.
+# Keep this frontend in YAZA; it does not read or write database files.
+
+shape YazaSqlTokenV1:
+    kind: Number
+    start_byte: Number
+    end_byte: Number
+
+shape YazaSqlSourceLocationV1:
+    byte_offset: Number
+    line: Number
+    column: Number
+
+shape YazaSqlDiagnosticV1:
+    phase: Number
+    code: Number
+    start_byte: Number
+    end_byte: Number
+    line: Number
+    column: Number
+    message: Text
+
+fn yaza_sql_v1_is_digit(byte: Number) -> Boolean:
+    return byte >= 48 and byte <= 57
+
+fn yaza_sql_v1_is_ascii_letter(byte: Number) -> Boolean:
+    return (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122)
+
+fn yaza_sql_v1_is_hex_digit(byte: Number) -> Boolean:
+    return yaza_sql_v1_is_digit(byte) or (byte >= 65 and byte <= 70) or (byte >= 97 and byte <= 102)
+
+fn yaza_sql_v1_utf8_width(source: Text, offset: Number, length: Number) -> Number:
+    let first: Number = text_byte(source, offset)
+    if first >= 194 and first <= 223:
+        if offset + 1 >= length: return 0
+        let second: Number = text_byte(source, offset + 1)
+        if second >= 128 and second <= 191: return 2
+        return 0
+    if first == 224:
+        if offset + 2 >= length: return 0
+        let second: Number = text_byte(source, offset + 1)
+        let third: Number = text_byte(source, offset + 2)
+        if second >= 160 and second <= 191 and third >= 128 and third <= 191: return 3
+        return 0
+    if (first >= 225 and first <= 236) or (first >= 238 and first <= 239):
+        if offset + 2 >= length: return 0
+        let second: Number = text_byte(source, offset + 1)
+        let third: Number = text_byte(source, offset + 2)
+        if second >= 128 and second <= 191 and third >= 128 and third <= 191: return 3
+        return 0
+    if first == 237:
+        if offset + 2 >= length: return 0
+        let second: Number = text_byte(source, offset + 1)
+        let third: Number = text_byte(source, offset + 2)
+        if second >= 128 and second <= 159 and third >= 128 and third <= 191: return 3
+        return 0
+    if first == 240:
+        if offset + 3 >= length: return 0
+        let second: Number = text_byte(source, offset + 1)
+        let third: Number = text_byte(source, offset + 2)
+        let fourth: Number = text_byte(source, offset + 3)
+        if second >= 144 and second <= 191 and third >= 128 and third <= 191 and fourth >= 128 and fourth <= 191: return 4
+        return 0
+    if first >= 241 and first <= 243:
+        if offset + 3 >= length: return 0
+        let second: Number = text_byte(source, offset + 1)
+        let third: Number = text_byte(source, offset + 2)
+        let fourth: Number = text_byte(source, offset + 3)
+        if second >= 128 and second <= 191 and third >= 128 and third <= 191 and fourth >= 128 and fourth <= 191: return 4
+        return 0
+    if first == 244:
+        if offset + 3 >= length: return 0
+        let second: Number = text_byte(source, offset + 1)
+        let third: Number = text_byte(source, offset + 2)
+        let fourth: Number = text_byte(source, offset + 3)
+        if second >= 128 and second <= 143 and third >= 128 and third <= 191 and fourth >= 128 and fourth <= 191: return 4
+        return 0
+    return 0
+
+fn yaza_sql_v1_is_identifier_start(source: Text, offset: Number, length: Number) -> Boolean:
+    let byte: Number = text_byte(source, offset)
+    if yaza_sql_v1_is_ascii_letter(byte) or byte == 95: return true
+    if byte >= 128: return yaza_sql_v1_utf8_width(source, offset, length) > 0
+    return false
+
+fn yaza_sql_v1_is_identifier_continue(source: Text, offset: Number, length: Number) -> Boolean:
+    let byte: Number = text_byte(source, offset)
+    if yaza_sql_v1_is_identifier_start(source, offset, length): return true
+    if yaza_sql_v1_is_digit(byte) or byte == 36: return true
+    return false
+
+fn yaza_sql_v1_emit(tokens: List[YazaSqlTokenV1], kind: Number, start: Number, end: Number) -> Boolean:
+    if list_count(tokens) >= 8191: return false
+    return list_try_push(tokens, YazaSqlTokenV1(kind, start, end))
+
+fn yaza_sql_v1_location(source: Text, byte_offset: Number) -> Result[YazaSqlSourceLocationV1, Text]:
+    let length: Number = text_length(source)
+    if byte_offset < 0 or byte_offset > length:
+        return err("SQL source location byte offset is out of range")
+    var line: Number = 1
+    var column: Number = 1
+    var index: Number = 0
+    while index < byte_offset:
+        let byte: Number = text_byte(source, index)
+        if byte == 13:
+            set line = line + 1
+            set column = 1
+            if index + 1 < byte_offset and text_byte(source, index + 1) == 10:
+                set index = index + 2
+            else:
+                set index = index + 1
+        elif byte == 10:
+            set line = line + 1
+            set column = 1
+            set index = index + 1
+        else:
+            set column = column + 1
+            set index = index + 1
+    return ok(YazaSqlSourceLocationV1(byte_offset, line, column))
+
+fn yaza_sql_v1_error_at(prefix: Text, offset: Number) -> Text:
+    let digits_result: Result[Text, Text] = number_try_text(offset)
+    if not result_is_ok(digits_result): return "SQL lexer could not allocate a diagnostic"
+    let message_result: Result[Text, Text] = text_try_concat(prefix, result_unwrap(digits_result))
+    if not result_is_ok(message_result): return "SQL lexer could not allocate a diagnostic"
+    return result_unwrap(message_result)
+
+fn yaza_sql_lex_v1(source: Text) -> Result[List[YazaSqlTokenV1], Text]:
+    let length: Number = text_length(source)
+    if length > 65536: return err("SQL lexer input exceeds 65536 bytes")
+
+    let created: Result[List[YazaSqlTokenV1], Text] = list_try_new()
+    if not result_is_ok(created): return err("SQL lexer could not allocate its token list")
+    var tokens: List[YazaSqlTokenV1] = result_unwrap(created)
+
+    var offset: Number = 0
+    while offset < length:
+        let byte: Number = text_byte(source, offset)
+
+        if byte == 32 or byte == 9 or byte == 10 or byte == 13:
+            set offset = offset + 1
+            continue
+
+        if byte == 45 and offset + 1 < length and text_byte(source, offset + 1) == 45:
+            set offset = offset + 2
+            while offset < length and text_byte(source, offset) != 10 and text_byte(source, offset) != 13:
+                set offset = offset + 1
+            continue
+
+        if byte == 47 and offset + 1 < length and text_byte(source, offset + 1) == 42:
+            let comment_start: Number = offset
+            set offset = offset + 2
+            var comment_closed: Boolean = false
+            while offset + 1 < length:
+                let comment_byte: Number = text_byte(source, offset)
+                if comment_byte >= 128:
+                    let width: Number = yaza_sql_v1_utf8_width(source, offset, length)
+                    if width == 0: return err(yaza_sql_v1_error_at("SQL lexer invalid UTF-8 at byte ", offset))
+                    set offset = offset + width
+                    continue
+                if comment_byte == 42 and text_byte(source, offset + 1) == 47:
+                    set offset = offset + 2
+                    set comment_closed = true
+                    break
+                set offset = offset + 1
+            if not comment_closed: return err(yaza_sql_v1_error_at("SQL lexer unterminated block comment at byte ", comment_start))
+            continue
+
+        if (byte == 88 or byte == 120) and offset + 1 < length and text_byte(source, offset + 1) == 39:
+            let start: Number = offset
+            set offset = offset + 2
+            let digits_start: Number = offset
+            while offset < length and yaza_sql_v1_is_hex_digit(text_byte(source, offset)):
+                set offset = offset + 1
+            if offset >= length or text_byte(source, offset) != 39: return err(yaza_sql_v1_error_at("SQL lexer malformed or unterminated X'hex' BLOB literal at byte ", start))
+            if (offset - digits_start) % 2 != 0: return err(yaza_sql_v1_error_at("SQL lexer BLOB literal requires an even number of hex digits at byte ", start))
+            if (offset - digits_start) / 2 > 65536: return err(yaza_sql_v1_error_at("SQL lexer BLOB literal exceeds the 64 KiB inline-literal limit at byte ", start))
+            set offset = offset + 1
+            if not yaza_sql_v1_emit(tokens, 8, start, offset): return err(yaza_sql_v1_error_at("SQL lexer token limit or allocation failure at byte ", start))
+            continue
+
+        if yaza_sql_v1_is_identifier_start(source, offset, length):
+            let start: Number = offset
+            while offset < length and yaza_sql_v1_is_identifier_continue(source, offset, length):
+                let current_byte: Number = text_byte(source, offset)
+                if current_byte >= 128:
+                    let width: Number = yaza_sql_v1_utf8_width(source, offset, length)
+                    if width == 0: return err(yaza_sql_v1_error_at("SQL lexer invalid UTF-8 at byte ", offset))
+                    set offset = offset + width
+                else:
+                    set offset = offset + 1
+            if not yaza_sql_v1_emit(tokens, 1, start, offset): return err(yaza_sql_v1_error_at("SQL lexer token limit or allocation failure at byte ", start))
+            continue
+
+        if yaza_sql_v1_is_digit(byte) or (byte == 46 and offset + 1 < length and yaza_sql_v1_is_digit(text_byte(source, offset + 1))):
+            let start: Number = offset
+            if byte == 46:
+                set offset = offset + 1
+            while offset < length and yaza_sql_v1_is_digit(text_byte(source, offset)):
+                set offset = offset + 1
+            if offset + 1 < length and text_byte(source, offset) == 46 and yaza_sql_v1_is_digit(text_byte(source, offset + 1)):
+                set offset = offset + 1
+                while offset < length and yaza_sql_v1_is_digit(text_byte(source, offset)):
+                    set offset = offset + 1
+            if offset < length and (text_byte(source, offset) == 69 or text_byte(source, offset) == 101):
+                let exponent_start: Number = offset
+                set offset = offset + 1
+                if offset < length and (text_byte(source, offset) == 43 or text_byte(source, offset) == 45):
+                    set offset = offset + 1
+                let exponent_digits: Number = offset
+                while offset < length and yaza_sql_v1_is_digit(text_byte(source, offset)):
+                    set offset = offset + 1
+                if offset == exponent_digits: return err(yaza_sql_v1_error_at("SQL lexer exponent has no digits at byte ", exponent_start))
+            if not yaza_sql_v1_emit(tokens, 3, start, offset): return err(yaza_sql_v1_error_at("SQL lexer token limit or allocation failure at byte ", start))
+            continue
+
+        if byte == 39:
+            let start: Number = offset
+            set offset = offset + 1
+            var string_closed: Boolean = false
+            while offset < length:
+                let string_byte: Number = text_byte(source, offset)
+                if string_byte == 39:
+                    if offset + 1 < length and text_byte(source, offset + 1) == 39:
+                        set offset = offset + 2
+                    else:
+                        set offset = offset + 1
+                        set string_closed = true
+                        break
+                elif string_byte >= 128:
+                    let width: Number = yaza_sql_v1_utf8_width(source, offset, length)
+                    if width == 0: return err(yaza_sql_v1_error_at("SQL lexer invalid UTF-8 at byte ", offset))
+                    set offset = offset + width
+                else:
+                    set offset = offset + 1
+            if not string_closed: return err(yaza_sql_v1_error_at("SQL lexer unterminated string at byte ", start))
+            if not yaza_sql_v1_emit(tokens, 4, start, offset): return err(yaza_sql_v1_error_at("SQL lexer token limit or allocation failure at byte ", start))
+            continue
+
+        if byte == 34:
+            let start: Number = offset
+            set offset = offset + 1
+            var identifier_closed: Boolean = false
+            while offset < length:
+                let identifier_byte: Number = text_byte(source, offset)
+                if identifier_byte == 34:
+                    if offset + 1 < length and text_byte(source, offset + 1) == 34:
+                        set offset = offset + 2
+                    else:
+                        set offset = offset + 1
+                        set identifier_closed = true
+                        break
+                elif identifier_byte >= 128:
+                    let width: Number = yaza_sql_v1_utf8_width(source, offset, length)
+                    if width == 0: return err(yaza_sql_v1_error_at("SQL lexer invalid UTF-8 at byte ", offset))
+                    set offset = offset + width
+                else:
+                    set offset = offset + 1
+            if not identifier_closed: return err(yaza_sql_v1_error_at("SQL lexer unterminated quoted identifier at byte ", start))
+            if not yaza_sql_v1_emit(tokens, 2, start, offset): return err(yaza_sql_v1_error_at("SQL lexer token limit or allocation failure at byte ", start))
+            continue
+
+        if byte == 63:
+            if not yaza_sql_v1_emit(tokens, 5, offset, offset + 1): return err(yaza_sql_v1_error_at("SQL lexer token limit or allocation failure at byte ", offset))
+            set offset = offset + 1
+            continue
+
+        if byte == 58:
+            let start: Number = offset
+            set offset = offset + 1
+            if offset >= length or not yaza_sql_v1_is_identifier_start(source, offset, length):
+                return err(yaza_sql_v1_error_at("SQL lexer expected a name after ':' at byte ", start))
+            while offset < length and yaza_sql_v1_is_identifier_continue(source, offset, length):
+                let current_byte: Number = text_byte(source, offset)
+                if current_byte >= 128:
+                    let width: Number = yaza_sql_v1_utf8_width(source, offset, length)
+                    if width == 0: return err(yaza_sql_v1_error_at("SQL lexer invalid UTF-8 at byte ", offset))
+                    set offset = offset + width
+                else:
+                    set offset = offset + 1
+            if not yaza_sql_v1_emit(tokens, 5, start, offset): return err(yaza_sql_v1_error_at("SQL lexer token limit or allocation failure at byte ", start))
+            continue
+
+        if byte == 36 and offset + 1 < length and yaza_sql_v1_is_digit(text_byte(source, offset + 1)):
+            let start: Number = offset
+            set offset = offset + 1
+            while offset < length and yaza_sql_v1_is_digit(text_byte(source, offset)):
+                set offset = offset + 1
+            if not yaza_sql_v1_emit(tokens, 5, start, offset): return err(yaza_sql_v1_error_at("SQL lexer token limit or allocation failure at byte ", start))
+            continue
+
+        if byte == 40 or byte == 41 or byte == 44 or byte == 59 or byte == 46:
+            if not yaza_sql_v1_emit(tokens, 6, offset, offset + 1): return err(yaza_sql_v1_error_at("SQL lexer token limit or allocation failure at byte ", offset))
+            set offset = offset + 1
+            continue
+
+        if byte == 43 or byte == 45 or byte == 42 or byte == 47 or byte == 37 or byte == 61:
+            if not yaza_sql_v1_emit(tokens, 7, offset, offset + 1): return err(yaza_sql_v1_error_at("SQL lexer token limit or allocation failure at byte ", offset))
+            set offset = offset + 1
+            continue
+
+        if byte == 60 or byte == 62:
+            let start: Number = offset
+            set offset = offset + 1
+            if offset < length:
+                let next_byte: Number = text_byte(source, offset)
+                if next_byte == 61 or (byte == 60 and next_byte == 62): set offset = offset + 1
+            if not yaza_sql_v1_emit(tokens, 7, start, offset): return err(yaza_sql_v1_error_at("SQL lexer token limit or allocation failure at byte ", start))
+            continue
+
+        if byte == 33 and offset + 1 < length and text_byte(source, offset + 1) == 61:
+            if not yaza_sql_v1_emit(tokens, 7, offset, offset + 2): return err(yaza_sql_v1_error_at("SQL lexer token limit or allocation failure at byte ", offset))
+            set offset = offset + 2
+            continue
+
+        if byte == 124 and offset + 1 < length and text_byte(source, offset + 1) == 124:
+            if not yaza_sql_v1_emit(tokens, 7, offset, offset + 2): return err(yaza_sql_v1_error_at("SQL lexer token limit or allocation failure at byte ", offset))
+            set offset = offset + 2
+            continue
+
+        if byte >= 128 and yaza_sql_v1_utf8_width(source, offset, length) == 0:
+            return err(yaza_sql_v1_error_at("SQL lexer invalid UTF-8 at byte ", offset))
+        return err(yaza_sql_v1_error_at("SQL lexer unsupported character at byte ", offset))
+
+    if not yaza_sql_v1_emit(tokens, 0, length, length): return err("SQL lexer token limit or allocation failure at end of input")
+    return ok(tokens)
+
+fn yaza_sql_v1_diagnostic_code(message: Text) -> Number:
+    if text_starts_with(message, "SQL lexer input exceeds 65536 bytes"): return 1001
+    if text_starts_with(message, "SQL lexer could not allocate"): return 1002
+    if text_starts_with(message, "SQL lexer token limit or allocation failure"): return 1002
+    if text_starts_with(message, "SQL lexer invalid UTF-8"): return 1003
+    if text_starts_with(message, "SQL lexer unterminated block comment"): return 1004
+    if text_starts_with(message, "SQL lexer exponent has no digits"): return 1005
+    if text_starts_with(message, "SQL lexer unterminated string"): return 1006
+    if text_starts_with(message, "SQL lexer unterminated quoted identifier"): return 1007
+    if text_starts_with(message, "SQL lexer expected a name after ':'"): return 1008
+    if text_starts_with(message, "SQL lexer unsupported character"): return 1009
+    return 1099
+
+fn yaza_sql_v1_error_offset(message: Text, source_length: Number) -> Number:
+    let marker: Text = " at byte "
+    var marker_offset: Number = 0
+    var found: Boolean = false
+    while not found and marker_offset + text_length(marker) <= text_length(message):
+        var matched: Boolean = true
+        var marker_index: Number = 0
+        while matched and marker_index < text_length(marker):
+            if text_byte(message, marker_offset + marker_index) != text_byte(marker, marker_index):
+                set matched = false
+            set marker_index = marker_index + 1
+        if matched:
+            set found = true
+        else:
+            set marker_offset = marker_offset + 1
+    if not found: return source_length
+
+    var digit_offset: Number = marker_offset + text_length(marker)
+    var value: Number = 0
+    var digits: Number = 0
+    while digit_offset < text_length(message):
+        let byte: Number = text_byte(message, digit_offset)
+        if byte < 48 or byte > 57: return value
+        if value > 65536: return source_length
+        set value = value * 10 + byte - 48
+        set digits = digits + 1
+        set digit_offset = digit_offset + 1
+    if digits == 0 or value > source_length: return source_length
+    return value
+
+fn yaza_sql_v1_diagnostic(source: Text, message: Text, phase: Number, code: Number) -> YazaSqlDiagnosticV1:
+    let offset: Number = yaza_sql_v1_error_offset(message, text_length(source))
+    let location_result: Result[YazaSqlSourceLocationV1, Text] = yaza_sql_v1_location(source, offset)
+    var line: Number = 1
+    var column: Number = 1
+    if result_is_ok(location_result):
+        let location: YazaSqlSourceLocationV1 = result_unwrap(location_result)
+        set line = location.line
+        set column = location.column
+    var end_byte: Number = offset
+    if end_byte < text_length(source): set end_byte = end_byte + 1
+    return YazaSqlDiagnosticV1(phase, code, offset, end_byte, line, column, message)
+
+fn yaza_sql_v1_structured_diagnostic(source: Text, message: Text) -> YazaSqlDiagnosticV1:
+    return yaza_sql_v1_diagnostic(source, message, 1, yaza_sql_v1_diagnostic_code(message))
+
+fn yaza_sql_lex_structured_v1(source: Text) -> Result[List[YazaSqlTokenV1], YazaSqlDiagnosticV1]:
+    let result: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(source)
+    if result_is_ok(result): return ok(result_unwrap(result))
+    return err(yaza_sql_v1_structured_diagnostic(source, result_unwrap_error(result)))

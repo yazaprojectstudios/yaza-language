@@ -1,0 +1,699 @@
+# Bounded CREATE TABLE parser/binder for the YDBv1 scalar profile.
+# Execution and persistent catalog publication are separate operations.
+use "./sql_binder_v1"
+use "./sql_insert_bind_v1"
+use "./sql_literal_v1"
+use "./sql_decimal_v1"
+use "./sql_date_v1"
+use "./sql_temporal_v1"
+
+shape YazaSqlCreateColumnAstV1:
+    name: YazaSqlNameV2
+    type_id: Number
+    precision: Number
+    scale: Number
+    nullable: Boolean
+    default_kind: Number
+    default_start_byte: Number
+    default_end_byte: Number
+
+shape YazaSqlCreateTypeParseV1:
+    type_id: Number
+    consumed_tokens: Number
+    precision: Number
+    scale: Number
+
+shape YazaSqlCreateForeignKeyAstV1:
+    local_column: YazaSqlNameV2
+    referenced_table: YazaSqlNameV2
+    referenced_column: YazaSqlNameV2
+
+shape YazaSqlCreateForeignKeyPlanV1:
+    local_column_ordinal: Number
+    referenced_table_id: Number
+    referenced_column_ordinal: Number
+
+shape YazaSqlCreateCheckAstV1:
+    column_name: YazaSqlNameV2
+    comparison_operator: Number
+    literal_kind: Number
+    literal_start_byte: Number
+    literal_end_byte: Number
+
+shape YazaSqlCreateCheckPlanV1:
+    column_ordinal: Number
+    comparison_operator: Number
+    literal: Text
+
+shape YazaSqlCreateCheckClauseParseV1:
+    clause: YazaSqlCreateCheckAstV1
+    consumed_tokens: Number
+
+shape YazaSqlCreateTableAstV1:
+    version: Number
+    start_byte: Number
+    end_byte: Number
+    table_name: YazaSqlNameV2
+    columns: List[YazaSqlCreateColumnAstV1]
+    primary_key_columns: List[YazaSqlNameV2]
+    unique_columns: List[YazaSqlNameV2]
+    foreign_keys: List[YazaSqlCreateForeignKeyAstV1]
+    check_constraints: List[YazaSqlCreateCheckAstV1]
+
+shape YazaSqlCreateTablePlanV1:
+    version: Number
+    catalog_version: Number
+    table_name: Text
+    columns: List[YazaSqlColumnSchemaV1]
+    key_ordinals: List[Number]
+    unique_ordinals: List[Number]
+    default_expressions: List[Text]
+    foreign_keys: List[YazaSqlCreateForeignKeyPlanV1]
+    check_constraints: List[YazaSqlCreateCheckPlanV1]
+
+fn yaza_sql_create_table_type_parameter_v1(source: Text, tokens: List[YazaSqlTokenV1], cursor: Number) -> Result[Number, Text]:
+    if cursor < 0 or cursor >= list_count(tokens): return err("SQL DECIMAL type parameter is missing")
+    let token: YazaSqlTokenV1 = list_get(tokens, cursor)
+    if token.kind != 3 or token.start_byte < 0 or token.end_byte <= token.start_byte or token.end_byte > text_length(source):
+        return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL DECIMAL precision and scale must be unsigned integer literals at byte "))
+    var value: Number = 0
+    var offset: Number = token.start_byte
+    while offset < token.end_byte:
+        let byte: Number = text_byte(source, offset)
+        if byte < 48 or byte > 57:
+            return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL DECIMAL precision and scale must be unsigned integer literals at byte "))
+        let digit: Number = byte - 48
+        if value > 38 or value * 10 + digit > 38:
+            return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL DECIMAL precision and scale are limited to 38 at byte "))
+        set value = value * 10 + digit
+        set offset = offset + 1
+    return ok(value)
+
+fn yaza_sql_create_table_type_v1(source: Text, tokens: List[YazaSqlTokenV1], cursor: Number) -> Result[YazaSqlCreateTypeParseV1, Text]:
+    if cursor < 0 or cursor >= list_count(tokens): return err("SQL CREATE TABLE parser expected a column type at end of input")
+    var type_id: Number = 0
+    var consumed_type_tokens: Number = 1
+    if yaza_sql_v2_is_keyword(source, tokens, cursor, "BOOLEAN") or yaza_sql_v2_is_keyword(source, tokens, cursor, "BOOL"):
+        set type_id = 1
+    elif yaza_sql_v2_is_keyword(source, tokens, cursor, "SMALLINT"):
+        set type_id = 2
+    elif yaza_sql_v2_is_keyword(source, tokens, cursor, "INTEGER") or yaza_sql_v2_is_keyword(source, tokens, cursor, "INT"):
+        set type_id = 3
+    elif yaza_sql_v2_is_keyword(source, tokens, cursor, "BIGINT"):
+        set type_id = 4
+    elif yaza_sql_v2_is_keyword(source, tokens, cursor, "DOUBLE"):
+        set type_id = 6
+    elif yaza_sql_v2_is_keyword(source, tokens, cursor, "TEXT"):
+        set type_id = 9
+    elif yaza_sql_v2_is_keyword(source, tokens, cursor, "BLOB") or yaza_sql_v2_is_keyword(source, tokens, cursor, "BYTES"):
+        set type_id = 16
+    elif yaza_sql_v2_is_keyword(source, tokens, cursor, "DATE"):
+        set type_id = 11
+    elif yaza_sql_v2_is_keyword(source, tokens, cursor, "UUID"):
+        set type_id = 12
+    elif yaza_sql_v2_is_keyword(source, tokens, cursor, "TIME"):
+        set type_id = 13
+    elif yaza_sql_v2_is_keyword(source, tokens, cursor, "TIMESTAMPTZ"):
+        set type_id = 15
+    elif yaza_sql_v2_is_keyword(source, tokens, cursor, "TIMESTAMP"):
+        set type_id = 14
+        if yaza_sql_v2_is_keyword(source, tokens, cursor + 1, "WITH") or yaza_sql_v2_is_keyword(source, tokens, cursor + 1, "WITHOUT"):
+            let qualifier: Boolean = yaza_sql_v2_is_keyword(source, tokens, cursor + 1, "WITH")
+            if not yaza_sql_v2_is_keyword(source, tokens, cursor + 2, "TIME") or not yaza_sql_v2_is_keyword(source, tokens, cursor + 3, "ZONE"):
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor + 1, "SQL TIMESTAMP zone qualifier must be WITH TIME ZONE or WITHOUT TIME ZONE at byte "))
+            if qualifier: set type_id = 15
+            set consumed_type_tokens = 4
+    elif yaza_sql_v2_is_keyword(source, tokens, cursor, "DECIMAL") or yaza_sql_v2_is_keyword(source, tokens, cursor, "NUMERIC"):
+        if not yaza_sql_v2_is_symbol(source, tokens, cursor + 1, 40):
+            return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL DECIMAL requires explicit precision, for example DECIMAL(18, 2), at byte "))
+        let precision_result: Result[Number, Text] = yaza_sql_create_table_type_parameter_v1(source, tokens, cursor + 2)
+        if not result_is_ok(precision_result): return err(result_unwrap_error(precision_result))
+        let precision: Number = result_unwrap(precision_result)
+        if precision < 1: return err(yaza_sql_v2_parse_error(source, tokens, cursor + 2, "SQL DECIMAL precision must be between 1 and 38 at byte "))
+        var scale: Number = 0
+        var consumed: Number = 4
+        if yaza_sql_v2_is_symbol(source, tokens, cursor + 3, 44):
+            let scale_result: Result[Number, Text] = yaza_sql_create_table_type_parameter_v1(source, tokens, cursor + 4)
+            if not result_is_ok(scale_result): return err(result_unwrap_error(scale_result))
+            set scale = result_unwrap(scale_result)
+            if not yaza_sql_v2_is_symbol(source, tokens, cursor + 5, 41):
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor + 5, "SQL DECIMAL expected ')' after scale at byte "))
+            set consumed = 6
+        elif not yaza_sql_v2_is_symbol(source, tokens, cursor + 3, 41):
+            return err(yaza_sql_v2_parse_error(source, tokens, cursor + 3, "SQL DECIMAL expected ')' or ',' after precision at byte "))
+        if scale > precision: return err(yaza_sql_v2_parse_error(source, tokens, cursor + 4, "SQL DECIMAL scale cannot exceed precision at byte "))
+        return ok(YazaSqlCreateTypeParseV1(10, consumed, precision, scale))
+    else:
+        return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE type is outside the supported scalar profile at byte "))
+    return ok(YazaSqlCreateTypeParseV1(type_id, consumed_type_tokens, 0, 0))
+
+fn yaza_sql_parse_create_check_clause_v1(source: Text, tokens: List[YazaSqlTokenV1], cursor: Number) -> Result[YazaSqlCreateCheckClauseParseV1, Text]:
+    let token_count: Number = list_count(tokens)
+    if cursor < 0 or cursor >= token_count: return err("SQL CREATE TABLE CHECK clause is missing its column")
+    let column_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, cursor, false)
+    if not result_is_ok(column_result): return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE CHECK requires a column name at byte "))
+    let column: YazaSqlNameV2 = result_unwrap(column_result)
+    if column.part_count != 1: return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE CHECK column name must be unqualified at byte "))
+    let operator_index: Number = cursor + column.consumed_tokens
+    let comparison_operator: Number = yaza_sql_v2_comparison_code(source, tokens, operator_index)
+    if comparison_operator == 0: return err(yaza_sql_v2_parse_error(source, tokens, operator_index, "SQL CREATE TABLE CHECK requires a scalar comparison operator at byte "))
+    var literal_index: Number = operator_index + 1
+    if literal_index < 0 or literal_index >= token_count: return err(yaza_sql_v2_parse_error(source, tokens, literal_index, "SQL CREATE TABLE CHECK requires a scalar literal at byte "))
+    var literal_kind: Number = 0
+    var literal_start_byte: Number = -1
+    var literal_end_byte: Number = -1
+    let literal_token: YazaSqlTokenV1 = list_get(tokens, literal_index)
+    if yaza_sql_v2_is_symbol(source, tokens, literal_index, 43) or yaza_sql_v2_is_symbol(source, tokens, literal_index, 45):
+        if literal_index + 1 >= token_count or list_get(tokens, literal_index + 1).kind != 3: return err(yaza_sql_v2_parse_error(source, tokens, literal_index, "SQL CREATE TABLE CHECK sign must precede an integer or numeric literal at byte "))
+        set literal_kind = 3
+        set literal_start_byte = literal_token.start_byte
+        set literal_end_byte = list_get(tokens, literal_index + 1).end_byte
+        set literal_index = literal_index + 2
+    else:
+        let is_null_literal: Boolean = literal_token.kind == 1 and yaza_sql_v2_is_keyword(source, tokens, literal_index, "NULL")
+        let is_boolean_literal: Boolean = literal_token.kind == 1 and (yaza_sql_v2_is_keyword(source, tokens, literal_index, "TRUE") or yaza_sql_v2_is_keyword(source, tokens, literal_index, "FALSE"))
+        if literal_token.kind != 3 and literal_token.kind != 4 and literal_token.kind != 8 and not is_null_literal and not is_boolean_literal: return err(yaza_sql_v2_parse_error(source, tokens, literal_index, "SQL CREATE TABLE CHECK right operand must be a scalar literal at byte "))
+        set literal_kind = literal_token.kind
+        set literal_start_byte = literal_token.start_byte
+        set literal_end_byte = literal_token.end_byte
+        set literal_index = literal_index + 1
+    let clause: YazaSqlCreateCheckAstV1 = YazaSqlCreateCheckAstV1(column, comparison_operator, literal_kind, literal_start_byte, literal_end_byte)
+    return ok(YazaSqlCreateCheckClauseParseV1(clause, literal_index - cursor))
+
+fn yaza_sql_parse_create_table_v1(source: Text) -> Result[YazaSqlCreateTableAstV1, Text]:
+    let lexed: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(source)
+    if not result_is_ok(lexed): return err(result_unwrap_error(lexed))
+    let tokens: List[YazaSqlTokenV1] = result_unwrap(lexed)
+    let token_count: Number = list_count(tokens)
+    if token_count < 2: return err("SQL parser received an invalid token stream")
+    if not yaza_sql_v2_is_keyword(source, tokens, 0, "CREATE"):
+        return err(yaza_sql_v2_parse_error(source, tokens, 0, "SQL parser expected CREATE at byte "))
+    if not yaza_sql_v2_is_keyword(source, tokens, 1, "TABLE"):
+        return err(yaza_sql_v2_parse_error(source, tokens, 1, "SQL parser expected TABLE after CREATE at byte "))
+
+    var name_cursor: Number = 2
+    if yaza_sql_v2_is_keyword(source, tokens, name_cursor, "IF"):
+        if not yaza_sql_v2_is_keyword(source, tokens, name_cursor + 1, "NOT"):
+            return err(yaza_sql_v2_parse_error(source, tokens, name_cursor + 1, "SQL CREATE TABLE expected NOT after IF at byte "))
+        if not yaza_sql_v2_is_keyword(source, tokens, name_cursor + 2, "EXISTS"):
+            return err(yaza_sql_v2_parse_error(source, tokens, name_cursor + 2, "SQL CREATE TABLE expected EXISTS after IF NOT at byte "))
+        set name_cursor = name_cursor + 3
+    let table_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, name_cursor, false)
+    if not result_is_ok(table_result): return err(result_unwrap_error(table_result))
+    let table_name: YazaSqlNameV2 = result_unwrap(table_result)
+    var cursor: Number = name_cursor + table_name.consumed_tokens
+    if not yaza_sql_v2_is_symbol(source, tokens, cursor, 40):
+        return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected '(' before CREATE TABLE columns at byte "))
+    set cursor = cursor + 1
+
+    let columns_created: Result[List[YazaSqlCreateColumnAstV1], Text] = list_try_new()
+    let keys_created: Result[List[YazaSqlNameV2], Text] = list_try_new()
+    let unique_columns_created: Result[List[YazaSqlNameV2], Text] = list_try_new()
+    let foreign_keys_created: Result[List[YazaSqlCreateForeignKeyAstV1], Text] = list_try_new()
+    let checks_created: Result[List[YazaSqlCreateCheckAstV1], Text] = list_try_new()
+    if not result_is_ok(columns_created) or not result_is_ok(keys_created) or not result_is_ok(unique_columns_created) or not result_is_ok(foreign_keys_created) or not result_is_ok(checks_created): return err("SQL CREATE TABLE parser could not allocate bounded schema metadata")
+    let columns: List[YazaSqlCreateColumnAstV1] = result_unwrap(columns_created)
+    let primary_key_columns: List[YazaSqlNameV2] = result_unwrap(keys_created)
+    let unique_columns: List[YazaSqlNameV2] = result_unwrap(unique_columns_created)
+    let foreign_keys: List[YazaSqlCreateForeignKeyAstV1] = result_unwrap(foreign_keys_created)
+    let check_constraints: List[YazaSqlCreateCheckAstV1] = result_unwrap(checks_created)
+    if yaza_sql_v2_is_symbol(source, tokens, cursor, 41):
+        return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE column list cannot be empty at byte "))
+
+    var table_primary_key_seen: Boolean = false
+    var table_unique_seen: Boolean = false
+    var definitions_done: Boolean = false
+    while not definitions_done:
+        if yaza_sql_v2_is_keyword(source, tokens, cursor, "PRIMARY"):
+            if table_primary_key_seen or list_count(primary_key_columns) > 0:
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE may declare only one primary key at byte "))
+            if not yaza_sql_v2_is_keyword(source, tokens, cursor + 1, "KEY"):
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor + 1, "SQL CREATE TABLE expected KEY after PRIMARY at byte "))
+            set table_primary_key_seen = true
+            set cursor = cursor + 2
+            if not yaza_sql_v2_is_symbol(source, tokens, cursor, 40):
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE expected '(' after PRIMARY KEY at byte "))
+            set cursor = cursor + 1
+            var key_done: Boolean = false
+            while not key_done:
+                let key_name_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, cursor, false)
+                if not result_is_ok(key_name_result): return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE expected a primary-key column at byte "))
+                let key_name: YazaSqlNameV2 = result_unwrap(key_name_result)
+                if key_name.part_count != 1: return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE primary-key columns must be unqualified at byte "))
+                if list_count(primary_key_columns) >= 1024 or not list_try_push(primary_key_columns, key_name):
+                    return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE primary-key list limit or allocation failure at byte "))
+                set cursor = cursor + key_name.consumed_tokens
+                if yaza_sql_v2_is_symbol(source, tokens, cursor, 44):
+                    set cursor = cursor + 1
+                elif yaza_sql_v2_is_symbol(source, tokens, cursor, 41):
+                    set cursor = cursor + 1
+                    set key_done = true
+                else:
+                    return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE expected ',' or ')' in PRIMARY KEY at byte "))
+            if list_count(primary_key_columns) == 0: return err("SQL CREATE TABLE primary key cannot be empty")
+            if yaza_sql_v2_is_symbol(source, tokens, cursor, 44):
+                set cursor = cursor + 1
+            elif yaza_sql_v2_is_symbol(source, tokens, cursor, 41):
+                set cursor = cursor + 1
+                set definitions_done = true
+            else:
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE expected ',' or ')' after PRIMARY KEY at byte "))
+        elif yaza_sql_v2_is_keyword(source, tokens, cursor, "FOREIGN"):
+            if list_count(columns) == 0: return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE FOREIGN KEY must follow its column definitions at byte "))
+            if list_count(foreign_keys) >= 64: return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE exceeds the 64 FOREIGN KEY constraint profile at byte "))
+            if not yaza_sql_v2_is_keyword(source, tokens, cursor + 1, "KEY"): return err(yaza_sql_v2_parse_error(source, tokens, cursor + 1, "SQL CREATE TABLE expected KEY after FOREIGN at byte "))
+            let key_open: Number = cursor + 2
+            if not yaza_sql_v2_is_symbol(source, tokens, key_open, 40): return err(yaza_sql_v2_parse_error(source, tokens, key_open, "SQL CREATE TABLE expected '(' after FOREIGN KEY at byte "))
+            let local_name_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, key_open + 1, false)
+            if not result_is_ok(local_name_result): return err(yaza_sql_v2_parse_error(source, tokens, key_open + 1, "SQL CREATE TABLE FOREIGN KEY requires one local column at byte "))
+            let local_name: YazaSqlNameV2 = result_unwrap(local_name_result)
+            if local_name.part_count != 1 or not yaza_sql_v2_is_symbol(source, tokens, key_open + 1 + local_name.consumed_tokens, 41): return err(yaza_sql_v2_parse_error(source, tokens, key_open + 1, "SQL CREATE TABLE currently supports one local FOREIGN KEY column at byte "))
+            let references_cursor: Number = key_open + 2 + local_name.consumed_tokens
+            if not yaza_sql_v2_is_keyword(source, tokens, references_cursor, "REFERENCES"): return err(yaza_sql_v2_parse_error(source, tokens, references_cursor, "SQL CREATE TABLE FOREIGN KEY expected REFERENCES at byte "))
+            let parent_table_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, references_cursor + 1, false)
+            if not result_is_ok(parent_table_result): return err(yaza_sql_v2_parse_error(source, tokens, references_cursor + 1, "SQL CREATE TABLE FOREIGN KEY expected a referenced table at byte "))
+            let parent_table: YazaSqlNameV2 = result_unwrap(parent_table_result)
+            let parent_open: Number = references_cursor + 1 + parent_table.consumed_tokens
+            if parent_table.part_count != 1 or not yaza_sql_v2_is_symbol(source, tokens, parent_open, 40): return err(yaza_sql_v2_parse_error(source, tokens, parent_open, "SQL CREATE TABLE FOREIGN KEY requires one unqualified referenced table and '(' at byte "))
+            let parent_column_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, parent_open + 1, false)
+            if not result_is_ok(parent_column_result): return err(yaza_sql_v2_parse_error(source, tokens, parent_open + 1, "SQL CREATE TABLE FOREIGN KEY expected one referenced column at byte "))
+            let parent_column: YazaSqlNameV2 = result_unwrap(parent_column_result)
+            let parent_close: Number = parent_open + 1 + parent_column.consumed_tokens
+            if parent_column.part_count != 1 or not yaza_sql_v2_is_symbol(source, tokens, parent_close, 41): return err(yaza_sql_v2_parse_error(source, tokens, parent_close, "SQL CREATE TABLE currently supports one referenced FOREIGN KEY column at byte "))
+            var cursor_after_reference: Number = parent_close + 1
+            var delete_action_seen: Boolean = false
+            var update_action_seen: Boolean = false
+            while yaza_sql_v2_is_keyword(source, tokens, cursor_after_reference, "ON"):
+                if yaza_sql_v2_is_keyword(source, tokens, cursor_after_reference + 1, "DELETE"):
+                    if delete_action_seen: return err(yaza_sql_v2_parse_error(source, tokens, cursor_after_reference, "SQL CREATE TABLE repeats its FOREIGN KEY ON DELETE action at byte "))
+                    set delete_action_seen = true
+                elif yaza_sql_v2_is_keyword(source, tokens, cursor_after_reference + 1, "UPDATE"):
+                    if update_action_seen: return err(yaza_sql_v2_parse_error(source, tokens, cursor_after_reference, "SQL CREATE TABLE repeats its FOREIGN KEY ON UPDATE action at byte "))
+                    set update_action_seen = true
+                else:
+                    return err(yaza_sql_v2_parse_error(source, tokens, cursor_after_reference + 1, "SQL CREATE TABLE FOREIGN KEY action must be ON DELETE or ON UPDATE at byte "))
+                if not yaza_sql_v2_is_keyword(source, tokens, cursor_after_reference + 2, "RESTRICT") and not yaza_sql_v2_is_keyword(source, tokens, cursor_after_reference + 2, "CASCADE") and not yaza_sql_v2_is_keyword(source, tokens, cursor_after_reference + 2, "SET"):
+                    return err(yaza_sql_v2_parse_error(source, tokens, cursor_after_reference + 2, "SQL CREATE TABLE currently supports RESTRICT, CASCADE, or SET NULL at byte "))
+                if yaza_sql_v2_is_keyword(source, tokens, cursor_after_reference + 2, "SET"):
+                    if not yaza_sql_v2_is_keyword(source, tokens, cursor_after_reference + 3, "NULL"):
+                        return err(yaza_sql_v2_parse_error(source, tokens, cursor_after_reference + 3, "SQL CREATE TABLE expected NULL after SET at byte "))
+                    set cursor_after_reference = cursor_after_reference + 4
+                else:
+                    set cursor_after_reference = cursor_after_reference + 3
+            if not list_try_push(foreign_keys, YazaSqlCreateForeignKeyAstV1(local_name, parent_table, parent_column)): return err("SQL CREATE TABLE could not retain FOREIGN KEY metadata")
+            set table_unique_seen = true
+            set cursor = cursor_after_reference
+            if yaza_sql_v2_is_symbol(source, tokens, cursor, 44):
+                set cursor = cursor + 1
+            elif yaza_sql_v2_is_symbol(source, tokens, cursor, 41):
+                set cursor = cursor + 1
+                set definitions_done = true
+            else:
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE expected ',' or ')' after FOREIGN KEY at byte "))
+        elif yaza_sql_v2_is_keyword(source, tokens, cursor, "CHECK"):
+            if list_count(columns) == 0: return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE CHECK must follow its column definitions at byte "))
+            if list_count(check_constraints) >= 64: return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE exceeds the 64 CHECK constraint profile at byte "))
+            let check_open: Number = cursor + 1
+            if not yaza_sql_v2_is_symbol(source, tokens, check_open, 40): return err(yaza_sql_v2_parse_error(source, tokens, check_open, "SQL CREATE TABLE expected '(' after CHECK at byte "))
+            var clause_cursor: Number = check_open + 1
+            var check_done: Boolean = false
+            while not check_done:
+                if list_count(check_constraints) >= 64: return err(yaza_sql_v2_parse_error(source, tokens, clause_cursor, "SQL CREATE TABLE CHECK conjunction exceeds the 64-clause profile at byte "))
+                let parsed_clause: YazaSqlCreateCheckClauseParseV1 = yaza_sql_parse_create_check_clause_v1(source, tokens, clause_cursor)?
+                if not list_try_push(check_constraints, parsed_clause.clause): return err("SQL CREATE TABLE could not retain CHECK metadata")
+                set clause_cursor = clause_cursor + parsed_clause.consumed_tokens
+                if yaza_sql_v2_is_symbol(source, tokens, clause_cursor, 41):
+                    set check_done = true
+                elif yaza_sql_v2_is_keyword(source, tokens, clause_cursor, "AND"):
+                    set clause_cursor = clause_cursor + 1
+                else:
+                    return err(yaza_sql_v2_parse_error(source, tokens, clause_cursor, "SQL CREATE TABLE CHECK supports comparison terms joined by AND at byte "))
+            set table_unique_seen = true
+            set cursor = clause_cursor + 1
+            if yaza_sql_v2_is_symbol(source, tokens, cursor, 44):
+                set cursor = cursor + 1
+            elif yaza_sql_v2_is_symbol(source, tokens, cursor, 41):
+                set cursor = cursor + 1
+                set definitions_done = true
+            else:
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE expected ',' or ')' after CHECK at byte "))
+        elif yaza_sql_v2_is_keyword(source, tokens, cursor, "UNIQUE"):
+            if list_count(columns) == 0:
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE table-level UNIQUE must follow its column definitions at byte "))
+            set table_unique_seen = true
+            set cursor = cursor + 1
+            if not yaza_sql_v2_is_symbol(source, tokens, cursor, 40):
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE expected '(' after UNIQUE at byte "))
+            set cursor = cursor + 1
+            let unique_name_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, cursor, false)
+            if not result_is_ok(unique_name_result): return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE expected one UNIQUE column at byte "))
+            let unique_name: YazaSqlNameV2 = result_unwrap(unique_name_result)
+            if unique_name.part_count != 1: return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE UNIQUE column names must be unqualified at byte "))
+            if not list_try_push(unique_columns, unique_name): return err("SQL CREATE TABLE UNIQUE metadata allocation failed")
+            set cursor = cursor + unique_name.consumed_tokens
+            if not yaza_sql_v2_is_symbol(source, tokens, cursor, 41):
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE currently supports one column per UNIQUE constraint at byte "))
+            set cursor = cursor + 1
+            if yaza_sql_v2_is_symbol(source, tokens, cursor, 44):
+                set cursor = cursor + 1
+            elif yaza_sql_v2_is_symbol(source, tokens, cursor, 41):
+                set cursor = cursor + 1
+                set definitions_done = true
+            else:
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE expected ',' or ')' after UNIQUE at byte "))
+        else:
+            if table_unique_seen:
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE table constraints must follow all column definitions at byte "))
+            if list_count(columns) >= 1024: return err("SQL CREATE TABLE exceeds the 1024-column profile limit")
+            let column_name_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, cursor, false)
+            if not result_is_ok(column_name_result): return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE expected a column name at byte "))
+            let column_name: YazaSqlNameV2 = result_unwrap(column_name_result)
+            if column_name.part_count != 1: return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE column names must be unqualified at byte "))
+            set cursor = cursor + column_name.consumed_tokens
+            let type_result: Result[YazaSqlCreateTypeParseV1, Text] = yaza_sql_create_table_type_v1(source, tokens, cursor)
+            if not result_is_ok(type_result): return err(result_unwrap_error(type_result))
+            let parsed_type: YazaSqlCreateTypeParseV1 = result_unwrap(type_result)
+            set cursor = cursor + parsed_type.consumed_tokens
+
+            var nullable: Boolean = true
+            var nullability_seen: Boolean = false
+            var column_primary_key_seen: Boolean = false
+            var column_unique_seen: Boolean = false
+            var default_kind: Number = 0
+            var default_start_byte: Number = -1
+            var default_end_byte: Number = -1
+            var constraints_done: Boolean = false
+            while not constraints_done:
+                if yaza_sql_v2_is_keyword(source, tokens, cursor, "NOT"):
+                    if nullability_seen: return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE column repeats a nullability constraint at byte "))
+                    if not yaza_sql_v2_is_keyword(source, tokens, cursor + 1, "NULL"):
+                        return err(yaza_sql_v2_parse_error(source, tokens, cursor + 1, "SQL CREATE TABLE expected NULL after NOT at byte "))
+                    set nullable = false
+                    set nullability_seen = true
+                    set cursor = cursor + 2
+                elif yaza_sql_v2_is_keyword(source, tokens, cursor, "NULL"):
+                    if nullability_seen: return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE column repeats a nullability constraint at byte "))
+                    set nullable = true
+                    set nullability_seen = true
+                    set cursor = cursor + 1
+                elif yaza_sql_v2_is_keyword(source, tokens, cursor, "PRIMARY"):
+                    if column_primary_key_seen or table_primary_key_seen or list_count(primary_key_columns) > 0:
+                        return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE may declare only one primary key at byte "))
+                    if not yaza_sql_v2_is_keyword(source, tokens, cursor + 1, "KEY"):
+                        return err(yaza_sql_v2_parse_error(source, tokens, cursor + 1, "SQL CREATE TABLE expected KEY after PRIMARY at byte "))
+                    let appended_key: Boolean = list_try_push(primary_key_columns, column_name)
+                    if not appended_key: return err("SQL CREATE TABLE primary-key list allocation failed")
+                    set nullable = false
+                    set column_primary_key_seen = true
+                    set cursor = cursor + 2
+                elif yaza_sql_v2_is_keyword(source, tokens, cursor, "UNIQUE"):
+                    if column_unique_seen: return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE column repeats UNIQUE at byte "))
+                    if not list_try_push(unique_columns, column_name): return err("SQL CREATE TABLE column UNIQUE metadata allocation failed")
+                    set column_unique_seen = true
+                    set cursor = cursor + 1
+                elif yaza_sql_v2_is_keyword(source, tokens, cursor, "DEFAULT"):
+                    if default_kind != 0: return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE column repeats DEFAULT at byte "))
+                    let value_cursor: Number = cursor + 1
+                    if (yaza_sql_v2_is_symbol(source, tokens, value_cursor, 45) or yaza_sql_v2_is_symbol(source, tokens, value_cursor, 43)) and list_get(tokens, value_cursor + 1).kind == 3:
+                        let sign_token: YazaSqlTokenV1 = list_get(tokens, value_cursor)
+                        let number_token: YazaSqlTokenV1 = list_get(tokens, value_cursor + 1)
+                        set default_kind = 3
+                        set default_start_byte = sign_token.start_byte
+                        set default_end_byte = number_token.end_byte
+                        set cursor = value_cursor + 2
+                    else:
+                        let value_token: YazaSqlTokenV1 = list_get(tokens, value_cursor)
+                        if value_token.kind == 3 or value_token.kind == 4 or value_token.kind == 8 or yaza_sql_v2_is_keyword(source, tokens, value_cursor, "TRUE") or yaza_sql_v2_is_keyword(source, tokens, value_cursor, "FALSE") or yaza_sql_v2_is_keyword(source, tokens, value_cursor, "NULL"):
+                            set default_kind = value_token.kind
+                            set default_start_byte = value_token.start_byte
+                            set default_end_byte = value_token.end_byte
+                            set cursor = value_cursor + 1
+                        else:
+                            return err(yaza_sql_v2_parse_error(source, tokens, value_cursor, "SQL CREATE TABLE DEFAULT requires a scalar literal at byte "))
+                else:
+                    set constraints_done = true
+
+            if not list_try_push(columns, YazaSqlCreateColumnAstV1(column_name, parsed_type.type_id, parsed_type.precision, parsed_type.scale, nullable, default_kind, default_start_byte, default_end_byte)):
+                return err("SQL CREATE TABLE column-list allocation failed")
+            if yaza_sql_v2_is_symbol(source, tokens, cursor, 44):
+                set cursor = cursor + 1
+                if table_primary_key_seen:
+                    return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE does not allow columns after its table-level primary key at byte "))
+            elif yaza_sql_v2_is_symbol(source, tokens, cursor, 41):
+                set cursor = cursor + 1
+                set definitions_done = true
+            else:
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE TABLE expected ',' or ')' after a column definition at byte "))
+
+    if list_count(columns) == 0: return err("SQL CREATE TABLE requires at least one column")
+    if list_count(primary_key_columns) == 0: return err("SQL CREATE TABLE requires a primary key in the current clustered-table profile")
+    var statement_end: Number = list_get(tokens, cursor - 1).end_byte
+    if yaza_sql_v2_is_symbol(source, tokens, cursor, 59):
+        set statement_end = list_get(tokens, cursor).end_byte
+        set cursor = cursor + 1
+    if cursor >= token_count or list_get(tokens, cursor).kind != 0:
+        return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser supports one statement; unexpected token at byte "))
+    let first_token: YazaSqlTokenV1 = list_get(tokens, 0)
+    return ok(YazaSqlCreateTableAstV1(1, first_token.start_byte, statement_end, table_name, columns, primary_key_columns, unique_columns, foreign_keys, check_constraints))
+
+fn yaza_sql_create_table_identifier_v1(source: Text, token: YazaSqlTokenV1) -> Result[Text, Text]:
+    if token.kind != 1 or token.start_byte < 0 or token.end_byte <= token.start_byte or token.end_byte > text_length(source):
+        return err("SQL CREATE TABLE binder supports bounded unquoted identifiers only")
+    let byte_count: Number = token.end_byte - token.start_byte
+    if byte_count > 128: return err("SQL CREATE TABLE identifier exceeds 128 bytes")
+    let bytes_result: Result[Bytes, Text] = bytes_try_new_zeroed(byte_count)
+    if not result_is_ok(bytes_result): return err(result_unwrap_error(bytes_result))
+    let bytes: Bytes = result_unwrap(bytes_result)
+    var index: Number = 0
+    while index < byte_count:
+        var byte: Number = text_byte(source, token.start_byte + index)
+        if (index == 0 and not ((byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122) or byte == 95)) or (index > 0 and not ((byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122) or (byte >= 48 and byte <= 57) or byte == 95 or byte == 36)):
+            return err("SQL CREATE TABLE identifiers must use ASCII letters, digits, '_' or '$'")
+        if byte >= 65 and byte <= 90: set byte = byte + 32
+        if not bytes_try_set(bytes, index, byte): return err("SQL CREATE TABLE identifier normalization failed")
+        set index = index + 1
+    return bytes_try_to_text(bytes)
+
+fn yaza_sql_create_table_diagnostic_at_v1(source: Text, start_byte: Number, end_byte: Number, code: Number, message: Text) -> YazaSqlDiagnosticV1:
+    var bounded_start: Number = start_byte
+    if bounded_start < 0: set bounded_start = 0
+    if bounded_start > text_length(source): set bounded_start = text_length(source)
+    var bounded_end: Number = end_byte
+    if bounded_end < bounded_start: set bounded_end = bounded_start
+    if bounded_end > text_length(source): set bounded_end = text_length(source)
+    let location_result: Result[YazaSqlSourceLocationV1, Text] = yaza_sql_v1_location(source, bounded_start)
+    var line: Number = 1
+    var column: Number = 1
+    if result_is_ok(location_result):
+        let location: YazaSqlSourceLocationV1 = result_unwrap(location_result)
+        set line = location.line
+        set column = location.column
+    return YazaSqlDiagnosticV1(3, code, bounded_start, bounded_end, line, column, message)
+
+fn yaza_sql_bind_create_table_v1(source: Text, create: YazaSqlCreateTableAstV1, catalog: YazaSqlCatalogSnapshotV1) -> Result[YazaSqlCreateTablePlanV1, YazaSqlDiagnosticV1]:
+    if create.version != 1 or not yaza_sql_bind_v1_span_valid(source, create.start_byte, create.end_byte):
+        return err(yaza_sql_create_table_diagnostic_at_v1(source, create.start_byte, create.end_byte, 3006, "SQL CREATE TABLE binder received an invalid AST version or source span"))
+    if catalog.version < 1 or list_count(catalog.tables) > 1024 or list_count(create.columns) < 1 or list_count(create.columns) > 1024:
+        return err(yaza_sql_create_table_diagnostic_at_v1(source, create.start_byte, create.end_byte, 3004, "SQL CREATE TABLE catalog or schema exceeds its supported bound"))
+    if not yaza_sql_bind_v1_name_valid(source, create.table_name) or create.table_name.part_count != 1:
+        return err(yaza_sql_create_table_diagnostic_at_v1(source, create.table_name.start_byte, create.table_name.end_byte, 3002, "SQL CREATE TABLE supports one-part table names only"))
+    let table_name_result: Result[Text, Text] = yaza_sql_create_table_identifier_v1(source, create.table_name.first_token)
+    if not result_is_ok(table_name_result):
+        return err(yaza_sql_create_table_diagnostic_at_v1(source, create.table_name.start_byte, create.table_name.end_byte, 3002, result_unwrap_error(table_name_result)))
+    let table_name: Text = result_unwrap(table_name_result)
+    var prior_table: Number = 0
+    while prior_table < list_count(catalog.tables):
+        let candidate: YazaSqlTableSchemaV1 = list_get(catalog.tables, prior_table)
+        if candidate.table_id < 1 or text_length(candidate.name) == 0:
+            return err(yaza_sql_create_table_diagnostic_at_v1(source, create.table_name.start_byte, create.table_name.end_byte, 3006, "SQL CREATE TABLE binder received an invalid catalog table"))
+        if yaza_sql_bind_v1_identifier_matches(source, create.table_name.first_token, candidate.name):
+            return err(yaza_sql_create_table_diagnostic_at_v1(source, create.table_name.start_byte, create.table_name.end_byte, 3002, "SQL CREATE TABLE name already exists"))
+        set prior_table = prior_table + 1
+
+    let columns_result: Result[List[YazaSqlColumnSchemaV1], Text] = list_try_new()
+    let names_result: Result[List[Text], Text] = list_try_new()
+    let key_result: Result[List[Number], Text] = list_try_new()
+    let unique_result: Result[List[Number], Text] = list_try_new()
+    let defaults_result: Result[List[Text], Text] = list_try_new()
+    let foreign_keys_result: Result[List[YazaSqlCreateForeignKeyPlanV1], Text] = list_try_new()
+    let checks_result: Result[List[YazaSqlCreateCheckPlanV1], Text] = list_try_new()
+    if not result_is_ok(columns_result) or not result_is_ok(names_result) or not result_is_ok(key_result) or not result_is_ok(unique_result) or not result_is_ok(defaults_result) or not result_is_ok(foreign_keys_result) or not result_is_ok(checks_result):
+        return err(yaza_sql_create_table_diagnostic_at_v1(source, create.start_byte, create.end_byte, 3005, "SQL CREATE TABLE binder could not allocate schema metadata"))
+    let columns: List[YazaSqlColumnSchemaV1] = result_unwrap(columns_result)
+    let names: List[Text] = result_unwrap(names_result)
+    let key_ordinals: List[Number] = result_unwrap(key_result)
+    let unique_ordinals: List[Number] = result_unwrap(unique_result)
+    let default_expressions: List[Text] = result_unwrap(defaults_result)
+    let foreign_keys: List[YazaSqlCreateForeignKeyPlanV1] = result_unwrap(foreign_keys_result)
+    let check_constraints: List[YazaSqlCreateCheckPlanV1] = result_unwrap(checks_result)
+    let column_count: Number = list_count(create.columns)
+    if list_count(create.foreign_keys) > 64: return err(yaza_sql_create_table_diagnostic_at_v1(source, create.start_byte, create.end_byte, 3004, "SQL CREATE TABLE exceeds the 64 FOREIGN KEY constraint profile"))
+    if list_count(create.check_constraints) > 64: return err(yaza_sql_create_table_diagnostic_at_v1(source, create.start_byte, create.end_byte, 3004, "SQL CREATE TABLE exceeds the 64 CHECK constraint profile"))
+    if not list_try_reserve(columns, column_count) or not list_try_reserve(names, column_count) or not list_try_reserve(key_ordinals, list_count(create.primary_key_columns)) or not list_try_reserve(unique_ordinals, list_count(create.unique_columns)) or not list_try_reserve(default_expressions, column_count) or not list_try_reserve(foreign_keys, list_count(create.foreign_keys)) or not list_try_reserve(check_constraints, list_count(create.check_constraints)):
+        return err(yaza_sql_create_table_diagnostic_at_v1(source, create.start_byte, create.end_byte, 3005, "SQL CREATE TABLE binder could not reserve schema metadata"))
+
+    var column_index: Number = 0
+    while column_index < column_count:
+        let definition: YazaSqlCreateColumnAstV1 = list_get(create.columns, column_index)
+        if not yaza_sql_bind_v1_name_valid(source, definition.name) or definition.name.part_count != 1:
+            return err(yaza_sql_create_table_diagnostic_at_v1(source, definition.name.start_byte, definition.name.end_byte, 3006, "SQL CREATE TABLE AST has an invalid column name"))
+        if definition.type_id != 1 and definition.type_id != 2 and definition.type_id != 3 and definition.type_id != 4 and definition.type_id != 6 and definition.type_id != 9 and definition.type_id != 10 and definition.type_id != 11 and definition.type_id != 12 and definition.type_id != 13 and definition.type_id != 14 and definition.type_id != 15 and definition.type_id != 16:
+            return err(yaza_sql_create_table_diagnostic_at_v1(source, definition.name.start_byte, definition.name.end_byte, 3003, "SQL CREATE TABLE type is outside the supported scalar profile"))
+        if definition.type_id == 10 and not yaza_sql_decimal_parameters_valid_v1(definition.precision, definition.scale):
+            return err(yaza_sql_create_table_diagnostic_at_v1(source, definition.name.start_byte, definition.name.end_byte, 3003, "SQL CREATE TABLE DECIMAL precision or scale is invalid"))
+        elif definition.type_id != 10 and (definition.precision != 0 or definition.scale != 0):
+            return err(yaza_sql_create_table_diagnostic_at_v1(source, definition.name.start_byte, definition.name.end_byte, 3006, "SQL CREATE TABLE non-DECIMAL type has unexpected precision metadata"))
+        let name_result: Result[Text, Text] = yaza_sql_create_table_identifier_v1(source, definition.name.first_token)
+        if not result_is_ok(name_result):
+            return err(yaza_sql_create_table_diagnostic_at_v1(source, definition.name.start_byte, definition.name.end_byte, 3002, result_unwrap_error(name_result)))
+        let name: Text = result_unwrap(name_result)
+        var earlier: Number = 0
+        while earlier < list_count(names):
+            if list_get(names, earlier) == name:
+                return err(yaza_sql_create_table_diagnostic_at_v1(source, definition.name.start_byte, definition.name.end_byte, 3002, "SQL CREATE TABLE has duplicate column names"))
+            set earlier = earlier + 1
+        if not list_try_push(names, name):
+            return err(yaza_sql_create_table_diagnostic_at_v1(source, definition.name.start_byte, definition.name.end_byte, 3005, "SQL CREATE TABLE binder could not record a column name"))
+        set column_index = column_index + 1
+
+    var key_index: Number = 0
+    while key_index < list_count(create.primary_key_columns):
+        let key_name: YazaSqlNameV2 = list_get(create.primary_key_columns, key_index)
+        if not yaza_sql_bind_v1_name_valid(source, key_name) or key_name.part_count != 1:
+            return err(yaza_sql_create_table_diagnostic_at_v1(source, key_name.start_byte, key_name.end_byte, 3006, "SQL CREATE TABLE AST has an invalid primary-key name"))
+        let key_text_result: Result[Text, Text] = yaza_sql_create_table_identifier_v1(source, key_name.first_token)
+        if not result_is_ok(key_text_result):
+            return err(yaza_sql_create_table_diagnostic_at_v1(source, key_name.start_byte, key_name.end_byte, 3002, result_unwrap_error(key_text_result)))
+        let key_text: Text = result_unwrap(key_text_result)
+        var matched_ordinal: Number = -1
+        var search_index: Number = 0
+        while search_index < list_count(names):
+            if list_get(names, search_index) == key_text: set matched_ordinal = search_index
+            set search_index = search_index + 1
+        if matched_ordinal < 0:
+            return err(yaza_sql_create_table_diagnostic_at_v1(source, key_name.start_byte, key_name.end_byte, 3002, "SQL CREATE TABLE primary key references an unknown column"))
+        var duplicate_key: Number = 0
+        while duplicate_key < list_count(key_ordinals):
+            if list_get(key_ordinals, duplicate_key) == matched_ordinal:
+                return err(yaza_sql_create_table_diagnostic_at_v1(source, key_name.start_byte, key_name.end_byte, 3002, "SQL CREATE TABLE primary key repeats a column"))
+            set duplicate_key = duplicate_key + 1
+        if not list_try_push(key_ordinals, matched_ordinal):
+            return err(yaza_sql_create_table_diagnostic_at_v1(source, key_name.start_byte, key_name.end_byte, 3005, "SQL CREATE TABLE binder could not record a primary-key column"))
+        set key_index = key_index + 1
+    if list_count(key_ordinals) == 0:
+        return err(yaza_sql_create_table_diagnostic_at_v1(source, create.start_byte, create.end_byte, 3003, "SQL CREATE TABLE requires a clustered primary key"))
+
+    if list_count(create.unique_columns) > 64:
+        return err(yaza_sql_create_table_diagnostic_at_v1(source, create.start_byte, create.end_byte, 3004, "SQL CREATE TABLE exceeds the 64 active secondary-index profile for UNIQUE constraints"))
+    var unique_index: Number = 0
+    while unique_index < list_count(create.unique_columns):
+        let unique_name: YazaSqlNameV2 = list_get(create.unique_columns, unique_index)
+        if not yaza_sql_bind_v1_name_valid(source, unique_name) or unique_name.part_count != 1:
+            return err(yaza_sql_create_table_diagnostic_at_v1(source, unique_name.start_byte, unique_name.end_byte, 3006, "SQL CREATE TABLE AST has an invalid UNIQUE column name"))
+        let unique_text_result: Result[Text, Text] = yaza_sql_create_table_identifier_v1(source, unique_name.first_token)
+        if not result_is_ok(unique_text_result): return err(yaza_sql_create_table_diagnostic_at_v1(source, unique_name.start_byte, unique_name.end_byte, 3002, result_unwrap_error(unique_text_result)))
+        let unique_text: Text = result_unwrap(unique_text_result)
+        var unique_ordinal: Number = 0
+        while unique_ordinal < list_count(names) and list_get(names, unique_ordinal) != unique_text:
+            set unique_ordinal = unique_ordinal + 1
+        if unique_ordinal >= list_count(names): return err(yaza_sql_create_table_diagnostic_at_v1(source, unique_name.start_byte, unique_name.end_byte, 3002, "SQL CREATE TABLE UNIQUE constraint references an unknown column"))
+        var earlier_unique: Number = 0
+        while earlier_unique < list_count(unique_ordinals):
+            if list_get(unique_ordinals, earlier_unique) == unique_ordinal:
+                return err(yaza_sql_create_table_diagnostic_at_v1(source, unique_name.start_byte, unique_name.end_byte, 3002, "SQL CREATE TABLE repeats a UNIQUE constraint for one column"))
+            set earlier_unique = earlier_unique + 1
+        if not list_try_push(unique_ordinals, unique_ordinal): return err(yaza_sql_create_table_diagnostic_at_v1(source, unique_name.start_byte, unique_name.end_byte, 3005, "SQL CREATE TABLE binder could not record a UNIQUE column"))
+        set unique_index = unique_index + 1
+
+    var foreign_index: Number = 0
+    while foreign_index < list_count(create.foreign_keys):
+        let foreign_ast: YazaSqlCreateForeignKeyAstV1 = list_get(create.foreign_keys, foreign_index)
+        if not yaza_sql_bind_v1_name_valid(source, foreign_ast.local_column) or foreign_ast.local_column.part_count != 1 or not yaza_sql_bind_v1_name_valid(source, foreign_ast.referenced_table) or foreign_ast.referenced_table.part_count != 1 or not yaza_sql_bind_v1_name_valid(source, foreign_ast.referenced_column) or foreign_ast.referenced_column.part_count != 1:
+            return err(yaza_sql_create_table_diagnostic_at_v1(source, foreign_ast.local_column.start_byte, foreign_ast.referenced_column.end_byte, 3006, "SQL CREATE TABLE AST has invalid FOREIGN KEY identifiers"))
+        let local_text_result: Result[Text, Text] = yaza_sql_create_table_identifier_v1(source, foreign_ast.local_column.first_token)
+        let parent_column_text_result: Result[Text, Text] = yaza_sql_create_table_identifier_v1(source, foreign_ast.referenced_column.first_token)
+        if not result_is_ok(local_text_result) or not result_is_ok(parent_column_text_result): return err(yaza_sql_create_table_diagnostic_at_v1(source, foreign_ast.local_column.start_byte, foreign_ast.referenced_column.end_byte, 3002, "SQL CREATE TABLE FOREIGN KEY identifier is invalid"))
+        let local_text: Text = result_unwrap(local_text_result)
+        let parent_column_text: Text = result_unwrap(parent_column_text_result)
+        var local_ordinal: Number = 0
+        while local_ordinal < list_count(names) and list_get(names, local_ordinal) != local_text:
+            set local_ordinal = local_ordinal + 1
+        if local_ordinal >= list_count(names): return err(yaza_sql_create_table_diagnostic_at_v1(source, foreign_ast.local_column.start_byte, foreign_ast.local_column.end_byte, 3002, "SQL CREATE TABLE FOREIGN KEY references an unknown local column"))
+        var parent_table_index: Number = 0
+        while parent_table_index < list_count(catalog.tables) and not yaza_sql_bind_v1_identifier_matches(source, foreign_ast.referenced_table.first_token, list_get(catalog.tables, parent_table_index).name):
+            set parent_table_index = parent_table_index + 1
+        if parent_table_index >= list_count(catalog.tables): return err(yaza_sql_create_table_diagnostic_at_v1(source, foreign_ast.referenced_table.start_byte, foreign_ast.referenced_table.end_byte, 3002, "SQL CREATE TABLE FOREIGN KEY references an unknown parent table"))
+        let parent_table: YazaSqlTableSchemaV1 = list_get(catalog.tables, parent_table_index)
+        var parent_ordinal: Number = 0
+        while parent_ordinal < list_count(parent_table.columns) and not yaza_sql_bind_v1_identifier_matches(source, foreign_ast.referenced_column.first_token, list_get(parent_table.columns, parent_ordinal).name):
+            set parent_ordinal = parent_ordinal + 1
+        if parent_ordinal >= list_count(parent_table.columns): return err(yaza_sql_create_table_diagnostic_at_v1(source, foreign_ast.referenced_column.start_byte, foreign_ast.referenced_column.end_byte, 3002, "SQL CREATE TABLE FOREIGN KEY references an unknown parent column"))
+        let local_column: YazaSqlColumnSchemaV1 = YazaSqlColumnSchemaV1(local_text, list_get(create.columns, local_ordinal).type_id, list_get(create.columns, local_ordinal).nullable, local_ordinal, list_get(create.columns, local_ordinal).precision, list_get(create.columns, local_ordinal).scale, "")
+        let parent_column: YazaSqlColumnSchemaV1 = list_get(parent_table.columns, parent_ordinal)
+        if local_column.type_id != parent_column.type_id or local_column.precision != parent_column.precision or local_column.scale != parent_column.scale:
+            return err(yaza_sql_create_table_diagnostic_at_v1(source, foreign_ast.local_column.start_byte, foreign_ast.referenced_column.end_byte, 3003, "SQL CREATE TABLE FOREIGN KEY columns must have identical scalar type and DECIMAL dimensions"))
+        var prior_foreign: Number = 0
+        while prior_foreign < list_count(foreign_keys):
+            if list_get(foreign_keys, prior_foreign).local_column_ordinal == local_ordinal and list_get(foreign_keys, prior_foreign).referenced_table_id == parent_table.table_id and list_get(foreign_keys, prior_foreign).referenced_column_ordinal == parent_ordinal:
+                return err(yaza_sql_create_table_diagnostic_at_v1(source, foreign_ast.local_column.start_byte, foreign_ast.referenced_column.end_byte, 3002, "SQL CREATE TABLE repeats a FOREIGN KEY relationship"))
+            set prior_foreign = prior_foreign + 1
+        if not list_try_push(foreign_keys, YazaSqlCreateForeignKeyPlanV1(local_ordinal, parent_table.table_id, parent_ordinal)):
+            return err(yaza_sql_create_table_diagnostic_at_v1(source, foreign_ast.local_column.start_byte, foreign_ast.referenced_column.end_byte, 3005, "SQL CREATE TABLE binder could not record a FOREIGN KEY"))
+        set foreign_index = foreign_index + 1
+
+    var check_index: Number = 0
+    while check_index < list_count(create.check_constraints):
+        let check_ast: YazaSqlCreateCheckAstV1 = list_get(create.check_constraints, check_index)
+        if not yaza_sql_bind_v1_name_valid(source, check_ast.column_name) or check_ast.column_name.part_count != 1 or check_ast.comparison_operator < 1 or check_ast.comparison_operator > 6 or check_ast.literal_start_byte < 0 or check_ast.literal_end_byte <= check_ast.literal_start_byte or check_ast.literal_end_byte > text_length(source):
+            return err(yaza_sql_create_table_diagnostic_at_v1(source, check_ast.column_name.start_byte, check_ast.literal_end_byte, 3006, "SQL CREATE TABLE AST has invalid CHECK metadata"))
+        let check_name_result: Result[Text, Text] = yaza_sql_create_table_identifier_v1(source, check_ast.column_name.first_token)
+        if not result_is_ok(check_name_result): return err(yaza_sql_create_table_diagnostic_at_v1(source, check_ast.column_name.start_byte, check_ast.column_name.end_byte, 3002, result_unwrap_error(check_name_result)))
+        let check_name: Text = result_unwrap(check_name_result)
+        var check_ordinal: Number = 0
+        while check_ordinal < list_count(names) and list_get(names, check_ordinal) != check_name:
+            set check_ordinal = check_ordinal + 1
+        if check_ordinal >= list_count(names): return err(yaza_sql_create_table_diagnostic_at_v1(source, check_ast.column_name.start_byte, check_ast.column_name.end_byte, 3002, "SQL CREATE TABLE CHECK references an unknown column"))
+        let check_definition: YazaSqlCreateColumnAstV1 = list_get(create.columns, check_ordinal)
+        var check_nullable: Boolean = check_definition.nullable
+        var check_key_index: Number = 0
+        while check_key_index < list_count(key_ordinals):
+            if list_get(key_ordinals, check_key_index) == check_ordinal: set check_nullable = false
+            set check_key_index = check_key_index + 1
+        let check_column: YazaSqlColumnSchemaV1 = YazaSqlColumnSchemaV1(check_name, check_definition.type_id, check_nullable, check_ordinal, check_definition.precision, check_definition.scale, "")
+        if not yaza_sql_bind_v1_comparison_valid(check_column.type_id, check_ast.comparison_operator): return err(yaza_sql_create_table_diagnostic_at_v1(source, check_ast.column_name.start_byte, check_ast.literal_end_byte, 3003, "SQL CREATE TABLE CHECK comparison is not supported for this scalar type"))
+        let check_token: YazaSqlTokenV1 = YazaSqlTokenV1(check_ast.literal_kind, check_ast.literal_start_byte, check_ast.literal_end_byte)
+        let check_literal_valid: Result[Boolean, Text] = yaza_sql_bind_insert_literal_v1(source, check_token, check_column)
+        if not result_is_ok(check_literal_valid) or not result_unwrap(check_literal_valid): return err(yaza_sql_create_table_diagnostic_at_v1(source, check_ast.literal_start_byte, check_ast.literal_end_byte, 3003, "SQL CREATE TABLE CHECK literal does not match its column type"))
+        let check_literal_result: Result[Text, Text] = text_try_slice(source, check_ast.literal_start_byte, check_ast.literal_end_byte - check_ast.literal_start_byte)
+        if not result_is_ok(check_literal_result): return err(yaza_sql_create_table_diagnostic_at_v1(source, check_ast.literal_start_byte, check_ast.literal_end_byte, 3005, "SQL CREATE TABLE could not retain its CHECK literal"))
+        if not list_try_push(check_constraints, YazaSqlCreateCheckPlanV1(check_ordinal, check_ast.comparison_operator, result_unwrap(check_literal_result))): return err(yaza_sql_create_table_diagnostic_at_v1(source, check_ast.column_name.start_byte, check_ast.literal_end_byte, 3005, "SQL CREATE TABLE could not retain a CHECK constraint"))
+        set check_index = check_index + 1
+
+    set column_index = 0
+    while column_index < column_count:
+        let definition: YazaSqlCreateColumnAstV1 = list_get(create.columns, column_index)
+        var nullable: Boolean = definition.nullable
+        var check_key: Number = 0
+        while check_key < list_count(key_ordinals):
+            if list_get(key_ordinals, check_key) == column_index: set nullable = false
+            set check_key = check_key + 1
+        var default_expression: Text = ""
+        if definition.default_kind != 0:
+            if definition.default_start_byte < 0 or definition.default_end_byte <= definition.default_start_byte or definition.default_end_byte > text_length(source):
+                return err(yaza_sql_create_table_diagnostic_at_v1(source, definition.name.start_byte, definition.name.end_byte, 3006, "SQL CREATE TABLE AST has an invalid DEFAULT literal span"))
+            let default_token: YazaSqlTokenV1 = YazaSqlTokenV1(definition.default_kind, definition.default_start_byte, definition.default_end_byte)
+            let default_column: YazaSqlColumnSchemaV1 = YazaSqlColumnSchemaV1(list_get(names, column_index), definition.type_id, nullable, column_index, definition.precision, definition.scale, "")
+            let default_valid: Result[Boolean, Text] = yaza_sql_bind_insert_literal_v1(source, default_token, default_column)
+            if not result_is_ok(default_valid):
+                return err(yaza_sql_create_table_diagnostic_at_v1(source, definition.default_start_byte, definition.default_end_byte, 3003, "SQL CREATE TABLE DEFAULT literal is invalid for its column type or nullability"))
+            if definition.default_kind == 4:
+                let decoded_default: Result[Text, Text] = yaza_sql_decode_text_literal_v1(source, definition.default_start_byte, definition.default_end_byte)
+                if not result_is_ok(decoded_default): return err(yaza_sql_create_table_diagnostic_at_v1(source, definition.default_start_byte, definition.default_end_byte, 3003, "SQL CREATE TABLE DEFAULT text literal is not valid bounded UTF-8"))
+            let default_slice: Result[Text, Text] = text_try_slice(source, definition.default_start_byte, definition.default_end_byte - definition.default_start_byte)
+            if not result_is_ok(default_slice): return err(yaza_sql_create_table_diagnostic_at_v1(source, definition.default_start_byte, definition.default_end_byte, 3005, "SQL CREATE TABLE could not retain its DEFAULT literal"))
+            set default_expression = result_unwrap(default_slice)
+        if not list_try_push(columns, YazaSqlColumnSchemaV1(list_get(names, column_index), definition.type_id, nullable, column_index, definition.precision, definition.scale, default_expression)):
+            return err(yaza_sql_create_table_diagnostic_at_v1(source, definition.name.start_byte, definition.name.end_byte, 3005, "SQL CREATE TABLE binder could not build its bound columns"))
+        if not list_try_push(default_expressions, default_expression): return err(yaza_sql_create_table_diagnostic_at_v1(source, definition.name.start_byte, definition.name.end_byte, 3005, "SQL CREATE TABLE binder could not retain column defaults"))
+        set column_index = column_index + 1
+    return ok(YazaSqlCreateTablePlanV1(1, catalog.version, table_name, columns, key_ordinals, unique_ordinals, default_expressions, foreign_keys, check_constraints))

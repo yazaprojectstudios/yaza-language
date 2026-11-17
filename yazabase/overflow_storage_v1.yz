@@ -1,0 +1,66 @@
+# File-backed overflow reads for provisional YDBv1 row references.
+# Writes remain transaction-owned and are intentionally not provided here.
+use "./overflow_v1"
+use "./row_v1"
+use "./storage_v1"
+
+fn yaza_db_storage_read_overflow_bytes_v1(file: Number, header: YazaDbFileHeaderV1, reference: YazaDbOverflowRefV1) -> Result[Bytes, Text]:
+    let ignored_reference: Bytes = yaza_db_overflow_ref_encode_v1(reference)?
+    let capacity: Number = yaza_db_overflow_payload_capacity_v1()
+    let expected_count: Number = (reference.total_length + capacity - 1) / capacity
+    let output: Bytes = bytes_try_new_zeroed(reference.total_length)?
+    var page_id: Number = reference.first_page_id
+    var previous_page_id: Number = 1
+    var offset: Number = 0
+    var index: Number = 0
+    while index < expected_count:
+        if page_id <= previous_page_id or page_id < 2 or page_id >= header.page_count: return err("YDBv1 overflow chain page ID is outside the allocated file or is non-canonical")
+        let page: Bytes = yaza_db_storage_read_page_v1(file, header, page_id)?
+        let decoded: YazaDbOverflowPageV1 = yaza_db_overflow_page_decode_v1(page, page_id)?
+        var expected_payload_length: Number = capacity
+        if expected_payload_length > reference.total_length - offset: set expected_payload_length = reference.total_length - offset
+        if bytes_length(decoded.payload) != expected_payload_length: return err("YDBv1 overflow page payload length does not match its reference")
+        if not yaza_db_write_bytes_v1(output, offset, decoded.payload): return err("YDBv1 overflow chain could not be copied into its bounded value buffer")
+        if index + 1 == expected_count:
+            if decoded.next_page_id != 0: return err("YDBv1 overflow chain extends beyond its declared value length")
+        else:
+            if decoded.next_page_id <= page_id or decoded.next_page_id >= header.page_count: return err("YDBv1 overflow chain has an invalid or non-increasing next-page link")
+            set previous_page_id = page_id
+            set page_id = decoded.next_page_id
+        set offset = offset + expected_payload_length
+        set index = index + 1
+    if offset != reference.total_length or bytes_ydbv1_checksum(output) != reference.checksum: return err("YDBv1 overflow chain length or checksum does not match its reference")
+    return ok(output)
+
+fn yaza_db_row_materialize_overflow_text_v1(file: Number, header: YazaDbFileHeaderV1, row: YazaDbRowV1, columns: List[YazaSqlColumnSchemaV1]) -> Result[YazaDbRowV1, Text]:
+    let count: Number = list_count(columns)
+    if list_count(row.values) != count or list_count(row.nulls) != count or list_count(row.overflow_refs) != count: return err("YDBv1 row fields and overflow references do not match the materialization schema")
+    var has_overflow_reference: Boolean = false
+    var reference_index: Number = 0
+    while reference_index < count:
+        if not yaza_db_row_overflow_ref_is_empty_v1(list_get(row.overflow_refs, reference_index)):
+            set has_overflow_reference = true
+            break
+        set reference_index = reference_index + 1
+    if not has_overflow_reference: return ok(row)
+    let values_created: Result[List[YazaSqlValueV1], Text] = list_try_new()
+    if not result_is_ok(values_created): return err(result_unwrap_error(values_created))
+    let values: List[YazaSqlValueV1] = result_unwrap(values_created)
+    if not list_try_reserve(values, count): return err("YDBv1 row materialization could not reserve its value list")
+    var index: Number = 0
+    while index < count:
+        let reference: YazaDbOverflowRefV1 = list_get(row.overflow_refs, index)
+        var value: YazaSqlValueV1 = list_get(row.values, index)
+        if reference.first_page_id != 0:
+            let column: YazaSqlColumnSchemaV1 = list_get(columns, index)
+            if (column.type_id != 9 and column.type_id != 16) or list_get(row.nulls, index): return err("YDBv1 overflow reference is attached to a non-TEXT/BLOB or NULL value")
+            let encoded_value: Bytes = yaza_db_storage_read_overflow_bytes_v1(file, header, reference)?
+            if column.type_id == 9:
+                let text_result: Result[Text, Text] = bytes_try_to_text(encoded_value)
+                if not result_is_ok(text_result): return err("YDBv1 external TEXT value contains invalid UTF-8")
+                set value = yaza_sql_value_text_v1(result_unwrap(text_result))
+            else:
+                set value = yaza_sql_value_blob_v1(encoded_value)?
+        if not list_try_push(values, value): return err("YDBv1 row materialization could not append a value")
+        set index = index + 1
+    return ok(YazaDbRowV1(row.version_ts, row.undo_ref, row.deleted, values, row.nulls, row.schema_epoch, row.schema_version, row.physical_column_count, row.text_input_bytes, row.max_text_input_bytes, row.overflow_refs))

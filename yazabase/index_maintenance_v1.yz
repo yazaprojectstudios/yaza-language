@@ -1,0 +1,220 @@
+# Transactional maintenance helpers for the bounded single-column secondary-index profile.
+use "./btree_scan_v1"
+use "./catalog_schema_v1"
+use "./catalog_snapshot_v1"
+use "./catalog_storage_v1"
+use "./index_catalog_v1"
+use "./key_codec_v1"
+use "./page_v1"
+use "./query_v1"
+use "./row_v1"
+use "./secondary_index_v1"
+use "./sql_decimal_v1"
+use "./sql_executor_v1"
+use "./storage_v1"
+use "./transaction_v1"
+use "./wal_v1"
+
+shape YazaDbSecondaryIndexV1:
+    index_id: Number
+    root_page_id: Number
+    plan: YazaSqlCreateIndexPlanV1
+    primary_key_ordinals: List[Number]
+    entry_columns: List[YazaSqlColumnSchemaV1]
+    entry_key_ordinals: List[Number]
+
+shape YazaDbSecondaryIndexTargetV1:
+    index: YazaDbSecondaryIndexV1
+    entry: YazaDbSqlCreateIndexEntryV1
+    page_id: Number
+    tombstone: Bytes
+
+shape YazaDbSecondaryIndexUpdateV1:
+    old_target: YazaDbSecondaryIndexTargetV1
+    new_entry: YazaDbSqlCreateIndexEntryV1
+
+fn yaza_db_index_maintenance_handles_closed_v1(message: Text) -> Boolean:
+    return text_starts_with(message, "YDBv1 leaf mutation failed; writer handles were closed") or text_starts_with(message, "YDBv1 split write failed; writer handles were closed") or text_starts_with(message, "YDBv1 row insert is durable but pending-row tracking failed; writer handles were closed") or text_starts_with(message, "YDBv1 transaction cannot reserve WAL space to finalize pending rows; writer handles were closed") or text_starts_with(message, "YDBv1 pending-row metadata is inconsistent; recovery is required") or text_starts_with(message, "YDBv1 pending row could not be committed; writer handles were closed")
+
+fn yaza_db_index_maintenance_close_after_error_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, message: Text) -> Unit:
+    if not yaza_db_index_maintenance_handles_closed_v1(message):
+        let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(wal)
+        let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(storage)
+    return
+
+fn yaza_db_index_maintenance_load_v1(storage: YazaDbStorageHandleV1, loaded: YazaDbCatalogSnapshotWithRootsV1, table_index: Number) -> Result[List[YazaDbSecondaryIndexV1], Text]:
+    if table_index < 0 or table_index >= list_count(loaded.sql_snapshot.tables) or table_index >= list_count(loaded.root_page_ids): return err("YDBv1 secondary-index maintenance received an invalid table index")
+    let table: YazaSqlTableSchemaV1 = list_get(loaded.sql_snapshot.tables, table_index)
+    let table_root_page_id: Number = list_get(loaded.root_page_ids, table_index)
+    let catalog: YazaDbCatalogRootV1 = yaza_db_catalog_storage_read_root_v1(storage.file, storage.header)?
+    let primary_key_ordinals: List[Number] = yaza_db_query_clustered_key_ordinals_v1(storage.file, storage.header, catalog, table.table_id, table_root_page_id, loaded.sql_snapshot.version, list_count(table.columns))?
+    let catalog_rows: List[YazaDbRowV1] = yaza_db_index_catalog_rows_v1(storage.file, storage.header, loaded.sql_snapshot.version)?
+    let created: Result[List[YazaDbSecondaryIndexV1], Text] = list_try_new()
+    if not result_is_ok(created): return err(result_unwrap_error(created))
+    let indexes: List[YazaDbSecondaryIndexV1] = result_unwrap(created)
+    var row_index: Number = 0
+    while row_index < list_count(catalog_rows):
+        let row: YazaDbRowV1 = list_get(catalog_rows, row_index)
+        if list_get(row.values, 1).integer_value == table.table_id and list_get(row.values, 4).integer_value == yaza_db_catalog_index_kind_secondary_active_v1():
+            if list_count(indexes) >= 64: return err("YDBv1 table exceeds the bounded 64-active-secondary-index DML profile")
+            let column_text: Text = list_get(row.values, 6).text_value
+            let parsed_column: Result[Number, Text] = number_try_parse(column_text)
+            if not result_is_ok(parsed_column): return err("YDBv1 active secondary-index key metadata is not a canonical column ordinal")
+            let column_ordinal: Number = result_unwrap(parsed_column)
+            if column_ordinal < 0 or column_ordinal >= list_count(table.columns) or number_text(column_ordinal) != column_text: return err("YDBv1 active secondary-index column ordinal is outside the current schema")
+            let plan: YazaSqlCreateIndexPlanV1 = YazaSqlCreateIndexPlanV1(1, loaded.sql_snapshot.version, list_get(row.values, 2).text_value, table.table_id, table.name, list_get(row.values, 5).boolean_value, column_ordinal, table.columns)
+            let entry_columns: List[YazaSqlColumnSchemaV1] = yaza_db_sql_create_index_entry_schema_v1(plan, primary_key_ordinals)?
+            let entry_key_ordinals: List[Number] = yaza_db_sql_create_index_entry_key_ordinals_v1(entry_columns)?
+            if not list_try_push(indexes, YazaDbSecondaryIndexV1(list_get(row.values, 0).integer_value, list_get(row.values, 3).integer_value, plan, primary_key_ordinals, entry_columns, entry_key_ordinals)):
+                return err("YDBv1 secondary-index maintenance could not retain its bounded descriptor")
+        set row_index = row_index + 1
+    return ok(indexes)
+
+fn yaza_db_index_maintenance_entry_v1(values: List[YazaSqlValueV1], nulls: List[Boolean], index: YazaDbSecondaryIndexV1) -> Result[YazaDbSqlCreateIndexEntryV1, Text]:
+    let source_row: YazaDbRowV1 = YazaDbRowV1(1, 0, false, values, nulls, 1, 1, list_count(values), 0, 0, List[YazaDbOverflowRefV1]())
+    return yaza_db_sql_create_index_entry_v1(source_row, index.plan, index.primary_key_ordinals, index.entry_columns, index.entry_key_ordinals)
+
+fn yaza_db_index_maintenance_nulls_v1(values: List[YazaSqlValueV1]) -> Result[List[Boolean], Text]:
+    let created: Result[List[Boolean], Text] = list_try_new()
+    if not result_is_ok(created): return err(result_unwrap_error(created))
+    let nulls: List[Boolean] = result_unwrap(created)
+    if not list_try_reserve(nulls, list_count(values)): return err("YDBv1 secondary-index maintenance could not reserve NULL metadata")
+    var index: Number = 0
+    while index < list_count(values):
+        if not list_try_push(nulls, list_get(values, index).is_null): return err("YDBv1 secondary-index maintenance could not build NULL metadata")
+        set index = index + 1
+    return ok(nulls)
+
+fn yaza_db_index_maintenance_value_equal_v1(left: YazaSqlValueV1, right: YazaSqlValueV1) -> Boolean:
+    if left.type_id != right.type_id: return false
+    if left.type_id == 1: return left.boolean_value == right.boolean_value
+    if left.type_id == 2 or left.type_id == 3 or left.type_id == 4 or left.type_id == 11 or left.type_id == 13 or left.type_id == 14 or left.type_id == 15: return left.integer_value == right.integer_value
+    if left.type_id == 6: return left.float_value == right.float_value
+    if left.type_id == 10: return yaza_sql_decimal_compare_text_v1(left.text_value, right.text_value) == 0
+    if left.type_id == 9 or left.type_id == 12: return left.text_value == right.text_value
+    if left.type_id == 16: return bytes_equal(left.bytes_value, right.bytes_value)
+    return false
+
+fn yaza_db_index_maintenance_value_prefix_v1(entry: YazaDbSqlCreateIndexEntryV1, index: YazaDbSecondaryIndexV1) -> Result[Bytes, Text]:
+    if list_count(entry.values) != list_count(index.entry_columns) or list_count(entry.nulls) != list_count(index.entry_columns) or list_count(entry.values) < 2:
+        return err("YDBv1 unique-index prefix row has an invalid width")
+    let values_result: Result[List[YazaSqlValueV1], Text] = list_try_new()
+    let nulls_result: Result[List[Boolean], Text] = list_try_new()
+    if not result_is_ok(values_result) or not result_is_ok(nulls_result): return err("YDBv1 unique-index prefix could not allocate its typed tuple")
+    let values: List[YazaSqlValueV1] = result_unwrap(values_result)
+    let nulls: List[Boolean] = result_unwrap(nulls_result)
+    if not list_try_reserve(values, list_count(entry.values)) or not list_try_reserve(nulls, list_count(entry.nulls)):
+        return err("YDBv1 unique-index prefix could not reserve its typed tuple")
+    var ordinal: Number = 0
+    while ordinal < list_count(entry.values):
+        if ordinal == 0:
+            if not list_try_push(values, list_get(entry.values, ordinal)) or not list_try_push(nulls, list_get(entry.nulls, ordinal)):
+                return err("YDBv1 unique-index prefix could not copy the indexed value")
+        else:
+            let null_value: YazaSqlValueV1 = yaza_sql_value_null_v1(list_get(index.entry_columns, ordinal).type_id)?
+            if not list_try_push(values, null_value) or not list_try_push(nulls, true): return err("YDBv1 unique-index prefix could not pad its primary-key suffix")
+        set ordinal = ordinal + 1
+    return yaza_db_key_encode_composite_v1(values, nulls, index.entry_columns, [0])
+
+fn yaza_db_index_maintenance_find_entry_v1(file: Number, file_header: YazaDbFileHeaderV1, index: YazaDbSecondaryIndexV1, expected: YazaDbSqlCreateIndexEntryV1) -> Result[YazaDbSecondaryIndexTargetV1, Text]:
+    let seek: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(file, file_header, index.root_page_id, expected.key)?
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(seek.leaf_page, seek.leaf_page_id)?
+    if header.page_type != 1 or header.level != 0: return err("YDBv1 secondary-index lookup did not resolve to a leaf")
+    let slot_index: Number = yaza_db_page_lower_bound_v1(seek.leaf_page, expected.key, seek.leaf_page_id)?
+    if slot_index >= header.count: return err("YDBv1 active secondary index is missing an entry for a visible table row")
+    let stored_key: Bytes = yaza_db_page_slot_key_v1(seek.leaf_page, slot_index, seek.leaf_page_id)?
+    if not bytes_equal(stored_key, expected.key): return err("YDBv1 active secondary index is missing an exact row key")
+    let slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(seek.leaf_page, slot_index, seek.leaf_page_id)?
+    let existing: YazaDbRowV1 = yaza_db_row_decode_for_schema_v1(slot.payload, index.entry_columns, 1)?
+    if existing.deleted or list_count(existing.values) != list_count(expected.values) or list_count(existing.nulls) != list_count(expected.nulls): return err("YDBv1 active secondary-index row is deleted or malformed")
+    var field: Number = 0
+    while field < list_count(expected.values):
+        if list_get(existing.nulls, field) != list_get(expected.nulls, field): return err("YDBv1 active secondary-index payload NULL metadata differs at field " + number_text(field))
+        if not yaza_db_index_maintenance_value_equal_v1(list_get(existing.values, field), list_get(expected.values, field)):
+            return err("YDBv1 active secondary-index payload differs at field " + number_text(field) + " (stored type " + number_text(list_get(existing.values, field).type_id) + ", expected type " + number_text(list_get(expected.values, field).type_id) + ")")
+        set field = field + 1
+    let encoded_key: Bytes = yaza_db_key_encode_composite_v1(existing.values, existing.nulls, index.entry_columns, index.entry_key_ordinals)?
+    if not bytes_equal(encoded_key, expected.key): return err("YDBv1 active secondary-index payload does not reproduce its physical key")
+    let tombstone: Bytes = yaza_db_row_encode_for_schema_v1(existing.values, existing.nulls, index.entry_columns, file_header.next_commit_ts, 1)?
+    let deleted_tombstone: Bytes = yaza_db_row_set_deleted_v1(tombstone, true)?
+    return ok(YazaDbSecondaryIndexTargetV1(index, expected, seek.leaf_page_id, deleted_tombstone))
+
+fn yaza_db_index_maintenance_find_resurrectable_page_v1(file: Number, file_header: YazaDbFileHeaderV1, index: YazaDbSecondaryIndexV1, entry: YazaDbSqlCreateIndexEntryV1) -> Result[Option[Number], Text]:
+    let seek: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(file, file_header, index.root_page_id, entry.key)?
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(seek.leaf_page, seek.leaf_page_id)?
+    let slot_index: Number = yaza_db_page_lower_bound_v1(seek.leaf_page, entry.key, seek.leaf_page_id)?
+    if slot_index < header.count:
+        let stored_key: Bytes = yaza_db_page_slot_key_v1(seek.leaf_page, slot_index, seek.leaf_page_id)?
+        if bytes_equal(stored_key, entry.key):
+            let slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(seek.leaf_page, slot_index, seek.leaf_page_id)?
+            let existing: YazaDbRowV1 = yaza_db_row_decode_for_schema_v1(slot.payload, index.entry_columns, 1)?
+            if not existing.deleted: return err("YDBv1 active secondary index already contains the new row key")
+            if list_count(existing.values) != list_count(entry.values) or list_count(existing.nulls) != list_count(entry.nulls):
+                return err("YDBv1 deleted secondary-index entry column count does not match schema")
+            let existing_key: Bytes = yaza_db_key_encode_composite_v1(existing.values, existing.nulls, index.entry_columns, index.entry_key_ordinals)?
+            if not bytes_equal(existing_key, entry.key): return err("YDBv1 deleted secondary-index entry payload does not match its slot key")
+            return ok(some(seek.leaf_page_id))
+    return ok(none)
+
+fn yaza_db_index_maintenance_verify_insert_absent_v1(file: Number, file_header: YazaDbFileHeaderV1, index: YazaDbSecondaryIndexV1, entry: YazaDbSqlCreateIndexEntryV1) -> Result[Boolean, Text]:
+    let resurrect_page: Option[Number] = yaza_db_index_maintenance_find_resurrectable_page_v1(file, file_header, index, entry)?
+    if not index.plan.is_unique or list_get(entry.nulls, 0): return ok(true)
+    let prefix: Bytes = yaza_db_index_maintenance_value_prefix_v1(entry, index)?
+    let matches: List[YazaDbRowV1] = yaza_db_btree_read_rows_with_key_prefix_v1(file, file_header, index.root_page_id, index.entry_columns, 1, index.entry_key_ordinals, file_header.next_commit_ts - 1, prefix, 65536)?
+    var match_index: Number = 0
+    while match_index < list_count(matches):
+        let candidate: YazaDbRowV1 = list_get(matches, match_index)
+        if not list_get(candidate.nulls, 0) and yaza_db_index_maintenance_value_equal_v1(list_get(candidate.values, 0), list_get(entry.values, 0)):
+            return err("YDBv1 UNIQUE INDEX rejects a duplicate non-NULL value")
+        set match_index = match_index + 1
+    return ok(true)
+
+fn yaza_db_index_maintenance_write_entry_v1(transaction: YazaDbWriteTransactionV1, index: YazaDbSecondaryIndexV1, entry: YazaDbSqlCreateIndexEntryV1) -> Result[YazaDbWriteTransactionV1, Text]:
+    let resurrect_page: Option[Number] = yaza_db_index_maintenance_find_resurrectable_page_v1(transaction.storage.file, transaction.storage.header, index, entry)?
+    if option_is_some(resurrect_page):
+        let live_payload: Bytes = yaza_db_row_encode_for_schema_v1(entry.values, entry.nulls, index.entry_columns, transaction.commit_ts, 1)?
+        return yaza_db_write_transaction_mutate_leaf_v1(transaction, yaza_db_wal_type_leaf_update_v1(), option_unwrap(resurrect_page), entry.key, live_payload)
+    return yaza_db_write_transaction_insert_committed_row_for_schema_v1(transaction, index.root_page_id, entry.values, entry.nulls, index.entry_columns, 1, index.entry_key_ordinals)
+
+fn yaza_db_index_maintenance_insert_row_v1(transaction: YazaDbWriteTransactionV1, indexes: List[YazaDbSecondaryIndexV1], values: List[YazaSqlValueV1], nulls: List[Boolean]) -> Result[YazaDbWriteTransactionV1, Text]:
+    var current: YazaDbWriteTransactionV1 = transaction
+    var index_number: Number = 0
+    while index_number < list_count(indexes):
+        let index: YazaDbSecondaryIndexV1 = list_get(indexes, index_number)
+        let entry: YazaDbSqlCreateIndexEntryV1 = yaza_db_index_maintenance_entry_v1(values, nulls, index)?
+        let inserted: Result[YazaDbWriteTransactionV1, Text] = yaza_db_index_maintenance_write_entry_v1(current, index, entry)
+        if not result_is_ok(inserted):
+            let message: Text = result_unwrap_error(inserted)
+            yaza_db_index_maintenance_close_after_error_v1(current.storage, current.wal, message)
+            return err("YDBv1 active-index writer handles were closed; INSERT requires recovery: " + message)
+        set current = result_unwrap(inserted)
+        set index_number = index_number + 1
+    return ok(current)
+
+fn yaza_db_index_maintenance_delete_entry_v1(transaction: YazaDbWriteTransactionV1, target: YazaDbSecondaryIndexTargetV1) -> Result[YazaDbWriteTransactionV1, Text]:
+    return yaza_db_write_transaction_mutate_leaf_v1(transaction, yaza_db_wal_type_leaf_update_v1(), target.page_id, target.entry.key, target.tombstone)
+
+fn yaza_db_index_maintenance_prepare_update_v1(file: Number, file_header: YazaDbFileHeaderV1, index: YazaDbSecondaryIndexV1, old_values: List[YazaSqlValueV1], old_nulls: List[Boolean], new_values: List[YazaSqlValueV1], new_nulls: List[Boolean]) -> Result[Option[YazaDbSecondaryIndexUpdateV1], Text]:
+    let old_entry: YazaDbSqlCreateIndexEntryV1 = yaza_db_index_maintenance_entry_v1(old_values, old_nulls, index)?
+    let new_entry: YazaDbSqlCreateIndexEntryV1 = yaza_db_index_maintenance_entry_v1(new_values, new_nulls, index)?
+    if bytes_equal(old_entry.key, new_entry.key): return ok(none)
+    let target: YazaDbSecondaryIndexTargetV1 = yaza_db_index_maintenance_find_entry_v1(file, file_header, index, old_entry)?
+    let absent: Boolean = yaza_db_index_maintenance_verify_insert_absent_v1(file, file_header, index, new_entry)?
+    if not absent: return err("YDBv1 UPDATE secondary-index preflight found a duplicate replacement key")
+    return ok(some(YazaDbSecondaryIndexUpdateV1(target, new_entry)))
+
+fn yaza_db_index_maintenance_apply_update_v1(transaction: YazaDbWriteTransactionV1, update: YazaDbSecondaryIndexUpdateV1) -> Result[YazaDbWriteTransactionV1, Text]:
+    let index: YazaDbSecondaryIndexV1 = update.old_target.index
+    let refreshed_target: YazaDbSecondaryIndexTargetV1 = yaza_db_index_maintenance_find_entry_v1(transaction.storage.file, transaction.storage.header, index, update.old_target.entry)?
+    let deleted_result: Result[YazaDbWriteTransactionV1, Text] = yaza_db_index_maintenance_delete_entry_v1(transaction, refreshed_target)
+    if not result_is_ok(deleted_result):
+        let message: Text = result_unwrap_error(deleted_result)
+        yaza_db_index_maintenance_close_after_error_v1(transaction.storage, transaction.wal, message)
+        return err("YDBv1 active-index writer handles were closed; UPDATE requires recovery: " + message)
+    let deleted: YazaDbWriteTransactionV1 = result_unwrap(deleted_result)
+    let inserted: Result[YazaDbWriteTransactionV1, Text] = yaza_db_index_maintenance_write_entry_v1(deleted, index, update.new_entry)
+    if not result_is_ok(inserted):
+        let message: Text = result_unwrap_error(inserted)
+        yaza_db_index_maintenance_close_after_error_v1(deleted.storage, deleted.wal, message)
+        return err("YDBv1 active-index writer handles were closed; UPDATE requires recovery: " + message)
+    return ok(result_unwrap(inserted))

@@ -1,0 +1,359 @@
+# Nonblocking PostgreSQL startup and SCRAM-SHA-256 authentication.
+# Use after a verified TLS connection; all writes and backend frames advance
+# through the cooperative scheduler and share one absolute deadline.
+use "std/task"
+use "async_query"
+use "async_transport"
+use "protocol"
+use "errors"
+use "scram"
+use "transport"
+use "std/security/secret"
+
+shape PgAsyncStartupState:
+    handle: Number
+    token: Number
+    transition: Number
+    deadline_ms: Number
+    phase: Number
+    username: Text
+    password: SecretText
+    authenticated: Boolean
+    saw_scram: Boolean
+    scram_verified: Boolean
+    scram_first: Option[PgScramClientFirst]
+    scram_final: Option[PgScramClientFinal]
+    write_state: Option[PgWriteState]
+    frame_state: Option[PgFrameReadState]
+    frame_count: Number
+
+variant PgAsyncStartupTransition:
+    Progress(state: PgAsyncStartupState)
+    WaitRead(state: PgAsyncStartupState)
+    WaitWrite(state: PgAsyncStartupState)
+    Complete(handle: Number)
+
+variant PgAsyncStartupStep:
+    Progress(state: PgAsyncStartupState)
+    WaitRead(state: PgAsyncStartupState)
+    WaitWrite(state: PgAsyncStartupState)
+    Complete(handle: Number)
+
+# SCRAM proof generation needs a byte buffer for PBKDF2. Copy it atomically
+# from the opaque secret without exposing a Text alias, then wipe the scratch
+# bytes after every proof attempt.
+fn pg_scram_client_final_secret(first: PgScramClientFirst, password: SecretText, server_first: Text) -> Result[PgScramClientFinal, Text]:
+    if not secret_is_valid(password):
+        return err("SCRAM password secret is invalid")
+    let copied: Option[Bytes] = secret_copy_bytes(password)
+    if not option_is_some(copied):
+        return err("SCRAM password secret is invalid")
+    let password_bytes: Bytes = option_unwrap(copied)
+    let result: Result[PgScramClientFinal, Text] = pg_scram_client_final_bytes(first, password_bytes, server_first)
+    let wiped: Number = bytes_zeroize(password_bytes)
+    return result
+
+fn pg_async_startup_state(state: PgAsyncStartupState, phase: Number, write_state: Option[PgWriteState], frame_state: Option[PgFrameReadState], authenticated: Boolean, saw_scram: Boolean, scram_verified: Boolean, scram_first: Option[PgScramClientFirst], scram_final: Option[PgScramClientFinal], frame_count: Number) -> PgAsyncStartupState:
+    return PgAsyncStartupState(state.handle, state.token, state.transition, state.deadline_ms, phase, state.username, state.password, authenticated, saw_scram, scram_verified, scram_first, scram_final, write_state, frame_state, frame_count)
+
+fn pg_async_startup_queue_write(state: PgAsyncStartupState, message: Bytes, authenticated: Boolean, saw_scram: Boolean, scram_verified: Boolean, scram_first: Option[PgScramClientFirst], scram_final: Option[PgScramClientFinal], frame_count: Number) -> Result[PgAsyncStartupState, Text]:
+    let write: Result[PgWriteState, Text] = pg_transport_write_begin_at(state.handle, message, state.deadline_ms)
+    if not result_is_ok(write):
+        return err(result_unwrap_error(write))
+    return ok(pg_async_startup_state(state, 0, some(result_unwrap(write)), none, authenticated, saw_scram, scram_verified, scram_first, scram_final, frame_count))
+
+fn pg_async_startup_queue_frame(state: PgAsyncStartupState, authenticated: Boolean, saw_scram: Boolean, scram_verified: Boolean, scram_first: Option[PgScramClientFirst], scram_final: Option[PgScramClientFinal], frame_count: Number) -> Result[PgAsyncStartupState, Text]:
+    let frame: Result[PgFrameReadState, Text] = pg_transport_read_frame_begin_at(state.handle, state.deadline_ms)
+    if not result_is_ok(frame):
+        return err(result_unwrap_error(frame))
+    return ok(pg_async_startup_state(state, 1, none, some(result_unwrap(frame)), authenticated, saw_scram, scram_verified, scram_first, scram_final, frame_count))
+
+fn pg_startup_async_begin(handle: Number, username: Text, database: Text, password: SecretText, timeout_ms: Number) -> Result[PgAsyncStartupState, Text]:
+    if handle <= 0:
+        let wiped: Boolean = secret_zeroize(password)
+        return err("postgres async startup: socket handle is invalid")
+    if not pg_transport_connection_allowed(handle):
+        let wiped: Boolean = secret_zeroize(password)
+        return err("postgres async startup: verified TLS or explicitly configured loopback plaintext is required")
+    if timeout_ms < 1 or timeout_ms > 3600000:
+        let wiped: Boolean = secret_zeroize(password)
+        return err("postgres async startup: timeout must be between 1 and 3600000 milliseconds")
+    if not secret_is_valid(password):
+        return err("postgres async startup: password secret is invalid")
+    if not secret_at_most(password, 1024):
+        let wiped: Boolean = secret_zeroize(password)
+        return err("postgres async startup: password exceeds the 1024-character limit")
+    # Arm/cap the task timer before taking the operation's absolute deadline.
+    # The operation deadline must be at least as late as the scheduler timer.
+    let capped: Boolean = task_deadline_cap(timeout_ms)
+    let now: Number = monotonic_ms()
+    let max_int64: Number = 9223372036854775 * 1000 + 807
+    if now < 0 or now > max_int64 - timeout_ms:
+        let wiped: Boolean = secret_zeroize(password)
+        return err("postgres async startup: monotonic deadline is unavailable")
+    return pg_startup_async_begin_at(handle, username, database, password, now + timeout_ms)
+
+fn pg_startup_async_begin_at(handle: Number, username: Text, database: Text, password: SecretText, deadline_ms: Number) -> Result[PgAsyncStartupState, Text]:
+    if handle <= 0:
+        let wiped: Boolean = secret_zeroize(password)
+        return err("postgres async startup: socket handle is invalid")
+    if not pg_transport_connection_allowed(handle):
+        let wiped: Boolean = secret_zeroize(password)
+        return err("postgres async startup: verified TLS or explicitly configured loopback plaintext is required")
+    if not secret_is_valid(password):
+        return err("postgres async startup: password secret is invalid")
+    if not secret_at_most(password, 1024):
+        let wiped: Boolean = secret_zeroize(password)
+        return err("postgres async startup: password exceeds the 1024-character limit")
+    let startup: Result[Bytes, Text] = pg_startup_packet(username, database)
+    if not result_is_ok(startup):
+        let wiped: Boolean = secret_zeroize(password)
+        return err(result_unwrap_error(startup))
+    let now: Number = monotonic_ms()
+    if now < 0 or deadline_ms <= now or deadline_ms - now > 3600000:
+        let wiped: Boolean = secret_zeroize(password)
+        return err("postgres async startup: absolute deadline is expired or exceeds one hour")
+    let write: Result[PgWriteState, Text] = pg_transport_write_begin_at(handle, result_unwrap(startup), deadline_ms)
+    if not result_is_ok(write):
+        let wiped: Boolean = secret_zeroize(password)
+        return err(result_unwrap_error(write))
+    let registered: Result[Number, Text] = pg_async_state_register_native(handle, deadline_ms)
+    if not result_is_ok(registered):
+        let closed: Number = net_close(handle)
+        let wiped: Boolean = secret_zeroize(password)
+        return err(result_unwrap_error(registered))
+    return ok(PgAsyncStartupState(handle, result_unwrap(registered), 1, deadline_ms, 0, username, password, false, false, false, none, none, some(result_unwrap(write)), none, 0))
+
+fn pg_async_startup_after_write(state: PgAsyncStartupState, stepped: PgWriteStep) -> Result[PgAsyncStartupTransition, Text]:
+    match stepped:
+        Progress(next_write):
+            let next: PgAsyncStartupState = pg_async_startup_state(state, 0, some(next_write), none, state.authenticated, state.saw_scram, state.scram_verified, state.scram_first, state.scram_final, state.frame_count)
+            return ok(PgAsyncStartupTransition::Progress(next))
+        WaitRead(read_wait):
+            let next: PgAsyncStartupState = pg_async_startup_state(state, 0, some(read_wait), none, state.authenticated, state.saw_scram, state.scram_verified, state.scram_first, state.scram_final, state.frame_count)
+            return ok(PgAsyncStartupTransition::WaitRead(next))
+        WaitWrite(write_wait):
+            let next: PgAsyncStartupState = pg_async_startup_state(state, 0, some(write_wait), none, state.authenticated, state.saw_scram, state.scram_verified, state.scram_first, state.scram_final, state.frame_count)
+            return ok(PgAsyncStartupTransition::WaitWrite(next))
+        Complete:
+            let next_frame: Result[PgAsyncStartupState, Text] = pg_async_startup_queue_frame(state, state.authenticated, state.saw_scram, state.scram_verified, state.scram_first, state.scram_final, state.frame_count)
+            if not result_is_ok(next_frame):
+                return err(result_unwrap_error(next_frame))
+            return ok(PgAsyncStartupTransition::Progress(result_unwrap(next_frame)))
+
+fn pg_async_startup_process_frame(state: PgAsyncStartupState, frame: PgBackendFrame) -> Result[PgAsyncStartupTransition, Text]:
+    if state.frame_count >= 255:
+        return err("postgres async startup: authentication exceeded the 256-frame limit")
+    let next_count: Number = state.frame_count + 1
+    if frame.tag == 82:
+        let parsed: Result[PgAuthentication, Text] = pg_parse_authentication(frame)
+        if not result_is_ok(parsed):
+            return err(result_unwrap_error(parsed))
+        match result_unwrap(parsed):
+            Accepted:
+                if state.authenticated:
+                    return err("postgres async startup: duplicate AuthenticationOk message")
+                let next: Result[PgAsyncStartupState, Text] = pg_async_startup_queue_frame(state, true, state.saw_scram, state.scram_verified, state.scram_first, state.scram_final, next_count)
+                if not result_is_ok(next):
+                    return err(result_unwrap_error(next))
+                return ok(PgAsyncStartupTransition::Progress(result_unwrap(next)))
+            CleartextPassword:
+                return err("postgres async startup: cleartext password authentication is unsupported")
+            Md5Password(salt):
+                return err("postgres async startup: MD5 password authentication is unsupported")
+            Sasl(mechanisms):
+                if state.saw_scram or not pg_transport_has_scram_sha256(mechanisms):
+                    return err("postgres async startup: server does not offer supported SCRAM-SHA-256 authentication")
+                let first_result: Result[PgScramClientFirst, Text] = pg_scram_client_first(state.username)
+                if not result_is_ok(first_result):
+                    return err(result_unwrap_error(first_result))
+                let first: PgScramClientFirst = result_unwrap(first_result)
+                let initial: Result[Bytes, Text] = pg_scram_initial_message(first)
+                if not result_is_ok(initial):
+                    return err(result_unwrap_error(initial))
+                let next: Result[PgAsyncStartupState, Text] = pg_async_startup_queue_write(state, result_unwrap(initial), state.authenticated, true, state.scram_verified, some(first), state.scram_final, next_count)
+                if not result_is_ok(next):
+                    return err(result_unwrap_error(next))
+                return ok(PgAsyncStartupTransition::Progress(result_unwrap(next)))
+            SaslContinue(data):
+                if not option_is_some(state.scram_first) or option_is_some(state.scram_final):
+                    return err("postgres async startup: unexpected SCRAM continuation")
+                let server_first: Option[Text] = bytes_to_text_checked(data)
+                if not option_is_some(server_first):
+                    return err("postgres async startup: SCRAM server-first message is not valid UTF-8")
+                let final_result: Result[PgScramClientFinal, Text] = pg_scram_client_final_secret(option_unwrap(state.scram_first), state.password, option_unwrap(server_first))
+                if not result_is_ok(final_result):
+                    return err(result_unwrap_error(final_result))
+                let final_message: PgScramClientFinal = result_unwrap(final_result)
+                let continue_message: Result[Bytes, Text] = pg_scram_continue_message(final_message)
+                if not result_is_ok(continue_message):
+                    return err(result_unwrap_error(continue_message))
+                let next: Result[PgAsyncStartupState, Text] = pg_async_startup_queue_write(state, result_unwrap(continue_message), state.authenticated, state.saw_scram, state.scram_verified, state.scram_first, some(final_message), next_count)
+                if not result_is_ok(next):
+                    return err(result_unwrap_error(next))
+                return ok(PgAsyncStartupTransition::Progress(result_unwrap(next)))
+            SaslFinal(data):
+                if not option_is_some(state.scram_final) or state.scram_verified:
+                    return err("postgres async startup: unexpected SCRAM final message")
+                let server_final: Option[Text] = bytes_to_text_checked(data)
+                if not option_is_some(server_final):
+                    return err("postgres async startup: SCRAM server-final message is not valid UTF-8")
+                let verified: Result[Boolean, Text] = pg_scram_verify_server_final(option_unwrap(state.scram_final), option_unwrap(server_final))
+                if not result_is_ok(verified):
+                    return err(result_unwrap_error(verified))
+                let next: Result[PgAsyncStartupState, Text] = pg_async_startup_queue_frame(state, state.authenticated, state.saw_scram, true, state.scram_first, state.scram_final, next_count)
+                if not result_is_ok(next):
+                    return err(result_unwrap_error(next))
+                return ok(PgAsyncStartupTransition::Progress(result_unwrap(next)))
+            Unsupported(code):
+                return err("postgres async startup: unsupported authentication method " + number_text(code))
+    if frame.tag == 69:
+        let server_error: Result[PgServerError, Text] = pg_parse_error_response(frame)
+        if not result_is_ok(server_error):
+            return err(result_unwrap_error(server_error))
+        let details: PgServerError = result_unwrap(server_error)
+        return err(pg_server_error_internal_text(details))
+    if frame.tag == 83:
+        let parameter: Result[PgParameterStatus, Text] = pg_parse_parameter_status(frame)
+        if not result_is_ok(parameter):
+            return err(result_unwrap_error(parameter))
+    else:
+        if frame.tag == 75:
+            let key: Result[PgBackendKeyData, Text] = pg_parse_backend_key_data(frame)
+            if not result_is_ok(key):
+                return err(result_unwrap_error(key))
+            if not pg_transport_register_cancel_key(state.handle, result_unwrap(key)):
+                return err("postgres async startup: backend cancellation key could not be registered")
+        else:
+            if frame.tag == 90:
+                let ready: Result[PgTransactionStatus, Text] = pg_parse_ready_for_query(frame)
+                if not result_is_ok(ready):
+                    return err(result_unwrap_error(ready))
+                if not state.authenticated or (state.saw_scram and not state.scram_verified):
+                    return err("postgres async startup: server became ready before authentication completed")
+                match result_unwrap(ready):
+                    Idle:
+                        return ok(PgAsyncStartupTransition::Complete(state.handle))
+                    InTransaction:
+                        return err("postgres async startup: new connection entered a transaction unexpectedly")
+                    FailedTransaction:
+                        return err("postgres async startup: new connection entered a failed transaction unexpectedly")
+            if frame.tag == 78:
+                let notice: Result[PgServerError, Text] = pg_parse_error_response(PgBackendFrame(69, frame.payload))
+                if not result_is_ok(notice):
+                    return err(result_unwrap_error(notice))
+            else:
+                return err("postgres async startup: unexpected backend frame during authentication")
+    let next: Result[PgAsyncStartupState, Text] = pg_async_startup_queue_frame(state, state.authenticated, state.saw_scram, state.scram_verified, state.scram_first, state.scram_final, next_count)
+    if not result_is_ok(next):
+        return err(result_unwrap_error(next))
+    return ok(PgAsyncStartupTransition::Progress(result_unwrap(next)))
+
+fn pg_async_startup_after_frame(state: PgAsyncStartupState, stepped: PgFrameReadStep) -> Result[PgAsyncStartupTransition, Text]:
+    match stepped:
+        Progress(next_frame):
+            let next: PgAsyncStartupState = pg_async_startup_state(state, 1, none, some(next_frame), state.authenticated, state.saw_scram, state.scram_verified, state.scram_first, state.scram_final, state.frame_count)
+            return ok(PgAsyncStartupTransition::Progress(next))
+        WaitRead(read_wait):
+            let next: PgAsyncStartupState = pg_async_startup_state(state, 1, none, some(read_wait), state.authenticated, state.saw_scram, state.scram_verified, state.scram_first, state.scram_final, state.frame_count)
+            return ok(PgAsyncStartupTransition::WaitRead(next))
+        WaitWrite(write_wait):
+            let next: PgAsyncStartupState = pg_async_startup_state(state, 1, none, some(write_wait), state.authenticated, state.saw_scram, state.scram_verified, state.scram_first, state.scram_final, state.frame_count)
+            return ok(PgAsyncStartupTransition::WaitWrite(next))
+        Complete(frame):
+            return pg_async_startup_process_frame(state, frame)
+
+fn pg_async_startup_step_apply(state: PgAsyncStartupState) -> Result[PgAsyncStartupTransition, Text]:
+    if state.handle <= 0 or state.token <= 0 or state.transition <= 0 or state.deadline_ms <= 0 or (state.phase != 0 and state.phase != 1) or text_length(state.username) == 0 or not secret_is_valid(state.password) or state.frame_count < 0 or state.frame_count > 255:
+        return err("postgres async startup: continuation state is malformed")
+    if (state.phase == 0 and (not option_is_some(state.write_state) or option_is_some(state.frame_state))) or (state.phase == 1 and (option_is_some(state.write_state) or not option_is_some(state.frame_state))):
+        return err("postgres async startup: continuation phase does not match its transport state")
+    if task_or_request_cancelled():
+        return err("postgres async startup: operation was cancelled")
+    if task_deadline_expired():
+        return err("postgres async startup: scheduler task deadline expired")
+    let now: Number = monotonic_ms()
+    if now < 0 or now >= state.deadline_ms:
+        return err("postgres async startup: operation timed out")
+    if state.deadline_ms - now > 3600000:
+        return err("postgres async startup: operation deadline exceeds one hour")
+    if state.phase == 0:
+        let stepped: Result[PgWriteStep, Text] = pg_transport_write_step(option_unwrap(state.write_state))
+        if not result_is_ok(stepped):
+            return err(result_unwrap_error(stepped))
+        return pg_async_startup_after_write(state, result_unwrap(stepped))
+    let stepped_frame: Result[PgFrameReadStep, Text] = pg_transport_read_frame_step(option_unwrap(state.frame_state))
+    if not result_is_ok(stepped_frame):
+        return err(result_unwrap_error(stepped_frame))
+    return pg_async_startup_after_frame(state, result_unwrap(stepped_frame))
+
+fn pg_async_startup_commit(original: PgAsyncStartupState, updated: PgAsyncStartupState) -> Result[PgAsyncStartupState, Text]:
+    let advanced: Result[Number, Text] = pg_async_state_advance_native(original.token, original.transition)
+    if not result_is_ok(advanced):
+        let released: Boolean = pg_async_state_release_native(original.token)
+        let closed: Number = net_close(original.handle)
+        let wiped: Boolean = secret_zeroize(original.password)
+        return err(result_unwrap_error(advanced))
+    return ok(PgAsyncStartupState(updated.handle, updated.token, result_unwrap(advanced), updated.deadline_ms, updated.phase, updated.username, updated.password, updated.authenticated, updated.saw_scram, updated.scram_verified, updated.scram_first, updated.scram_final, updated.write_state, updated.frame_state, updated.frame_count))
+
+fn pg_startup_async_step(state: PgAsyncStartupState) -> Result[PgAsyncStartupStep, Text]:
+    let claimed: Result[Boolean, Text] = pg_async_state_claim_native(state.handle, state.token, state.transition, state.deadline_ms)
+    if not result_is_ok(claimed):
+        let wiped: Boolean = secret_zeroize(state.password)
+        if result_unwrap_error(claimed) == "postgres async query: continuation expired":
+            let closed: Number = net_close(state.handle)
+            return err("postgres async startup: operation timed out")
+        return err(result_unwrap_error(claimed))
+    let stepped: Result[PgAsyncStartupTransition, Text] = pg_async_startup_step_apply(state)
+    if not result_is_ok(stepped):
+        let released: Boolean = pg_async_state_release_native(state.token)
+        let closed: Number = net_close(state.handle)
+        let wiped: Boolean = secret_zeroize(state.password)
+        return err(result_unwrap_error(stepped))
+    match result_unwrap(stepped):
+        Progress(next):
+            let committed: Result[PgAsyncStartupState, Text] = pg_async_startup_commit(state, next)
+            if not result_is_ok(committed):
+                return err(result_unwrap_error(committed))
+            return ok(PgAsyncStartupStep::Progress(result_unwrap(committed)))
+        WaitRead(next):
+            let committed: Result[PgAsyncStartupState, Text] = pg_async_startup_commit(state, next)
+            if not result_is_ok(committed):
+                return err(result_unwrap_error(committed))
+            return ok(PgAsyncStartupStep::WaitRead(result_unwrap(committed)))
+        WaitWrite(next):
+            let committed: Result[PgAsyncStartupState, Text] = pg_async_startup_commit(state, next)
+            if not result_is_ok(committed):
+                return err(result_unwrap_error(committed))
+            return ok(PgAsyncStartupStep::WaitWrite(result_unwrap(committed)))
+        Complete(handle):
+            if not pg_async_state_release_native(state.token):
+                let closed: Number = net_close(handle)
+                let wiped: Boolean = secret_zeroize(state.password)
+                return err("postgres async startup: completed continuation could not be released")
+            let wiped: Boolean = secret_zeroize(state.password)
+            return ok(PgAsyncStartupStep::Complete(handle))
+
+fn pg_startup_async_wait(state: PgAsyncStartupState, writable: Boolean) -> Result[Boolean, Text]:
+    let now: Number = monotonic_ms()
+    if now < 0 or now >= state.deadline_ms:
+        let closed: Number = net_close(state.handle)
+        let wiped: Boolean = secret_zeroize(state.password)
+        return err("postgres async startup: operation timed out before readiness wait")
+    let waiting: Result[Boolean, Text] = pg_async_state_wait_native(state.handle, state.token, state.transition, state.deadline_ms, writable)
+    if not result_is_ok(waiting):
+        let wiped: Boolean = secret_zeroize(state.password)
+    return waiting
+
+fn pg_startup_async_cancel(state: PgAsyncStartupState) -> Boolean:
+    let claimed: Result[Boolean, Text] = pg_async_state_claim_native(state.handle, state.token, state.transition, state.deadline_ms)
+    if not result_is_ok(claimed):
+        let wiped: Boolean = secret_zeroize(state.password)
+        return false
+    let released: Boolean = pg_async_state_release_native(state.token)
+    if not released:
+        let closed: Number = net_close(state.handle)
+        let wiped: Boolean = secret_zeroize(state.password)
+        return false
+    let wiped: Boolean = secret_zeroize(state.password)
+    return net_close(state.handle) >= 0

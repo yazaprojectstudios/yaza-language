@@ -1,0 +1,1435 @@
+# YazaBase database administration entry point, invoked by yaza-llvm db.
+use "std/fs"
+use "std/csv"
+use "std/convert"
+use "../yazabase/backup_v1"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/checkpoint_v1"
+use "../yazabase/query_page_v1"
+use "../yazabase/session_v1"
+use "../yazabase/sql_dispatch_v1"
+use "../yazabase/sql_decimal_v1"
+use "../yazabase/sql_date_v1"
+use "../yazabase/sql_uuid_v1"
+use "../yazabase/sql_temporal_v1"
+use "../yazabase/sql_executor_v1"
+use "../yazabase/transaction_v1"
+use "../yazabase/api_v1"
+use "std/config/api_config"
+use "std/db/yazabase"
+
+shape YazaCliSqlBatchEntryV1:
+    source: Text
+    parameters: List[YazaSqlValueV1]
+
+shape YazaCliSqlTypeDescriptorV1:
+    type_id: Number
+    precision: Number
+    scale: Number
+
+shape YazaCliSessionRequestV1:
+    kind: Number
+    entry: YazaCliSqlBatchEntryV1
+    page_size: Number
+    continuation: Option[YazaDbQueryPageTokenV1]
+
+fn yaza_cli_db_init_v1(root_path: Text, database_name: Text) -> Number:
+    let root_result: Result[Number, Text] = root_open(root_path)
+    if not result_is_ok(root_result):
+        say "YazaBase: could not open database directory: " + result_unwrap_error(root_result)
+        return 1
+    let root: Number = result_unwrap(root_result)
+
+    let database_result: Result[YazaDbCatalogBootstrapV1, Text] = yaza_db_catalog_create_v1(root, database_name)
+    if not result_is_ok(database_result):
+        let root_closed: Result[Boolean, Text] = close(root)
+        say "YazaBase: database initialization failed: " + result_unwrap_error(database_result)
+        if not result_is_ok(root_closed): say "YazaBase: could not close database directory: " + result_unwrap_error(root_closed)
+        return 1
+
+    let database: YazaDbCatalogBootstrapV1 = result_unwrap(database_result)
+    let wal_closed: Result[Boolean, Text] = yaza_db_wal_log_close_v1(database.wal)
+    let storage_closed: Result[Boolean, Text] = yaza_db_storage_close_v1(database.storage)
+    let root_closed: Result[Boolean, Text] = close(root)
+    if not result_is_ok(wal_closed):
+        say "YazaBase: database is initialized, but WAL close failed: " + result_unwrap_error(wal_closed)
+        return 1
+    if not result_unwrap(wal_closed):
+        say "YazaBase: database is initialized, but WAL close did not release its handle"
+        return 1
+    if not result_is_ok(storage_closed):
+        say "YazaBase: database is initialized, but storage close failed: " + result_unwrap_error(storage_closed)
+        return 1
+    if not result_unwrap(storage_closed):
+        say "YazaBase: database is initialized, but storage close did not release its locks"
+        return 1
+    if not result_is_ok(root_closed):
+        say "YazaBase: database is initialized, but directory close failed: " + result_unwrap_error(root_closed)
+        return 1
+    if not result_unwrap(root_closed):
+        say "YazaBase: database is initialized, but directory close did not release its handle"
+        return 1
+    say "Created YazaBase database '" + database_name + "' in '" + root_path + "'"
+    return 0
+
+fn yaza_cli_db_backup_restore_v1(operation: Text, source_path: Text, database_name: Text, destination_path: Text) -> Number:
+    let source_result: Result[Number, Text] = root_open(source_path)
+    if not result_is_ok(source_result):
+        say "YazaBase: could not open source directory: " + result_unwrap_error(source_result)
+        return 1
+    let source_root: Number = result_unwrap(source_result)
+    let destination_result: Result[Number, Text] = root_open(destination_path)
+    if not result_is_ok(destination_result):
+        let ignored_source_close: Result[Boolean, Text] = close(source_root)
+        say "YazaBase: could not open destination directory: " + result_unwrap_error(destination_result)
+        return 1
+    let destination_root: Number = result_unwrap(destination_result)
+    let copied: Result[YazaDbBackupReportV1, Text] = yaza_db_backup_v1(source_root, database_name, destination_root)
+    let destination_closed: Result[Boolean, Text] = close(destination_root)
+    let source_closed: Result[Boolean, Text] = close(source_root)
+    if not result_is_ok(copied):
+        say "YazaBase " + operation + " failed: " + result_unwrap_error(copied)
+        return 1
+    if not result_is_ok(destination_closed) or not result_is_ok(source_closed):
+        say "YazaBase " + operation + " copied the database, but a directory handle failed to close"
+        return 1
+    if not result_unwrap(destination_closed) or not result_unwrap(source_closed):
+        say "YazaBase " + operation + " copied the database, but a directory handle remained open"
+        return 1
+    let report: YazaDbBackupReportV1 = result_unwrap(copied)
+    if operation == "restore":
+        say "Restored YazaBase database '" + database_name + "': " + number_text(report.file_count) + " files, " + number_text(report.wal_segment_count) + " WAL segments, " + number_text(report.bytes_copied) + " bytes"
+    else:
+        say "Backed up YazaBase database '" + database_name + "': " + number_text(report.file_count) + " files, " + number_text(report.wal_segment_count) + " WAL segments, " + number_text(report.bytes_copied) + " bytes"
+    return 0
+
+fn yaza_cli_sql_value_text_v1(value: YazaSqlValueV1) -> Text:
+    if value.is_null: return "NULL"
+    if value.type_id == 1:
+        if value.boolean_value: return "TRUE"
+        return "FALSE"
+    if value.type_id == 2 or value.type_id == 3 or value.type_id == 4: return number_text(value.integer_value)
+    if value.type_id == 6: return float64_text(value.float_value)
+    if value.type_id == 10: return value.text_value
+    if value.type_id == 9: return value.text_value
+    if value.type_id == 11: return value.text_value
+    if value.type_id == 12: return value.text_value
+    if value.type_id == 13 or value.type_id == 14 or value.type_id == 15: return value.text_value
+    if value.type_id == 16: return "<BLOB " + number_text(bytes_length(value.bytes_value)) + " bytes>"
+    return "<unsupported-type>"
+
+fn yaza_cli_sql_csv_value_v1(value: YazaSqlValueV1) -> Result[Text, Text]:
+    if value.is_null: return ok("\\N")
+    if value.type_id == 9:
+        if text_compare(value.text_value, "\\N") == 0: return ok("\"\\N\"")
+        return csv_encode_field(value.text_value)
+    if value.type_id == 16:
+        let encoded: Result[Text, Text] = convert_try_hex_encode(value.bytes_value)
+        if not result_is_ok(encoded): return err("YazaBase could not encode a BLOB result as hexadecimal")
+        return text_try_concat("X'" + result_unwrap(encoded) + "'", "")
+    return ok(yaza_cli_sql_value_text_v1(value))
+
+fn yaza_cli_sql_type_id_v1(type_name: Text) -> Number:
+    if type_name == "boolean": return 1
+    if type_name == "smallint": return 2
+    if type_name == "integer": return 3
+    if type_name == "bigint": return 4
+    if type_name == "double": return 6
+    if type_name == "text": return 9
+    if type_name == "blob" or type_name == "bytes": return 16
+    if type_name == "date": return 11
+    if type_name == "uuid": return 12
+    if type_name == "time": return 13
+    if type_name == "timestamp": return 14
+    if type_name == "timestamptz" or type_name == "timestamp with time zone": return 15
+    return -1
+
+fn yaza_cli_sql_parse_decimal_dimension_v1(source: Text) -> Result[Number, Text]:
+    if text_length(source) < 1 or text_length(source) > 2: return err("DECIMAL precision and scale must use one or two decimal digits")
+    var value: Number = 0
+    var cursor: Number = 0
+    while cursor < text_length(source):
+        let byte: Number = text_byte(source, cursor)
+        if byte < 48 or byte > 57: return err("DECIMAL precision and scale must contain decimal digits only")
+        set value = value * 10 + byte - 48
+        set cursor = cursor + 1
+    return ok(value)
+
+fn yaza_cli_sql_type_descriptor_v1(type_name: Text) -> Result[YazaCliSqlTypeDescriptorV1, Text]:
+    let ordinary_type_id: Number = yaza_cli_sql_type_id_v1(type_name)
+    if ordinary_type_id >= 0: return ok(YazaCliSqlTypeDescriptorV1(ordinary_type_id, 0, 0))
+    if text_length(type_name) < 12 or text_slice(type_name, 0, 8) != "decimal(" or text_byte(type_name, text_length(type_name) - 1) != 41:
+        return err("unsupported SQL bind type")
+    let content_length: Number = text_length(type_name) - 9
+    var comma: Number = 8
+    while comma < 8 + content_length and text_byte(type_name, comma) != 44:
+        set comma = comma + 1
+    if comma <= 8 or comma >= text_length(type_name) - 2: return err("DECIMAL bind type must use decimal(precision,scale)")
+    let precision_text: Text = text_slice(type_name, 8, comma - 8)
+    let scale_text: Text = text_slice(type_name, comma + 1, text_length(type_name) - comma - 2)
+    let precision_result: Result[Number, Text] = yaza_cli_sql_parse_decimal_dimension_v1(precision_text)
+    let scale_result: Result[Number, Text] = yaza_cli_sql_parse_decimal_dimension_v1(scale_text)
+    if not result_is_ok(precision_result) or not result_is_ok(scale_result): return err("DECIMAL bind type has invalid precision or scale")
+    let precision: Number = result_unwrap(precision_result)
+    let scale: Number = result_unwrap(scale_result)
+    if not yaza_sql_decimal_parameters_valid_v1(precision, scale): return err("DECIMAL bind precision must be 1..38 and scale must be 0..precision")
+    return ok(YazaCliSqlTypeDescriptorV1(10, precision, scale))
+
+fn yaza_cli_sql_parse_parameter_v1(encoded: Text) -> Result[YazaSqlValueV1, Text]:
+    if text_length(encoded) > 65544: return err("YazaBase: a CLI bind parameter exceeds the 64 KiB value limit")
+    var separator: Number = 0
+    while separator < text_length(encoded) and text_byte(encoded, separator) != 58:
+        set separator = separator + 1
+    if separator == 0 or separator >= text_length(encoded): return err("YazaBase: bind parameters must use type:value syntax")
+    let type_name: Text = text_slice(encoded, 0, separator)
+    let raw_value: Text = text_slice(encoded, separator + 1, text_length(encoded) - separator - 1)
+    if type_name == "null":
+        let null_descriptor: Result[YazaCliSqlTypeDescriptorV1, Text] = yaza_cli_sql_type_descriptor_v1(raw_value)
+        if not result_is_ok(null_descriptor): return err("YazaBase: NULL bind parameter type must be a supported scalar type, including date, uuid, time, timestamp, timestamptz, and decimal(precision,scale)")
+        return yaza_sql_value_null_v1(result_unwrap(null_descriptor).type_id)
+    let descriptor_result: Result[YazaCliSqlTypeDescriptorV1, Text] = yaza_cli_sql_type_descriptor_v1(type_name)
+    if not result_is_ok(descriptor_result): return err("YazaBase: bind parameter type must be boolean, smallint, integer, bigint, double, text, date, uuid, time, timestamp, timestamptz, decimal(precision,scale), or null:<type>")
+    let descriptor: YazaCliSqlTypeDescriptorV1 = result_unwrap(descriptor_result)
+    let type_id: Number = descriptor.type_id
+    if type_id == 2 or type_id == 3 or type_id == 4:
+        let parsed_integer: Result[Number, Text] = number_try_parse(raw_value)
+        if not result_is_ok(parsed_integer): return err("YazaBase: integer bind parameter is invalid or out of range")
+        return yaza_sql_value_integer_v1(type_id, result_unwrap(parsed_integer))
+    if type_id == 6:
+        let parsed_double: Result[Float64, Text] = float64_try_parse(raw_value)
+        if not result_is_ok(parsed_double): return err("YazaBase: DOUBLE bind parameter is invalid or out of range")
+        return ok(yaza_sql_value_double_v1(result_unwrap(parsed_double)))
+    if type_id == 10:
+        let parsed_decimal: Result[YazaSqlDecimalV1, Text] = yaza_sql_decimal_parse_v1(raw_value, descriptor.precision, descriptor.scale)
+        if not result_is_ok(parsed_decimal): return err("YazaBase: DECIMAL bind value is invalid, inexact at its declared scale, or out of range")
+        return yaza_sql_value_decimal_v1(result_unwrap(parsed_decimal))
+    if type_id == 11:
+        let parsed_date: Number = yaza_sql_date_parse_v1(raw_value)?
+        return yaza_sql_value_integer_v1(11, parsed_date)
+    if type_id == 12:
+        return yaza_sql_value_uuid_v1(raw_value)
+    if type_id == 13:
+        let parsed_time: Number = yaza_sql_time_parse_v1(raw_value)?
+        return yaza_sql_value_integer_v1(13, parsed_time)
+    if type_id == 14:
+        let parsed_timestamp: Number = yaza_sql_timestamp_parse_v1(raw_value)?
+        return yaza_sql_value_integer_v1(14, parsed_timestamp)
+    if type_id == 15:
+        let parsed_timestamptz: Number = yaza_sql_timestamptz_parse_v1(raw_value)?
+        return yaza_sql_value_integer_v1(15, parsed_timestamptz)
+    if type_id == 16:
+        if text_length(raw_value) % 2 != 0: return err("YazaBase: BLOB bind value must contain an even number of hexadecimal digits")
+        if text_length(raw_value) > 65536: return err("YazaBase: BLOB bind value exceeds the 32 KiB CLI bind limit")
+        let parsed_blob: Result[Bytes, Text] = convert_try_hex_decode(raw_value)
+        if not result_is_ok(parsed_blob): return err("YazaBase: BLOB bind value contains invalid hexadecimal data")
+        return yaza_sql_value_blob_v1(result_unwrap(parsed_blob))
+    if type_id == 1:
+        if raw_value == "true": return ok(yaza_sql_value_boolean_v1(true))
+        if raw_value == "false": return ok(yaza_sql_value_boolean_v1(false))
+        return err("YazaBase: BOOLEAN bind parameter must be lowercase true or false")
+    if text_length(raw_value) > yaza_sql_executor_max_text_value_bytes_v1(): return err("YazaBase: Text bind parameter exceeds the 64 KiB value limit")
+    return ok(yaza_sql_value_text_v1(raw_value))
+
+fn yaza_cli_sql_parse_parameters_v1(first_parameter_arg: Number) -> Result[List[YazaSqlValueV1], Text]:
+    let created: Result[List[YazaSqlValueV1], Text] = list_try_new()
+    if not result_is_ok(created): return err("YazaBase: could not allocate CLI bind parameters")
+    let parameters: List[YazaSqlValueV1] = result_unwrap(created)
+    var argument_index: Number = first_parameter_arg
+    while argument_index <= arg_count():
+        if arg(argument_index) != "--param" or argument_index + 1 > arg_count(): return err("YazaBase: expected repeated --param type:value options after the SQL statement")
+        if list_count(parameters) >= 4096: return err("YazaBase: CLI bind parameter count exceeds 4096")
+        let parsed: Result[YazaSqlValueV1, Text] = yaza_cli_sql_parse_parameter_v1(arg(argument_index + 1))
+        if not result_is_ok(parsed): return err(result_unwrap_error(parsed))
+        if not list_try_push(parameters, result_unwrap(parsed)): return err("YazaBase: could not append a CLI bind parameter")
+        set argument_index = argument_index + 2
+    return ok(parameters)
+
+fn yaza_cli_sql_parse_batch_v1(first_argument: Number) -> Result[List[YazaCliSqlBatchEntryV1], Text]:
+    let entries_result: Result[List[YazaCliSqlBatchEntryV1], Text] = list_try_new()
+    if not result_is_ok(entries_result): return err("YazaBase: could not allocate SQL batch entries")
+    let entries: List[YazaCliSqlBatchEntryV1] = result_unwrap(entries_result)
+    var argument_index: Number = first_argument
+    var total_argument_bytes: Number = 0
+    var total_parameter_count: Number = 0
+    while argument_index <= arg_count():
+        if arg(argument_index) != "--statement" or argument_index + 1 > arg_count(): return err("YazaBase: SQL batch expects repeated --statement <sql> groups")
+        if list_count(entries) >= 100: return err("YazaBase: SQL batch exceeds the 100-statement bound")
+        let source: Text = arg(argument_index + 1)
+        let source_bytes: Number = text_length(source)
+        if source_bytes <= 0 or source_bytes > 65536 or total_argument_bytes > 262144 - source_bytes: return err("YazaBase: SQL batch source exceeds its bounded command-size profile")
+        set total_argument_bytes = total_argument_bytes + source_bytes
+        let tokens_result: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(source)
+        if not result_is_ok(tokens_result): return err("YazaBase: SQL batch could not tokenize a statement: " + result_unwrap_error(tokens_result))
+        let tokens: List[YazaSqlTokenV1] = result_unwrap(tokens_result)
+        if list_count(tokens) < 2: return err("YazaBase: SQL batch statement is empty or incomplete")
+        if not yaza_sql_v2_is_keyword(source, tokens, 0, "INSERT") and not yaza_sql_v2_is_keyword(source, tokens, 0, "UPDATE") and not yaza_sql_v2_is_keyword(source, tokens, 0, "DELETE"):
+            return err("YazaBase: SQL batch accepts only INSERT, UPDATE, and DELETE statements")
+        let parameters_result: Result[List[YazaSqlValueV1], Text] = list_try_new()
+        if not result_is_ok(parameters_result): return err("YazaBase: could not allocate SQL batch parameters")
+        let parameters: List[YazaSqlValueV1] = result_unwrap(parameters_result)
+        set argument_index = argument_index + 2
+        while argument_index <= arg_count() and arg(argument_index) == "--param":
+            if argument_index + 1 > arg_count(): return err("YazaBase: SQL batch --param is missing its type:value argument")
+            let encoded: Text = arg(argument_index + 1)
+            let encoded_bytes: Number = text_length(encoded)
+            if encoded_bytes > 65544 or total_argument_bytes > 262144 - encoded_bytes: return err("YazaBase: SQL batch bind values exceed the bounded command-size profile")
+            if total_parameter_count >= 4096: return err("YazaBase: SQL batch exceeds the 4096-parameter bound")
+            let parsed: Result[YazaSqlValueV1, Text] = yaza_cli_sql_parse_parameter_v1(encoded)
+            if not result_is_ok(parsed): return err(result_unwrap_error(parsed))
+            if not list_try_push(parameters, result_unwrap(parsed)): return err("YazaBase: could not append a SQL batch parameter")
+            set total_parameter_count = total_parameter_count + 1
+            set total_argument_bytes = total_argument_bytes + encoded_bytes
+            set argument_index = argument_index + 2
+        if argument_index <= arg_count() and arg(argument_index) != "--statement": return err("YazaBase: SQL batch expected --param or the next --statement group")
+        if not list_try_push(entries, YazaCliSqlBatchEntryV1(source, parameters)): return err("YazaBase: could not append a SQL batch statement")
+    if list_count(entries) == 0: return err("YazaBase: SQL batch requires at least one statement")
+    return ok(entries)
+
+fn yaza_cli_sql_csv_lines_v1(result: YazaSqlQueryResultV1) -> Result[TextList, Text]:
+    let out_lines: TextList = text_list()
+    let header_fields: TextList = text_list()
+    var column_index: Number = 0
+    while column_index < list_count(result.columns):
+        let encoded: Result[Text, Text] = csv_encode_field(list_get(result.columns, column_index).output_name)
+        if not result_is_ok(encoded):
+            return err("YazaBase: could not encode CSV result headers")
+        if not list_try_push(header_fields, result_unwrap(encoded)):
+            return err("YazaBase: could not allocate CSV result headers")
+        set column_index = column_index + 1
+    if not list_try_push(out_lines, text_join(header_fields, ",")):
+        return err("YazaBase: could not append CSV header line")
+
+    var row_index: Number = 0
+    while row_index < list_count(result.rows):
+        let row: List[YazaSqlValueV1] = list_get(result.rows, row_index)
+        if list_count(row) != list_count(result.columns):
+            return err("YazaBase: SQL result row width does not match its columns")
+        let fields: TextList = text_list()
+        var value_index: Number = 0
+        while value_index < list_count(row):
+            let encoded: Result[Text, Text] = yaza_cli_sql_csv_value_v1(list_get(row, value_index))
+            if not result_is_ok(encoded):
+                return err("YazaBase: could not encode CSV result row")
+            if not list_try_push(fields, result_unwrap(encoded)):
+                return err("YazaBase: could not allocate CSV result row")
+            set value_index = value_index + 1
+        if not list_try_push(out_lines, text_join(fields, ",")):
+            return err("YazaBase: could not append CSV result line")
+        set row_index = row_index + 1
+    return ok(out_lines)
+
+fn yaza_cli_sql_format_csv_result_v1(result: YazaSqlQueryResultV1) -> Result[Text, Text]:
+    let lines: TextList = yaza_cli_sql_csv_lines_v1(result)?
+    return ok(text_join(lines, "\r\n") + "\r\n")
+
+fn yaza_cli_sql_print_csv_result_v1(result: YazaSqlQueryResultV1) -> Number:
+    let lines_res: Result[TextList, Text] = yaza_cli_sql_csv_lines_v1(result)
+    if not result_is_ok(lines_res):
+        say result_unwrap_error(lines_res)
+        return 1
+    let lines: TextList = result_unwrap(lines_res)
+    var i: Number = 0
+    while i < list_count(lines):
+        say list_get(lines, i) + "\r"
+        set i = i + 1
+    return 0
+
+fn yaza_cli_sql_print_result_v1(result: YazaSqlQueryResultV1, csv_mode: Boolean) -> Number:
+    if csv_mode: return yaza_cli_sql_print_csv_result_v1(result)
+    let column_names: TextList = text_list()
+    var column_index: Number = 0
+    while column_index < list_count(result.columns):
+        if not list_try_push(column_names, list_get(result.columns, column_index).output_name):
+            say "YazaBase: could not format result column names"
+            return 1
+        set column_index = column_index + 1
+    say text_join(column_names, " | ")
+
+    var row_index: Number = 0
+    while row_index < list_count(result.rows):
+        let row: List[YazaSqlValueV1] = list_get(result.rows, row_index)
+        if list_count(row) != list_count(result.columns):
+            say "YazaBase: SQL result row width does not match its columns"
+            return 1
+        let formatted_values: TextList = text_list()
+        var value_index: Number = 0
+        while value_index < list_count(row):
+            if not list_try_push(formatted_values, yaza_cli_sql_value_text_v1(list_get(row, value_index))):
+                say "YazaBase: could not format SQL result row"
+                return 1
+            set value_index = value_index + 1
+        say text_join(formatted_values, " | ")
+        set row_index = row_index + 1
+    say number_text(list_count(result.rows)) + " row(s)"
+    return 0
+
+fn yaza_cli_sql_print_explain_v1(plan: Text) -> Number:
+    var output: Text = plan
+    let output_length: Number = text_length(output)
+    if output_length > 0 and text_byte(output, output_length - 1) == 10:
+        set output = text_slice(output, 0, output_length - 1)
+    say output
+    return 0
+
+fn yaza_cli_elapsed_ns_v1(started_ns: Number, finished_ns: Number) -> Number:
+    if started_ns <= 0 or finished_ns < started_ns: return 0
+    return finished_ns - started_ns
+
+fn yaza_cli_db_sql_v1(root_path: Text, database_name: Text, source: Text, parameters: List[YazaSqlValueV1], csv_mode: Boolean, report_counts: Boolean, report_timings: Boolean) -> Number:
+    var total_started_ns: Number = 0
+    var stage_started_ns: Number = 0
+    var root_open_ns: Number = 0
+    var recovery_ns: Number = 0
+    var execute_ns: Number = 0
+    var output_ns: Number = 0
+    var close_ns: Number = 0
+    if report_timings:
+        set total_started_ns = monotonic_ns()
+        set stage_started_ns = total_started_ns
+    let root_result: Result[Number, Text] = root_open(root_path)
+    if not result_is_ok(root_result):
+        say "YazaBase: could not open database directory: " + result_unwrap_error(root_result)
+        return 1
+    if report_timings:
+        let root_open_finished_ns: Number = monotonic_ns()
+        set root_open_ns = yaza_cli_elapsed_ns_v1(stage_started_ns, root_open_finished_ns)
+        set stage_started_ns = root_open_finished_ns
+    let root: Number = result_unwrap(root_result)
+    let recovered_result: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_open_recovered_v1(root, database_name)
+    if not result_is_ok(recovered_result):
+        let ignored_root_close: Result[Boolean, Text] = close(root)
+        say "YazaBase: could not open or recover database: " + result_unwrap_error(recovered_result)
+        return 1
+    if report_timings:
+        let recovery_finished_ns: Number = monotonic_ns()
+        set recovery_ns = yaza_cli_elapsed_ns_v1(stage_started_ns, recovery_finished_ns)
+        set stage_started_ns = recovery_finished_ns
+    let recovered: YazaDbCheckpointRecoveryV1 = result_unwrap(recovered_result)
+    var query_profile_ns: List[Number] = List[Number]()
+    if report_timings:
+        var profile_slot: Number = 0
+        var profile_slots_allocated: Boolean = true
+        while profile_slot < 37:
+            if not list_try_push(query_profile_ns, 0):
+                set profile_slots_allocated = false
+                break
+            set profile_slot = profile_slot + 1
+        if not profile_slots_allocated:
+            let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(recovered.wal)
+            let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(recovered.storage)
+            let ignored_root_close: Result[Boolean, Text] = close(root)
+            say "YazaBase: could not allocate query timing slots"
+            return 1
+    var executed_result: Result[YazaDbSqlStatementResultV1, Text] = err("YDBv1 SQL statement did not execute")
+    if report_timings:
+        set executed_result = yaza_db_execute_statement_profiled_v1(recovered.storage, recovered.wal, source, parameters, query_profile_ns)
+    else:
+        set executed_result = yaza_db_execute_statement_v1(recovered.storage, recovered.wal, source, parameters)
+    if not result_is_ok(executed_result):
+        let ignored_root_close: Result[Boolean, Text] = close(root)
+        say "YazaBase: SQL statement failed: " + result_unwrap_error(executed_result)
+        return 1
+    if report_timings:
+        let execute_finished_ns: Number = monotonic_ns()
+        set execute_ns = yaza_cli_elapsed_ns_v1(stage_started_ns, execute_finished_ns)
+        set stage_started_ns = execute_finished_ns
+
+    let executed: YazaDbSqlStatementResultV1 = result_unwrap(executed_result)
+    var command_status: Number = 0
+    if option_is_some(executed.query_result):
+        set command_status = yaza_cli_sql_print_result_v1(option_unwrap(executed.query_result), csv_mode)
+    elif option_is_some(executed.write_commit):
+        let commit: YazaDbWriteCommitV1 = option_unwrap(executed.write_commit)
+        say "Committed transaction " + number_text(commit.txn_id) + " at timestamp " + number_text(commit.commit_ts)
+        if report_counts and (executed.statement_kind == yaza_db_sql_statement_kind_insert_v1() or executed.statement_kind == yaza_db_sql_statement_kind_update_v1() or executed.statement_kind == yaza_db_sql_statement_kind_delete_v1()):
+            say "YAZA_ROWS_AFFECTED=" + number_text(commit.affected_rows)
+    elif option_is_some(executed.explain_text):
+        if csv_mode:
+            say "YazaBase: --csv applies only to tabular query results"
+            set command_status = 1
+        else:
+            set command_status = yaza_cli_sql_print_explain_v1(option_unwrap(executed.explain_text))
+    else:
+        say "YazaBase: SQL dispatcher returned no query, plan, or write result"
+        set command_status = 1
+
+    if report_timings:
+        let output_finished_ns: Number = monotonic_ns()
+        set output_ns = yaza_cli_elapsed_ns_v1(stage_started_ns, output_finished_ns)
+        set stage_started_ns = output_finished_ns
+    let wal_closed: Result[Boolean, Text] = yaza_db_wal_log_close_v1(executed.wal)
+    let storage_closed: Result[Boolean, Text] = yaza_db_storage_close_v1(executed.storage)
+    let root_closed: Result[Boolean, Text] = close(root)
+    if not result_is_ok(wal_closed) or not result_is_ok(storage_closed) or not result_is_ok(root_closed):
+        say "YazaBase: SQL completed, but one or more database handles failed to close"
+        return 1
+    if not result_unwrap(wal_closed) or not result_unwrap(storage_closed) or not result_unwrap(root_closed):
+        say "YazaBase: SQL completed, but one or more database handles remained open"
+        return 1
+    if report_timings:
+        let close_finished_ns: Number = monotonic_ns()
+        set close_ns = yaza_cli_elapsed_ns_v1(stage_started_ns, close_finished_ns)
+        let total_ns: Number = yaza_cli_elapsed_ns_v1(total_started_ns, close_finished_ns)
+        say "YAZA_PROFILE_NS total=" + number_text(total_ns) + " root_open=" + number_text(root_open_ns) + " recovery=" + number_text(recovery_ns) + " execute=" + number_text(execute_ns) + " output=" + number_text(output_ns) + " close=" + number_text(close_ns)
+        say "YAZA_QUERY_PROFILE_NS catalog=" + number_text(list_get(query_profile_ns, 0)) + " plan=" + number_text(list_get(query_profile_ns, 1)) + " access=" + number_text(list_get(query_profile_ns, 2)) + " materialize=" + number_text(list_get(query_profile_ns, 3))
+        say "YAZA_LOOKUP_PROFILE_NS key_metadata=" + number_text(list_get(query_profile_ns, 4)) + " primary_lookup=" + number_text(list_get(query_profile_ns, 5)) + " secondary_lookup=" + number_text(list_get(query_profile_ns, 6))
+        say "YAZA_SCAN_PROFILE_NS page_cursor=" + number_text(list_get(query_profile_ns, 7)) + " row_bounds_check=" + number_text(list_get(query_profile_ns, 8)) + " row_decode=" + number_text(list_get(query_profile_ns, 9)) + " overflow_materialize=" + number_text(list_get(query_profile_ns, 10)) + " stored_key_check=" + number_text(list_get(query_profile_ns, 11)) + " visibility_filter=" + number_text(list_get(query_profile_ns, 12)) + " row_retention=" + number_text(list_get(query_profile_ns, 13))
+        say "YAZA_SCAN_PAGE_PROFILE_NS read=" + number_text(list_get(query_profile_ns, 34)) + " header_crc_and_decode=" + number_text(list_get(query_profile_ns, 35)) + " allocation_bitmap=" + number_text(list_get(query_profile_ns, 36))
+        say "YAZA_POINT_LOOKUP_PROFILE_NS tuple_prepare=" + number_text(list_get(query_profile_ns, 14)) + " key_encode=" + number_text(list_get(query_profile_ns, 15)) + " btree_seek=" + number_text(list_get(query_profile_ns, 16)) + " row_decode_verify=" + number_text(list_get(query_profile_ns, 17))
+        say "YAZA_POINT_SEEK_PROFILE_NS page_read=" + number_text(list_get(query_profile_ns, 18)) + " page_header_crc=" + number_text(list_get(query_profile_ns, 19)) + " allocation_role=" + number_text(list_get(query_profile_ns, 20)) + " btree_route=" + number_text(list_get(query_profile_ns, 21))
+        say "YAZA_DELETE_PROFILE_NS bind=" + number_text(list_get(query_profile_ns, 22)) + " select=" + number_text(list_get(query_profile_ns, 23)) + " target_preflight=" + number_text(list_get(query_profile_ns, 24)) + " mutations=" + number_text(list_get(query_profile_ns, 25)) + " commit=" + number_text(list_get(query_profile_ns, 26))
+        say "YAZA_DELETE_WRITE_PROFILE_NS txn_begin=" + number_text(list_get(query_profile_ns, 27)) + " group_stage=" + number_text(list_get(query_profile_ns, 28)) + " page_validate_read=" + number_text(list_get(query_profile_ns, 29)) + " page_rebuild=" + number_text(list_get(query_profile_ns, 30)) + " wal_encode_append=" + number_text(list_get(query_profile_ns, 31)) + " wal_sync=" + number_text(list_get(query_profile_ns, 32)) + " page_write=" + number_text(list_get(query_profile_ns, 33))
+    return command_status
+
+fn yaza_cli_db_sql_batch_v1(root_path: Text, database_name: Text, entries: List[YazaCliSqlBatchEntryV1], report_counts: Boolean) -> Number:
+    let root_result: Result[Number, Text] = root_open(root_path)
+    if not result_is_ok(root_result):
+        say "YazaBase: could not open database directory: " + result_unwrap_error(root_result)
+        return 1
+    let root: Number = result_unwrap(root_result)
+    let recovered_result: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_open_recovered_v1(root, database_name)
+    if not result_is_ok(recovered_result):
+        let ignored_root_close: Result[Boolean, Text] = close(root)
+        say "YazaBase: could not open or recover database: " + result_unwrap_error(recovered_result)
+        return 1
+    let recovered: YazaDbCheckpointRecoveryV1 = result_unwrap(recovered_result)
+    var current_storage: YazaDbStorageHandleV1 = recovered.storage
+    var current_wal: YazaDbWalLogV1 = recovered.wal
+    var statement_index: Number = 0
+    while statement_index < list_count(entries):
+        let entry: YazaCliSqlBatchEntryV1 = list_get(entries, statement_index)
+        let executed_result: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(current_storage, current_wal, entry.source, entry.parameters)
+        if not result_is_ok(executed_result):
+            let ignored_root_close: Result[Boolean, Text] = close(root)
+            say "YazaBase: SQL batch statement " + number_text(statement_index + 1) + " failed: " + result_unwrap_error(executed_result)
+            return 1
+        let executed: YazaDbSqlStatementResultV1 = result_unwrap(executed_result)
+        if (executed.statement_kind != yaza_db_sql_statement_kind_insert_v1() and executed.statement_kind != yaza_db_sql_statement_kind_update_v1() and executed.statement_kind != yaza_db_sql_statement_kind_delete_v1()) or not option_is_some(executed.write_commit):
+            let ignored_root_close: Result[Boolean, Text] = close(root)
+            say "YazaBase: SQL batch execution returned a non-DML or uncommitted result"
+            return 1
+        if report_counts:
+            let commit: YazaDbWriteCommitV1 = option_unwrap(executed.write_commit)
+            say "YAZA_BATCH_ROWS_AFFECTED=" + number_text(commit.affected_rows)
+        set current_storage = executed.storage
+        set current_wal = executed.wal
+        set statement_index = statement_index + 1
+
+    let wal_closed: Result[Boolean, Text] = yaza_db_wal_log_close_v1(current_wal)
+    let storage_closed: Result[Boolean, Text] = yaza_db_storage_close_v1(current_storage)
+    let root_closed: Result[Boolean, Text] = close(root)
+    if not result_is_ok(wal_closed) or not result_is_ok(storage_closed) or not result_is_ok(root_closed):
+        say "YazaBase: SQL batch completed, but one or more database handles failed to close"
+        return 1
+    if not result_unwrap(wal_closed) or not result_unwrap(storage_closed) or not result_unwrap(root_closed):
+        say "YazaBase: SQL batch completed, but one or more database handles remained open"
+        return 1
+    say "Executed " + number_text(statement_index) + " committed YazaBase batch statements"
+    return 0
+
+fn yaza_cli_print_sql_help_v1() -> Number:
+    say "YazaBase — SQL command"
+    say ""
+    say "SQL QUERY"
+    say "  db sql [--csv] [--timings | --count] <directory> <database-name>"
+    say "         <statement> [--param type:value]..."
+    say ""
+    say "BIND VALUES"
+    say "  Repeat --param type:value after the statement."
+    say "  Numeric: boolean, smallint, integer, bigint, double, decimal(p,s)"
+    say "  Other: text, date, time, timestamp, timestamptz, uuid"
+    say "  Binary: blob:<hex> / bytes:<hex> (CLI bind limit: 32 KiB)"
+    say "  NULL: null:<type>"
+    return 0
+
+fn yaza_cli_print_sql_batch_help_v1() -> Number:
+    say "YazaBase — SQL batch command"
+    say ""
+    say "SQL BATCH"
+    say "  db sql-batch [--count] <directory> <database-name>"
+    say "      --statement <DML> [--param type:value]... [--statement ...]"
+    say ""
+    say "Each statement commits independently; a later error does not roll back earlier statements."
+    return 0
+
+fn yaza_cli_db_export_csv_v1(root_path: Text, database_name: Text, table_name: Text, output_path: Text) -> Number:
+    let root_result: Result[Number, Text] = root_open(root_path)
+    if not result_is_ok(root_result):
+        say "YazaBase: could not open database directory: " + result_unwrap_error(root_result)
+        return 1
+    let root: Number = result_unwrap(root_result)
+    let recovered_result: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_open_recovered_v1(root, database_name)
+    if not result_is_ok(recovered_result):
+        let ignored_close: Result[Boolean, Text] = close(root)
+        say "YazaBase: could not open database: " + result_unwrap_error(recovered_result)
+        return 1
+    let recovered: YazaDbCheckpointRecoveryV1 = result_unwrap(recovered_result)
+    let sql: Text = "SELECT * FROM " + table_name + ";"
+    let params: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let executed_result: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(recovered.storage, recovered.wal, sql, params)
+    let ignored_wal: Result[Boolean, Text] = yaza_db_wal_log_close_v1(recovered.wal)
+    let ignored_storage: Result[Boolean, Text] = yaza_db_storage_close_v1(recovered.storage)
+    let ignored_root: Result[Boolean, Text] = close(root)
+    if not result_is_ok(executed_result):
+        say "YazaBase: export query failed: " + result_unwrap_error(executed_result)
+        return 1
+    let executed: YazaDbSqlStatementResultV1 = result_unwrap(executed_result)
+    if not option_is_some(executed.query_result):
+        say "YazaBase: table has no query result"
+        return 1
+    let q_res: YazaSqlQueryResultV1 = option_unwrap(executed.query_result)
+    var csv_text: Text = ""
+    let header_fields: TextList = text_list()
+    var col_i: Number = 0
+    while col_i < list_count(q_res.columns):
+        list_push(header_fields, list_get(q_res.columns, col_i).output_name)
+        set col_i = col_i + 1
+    set csv_text = text_join(header_fields, ",") + "\n"
+    var row_i: Number = 0
+    while row_i < list_count(q_res.rows):
+        let row: List[YazaSqlValueV1] = list_get(q_res.rows, row_i)
+        let row_fields: TextList = text_list()
+        var val_i: Number = 0
+        while val_i < list_count(row):
+            let val: YazaSqlValueV1 = list_get(row, val_i)
+            if val.is_null: list_push(row_fields, "")
+            elif val.type_id == 1:
+                if val.boolean_value: list_push(row_fields, "true")
+                else: list_push(row_fields, "false")
+            elif val.type_id == 2 or val.type_id == 3 or val.type_id == 4:
+                list_push(row_fields, number_text(val.integer_value))
+            elif val.type_id == 6:
+                list_push(row_fields, float64_text(val.float_value))
+            else:
+                list_push(row_fields, val.text_value)
+            set val_i = val_i + 1
+        set csv_text = csv_text + text_join(row_fields, ",") + "\n"
+        set row_i = row_i + 1
+    if output_path != "":
+        let write_res: Number = file_write(output_path, csv_text)
+        if write_res != 0:
+            say "YazaBase: failed to write CSV to " + output_path
+            return 1
+        say "Exported " + number_text(row_i) + " row(s) to " + output_path
+    else:
+        say csv_text
+    return 0
+
+fn yaza_cli_db_import_csv_v1(root_path: Text, database_name: Text, table_name: Text, input_path: Text) -> Number:
+    let csv_content: Text = file_read(input_path)
+    if text_length(csv_content) == 0:
+        say "YazaBase: could not read CSV file or file is empty: " + input_path
+        return 1
+    let lines: TextList = text_lines(csv_content)
+    let line_count: Number = list_count(lines)
+    if line_count < 2:
+        say "YazaBase: CSV file must contain a header and at least one data row"
+        return 1
+
+    let root_result: Result[Number, Text] = root_open(root_path)
+    if not result_is_ok(root_result):
+        say "YazaBase: could not open database directory: " + result_unwrap_error(root_result)
+        return 1
+    let root: Number = result_unwrap(root_result)
+    let recovered_result: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_open_recovered_v1(root, database_name)
+    if not result_is_ok(recovered_result):
+        let ignored_close: Result[Boolean, Text] = close(root)
+        say "YazaBase: could not open database: " + result_unwrap_error(recovered_result)
+        return 1
+    let recovered: YazaDbCheckpointRecoveryV1 = result_unwrap(recovered_result)
+    var current_wal: YazaDbWalLogV1 = recovered.wal
+    var current_storage: YazaDbStorageHandleV1 = recovered.storage
+    var imported_count: Number = 0
+    var line_i: Number = 1
+    while line_i < line_count:
+        let raw_line: Text = text_trim(list_get(lines, line_i))
+        if text_length(raw_line) > 0:
+            let cells: TextList = text_split(raw_line, ",")
+            var values_sql: Text = ""
+            var cell_i: Number = 0
+            while cell_i < list_count(cells):
+                if cell_i > 0: set values_sql = values_sql + ", "
+                let cell: Text = text_trim(list_get(cells, cell_i))
+                let parsed_num: Result[Number, Text] = number_try_parse(cell)
+                if result_is_ok(parsed_num):
+                    set values_sql = values_sql + cell
+                elif cell == "true" or cell == "false":
+                    set values_sql = values_sql + cell
+                elif cell == "NULL" or cell == "null":
+                    set values_sql = values_sql + "NULL"
+                else:
+                    set values_sql = values_sql + "'" + cell + "'"
+                set cell_i = cell_i + 1
+            let insert_sql: Text = "INSERT INTO " + table_name + " VALUES (" + values_sql + ");"
+            let params: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+            let exec_res: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(current_storage, current_wal, insert_sql, params)
+            if not result_is_ok(exec_res):
+                say "YazaBase: CSV import row " + number_text(line_i) + " failed: " + result_unwrap_error(exec_res)
+                let ignored_wal: Result[Boolean, Text] = yaza_db_wal_log_close_v1(current_wal)
+                let ignored_storage: Result[Boolean, Text] = yaza_db_storage_close_v1(current_storage)
+                let ignored_root: Result[Boolean, Text] = close(root)
+                return 1
+            let exec_out: YazaDbSqlStatementResultV1 = result_unwrap(exec_res)
+            set current_storage = exec_out.storage
+            set current_wal = exec_out.wal
+            set imported_count = imported_count + 1
+        set line_i = line_i + 1
+    let wal_close_res: Result[Boolean, Text] = yaza_db_wal_log_close_v1(current_wal)
+    let storage_close_res: Result[Boolean, Text] = yaza_db_storage_close_v1(current_storage)
+    let root_close_res: Result[Boolean, Text] = close(root)
+    say "Imported " + number_text(imported_count) + " row(s) into table '" + table_name + "' from " + input_path
+    return 0
+
+fn yaza_cli_print_db_help_v1() -> Number:
+    say "YazaBase — database commands"
+    say "Usage: yaza-llvm db <command> [options]"
+    say "       yazabase [shell] [<directory> <database-name> | :memory:]"
+    say ""
+    say "INTERACTIVE CONSOLE"
+    say "  shell [<directory> <database-name> | :memory:]"
+    say "      Start interactive SQL REPL (default: :memory: if omitted)."
+    say "      Supports .tables, .schema <table>, .indexes, .quit, .help."
+    say ""
+    say "DATABASE LIFECYCLE"
+    say "  init <directory> <database-name>"
+    say "  backup <source-directory> <database-name> <destination-directory>"
+    say "  restore <backup-directory> <database-name> <target-directory>"
+    say ""
+    say "SQL AND CLIENT SESSIONS"
+    say "  sql [--csv] [--timings | --count] <directory> <database-name> <statement>"
+    say "  sql-batch [--count] <directory> <database-name> --statement <DML> ..."
+    say "  session <directory> <database-name>"
+    say "  api <directory> <database-name> [--host <h>] [--port <p>] [--secret <s>] [--max-requests <n>]"
+    say ""
+    say "DATA IMPORT & EXPORT"
+    say "  export <directory> <database-name> <table-name> [output-path.csv]"
+    say "  import <directory> <database-name> <table-name> <input-path.csv>"
+    say ""
+    say "AUTHENTICATION & CREDENTIALS (explicit credentials required; no built-in default)"
+    say "  set-user <directory> <username> <password>"
+    say "  auth-check <directory> <username> <password>"
+    say ""
+    say "Run 'yaza-llvm db --help' for command details and examples."
+    return 0
+
+fn yaza_cli_db_sql_out_v1(out_path: Text, root_path: Text, database_name: Text, source: Text, parameters: List[YazaSqlValueV1]) -> Number:
+    let root_result: Result[Number, Text] = root_open(root_path)
+    if not result_is_ok(root_result):
+        let _w: Number = file_write(out_path, "ERR:could not open database directory: " + result_unwrap_error(root_result))
+        return 1
+    let root: Number = result_unwrap(root_result)
+    let recovered_result: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_open_recovered_v1(root, database_name)
+    if not result_is_ok(recovered_result):
+        let _c: Result[Boolean, Text] = close(root)
+        let _w: Number = file_write(out_path, "ERR:could not open or recover database: " + result_unwrap_error(recovered_result))
+        return 1
+    let recovered: YazaDbCheckpointRecoveryV1 = result_unwrap(recovered_result)
+    let executed_result: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(recovered.storage, recovered.wal, source, parameters)
+    if not result_is_ok(executed_result):
+        let _wc: Result[Boolean, Text] = yaza_db_wal_log_close_v1(recovered.wal)
+        let _sc: Result[Boolean, Text] = yaza_db_storage_close_v1(recovered.storage)
+        let _rc: Result[Boolean, Text] = close(root)
+        let _w: Number = file_write(out_path, "ERR:" + result_unwrap_error(executed_result))
+        return 1
+    let executed: YazaDbSqlStatementResultV1 = result_unwrap(executed_result)
+    var write_status: Number = 0
+    if option_is_some(executed.query_result):
+        let formatted: Result[Text, Text] = yaza_cli_sql_format_csv_result_v1(option_unwrap(executed.query_result))
+        if not result_is_ok(formatted):
+            let _w: Number = file_write(out_path, "ERR:" + result_unwrap_error(formatted))
+            set write_status = 1
+        elif file_write(out_path, result_unwrap(formatted)) != 0:
+            set write_status = 1
+    elif option_is_some(executed.write_commit):
+        let commit: YazaDbWriteCommitV1 = option_unwrap(executed.write_commit)
+        let _w: Number = file_write(out_path, "OK|" + number_text(commit.affected_rows) + "|" + number_text(commit.txn_id))
+    else:
+        let _w: Number = file_write(out_path, "OK|0|0")
+    let _wc2: Result[Boolean, Text] = yaza_db_wal_log_close_v1(executed.wal)
+    let _sc2: Result[Boolean, Text] = yaza_db_storage_close_v1(executed.storage)
+    let _rc2: Result[Boolean, Text] = close(root)
+    return write_status
+
+fn yaza_cli_db_sql_from_args_v1(root_argument_index: Number, csv_mode: Boolean, report_counts: Boolean, report_timings: Boolean) -> Number:
+    if arg_count() < root_argument_index + 2:
+        yaza_cli_print_sql_help_v1()
+        return 2
+    let parameters: Result[List[YazaSqlValueV1], Text] = yaza_cli_sql_parse_parameters_v1(root_argument_index + 3)
+    if not result_is_ok(parameters):
+        say result_unwrap_error(parameters)
+        return 2
+    return yaza_cli_db_sql_v1(arg(root_argument_index), arg(root_argument_index + 1), arg(root_argument_index + 2), result_unwrap(parameters), csv_mode, report_counts, report_timings)
+
+# The JDBC wire protocol is deliberately line-framed and ASCII-safe. SQL and
+# parameter values are Base64 encoded, so arbitrary UTF-8 and newlines never
+# affect framing. A process rotates after bounded work/memory to reclaim its
+# request arena while the Java bridge transparently starts the next session.
+fn yaza_cli_session_encode_text_v1(tag: Text, value: Text) -> Boolean:
+    let bytes_result: Result[Bytes, Text] = bytes_try_from_text(value)
+    if not result_is_ok(bytes_result): return false
+    let encoded_result: Result[Text, Text] = convert_try_base64_encode(result_unwrap(bytes_result))
+    if not result_is_ok(encoded_result): return false
+    say tag + "|" + result_unwrap(encoded_result)
+    return true
+
+fn yaza_cli_session_error_v1(message: Text, rotate: Boolean) -> Number:
+    if not yaza_cli_session_encode_text_v1("ERR", message):
+        say "ERR|"
+    if rotate: say "END|ROTATE"
+    else: say "END|KEEP"
+    return 0
+
+fn yaza_cli_session_decode_text_v1(encoded: Text) -> Result[Text, Text]:
+    let bytes_result: Result[Bytes, Text] = convert_try_base64_decode(encoded)
+    if not result_is_ok(bytes_result): return err("YazaBase protocol contains malformed Base64")
+    let text_result: Result[Text, Text] = bytes_try_to_text(result_unwrap(bytes_result))
+    if not result_is_ok(text_result): return err("YazaBase protocol field is not valid UTF-8")
+    return text_result
+
+fn yaza_cli_session_parse_entry_fields_v1(fields: TextList, source_index: Number, count_index: Number, parameter_index: Number, expected_fixed_fields: Number) -> Result[YazaCliSqlBatchEntryV1, Text]:
+    let expected_parameter_count: Result[Number, Text] = number_try_parse(list_get(fields, count_index))
+    if not result_is_ok(expected_parameter_count): return err("YazaBase protocol parameter count is invalid")
+    let parameter_count: Number = result_unwrap(expected_parameter_count)
+    if parameter_count < 0 or parameter_count > 4096 or list_count(fields) != parameter_count + expected_fixed_fields:
+        return err("YazaBase protocol parameter count does not match its frame")
+    let source_result: Result[Text, Text] = yaza_cli_session_decode_text_v1(list_get(fields, source_index))
+    if not result_is_ok(source_result): return err(result_unwrap_error(source_result))
+    let source: Text = result_unwrap(source_result)
+    if text_length(source) == 0 or text_length(source) > 65536: return err("YazaBase protocol SQL is empty or exceeds 64 KiB")
+    let parameters_result: Result[List[YazaSqlValueV1], Text] = list_try_new()
+    if not result_is_ok(parameters_result): return err("YazaBase protocol could not allocate bind parameters")
+    let parameters: List[YazaSqlValueV1] = result_unwrap(parameters_result)
+    var index: Number = 0
+    while index < parameter_count:
+        let parameter_text_result: Result[Text, Text] = yaza_cli_session_decode_text_v1(list_get(fields, parameter_index + index))
+        if not result_is_ok(parameter_text_result): return err(result_unwrap_error(parameter_text_result))
+        let parameter_result: Result[YazaSqlValueV1, Text] = yaza_cli_sql_parse_parameter_v1(result_unwrap(parameter_text_result))
+        if not result_is_ok(parameter_result): return err(result_unwrap_error(parameter_result))
+        if not list_try_push(parameters, result_unwrap(parameter_result)): return err("YazaBase protocol could not append a bind parameter")
+        set index = index + 1
+    return ok(YazaCliSqlBatchEntryV1(source, parameters))
+
+fn yaza_cli_session_parse_request_v1(line: Text) -> Result[YazaCliSessionRequestV1, Text]:
+    if text_length(line) > 1048576: return err("YazaBase protocol request exceeds the 1 MiB line limit")
+    let fields: TextList = text_split(line, "|")
+    if list_count(fields) < 3: return err("YazaBase protocol request has too few fields")
+    if list_get(fields, 0) == "Q1":
+        let entry: Result[YazaCliSqlBatchEntryV1, Text] = yaza_cli_session_parse_entry_fields_v1(fields, 1, 2, 3, 3)
+        if not result_is_ok(entry): return err(result_unwrap_error(entry))
+        return ok(YazaCliSessionRequestV1(0, result_unwrap(entry), 0, none))
+    if list_get(fields, 0) == "P1":
+        if list_count(fields) < 5: return err("YazaBase page request is missing required fields")
+        let page_size_result: Result[Number, Text] = number_try_parse(list_get(fields, 1))
+        if not result_is_ok(page_size_result): return err("YazaBase page request size is invalid")
+        let page_size: Number = result_unwrap(page_size_result)
+        if page_size < 1 or page_size > yaza_db_query_page_max_size_v1(): return err("YazaBase page request size must be between 1 and 256")
+        let entry: Result[YazaCliSqlBatchEntryV1, Text] = yaza_cli_session_parse_entry_fields_v1(fields, 2, 3, 4, 5)
+        if not result_is_ok(entry): return err(result_unwrap_error(entry))
+        let token_field: Text = list_get(fields, list_count(fields) - 1)
+        var continuation: Option[YazaDbQueryPageTokenV1] = none
+        if token_field != "-":
+            let token_result: Result[YazaDbQueryPageTokenV1, Text] = yaza_db_query_page_token_decode_v1(token_field)
+            if not result_is_ok(token_result): return err(result_unwrap_error(token_result))
+            set continuation = some(result_unwrap(token_result))
+        return ok(YazaCliSessionRequestV1(1, result_unwrap(entry), page_size, continuation))
+    return err("YazaBase protocol request must start with Q1 or P1")
+
+fn yaza_cli_session_csv_texts_v1(fields: TextList) -> Result[Text, Text]:
+    let encoded_fields: TextList = text_list()
+    var index: Number = 0
+    while index < list_count(fields):
+        let encoded: Result[Text, Text] = csv_encode_field(list_get(fields, index))
+        if not result_is_ok(encoded): return err(result_unwrap_error(encoded))
+        if not list_try_push(encoded_fields, result_unwrap(encoded)): return err("YazaBase protocol could not allocate a CSV record")
+        set index = index + 1
+    return ok(text_join(encoded_fields, ","))
+
+fn yaza_cli_session_emit_query_v1(query: YazaSqlQueryResultV1) -> Boolean:
+    let column_count: Number = list_count(query.columns)
+    let row_count: Number = list_count(query.rows)
+    say "OK|Q|" + number_text(column_count) + "|" + number_text(row_count) + "|0"
+    let header_fields: TextList = text_list()
+    var column_index: Number = 0
+    while column_index < column_count:
+        if not list_try_push(header_fields, list_get(query.columns, column_index).output_name): return false
+        set column_index = column_index + 1
+    let header: Result[Text, Text] = yaza_cli_session_csv_texts_v1(header_fields)
+    if not result_is_ok(header) or not yaza_cli_session_encode_text_v1("H", result_unwrap(header)): return false
+    var row_index: Number = 0
+    while row_index < row_count:
+        let row: List[YazaSqlValueV1] = list_get(query.rows, row_index)
+        if list_count(row) != column_count: return false
+        let row_fields: TextList = text_list()
+        var value_index: Number = 0
+        while value_index < column_count:
+            let field: Result[Text, Text] = yaza_cli_sql_csv_value_v1(list_get(row, value_index))
+            if not result_is_ok(field) or not list_try_push(row_fields, result_unwrap(field)): return false
+            set value_index = value_index + 1
+        let record: Result[Text, Text] = ok(text_join(row_fields, ","))
+        if not yaza_cli_session_encode_text_v1("R", result_unwrap(record)): return false
+        set row_index = row_index + 1
+    return true
+
+fn yaza_cli_session_emit_query_page_v1(page: YazaDbQueryPageV1) -> Boolean:
+    let query: YazaSqlQueryResultV1 = page.query_result
+    let column_count: Number = list_count(query.columns)
+    let row_count: Number = list_count(query.rows)
+    if page.has_more != option_is_some(page.next_token): return false
+    if page.has_more: say "OK|P|" + number_text(column_count) + "|" + number_text(row_count) + "|1"
+    else: say "OK|P|" + number_text(column_count) + "|" + number_text(row_count) + "|0"
+    let header_fields: TextList = text_list()
+    var column_index: Number = 0
+    while column_index < column_count:
+        if not list_try_push(header_fields, list_get(query.columns, column_index).output_name): return false
+        set column_index = column_index + 1
+    let header: Result[Text, Text] = yaza_cli_session_csv_texts_v1(header_fields)
+    if not result_is_ok(header) or not yaza_cli_session_encode_text_v1("H", result_unwrap(header)): return false
+    var row_index: Number = 0
+    while row_index < row_count:
+        let row: List[YazaSqlValueV1] = list_get(query.rows, row_index)
+        if list_count(row) != column_count: return false
+        let row_fields: TextList = text_list()
+        var value_index: Number = 0
+        while value_index < column_count:
+            let field: Result[Text, Text] = yaza_cli_sql_csv_value_v1(list_get(row, value_index))
+            if not result_is_ok(field) or not list_try_push(row_fields, result_unwrap(field)): return false
+            set value_index = value_index + 1
+        let record: Result[Text, Text] = ok(text_join(row_fields, ","))
+        if not yaza_cli_session_encode_text_v1("R", result_unwrap(record)): return false
+        set row_index = row_index + 1
+    if page.has_more:
+        let token_text: Result[Text, Text] = yaza_db_query_page_token_encode_v1(option_unwrap(page.next_token))
+        if not result_is_ok(token_text): return false
+        say "C|" + result_unwrap(token_text)
+    else:
+        say "C|"
+    return true
+
+fn yaza_cli_session_emit_statement_v1(statement: YazaDbSqlStatementResultV1) -> Boolean:
+    if option_is_some(statement.query_result): return yaza_cli_session_emit_query_v1(option_unwrap(statement.query_result))
+    if option_is_some(statement.write_commit):
+        let commit: YazaDbWriteCommitV1 = option_unwrap(statement.write_commit)
+        say "OK|W|0|0|" + number_text(commit.affected_rows)
+        return true
+    if option_is_some(statement.explain_text):
+        say "OK|X|0|0|0"
+        return yaza_cli_session_encode_text_v1("T", option_unwrap(statement.explain_text))
+    return false
+
+fn yaza_cli_db_session_v1(root_path: Text, database_name: Text) -> Number:
+    let root_result: Result[Number, Text] = root_open(root_path)
+    if not result_is_ok(root_result):
+        yaza_cli_session_error_v1("could not open database directory: " + result_unwrap_error(root_result), true)
+        return 1
+    let session_result: Result[YazaDbSessionV1, Text] = yaza_db_session_open_v1(result_unwrap(root_result), database_name)
+    if not result_is_ok(session_result):
+        yaza_cli_session_error_v1("could not open or recover database session: " + result_unwrap_error(session_result), true)
+        return 1
+    var session: YazaDbSessionV1 = result_unwrap(session_result)
+    say "YB1|READY"
+    var statement_count: Number = 0
+    while true:
+        let line_option: Option[Text] = console_read_line()
+        if not option_is_some(line_option):
+            let ignored_close: Result[Boolean, Text] = yaza_db_session_close_v1(session)
+            return 0
+        let line: Text = option_unwrap(line_option)
+        if line == "QUIT":
+            let closed: Result[Boolean, Text] = yaza_db_session_close_v1(session)
+            if not result_is_ok(closed) or not result_unwrap(closed):
+                yaza_cli_session_error_v1("could not close database session cleanly", true)
+                return 1
+            say "END|CLOSE"
+            return 0
+        let request: Result[YazaCliSessionRequestV1, Text] = yaza_cli_session_parse_request_v1(line)
+        if not result_is_ok(request):
+            yaza_cli_session_error_v1(result_unwrap_error(request), false)
+        else:
+            let parsed_request: YazaCliSessionRequestV1 = result_unwrap(request)
+            if parsed_request.kind == 1:
+                let page_result: Result[YazaDbQueryPageV1, Text] = yaza_db_execute_select_page_v1(session.storage, session.wal, parsed_request.entry.source, parsed_request.entry.parameters, parsed_request.page_size, parsed_request.continuation)
+                if not result_is_ok(page_result):
+                    yaza_cli_session_error_v1(result_unwrap_error(page_result), false)
+                elif not yaza_cli_session_emit_query_page_v1(result_unwrap(page_result)):
+                    yaza_cli_session_error_v1("could not encode YazaBase page response", true)
+                    return 0
+            else:
+                let executed: Result[YazaDbSessionStatementV1, Text] = yaza_db_session_execute_v1(session, parsed_request.entry.source, parsed_request.entry.parameters)
+                if not result_is_ok(executed):
+                    yaza_cli_session_error_v1(result_unwrap_error(executed), true)
+                    return 0
+                let session_statement: YazaDbSessionStatementV1 = result_unwrap(executed)
+                set session = session_statement.session
+                if not yaza_cli_session_emit_statement_v1(session_statement.statement):
+                    yaza_cli_session_error_v1("could not encode SQL response", true)
+                    return 0
+            set statement_count = statement_count + 1
+            if statement_count >= 512 or arena_used() >= 268435456:
+                let ignored_close: Result[Boolean, Text] = yaza_db_session_close_v1(session)
+                say "END|ROTATE"
+                return 0
+            say "END|KEEP"
+    return 0
+
+fn yaza_cli_db_api_v1(root_path: Text, database_name: Text) -> Number:
+    var host: Text = "127.0.0.1"
+    var port: Number = 8080
+    var secret: Text = ""
+    var max_requests: Number = 0
+    var config_path: Text = ""
+    var explicit_host: Boolean = false
+    var explicit_port: Boolean = false
+    var i: Number = 4
+    while i <= arg_count():
+        if arg(i) == "--host" and i + 1 <= arg_count():
+            set host = arg(i + 1)
+            set explicit_host = true
+            set i = i + 2
+        elif arg(i) == "--port" and i + 1 <= arg_count():
+            let p_res: Result[Number, Text] = number_try_parse(arg(i + 1))
+            if result_is_ok(p_res):
+                set port = result_unwrap(p_res)
+                set explicit_port = true
+            set i = i + 2
+        elif arg(i) == "--secret" and i + 1 <= arg_count():
+            set secret = arg(i + 1)
+            set i = i + 2
+        elif arg(i) == "--max-requests" and i + 1 <= arg_count():
+            let m_res: Result[Number, Text] = number_try_parse(arg(i + 1))
+            if result_is_ok(m_res): set max_requests = result_unwrap(m_res)
+            set i = i + 2
+        elif arg(i) == "--config" and i + 1 <= arg_count():
+            set config_path = arg(i + 1)
+            set i = i + 2
+        else:
+            set i = i + 1
+
+    var effective_config: ApiServiceConfig = yaza_api_default_service_config(database_name)
+    if config_path == "" and file_exists("yaza.toml"):
+        set config_path = "yaza.toml"
+
+    if config_path != "":
+        if not file_exists(config_path):
+            say "YazaBase: configuration file not found: " + config_path
+            return 1
+        let toml_raw: Text = file_read(config_path)
+        let parsed_res: Result[ApiServiceConfig, Text] = api_config_parse(toml_raw)
+        if not result_is_ok(parsed_res):
+            say "YazaBase: invalid configuration: " + result_unwrap_error(parsed_res)
+            return 1
+        set effective_config = result_unwrap(parsed_res)
+        if not explicit_host:
+            set host = effective_config.bind_host
+        if not explicit_port:
+            set port = effective_config.bind_port
+
+    set effective_config.bind_host = host
+    set effective_config.bind_port = port
+
+    if secret == "":
+        set secret = env_get("YAZABASE_API_SECRET")
+    if text_length(secret) < 32:
+        say "YazaBase: refusing to start HTTP API without --secret or YAZABASE_API_SECRET (minimum 32 characters)"
+        return 1
+    if host != "127.0.0.1" and host != "localhost" and env_get("YAZA_TRUST_TLS_PROXY") != "1":
+        say "YazaBase: refusing unencrypted HTTP bind on non-loopback address '" + host + "'; place behind a TLS-terminating reverse proxy and set YAZA_TRUST_TLS_PROXY=1"
+        return 1
+
+    let root_result: Result[Number, Text] = root_open(root_path)
+    if not result_is_ok(root_result):
+        say "YazaBase: could not open database directory: " + result_unwrap_error(root_result)
+        return 1
+    let root: Number = result_unwrap(root_result)
+    let session_result: Result[YazaDbSessionV1, Text] = yaza_db_session_open_v1(root, database_name)
+    if not result_is_ok(session_result):
+        let ignored_close: Result[Boolean, Text] = close(root)
+        say "YazaBase: could not open database session: " + result_unwrap_error(session_result)
+        return 1
+    let session: YazaDbSessionV1 = result_unwrap(session_result)
+
+    say "YazaBase HTTP API starting..."
+    say "  Profile                 : " + effective_config.resources.profile + " [" + effective_config.resources.profile_source + "]"
+    say "  Arena Budget Mode       : " + effective_config.resources.arena_mode + " [" + effective_config.resources.arena_mode_source + "]"
+    say "  Process Arena Limit     : " + number_text(effective_config.resources.process_arena_limit) + " bytes (" + api_config_format_bytes(effective_config.resources.process_arena_limit) + ")"
+    say "  Max Concurrency (Slots) : " + number_text(effective_config.resources.max_in_flight) + " in-flight"
+    say "  Max Request Body        : " + number_text(effective_config.max_request_body_bytes) + " bytes (" + api_config_format_bytes(effective_config.max_request_body_bytes) + ")"
+    say "  Transport Security      : Loopback / Reverse-Proxy TLS required for public access"
+    say "  Listening on            : http://" + host + ":" + number_text(port) + " (database: " + database_name + ")"
+
+    let served: Result[Number, Text] = yaza_api_serve_loop_config(session, root_path, database_name, effective_config, max_requests, secret)
+    let session_closed: Result[Boolean, Text] = yaza_db_session_close_v1(session)
+    if not result_is_ok(served):
+        say "YazaBase: API server error: " + result_unwrap_error(served)
+        return 1
+    say "YazaBase API server stopped. Served " + number_text(result_unwrap(served)) + " requests."
+    return 0
+
+fn yaza_cli_format_ms_v1(elapsed_ns: Number) -> Text:
+    if elapsed_ns <= 0: return "0.0 ms"
+    let ms_whole: Number = elapsed_ns / 1000000
+    let ms_fraction: Number = (elapsed_ns % 1000000) / 100000
+    return number_text(ms_whole) + "." + number_text(ms_fraction) + " ms"
+
+fn yaza_cli_pad_right_v1(source: Text, width: Number) -> Text:
+    var padded: Text = source
+    while text_length(padded) < width:
+        set padded = padded + " "
+    return padded
+
+fn yaza_cli_repeat_char_v1(ch: Text, count: Number) -> Text:
+    var repeated: Text = ""
+    var i: Number = 0
+    while i < count:
+        set repeated = repeated + ch
+        set i = i + 1
+    return repeated
+
+fn yaza_cli_sql_type_name_v1(type_id: Number) -> Text:
+    if type_id == 1: return "BOOLEAN"
+    if type_id == 2: return "SMALLINT"
+    if type_id == 3: return "INTEGER"
+    if type_id == 4: return "BIGINT"
+    if type_id == 6: return "DOUBLE"
+    if type_id == 9: return "TEXT"
+    if type_id == 10: return "DECIMAL"
+    if type_id == 11: return "DATE"
+    if type_id == 12: return "UUID"
+    if type_id == 13: return "TIME"
+    if type_id == 14: return "TIMESTAMP"
+    if type_id == 15: return "TIMESTAMPTZ"
+    if type_id == 16: return "BLOB"
+    return "UNKNOWN"
+
+fn yaza_cli_print_pretty_table_v1(result: YazaSqlQueryResultV1, elapsed_ns: Number) -> Unit:
+    let col_count: Number = list_count(result.columns)
+    if col_count == 0:
+        say "Empty set (" + yaza_cli_format_ms_v1(elapsed_ns) + ")"
+        return
+
+    let widths: List[Number] = List[Number]()
+    var c: Number = 0
+    while c < col_count:
+        let col: YazaSqlBoundProjectionV1 = list_get(result.columns, c)
+        let name_len: Number = text_length(col.output_name)
+        list_push(widths, name_len)
+        set c = c + 1
+
+    var r: Number = 0
+    while r < list_count(result.rows):
+        let row: List[YazaSqlValueV1] = list_get(result.rows, r)
+        var cv: Number = 0
+        while cv < list_count(row) and cv < col_count:
+            let val_text: Text = yaza_cli_sql_value_text_v1(list_get(row, cv))
+            let val_len: Number = text_length(val_text)
+            if val_len > list_get(widths, cv):
+                list_set(widths, cv, val_len)
+            set cv = cv + 1
+        set r = r + 1
+
+    var sep: Text = "+"
+    var hc: Number = 0
+    while hc < col_count:
+        set sep = sep + "-" + yaza_cli_repeat_char_v1("-", list_get(widths, hc)) + "-+"
+        set hc = hc + 1
+
+    say sep
+
+    var header_row: Text = "|"
+    var hdr_idx: Number = 0
+    while hdr_idx < col_count:
+        let col_name: Text = list_get(result.columns, hdr_idx).output_name
+        set header_row = header_row + " " + yaza_cli_pad_right_v1(col_name, list_get(widths, hdr_idx)) + " |"
+        set hdr_idx = hdr_idx + 1
+    say header_row
+    say sep
+
+    var row_idx: Number = 0
+    while row_idx < list_count(result.rows):
+        let row_data: List[YazaSqlValueV1] = list_get(result.rows, row_idx)
+        var row_text: Text = "|"
+        var col_val_idx: Number = 0
+        while col_val_idx < col_count:
+            var cell_text: Text = "NULL"
+            if col_val_idx < list_count(row_data):
+                set cell_text = yaza_cli_sql_value_text_v1(list_get(row_data, col_val_idx))
+            set row_text = row_text + " " + yaza_cli_pad_right_v1(cell_text, list_get(widths, col_val_idx)) + " |"
+            set col_val_idx = col_val_idx + 1
+        say row_text
+        set row_idx = row_idx + 1
+
+    say sep
+    let total_rows: Number = list_count(result.rows)
+    if total_rows == 1:
+        say "1 row in set (" + yaza_cli_format_ms_v1(elapsed_ns) + ")"
+    else:
+        say number_text(total_rows) + " rows in set (" + yaza_cli_format_ms_v1(elapsed_ns) + ")"
+
+fn yaza_cli_db_repl_v1(root_path: Text, database_name: Text) -> Number:
+    var eff_root: Text = root_path
+    var eff_db: Text = database_name
+    if root_path == ":memory:" or database_name == ":memory:":
+        set eff_db = "memdb"
+        let t_ns: Number = monotonic_ns()
+        set eff_root = "/tmp/yazabase_mem_" + number_text(t_ns)
+
+    if not is_directory(eff_root):
+        let dir_created: Number = directory_create(eff_root)
+
+    let root_result: Result[Number, Text] = root_open(eff_root)
+    if not result_is_ok(root_result):
+        say "YazaBase REPL: could not open database directory: " + result_unwrap_error(root_result)
+        return 1
+    var root: Number = result_unwrap(root_result)
+    var session_result: Result[YazaDbSessionV1, Text] = yaza_db_session_open_v1(root, eff_db)
+    if not result_is_ok(session_result):
+        let init_root_res: Result[Number, Text] = root_open(eff_root)
+        if not result_is_ok(init_root_res):
+            say "YazaBase REPL: could not open directory for initialization: " + result_unwrap_error(init_root_res)
+            return 1
+        let init_root: Number = result_unwrap(init_root_res)
+        let init_res: Result[YazaDbCatalogBootstrapV1, Text] = yaza_db_catalog_create_v1(init_root, eff_db)
+        if not result_is_ok(init_res):
+            let ignored_close: Result[Boolean, Text] = close(init_root)
+            say "YazaBase REPL: database auto-initialization failed: " + result_unwrap_error(init_res)
+            return 1
+        let bootstrap: YazaDbCatalogBootstrapV1 = result_unwrap(init_res)
+        let wal_c: Result[Boolean, Text] = yaza_db_wal_log_close_v1(bootstrap.wal)
+        let storage_c: Result[Boolean, Text] = yaza_db_storage_close_v1(bootstrap.storage)
+        let root_c: Result[Boolean, Text] = close(init_root)
+        let fresh_root_res: Result[Number, Text] = root_open(eff_root)
+        if not result_is_ok(fresh_root_res):
+            say "YazaBase REPL: could not reopen directory: " + result_unwrap_error(fresh_root_res)
+            return 1
+        set session_result = yaza_db_session_open_v1(result_unwrap(fresh_root_res), eff_db)
+        if not result_is_ok(session_result):
+            say "YazaBase REPL: session open failed after init: " + result_unwrap_error(session_result)
+            return 1
+    var session: YazaDbSessionV1 = result_unwrap(session_result)
+
+    say "  ▲  YAZABASE SQL CONSOLE v1.0.0"
+    say "  Zero-GC Arena · Clustered B+Tree · MVCC ACID Engine"
+    say "  Connected to: " + eff_db + " (" + eff_root + ")"
+    say "  Type .help for commands, .tables for tables, .quit to exit."
+    say ""
+
+    var empty_params: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    while true:
+        say "yazabase> "
+        let line_opt: Option[Text] = console_read_line()
+        if not option_is_some(line_opt):
+            say "Bye!"
+            let closed: Result[Boolean, Text] = yaza_db_session_close_v1(session)
+            return 0
+        var line: Text = text_trim(option_unwrap(line_opt))
+        if text_length(line) == 0:
+            continue
+
+        var is_quit: Boolean = line == "quit" or line == "exit" or line == ".quit" or line == ".exit"
+        if not is_quit and text_length(line) == 2 and text_byte(line, 0) == 92 and text_byte(line, 1) == 113:
+            set is_quit = true
+        if is_quit:
+            say "Bye!"
+            let closed: Result[Boolean, Text] = yaza_db_session_close_v1(session)
+            return 0
+
+        var is_help: Boolean = line == "help" or line == ".help"
+        if not is_help and text_length(line) == 2 and text_byte(line, 0) == 92 and (text_byte(line, 1) == 104 or text_byte(line, 1) == 63):
+            set is_help = true
+        if is_help:
+            say "YazaBase Interactive Shell Commands:"
+            say "  .tables                List all user tables"
+            say "  .schema <table>        Describe columns and types of a table"
+            say "  .indexes               List all secondary indexes"
+            say "  .clear                 Clear screen"
+            say "  .quit, exit            Close session and exit"
+            say "  .help                  Show this help message"
+            say ""
+            say "Supported SQL Statements:"
+            say "  SELECT, INSERT, UPDATE, DELETE,"
+            say "  CREATE/DROP/ALTER TABLE, CREATE/DROP INDEX, CREATE/DROP VIEW,"
+            say "  INNER/LEFT/RIGHT/FULL/CROSS JOIN,"
+            say "  UNION/INTERSECT/EXCEPT, WITH (CTE), GROUP BY, ORDER BY, LIMIT, OFFSET."
+            say ""
+            continue
+
+        if line == ".clear" or line == "clear":
+            say ""
+            say ""
+            say ""
+            say ""
+            say ""
+            say ""
+            say ""
+            say ""
+            continue
+
+        var describe_target: Text = ""
+        var is_dt: Boolean = line == ".tables"
+        if not is_dt and text_length(line) == 3 and text_byte(line, 0) == 92 and text_byte(line, 1) == 100 and text_byte(line, 2) == 116:
+            set is_dt = true
+
+        var is_di: Boolean = line == ".indexes"
+        if not is_di and text_length(line) == 3 and text_byte(line, 0) == 92 and text_byte(line, 1) == 100 and text_byte(line, 2) == 105:
+            set is_di = true
+
+        var is_d: Boolean = text_starts_with(line, ".schema ")
+        if not is_d and text_starts_with(line, ".d "): set is_d = true
+        if not is_d and text_length(line) >= 4 and text_byte(line, 0) == 92 and text_byte(line, 1) == 100 and text_byte(line, 2) == 32:
+            set is_d = true
+
+        if is_dt:
+            set line = "SELECT table_name FROM sys_tables WHERE schema_name = 'public' ORDER BY table_name ASC;"
+        elif is_d:
+            if text_starts_with(line, ".schema "):
+                set describe_target = text_trim(text_slice(line, 8, text_length(line) - 8))
+            elif text_starts_with(line, ".d "):
+                set describe_target = text_trim(text_slice(line, 3, text_length(line) - 3))
+            else:
+                set describe_target = text_trim(text_slice(line, 3, text_length(line) - 3))
+            let t_len: Number = text_length(describe_target)
+            if t_len > 0 and text_byte(describe_target, t_len - 1) == 59:
+                set describe_target = text_trim(text_slice(describe_target, 0, t_len - 1))
+            set line = "SELECT sys_columns.ordinal, sys_columns.column_name, sys_columns.type_id, sys_columns.nullable FROM sys_columns INNER JOIN sys_tables ON sys_columns.table_id = sys_tables.table_id WHERE sys_tables.table_name = '" + describe_target + "' ORDER BY sys_columns.ordinal;"
+        elif is_di:
+            set line = "SELECT index_name, is_unique, key_columns FROM sys_indexes ORDER BY index_name ASC;"
+
+        let start_ns: Number = monotonic_ns()
+        let executed_res: Result[YazaDbSessionStatementV1, Text] = yaza_db_session_execute_v1(session, line, empty_params)
+        let end_ns: Number = monotonic_ns()
+        let elapsed_ns: Number = yaza_cli_elapsed_ns_v1(start_ns, end_ns)
+
+        if not result_is_ok(executed_res):
+            let err_msg: Text = result_unwrap_error(executed_res)
+            say "Error: " + err_msg
+            if text_find(err_msg, "CREATE TABLE columns") >= 0:
+                say "Hint: include column definitions, e.g.: CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT NOT NULL);"
+            let reopen_root_res: Result[Number, Text] = root_open(eff_root)
+            if result_is_ok(reopen_root_res):
+                let reopen_root: Number = result_unwrap(reopen_root_res)
+                let reopen_session_res: Result[YazaDbSessionV1, Text] = yaza_db_session_open_v1(reopen_root, eff_db)
+                if result_is_ok(reopen_session_res):
+                    set session = result_unwrap(reopen_session_res)
+                else:
+                    let ignored_close: Result[Boolean, Text] = close(reopen_root)
+                    say "Warning: could not recover session: " + result_unwrap_error(reopen_session_res)
+                    return 1
+            else:
+                say "Warning: could not reopen directory: " + result_unwrap_error(reopen_root_res)
+                return 1
+        else:
+            let session_statement: YazaDbSessionStatementV1 = result_unwrap(executed_res)
+            set session = session_statement.session
+            let stmt: YazaDbSqlStatementResultV1 = session_statement.statement
+            if option_is_some(stmt.query_result):
+                let q_res: YazaSqlQueryResultV1 = option_unwrap(stmt.query_result)
+                if describe_target != "":
+                    let row_count: Number = list_count(q_res.rows)
+                    if row_count == 0:
+                        say "Table '" + describe_target + "' does not exist or has no columns."
+                    else:
+                        say "Table: " + describe_target
+                        say "+---------+----------------------+---------------+----------+"
+                        say "| Ordinal | Column               | Type          | Nullable |"
+                        say "+---------+----------------------+---------------+----------+"
+                        var ri: Number = 0
+                        while ri < row_count:
+                            let r_vals: List[YazaSqlValueV1] = list_get(q_res.rows, ri)
+                            let ord_num: Number = list_get(r_vals, 0).integer_value
+                            let col_name: Text = list_get(r_vals, 1).text_value
+                            let type_num: Number = list_get(r_vals, 2).integer_value
+                            let is_null: Boolean = list_get(r_vals, 3).boolean_value
+                            var null_label: Text = "NO"
+                            if is_null: set null_label = "YES"
+                            let type_name: Text = yaza_cli_sql_type_name_v1(type_num)
+                            say "| " + yaza_cli_pad_right_v1(number_text(ord_num), 7) + " | " + yaza_cli_pad_right_v1(col_name, 20) + " | " + yaza_cli_pad_right_v1(type_name, 13) + " | " + yaza_cli_pad_right_v1(null_label, 8) + " |"
+                            set ri = ri + 1
+                        say "+---------+----------------------+---------------+----------+"
+                        say number_text(row_count) + " column(s) (" + yaza_cli_format_ms_v1(elapsed_ns) + ")"
+                else:
+                    yaza_cli_print_pretty_table_v1(q_res, elapsed_ns)
+            elif option_is_some(stmt.write_commit):
+                let commit: YazaDbWriteCommitV1 = option_unwrap(stmt.write_commit)
+                if stmt.statement_kind == yaza_db_sql_statement_kind_insert_v1() or stmt.statement_kind == yaza_db_sql_statement_kind_update_v1() or stmt.statement_kind == yaza_db_sql_statement_kind_delete_v1():
+                    say "Query OK, " + number_text(commit.affected_rows) + " row(s) affected (" + yaza_cli_format_ms_v1(elapsed_ns) + ")"
+                else:
+                    say "Query OK, schema updated (" + yaza_cli_format_ms_v1(elapsed_ns) + ")"
+            elif option_is_some(stmt.explain_text):
+                say option_unwrap(stmt.explain_text)
+            else:
+                say "Query OK (" + yaza_cli_format_ms_v1(elapsed_ns) + ")"
+    return 0
+
+start:
+    if arg_count() == 0: exit(yaza_cli_db_repl_v1(":memory:", "memdb"))
+    if arg_count() == 1 and (arg(1) == "--version" or arg(1) == "-v" or arg(1) == "-V" or arg(1) == "version"):
+        say "yazabase 1.0.0"
+        exit(0)
+    if arg_count() == 1 and (arg(1) == "--help" or arg(1) == "-h" or arg(1) == "help"):
+        yaza_cli_print_db_help_v1()
+        exit(0)
+    if arg_count() == 1 and arg(1) == ":memory:": exit(yaza_cli_db_repl_v1(":memory:", "memdb"))
+    if arg_count() == 1 and (arg(1) == "shell" or arg(1) == "console"): exit(yaza_cli_db_repl_v1(":memory:", "memdb"))
+    if arg_count() == 3 and (arg(1) == "shell" or arg(1) == "console"): exit(yaza_cli_db_repl_v1(arg(2), arg(3)))
+    if arg_count() == 2 and (arg(1) == "shell" or arg(1) == "console"): exit(yaza_cli_db_repl_v1(arg(2), "app"))
+    if arg_count() >= 3 and arg(1) == "api": exit(yaza_cli_db_api_v1(arg(2), arg(3)))
+    if arg_count() == 3 and arg(1) == "session": exit(yaza_cli_db_session_v1(arg(2), arg(3)))
+    if arg_count() == 3 and arg(1) == "init": exit(yaza_cli_db_init_v1(arg(2), arg(3)))
+    if arg_count() == 4 and arg(1) == "backup": exit(yaza_cli_db_backup_restore_v1("backup", arg(2), arg(3), arg(4)))
+    if arg_count() == 4 and arg(1) == "restore": exit(yaza_cli_db_backup_restore_v1("restore", arg(2), arg(3), arg(4)))
+    if arg_count() >= 1 and arg(1) == "sql":
+        if arg_count() >= 2 and arg(2) == "--timings": exit(yaza_cli_db_sql_from_args_v1(3, false, false, true))
+        if arg_count() >= 2 and arg(2) == "--csv":
+            if arg_count() >= 3 and arg(3) == "--timings": exit(yaza_cli_db_sql_from_args_v1(4, true, false, true))
+            if arg_count() >= 3 and arg(3) == "--count": exit(yaza_cli_db_sql_from_args_v1(4, true, true, false))
+            exit(yaza_cli_db_sql_from_args_v1(3, true, false, false))
+        if arg_count() >= 6 and arg(2) == "--csv-out":
+            let out_params: Result[List[YazaSqlValueV1], Text] = yaza_cli_sql_parse_parameters_v1(7)
+            if not result_is_ok(out_params):
+                say result_unwrap_error(out_params)
+                exit(2)
+            exit(yaza_cli_db_sql_out_v1(arg(3), arg(4), arg(5), arg(6), result_unwrap(out_params)))
+        if arg_count() >= 2 and arg(2) == "--count": exit(yaza_cli_db_sql_from_args_v1(3, false, true, false))
+        exit(yaza_cli_db_sql_from_args_v1(2, false, false, false))
+    if arg_count() >= 1 and arg(1) == "sql-batch":
+        if arg_count() >= 2 and arg(2) == "--count":
+            if arg_count() < 5 or arg(5) != "--statement":
+                yaza_cli_print_sql_batch_help_v1()
+                exit(2)
+            let entries: Result[List[YazaCliSqlBatchEntryV1], Text] = yaza_cli_sql_parse_batch_v1(5)
+            if not result_is_ok(entries):
+                say result_unwrap_error(entries)
+                exit(2)
+            exit(yaza_cli_db_sql_batch_v1(arg(3), arg(4), result_unwrap(entries), true))
+        if arg_count() < 4 or arg(4) != "--statement":
+            yaza_cli_print_sql_batch_help_v1()
+            exit(2)
+        let entries: Result[List[YazaCliSqlBatchEntryV1], Text] = yaza_cli_sql_parse_batch_v1(4)
+        if not result_is_ok(entries):
+            say result_unwrap_error(entries)
+            exit(2)
+        exit(yaza_cli_db_sql_batch_v1(arg(2), arg(3), result_unwrap(entries), false))
+    if arg_count() >= 4 and arg(1) == "export":
+        var out_csv: Text = ""
+        if arg_count() >= 5: set out_csv = arg(5)
+        exit(yaza_cli_db_export_csv_v1(arg(2), arg(3), arg(4), out_csv))
+    if arg_count() >= 5 and arg(1) == "import":
+        exit(yaza_cli_db_import_csv_v1(arg(2), arg(3), arg(4), arg(5)))
+    if arg_count() == 4 and arg(1) == "set-user":
+        let set_res: Result[Boolean, Text] = yazabase_set_credentials(arg(2), arg(3), arg(4))
+        if not result_is_ok(set_res):
+            say result_unwrap_error(set_res)
+            exit(1)
+        say "Updated YazaBase credentials for user '" + arg(3) + "' in " + arg(2)
+        exit(0)
+    if arg_count() == 4 and arg(1) == "auth-check":
+        if yazabase_verify_credentials(arg(2), arg(3), arg(4)):
+            say "YazaBase authentication OK for user '" + arg(3) + "'"
+            exit(0)
+        say "YazaBase authentication FAILED for user '" + arg(3) + "'"
+        exit(1)
+    if arg_count() == 2 and arg(1) != "sql" and arg(1) != "sql-batch" and arg(1) != "session" and arg(1) != "init" and arg(1) != "backup" and arg(1) != "restore" and arg(1) != "api" and arg(1) != "export" and arg(1) != "import" and arg(1) != "set-user" and arg(1) != "auth-check":
+        exit(yaza_cli_db_repl_v1(arg(1), arg(2)))
+    if arg_count() == 1 and arg(1) != "sql" and arg(1) != "sql-batch" and arg(1) != "session" and arg(1) != "init" and arg(1) != "backup" and arg(1) != "restore" and arg(1) != "api" and arg(1) != "export" and arg(1) != "import" and arg(1) != "set-user" and arg(1) != "auth-check" and arg(1) != "--help" and arg(1) != "-h":
+        exit(yaza_cli_db_repl_v1(arg(1), "app"))
+    yaza_cli_print_db_help_v1()
+    exit(2)

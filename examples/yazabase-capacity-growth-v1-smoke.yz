@@ -1,0 +1,52 @@
+use "std/fs"
+use "../yazabase/allocator_v1"
+use "../yazabase/checkpoint_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/transaction_v1"
+use "../yazabase/wal_v1"
+
+fn yazabase_capacity_growth_v1_check(root_path: Text) -> Result[Number, Text]:
+    let root: Number = root_open(root_path)?
+    let db_uuid: Bytes = bytes_from_text("growth-v1-uuid01")
+    let initial_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(db_uuid, 0, 1, 1, 0, 2, 1)
+    let storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, "capacity-growth-smoke.ydb", initial_header)?
+    let wal: YazaDbWalLogV1 = yaza_db_wal_log_open_for_v1(root, db_uuid)?
+    let first_chunk: Number = yaza_db_storage_preallocated_page_count_v1()
+    if storage.header.page_count != first_chunk: return err("YDBv1 fresh database did not start with one preallocated page chunk")
+    let initial_free_pages: Number = yaza_db_allocator_count_free_pages_v1(storage, first_chunk)?
+    if initial_free_pages >= first_chunk: return err("YDBv1 capacity fixture did not leave a reserve request that forces extension")
+
+    let transaction: YazaDbWriteTransactionV1 = yaza_db_write_transaction_begin_with_reserve_v1(storage, wal, first_chunk)?
+    if transaction.storage.header.page_count != first_chunk * 2: return err("YDBv1 transaction begin did not extend by exactly one 64 MiB chunk")
+    let reserved_free_pages: Number = yaza_db_allocator_count_free_pages_v1(transaction.storage, first_chunk)?
+    if reserved_free_pages < first_chunk: return err("YDBv1 transaction begin did not meet its requested free-page reserve")
+    let committed: YazaDbWriteCommitV1 = yaza_db_write_transaction_commit_v1(transaction)?
+    if committed.storage.header.page_count != first_chunk * 2 or committed.storage.header.next_txn_id != 2: return err("YDBv1 auto-growth transaction did not commit its extended capacity")
+    let expected_file_bytes: Number = first_chunk * 2 * yaza_db_page_size_v1()
+    let committed_file_bytes: Number = file_size(committed.storage.file)?
+    if committed_file_bytes != expected_file_bytes: return err("YDBv1 auto-growth did not preallocate the complete second chunk")
+
+    let wal_closed: Boolean = yaza_db_wal_log_close_v1(committed.wal)?
+    let storage_closed: Boolean = yaza_db_storage_close_v1(committed.storage)?
+    if not wal_closed or not storage_closed: return err("YDBv1 capacity-growth handles could not close")
+    let recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "capacity-growth-smoke.ydb")?
+    if recovered.storage.header.page_count != first_chunk * 2 or recovered.storage.header.next_txn_id != 2: return err("YDBv1 recovered header lost transaction-driven capacity growth")
+    let recovered_wal_closed: Boolean = yaza_db_wal_log_close_v1(recovered.wal)?
+    let recovered_storage_closed: Boolean = yaza_db_storage_close_v1(recovered.storage)?
+    if not recovered_wal_closed or not recovered_storage_closed: return err("YDBv1 recovered capacity-growth handles could not close")
+    let wal_name: Text = yaza_db_wal_segment_name_for_v1(0, db_uuid)?
+    let database_removed: Boolean = remove(root, "capacity-growth-smoke.ydb")?
+    let wal_removed: Boolean = remove(root, wal_name)?
+    let owner_removed: Boolean = remove(root, ".ydb-uuid-67726f7774682d76312d757569643031.owner")?
+    if not database_removed or not wal_removed or not owner_removed: return err("YDBv1 capacity-growth fixture cleanup failed")
+    let directory_synced: Boolean = sync_directory(root)?
+    let root_closed: Boolean = close(root)?
+    if not directory_synced or not root_closed: return err("YDBv1 capacity-growth fixture directory cleanup failed")
+    return ok(reserved_free_pages)
+
+start:
+    let outcome: Result[Number, Text] = yazabase_capacity_growth_v1_check(arg(1))
+    if result_is_ok(outcome):
+        say "yazabase-capacity-growth-v1-ok free-pages=" + number_text(result_unwrap(outcome))
+    else:
+        say result_unwrap_error(outcome)

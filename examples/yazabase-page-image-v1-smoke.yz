@@ -1,0 +1,80 @@
+use "std/fs"
+use "../yazabase/page_image_v1"
+
+fn yaza_base_page_image_v1_check(root_path: Text) -> Result[Number, Text]:
+    let root: Number = root_open(root_path)?
+    let uuid: Bytes = bytes_from_text("page-image-uuid1")
+    let initial: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(uuid, 0, 1, 1, 0, 2, 1)
+    let storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, "page-image-smoke.ydb", initial)?
+    let bitmap: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, 2)?
+    let allocated: Boolean = yaza_db_bitmap_page_set_allocated_v1(bitmap, 1, true, 16, 2)?
+    if not allocated: return err("YDBv1 page-image fixture could not allocate its data page")
+    let bitmap_write: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, bitmap)?
+    if bitmap_write != yaza_db_page_size_v1(): return err("YDBv1 page-image fixture bitmap write was incomplete")
+
+    let image: Bytes = yaza_db_page_new_v1(3, 64, 1, 0)?
+    let payload: Bytes = yaza_db_wal_page_image_payload_encode_v1(3, 64, image)?
+    let record: YazaDbWalRecordV1 = YazaDbWalRecordV1(64, 0, 0, yaza_db_wal_type_full_page_image_v1(), 0, payload)
+    let encoded: Bytes = yaza_db_wal_encode_v1(record)?
+    let decoded: YazaDbWalRecordV1 = yaza_db_wal_decode_v1(encoded, 64)?
+    let decoded_image: YazaDbWalPageImageV1 = yaza_db_wal_page_image_payload_decode_v1(decoded)?
+    if decoded_image.page_id != 3 or not bytes_equal(decoded_image.image, image): return err("YDBv1 FULL_PAGE_IMAGE payload did not round-trip")
+    let transaction_owned: YazaDbWalRecordV1 = YazaDbWalRecordV1(64, 0, 1, yaza_db_wal_type_full_page_image_v1(), 0, payload)
+    if result_is_ok(yaza_db_wal_encode_v1(transaction_owned)): return err("YDBv1 system FULL_PAGE_IMAGE was accepted as a transaction record")
+
+    let replayed: Boolean = yaza_db_storage_redo_page_image_v1(storage, record, 65536)?
+    if not replayed: return err("YDBv1 FULL_PAGE_IMAGE redo did not report success")
+    let stored: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, 3)?
+    if not bytes_equal(stored, image): return err("YDBv1 FULL_PAGE_IMAGE redo did not write its page")
+    let replayed_again: Boolean = yaza_db_storage_redo_page_image_v1(storage, record, 65536)?
+    if not replayed_again: return err("YDBv1 FULL_PAGE_IMAGE repeated redo failed")
+
+    let stale_image: Bytes = yaza_db_page_new_v1(3, 32, 1, 0)?
+    let stale_payload: Bytes = yaza_db_wal_page_image_payload_encode_v1(3, 32, stale_image)?
+    let stale_record: YazaDbWalRecordV1 = YazaDbWalRecordV1(32, 0, 0, yaza_db_wal_type_full_page_image_v1(), 0, stale_payload)
+    let stale_replay: Boolean = yaza_db_storage_redo_page_image_v1(storage, stale_record, 65536)?
+    if not stale_replay: return err("YDBv1 stale FULL_PAGE_IMAGE redo failed")
+    let after_stale: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, 3)?
+    if not bytes_equal(after_stale, image): return err("YDBv1 stale FULL_PAGE_IMAGE overwrote a page with a newer LSN")
+
+    let conflict_page: Bytes = yaza_db_page_new_v1(3, 64, 1, 0)?
+    let ignored_slot: Number = yaza_db_page_add_slot_v1(conflict_page, bytes_from_text("x"), bytes_from_text("different"))?
+    let finalized_conflict: Bytes = yaza_db_page_finalize_v1(conflict_page)?
+    let conflict_payload: Bytes = yaza_db_wal_page_image_payload_encode_v1(3, 64, finalized_conflict)?
+    let conflict_record: YazaDbWalRecordV1 = YazaDbWalRecordV1(64, 0, 0, yaza_db_wal_type_full_page_image_v1(), 0, conflict_payload)
+    if result_is_ok(yaza_db_storage_redo_page_image_v1(storage, conflict_record, 65536)): return err("YDBv1 same-LSN FULL_PAGE_IMAGE conflict was accepted")
+
+    let data_page_offset: Number = yaza_db_storage_page_offset_v1(3)?
+    let torn: Bytes = read_exact(storage.file, data_page_offset, yaza_db_page_size_v1())?
+    if not bytes_try_set(torn, 100, bytes_get(torn, 100) + 1): return err("YDBv1 torn-page fixture could not corrupt a byte")
+    let torn_write: Number = write_exact(storage.file, data_page_offset, torn)?
+    if torn_write != yaza_db_page_size_v1(): return err("YDBv1 torn-page fixture write was incomplete")
+    let repair_image: Bytes = yaza_db_page_new_v1(3, 96, 1, 0)?
+    let repair_payload: Bytes = yaza_db_wal_page_image_payload_encode_v1(3, 96, repair_image)?
+    let repair_record: YazaDbWalRecordV1 = YazaDbWalRecordV1(96, 0, 0, yaza_db_wal_type_full_page_image_v1(), 0, repair_payload)
+    let repaired: Boolean = yaza_db_storage_redo_page_image_v1(storage, repair_record, 65536)?
+    if not repaired: return err("YDBv1 FULL_PAGE_IMAGE did not repair a torn page")
+    let repaired_page: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, 3)?
+    if not bytes_equal(repaired_page, repair_image): return err("YDBv1 torn page was not replaced by its valid image")
+
+    let bad_lsn_image: Bytes = yaza_db_page_new_v1(3, 95, 1, 0)?
+    if result_is_ok(yaza_db_wal_page_image_payload_encode_v1(3, 96, bad_lsn_image)): return err("YDBv1 FULL_PAGE_IMAGE encoder accepted a page-LSN mismatch")
+    let beyond_end: Result[Boolean, Text] = yaza_db_storage_redo_page_image_v1(storage, repair_record, 96)
+    if result_is_ok(beyond_end): return err("YDBv1 FULL_PAGE_IMAGE redo accepted a WAL end before the complete record")
+
+    let closed_storage: Boolean = yaza_db_storage_close_v1(storage)?
+    if not closed_storage: return err("YDBv1 page-image fixture could not close storage")
+    let removed: Boolean = remove(root, "page-image-smoke.ydb")?
+    if not removed: return err("YDBv1 page-image fixture could not remove its database file")
+    let directory_sync: Boolean = sync_directory(root)?
+    if not directory_sync: return err("YDBv1 page-image fixture cleanup sync failed")
+    let closed_root: Boolean = close(root)?
+    if not closed_root: return err("YDBv1 page-image fixture could not close its root")
+    return ok(bytes_length(payload) + bytes_length(image))
+
+start:
+    let outcome: Result[Number, Text] = yaza_base_page_image_v1_check(arg(1))
+    if result_is_ok(outcome):
+        say "yazabase-page-image-v1-ok bytes=" + number_text(result_unwrap(outcome))
+    else:
+        say result_unwrap_error(outcome)

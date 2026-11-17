@@ -1,0 +1,348 @@
+# Provider adapter from the shared DbValue contract to PostgreSQL v3 parameters.
+# Query structure comes from bounded YAZA query nodes; values use separate Bind fields.
+use "core"
+use "query"
+use "../pg/protocol"
+use "../pg/errors"
+use "../pg/transport"
+
+shape DbPostgresCompiledQuery:
+    statement: Text
+    parameters: PgParameters
+
+fn db_postgres_float64_text_valid(value: Text) -> Boolean:
+    let byte_length: Number = bytes_length(bytes_from_text(value))
+    if byte_length < 1 or byte_length > 64 or text_length(value) != byte_length:
+        return false
+    var index: Number = 0
+    if text_byte(value, index) == 43 or text_byte(value, index) == 45:
+        set index = index + 1
+    var integer_digits: Number = 0
+    var significand_digits: Number = 0
+    var first_nonzero: Number = -1
+    while index < byte_length and text_byte(value, index) >= 48 and text_byte(value, index) <= 57:
+        if first_nonzero < 0 and text_byte(value, index) != 48:
+            set first_nonzero = significand_digits
+        set integer_digits = integer_digits + 1
+        set significand_digits = significand_digits + 1
+        set index = index + 1
+    if integer_digits == 0:
+        return false
+    if index < byte_length and text_byte(value, index) == 46:
+        set index = index + 1
+        var fraction_digits: Number = 0
+        while index < byte_length and text_byte(value, index) >= 48 and text_byte(value, index) <= 57:
+            if first_nonzero < 0 and text_byte(value, index) != 48:
+                set first_nonzero = significand_digits
+            set fraction_digits = fraction_digits + 1
+            set significand_digits = significand_digits + 1
+            set index = index + 1
+        if fraction_digits == 0:
+            return false
+    var exponent: Number = 0
+    var exponent_sign: Number = 1
+    if index < byte_length and (text_byte(value, index) == 69 or text_byte(value, index) == 101):
+        set index = index + 1
+        if index < byte_length and text_byte(value, index) == 45:
+            set exponent_sign = -1
+            set index = index + 1
+        else:
+            if index < byte_length and text_byte(value, index) == 43:
+                set index = index + 1
+        var exponent_digits: Number = 0
+        while index < byte_length and text_byte(value, index) >= 48 and text_byte(value, index) <= 57:
+            if exponent > 300:
+                return false
+            set exponent = exponent * 10 + text_byte(value, index) - 48
+            if exponent > 300:
+                return false
+            set exponent_digits = exponent_digits + 1
+            set index = index + 1
+        if exponent_digits == 0:
+            return false
+    if index != byte_length:
+        return false
+    if first_nonzero < 0:
+        return true
+    let decimal_order: Number = integer_digits - first_nonzero - 1 + exponent_sign * exponent
+    return decimal_order >= -307 and decimal_order < 308
+
+fn db_postgres_error(kind: DbErrorKind, message: Text) -> DbError:
+    let provider_code: Option[Text] = none
+    return db_error(kind, message, provider_code, false)
+
+fn db_postgres_parameter_result(added: Result[Boolean, Text]) -> Result[Boolean, DbError]:
+    if not result_is_ok(added):
+        return err(db_postgres_error(DbErrorKind::Configuration, "PostgreSQL parameter is invalid or exceeds its configured bound"))
+    return ok(result_unwrap(added))
+
+fn db_postgres_add_parameter(parameters: PgParameters, value: DbValue, sql_null_type_oid: Number) -> Result[Boolean, DbError]:
+    if not db_value_is_valid(value):
+        return err(db_postgres_error(DbErrorKind::Configuration, "PostgreSQL parameter value is malformed or outside the shared value bounds"))
+    match value:
+        Null:
+            return db_postgres_parameter_result(pg_parameters_add_null(parameters, sql_null_type_oid))
+        BooleanValue(inner):
+            return db_postgres_parameter_result(pg_parameters_add_boolean(parameters, inner))
+        Int32Value(inner):
+            return db_postgres_parameter_result(pg_parameters_add_int32(parameters, inner))
+        Int64Value(inner):
+            return db_postgres_parameter_result(pg_parameters_add_number(parameters, inner))
+        Float64Value(inner):
+            return db_postgres_parameter_result(pg_parameters_add_float64(parameters, inner))
+        DecimalValue(inner):
+            return db_postgres_parameter_result(pg_parameters_add_text_as(parameters, inner, 1700))
+        DateValue(inner):
+            return db_postgres_parameter_result(pg_parameters_add_text_as(parameters, inner, 1082))
+        TimeValue(inner):
+            return db_postgres_parameter_result(pg_parameters_add_text_as(parameters, inner, 1083))
+        TimeTzValue(inner):
+            return db_postgres_parameter_result(pg_parameters_add_text_as(parameters, inner, 1266))
+        TimestampValue(inner):
+            return db_postgres_parameter_result(pg_parameters_add_text_as(parameters, inner, 1114))
+        TimestampTzValue(inner):
+            return db_postgres_parameter_result(pg_parameters_add_text_as(parameters, inner, 1184))
+        JsonValue(inner):
+            return db_postgres_parameter_result(pg_parameters_add_text_as(parameters, inner, 114))
+        JsonbValue(inner):
+            return db_postgres_parameter_result(pg_parameters_add_text_as(parameters, inner, 3802))
+        TextValue(inner):
+            return db_postgres_parameter_result(pg_parameters_add_text(parameters, inner))
+        BytesValue(inner):
+            return db_postgres_parameter_result(pg_parameters_add_bytes(parameters, inner))
+    return err(db_postgres_error(DbErrorKind::UnsupportedFeature, "Shared database value cannot be encoded by PostgreSQL"))
+
+fn db_postgres_read_value(result: PgQueryResult, row_index: Number, column_index: Number) -> Result[DbValue, DbError]:
+    let column_result: Result[PgColumnDescription, Text] = pg_query_column(result, column_index)
+    if not result_is_ok(column_result):
+        return err(db_postgres_error(DbErrorKind::Protocol, "PostgreSQL result column metadata is invalid"))
+    let column: PgColumnDescription = result_unwrap(column_result)
+    if not db_postgres_column_type_supported(column):
+        let unsupported_column_error: DbError = db_postgres_unsupported_error("PostgreSQL result column type or format is not supported by DbValue")
+        return err(unsupported_column_error)
+    let decoded: Result[PgValue, Text] = pg_query_value(result, row_index, column_index)
+    if not result_is_ok(decoded):
+        return err(db_postgres_error(DbErrorKind::Protocol, "PostgreSQL result value is invalid"))
+    match result_unwrap(decoded):
+        Null:
+            return ok(DbValue::Null)
+        BooleanValue(inner):
+            if column.type_oid != 16:
+                return err(db_postgres_error(DbErrorKind::Protocol, "PostgreSQL Boolean value does not match column metadata"))
+            return ok(DbValue::BooleanValue(inner))
+        NumberValue(inner):
+            if column.type_oid == 20:
+                return ok(DbValue::Int64Value(inner))
+            if column.type_oid == 21 or column.type_oid == 23:
+                return ok(DbValue::Int32Value(int32_from_number(inner)))
+            if column.type_oid == 26:
+                return ok(DbValue::Int64Value(inner))
+            return err(db_postgres_error(DbErrorKind::UnsupportedFeature, "PostgreSQL integer column type is not supported by DbValue"))
+        BytesValue(inner):
+            if column.type_oid != 17:
+                return err(db_postgres_error(DbErrorKind::UnsupportedFeature, "PostgreSQL binary column type is not supported by DbValue"))
+            return ok(DbValue::BytesValue(inner))
+        TextValue(inner):
+            if column.type_oid == 700 or column.type_oid == 701:
+                if not db_postgres_float64_text_valid(inner):
+                    return err(db_postgres_error(DbErrorKind::Protocol, "PostgreSQL Float64 result is malformed or outside the supported finite range"))
+                return ok(DbValue::Float64Value(float64_parse(inner)))
+            if column.type_oid == 1700:
+                if not db_decimal_text_valid(inner):
+                    return err(db_postgres_error(DbErrorKind::Protocol, "PostgreSQL Decimal result is malformed or exceeds the supported bound"))
+                return ok(DbValue::DecimalValue(inner))
+            if column.type_oid == 1082:
+                if not db_date_text_valid(inner):
+                    return err(db_postgres_error(DbErrorKind::Protocol, "PostgreSQL Date result is outside the supported ISO calendar range"))
+                return ok(DbValue::DateValue(inner))
+            if column.type_oid == 1083:
+                if not db_time_text_valid(inner):
+                    return err(db_postgres_error(DbErrorKind::Protocol, "PostgreSQL Time result is malformed or outside the supported range"))
+                return ok(DbValue::TimeValue(inner))
+            if column.type_oid == 1266:
+                if not db_time_tz_text_valid(inner):
+                    return err(db_postgres_error(DbErrorKind::Protocol, "PostgreSQL TimeTz result is malformed or outside the supported range"))
+                return ok(DbValue::TimeTzValue(inner))
+            if column.type_oid == 1114:
+                if not db_timestamp_text_valid(inner):
+                    return err(db_postgres_error(DbErrorKind::Protocol, "PostgreSQL Timestamp result is malformed or outside the supported range"))
+                return ok(DbValue::TimestampValue(inner))
+            if column.type_oid == 1184:
+                if not db_timestamp_tz_text_valid(inner):
+                    return err(db_postgres_error(DbErrorKind::Protocol, "PostgreSQL TimestampTz result is malformed or outside the supported range"))
+                return ok(DbValue::TimestampTzValue(inner))
+            if column.type_oid == 114:
+                if not json_is_valid(inner):
+                    return err(db_postgres_error(DbErrorKind::Protocol, "PostgreSQL JSON result is malformed or exceeds the supported bounds"))
+                return ok(DbValue::JsonValue(inner))
+            if column.type_oid == 3802:
+                if not json_is_valid(inner):
+                    return err(db_postgres_error(DbErrorKind::Protocol, "PostgreSQL JSONB result is malformed or exceeds the supported bounds"))
+                return ok(DbValue::JsonbValue(inner))
+            if column.type_oid == 18 or column.type_oid == 19 or column.type_oid == 25 or column.type_oid == 1042 or column.type_oid == 1043:
+                return ok(DbValue::TextValue(inner))
+            return err(db_postgres_error(DbErrorKind::UnsupportedFeature, "PostgreSQL column type is not supported by DbValue"))
+    return err(db_postgres_error(DbErrorKind::Protocol, "PostgreSQL result value is not supported by the adapter"))
+
+fn db_postgres_column_type_supported(column: PgColumnDescription) -> Boolean:
+    if column.format_code != 0:
+        return false
+    return column.type_oid == 16 or column.type_oid == 17 or column.type_oid == 18 or column.type_oid == 19 or column.type_oid == 20 or column.type_oid == 21 or column.type_oid == 23 or column.type_oid == 25 or column.type_oid == 26 or column.type_oid == 700 or column.type_oid == 701 or column.type_oid == 1042 or column.type_oid == 1043 or column.type_oid == 1700 or column.type_oid == 1082 or column.type_oid == 1083 or column.type_oid == 1266 or column.type_oid == 1114 or column.type_oid == 1184 or column.type_oid == 114 or column.type_oid == 3802
+
+fn db_postgres_protocol_error(message: Text) -> DbError:
+    return db_error(DbErrorKind::Protocol, message, none, false)
+
+fn db_postgres_unsupported_error(message: Text) -> DbError:
+    return db_error(DbErrorKind::UnsupportedFeature, message, none, false)
+
+fn db_postgres_configuration_error(message: Text) -> DbError:
+    return db_error(DbErrorKind::Configuration, message, none, false)
+
+fn db_postgres_result_columns(result: PgQueryResult) -> Result[List[PgColumnDescription], DbError]:
+    let column_count: Number = pg_query_column_count(result)
+    if column_count < 0:
+        let invalid_metadata_error: DbError = db_postgres_protocol_error("PostgreSQL result column metadata is malformed")
+        return err(invalid_metadata_error)
+    if column_count > 256:
+        return err(db_postgres_unsupported_error("PostgreSQL result exceeds the 256-column shared row limit"))
+    let columns: List[PgColumnDescription] = List[PgColumnDescription]()
+    var column_index: Number = 0
+    while column_index < column_count:
+        let column_result: Result[PgColumnDescription, Text] = pg_query_column(result, column_index)
+        if not result_is_ok(column_result):
+            return err(db_postgres_protocol_error("PostgreSQL result column metadata is invalid"))
+        let column: PgColumnDescription = result_unwrap(column_result)
+        let name_length: Number = text_length(column.name)
+        if name_length < 1 or name_length > 255:
+            return err(db_postgres_protocol_error("PostgreSQL result contains an invalid column name"))
+        if not db_postgres_column_type_supported(column):
+            return err(db_postgres_unsupported_error("PostgreSQL result column type or format is not supported by DbValue"))
+        list_push(columns, column)
+        set column_index = column_index + 1
+    return ok(columns)
+
+fn db_postgres_result_shape_valid(result: PgQueryResult) -> Result[Boolean, DbError]:
+    let column_count: Number = pg_query_column_count(result)
+    if column_count < 0:
+        return err(db_postgres_protocol_error("PostgreSQL result column metadata is malformed"))
+    if column_count > 256:
+        return err(db_postgres_unsupported_error("PostgreSQL result exceeds the 256-column shared row limit"))
+    if result.row_count < 0 or result.row_count > 10000:
+        return err(db_postgres_protocol_error("PostgreSQL result row count is outside the supported bound"))
+    if column_count == 0 and result.row_count != 0:
+        return err(db_postgres_protocol_error("PostgreSQL result has rows without columns"))
+    if column_count > 0 and result.row_count > 10000 / column_count:
+        return err(db_postgres_unsupported_error("PostgreSQL result exceeds the 10000-cell shared result limit"))
+    let cell_count: Number = result.row_count * column_count
+    if list_count(result.cell_values) != cell_count or list_count(result.cell_is_null) != cell_count:
+        return err(db_postgres_protocol_error("PostgreSQL result cell storage is inconsistent"))
+    return ok(true)
+
+fn db_postgres_row_from_columns(result: PgQueryResult, columns: List[PgColumnDescription], row_index: Number) -> Result[DbRow, DbError]:
+    if row_index < 0 or row_index >= result.row_count:
+        return err(db_postgres_configuration_error("PostgreSQL result row index is out of range"))
+    let values: List[DbColumn] = List[DbColumn]()
+    var column_index: Number = 0
+    while column_index < list_count(columns):
+        let metadata: PgColumnDescription = list_get(columns, column_index)
+        let value: Result[DbValue, DbError] = db_postgres_read_value(result, row_index, column_index)
+        if not result_is_ok(value):
+            return err(result_unwrap_error(value))
+        list_push(values, DbColumn(metadata.name, result_unwrap(value)))
+        set column_index = column_index + 1
+    let row: Result[DbRow, DbError] = db_row_new(values)
+    if not result_is_ok(row):
+        return err(db_postgres_protocol_error("PostgreSQL result could not be represented as a shared database row"))
+    return ok(result_unwrap(row))
+
+fn db_postgres_row(result: PgQueryResult, row_index: Number) -> Result[DbRow, DbError]:
+    let shape: Result[Boolean, DbError] = db_postgres_result_shape_valid(result)
+    if not result_is_ok(shape):
+        return err(result_unwrap_error(shape))
+    let columns: Result[List[PgColumnDescription], DbError] = db_postgres_result_columns(result)
+    if not result_is_ok(columns):
+        return err(result_unwrap_error(columns))
+    return db_postgres_row_from_columns(result, result_unwrap(columns), row_index)
+
+fn db_postgres_rows(result: PgQueryResult) -> Result[List[DbRow], DbError]:
+    let shape: Result[Boolean, DbError] = db_postgres_result_shape_valid(result)
+    if not result_is_ok(shape):
+        return err(result_unwrap_error(shape))
+    let columns: Result[List[PgColumnDescription], DbError] = db_postgres_result_columns(result)
+    if not result_is_ok(columns):
+        return err(result_unwrap_error(columns))
+    let metadata: List[PgColumnDescription] = result_unwrap(columns)
+    let rows: List[DbRow] = List[DbRow]()
+    var row_index: Number = 0
+    while row_index < result.row_count:
+        let row: Result[DbRow, DbError] = db_postgres_row_from_columns(result, metadata, row_index)
+        if not result_is_ok(row):
+            return err(result_unwrap_error(row))
+        list_push(rows, result_unwrap(row))
+        set row_index = row_index + 1
+    return ok(rows)
+
+fn db_postgres_comparison_sql(comparison: DbComparison) -> Text:
+    return db_comparison_postgres_operator(comparison)
+
+# Only identifiers and operators from the closed YAZA query model are emitted.
+# Values remain separate PostgreSQL Bind parameters.
+fn db_postgres_compile_select(query: DbSelect) -> Result[DbPostgresCompiledQuery, DbError]:
+    let statement: Result[Text, DbError] = db_select_postgres_sql(query)
+    if not result_is_ok(statement):
+        return err(result_unwrap_error(statement))
+    let parameters: PgParameters = pg_parameters_new()
+    var predicate_index: Number = 0
+    while predicate_index < list_count(query.predicates):
+        let predicate: DbPredicate = list_get(query.predicates, predicate_index)
+        if not db_value_is_null(predicate.value):
+            let added: Result[Boolean, DbError] = db_postgres_add_parameter(parameters, predicate.value, 0)
+            if not result_is_ok(added):
+                return err(result_unwrap_error(added))
+        set predicate_index = predicate_index + 1
+    return ok(DbPostgresCompiledQuery(result_unwrap(statement), parameters))
+
+fn db_postgres_execution_error(message: Text) -> DbError:
+    let sqlstate: Option[Text] = pg_error_sqlstate(message)
+    if option_is_some(sqlstate):
+        let code: Text = option_unwrap(sqlstate)
+        let classification: PgErrorKind = pg_error_classify(message)
+        let provider_code: Option[Text] = some(code)
+        match classification:
+            UniqueConstraint:
+                return db_error(DbErrorKind::Constraint, "Database constraint rejected the query", provider_code, false)
+            Constraint:
+                return db_error(DbErrorKind::Constraint, "Database constraint rejected the query", provider_code, false)
+            QueryTimeout:
+                return db_error(DbErrorKind::Timeout, "Database query exceeded its time limit", provider_code, false)
+            TransactionConflict:
+                return db_error(DbErrorKind::Serialization, "Database transaction conflicted with another transaction", provider_code, false)
+            ConnectionFailure:
+                return db_error(DbErrorKind::Unavailable, "Database connection failed", provider_code, false)
+            ServerFailure:
+                return db_error(DbErrorKind::Internal, "Database query failed", provider_code, false)
+            Unclassified:
+                return db_error(DbErrorKind::Internal, "Database query failed", provider_code, false)
+    if text_find(message, "deadline expired") >= 0 or text_find(message, "timed out") >= 0 or text_find(message, "timeout") >= 0:
+        return db_postgres_error(DbErrorKind::Timeout, "Database query exceeded its time limit")
+    if text_starts_with(message, "postgres query:") or text_starts_with(message, "postgres transport:"):
+        return db_postgres_error(DbErrorKind::Unavailable, "Database operation could not be completed")
+    return db_postgres_error(DbErrorKind::Protocol, "Database returned an invalid query response")
+
+fn db_postgres_select(handle: Number, query: DbSelect, timeout_ms: Number) -> Result[PgQueryResult, DbError]:
+    if timeout_ms < 1 or timeout_ms > 3600000:
+        return err(db_postgres_error(DbErrorKind::Configuration, "Database timeout must be between 1 and 3600000 milliseconds"))
+    let compiled: Result[DbPostgresCompiledQuery, DbError] = db_postgres_compile_select(query)
+    if not result_is_ok(compiled):
+        return err(result_unwrap_error(compiled))
+    let statement: DbPostgresCompiledQuery = result_unwrap(compiled)
+    let result: Result[PgQueryResult, Text] = pg_query_with_parameters(handle, statement.statement, statement.parameters, timeout_ms)
+    if not result_is_ok(result):
+        return err(db_postgres_execution_error(result_unwrap_error(result)))
+    return ok(result_unwrap(result))
+
+fn db_postgres_select_rows(handle: Number, query: DbSelect, timeout_ms: Number) -> Result[List[DbRow], DbError]:
+    let result: Result[PgQueryResult, DbError] = db_postgres_select(handle, query, timeout_ms)
+    if not result_is_ok(result):
+        return err(result_unwrap_error(result))
+    return db_postgres_rows(result_unwrap(result))

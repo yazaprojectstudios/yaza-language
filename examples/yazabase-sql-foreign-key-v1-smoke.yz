@@ -1,0 +1,82 @@
+use "std/fs"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/sql_dispatch_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/wal_v1"
+use "../yazabase/checkpoint_v1"
+
+fn yazabase_sql_foreign_key_v1(root_path: Text) -> Result[Boolean, Text]:
+    let root: Number = root_open(root_path)?
+    let database_name: Text = "foreign-key-v1-smoke.ydb"
+    let header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_from_text("fk-v1-smoke-uuid"), 0, 1, 1, 0, 2, 1)
+    let empty: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, database_name, header)?
+    let empty_closed: Boolean = yaza_db_storage_close_v1(empty)?
+    if not empty_closed: return err("YDBv1 FOREIGN KEY smoke could not close the empty database")
+    let initialized: YazaDbCatalogBootstrapV1 = yaza_db_catalog_initialize_v1(root, database_name)?
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+
+    let parent_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(initialized.storage, initialized.wal, "CREATE TABLE parent_rows (id BIGINT PRIMARY KEY, code BIGINT)", no_parameters)?
+    if not option_is_some(parent_result.write_commit): return err("YDBv1 FOREIGN KEY smoke could not create its parent table")
+    let parent_created: YazaDbWriteCommitV1 = option_unwrap(parent_result.write_commit)
+    let non_primary_reference: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(parent_created.storage, parent_created.wal, "CREATE TABLE invalid_target (id BIGINT PRIMARY KEY, code BIGINT, FOREIGN KEY (code) REFERENCES parent_rows(code))", no_parameters)
+    if result_is_ok(non_primary_reference): return err("YDBv1 FOREIGN KEY accepted a target that is not the parent primary key")
+    let type_mismatch: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(parent_created.storage, parent_created.wal, "CREATE TABLE invalid_type (id BIGINT PRIMARY KEY, parent_id INTEGER, FOREIGN KEY (parent_id) REFERENCES parent_rows(id))", no_parameters)
+    if result_is_ok(type_mismatch): return err("YDBv1 FOREIGN KEY accepted mismatched scalar types")
+    let unsupported_action: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(parent_created.storage, parent_created.wal, "CREATE TABLE invalid_action (id BIGINT PRIMARY KEY, parent_id BIGINT, FOREIGN KEY (parent_id) REFERENCES parent_rows(id) ON DELETE CASCADE)", no_parameters)
+    if result_is_ok(unsupported_action): return err("YDBv1 FOREIGN KEY accepted the unsupported CASCADE action")
+    let child_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(parent_created.storage, parent_created.wal, "CREATE TABLE child_rows (id BIGINT PRIMARY KEY, parent_id BIGINT, FOREIGN KEY (parent_id) REFERENCES parent_rows(id) ON DELETE RESTRICT ON UPDATE RESTRICT)", no_parameters)?
+    if not option_is_some(child_result.write_commit): return err("YDBv1 FOREIGN KEY smoke could not create its child table")
+    let child_created: YazaDbWriteCommitV1 = option_unwrap(child_result.write_commit)
+    let wal_closed: Boolean = yaza_db_wal_log_close_v1(child_created.wal)?
+    let storage_closed: Boolean = yaza_db_storage_close_v1(child_created.storage)?
+    if not wal_closed or not storage_closed: return err("YDBv1 FOREIGN KEY smoke could not close handles before recovery")
+
+    let recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, database_name)?
+    let parent_insert_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(recovered.storage, recovered.wal, "INSERT INTO parent_rows (id, code) VALUES (1, 101)", no_parameters)?
+    if not option_is_some(parent_insert_result.write_commit): return err("YDBv1 FOREIGN KEY smoke could not insert the parent key")
+    let parent_inserted: YazaDbWriteCommitV1 = option_unwrap(parent_insert_result.write_commit)
+    let valid_child_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(parent_inserted.storage, parent_inserted.wal, "INSERT INTO child_rows (id, parent_id) VALUES (10, 1)", no_parameters)?
+    if not option_is_some(valid_child_result.write_commit): return err("YDBv1 FOREIGN KEY accepted-parent insert did not commit")
+    let valid_child: YazaDbWriteCommitV1 = option_unwrap(valid_child_result.write_commit)
+    let invalid_child: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(valid_child.storage, valid_child.wal, "INSERT INTO child_rows (id, parent_id) VALUES (11, 999)", no_parameters)
+    if result_is_ok(invalid_child): return err("YDBv1 FOREIGN KEY accepted a missing parent key")
+    let null_child_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(valid_child.storage, valid_child.wal, "INSERT INTO child_rows (id, parent_id) VALUES (12, NULL)", no_parameters)?
+    if not option_is_some(null_child_result.write_commit): return err("YDBv1 FOREIGN KEY did not permit a nullable child key")
+    let null_child: YazaDbWriteCommitV1 = option_unwrap(null_child_result.write_commit)
+    let invalid_update: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(null_child.storage, null_child.wal, "UPDATE child_rows SET parent_id = 999 WHERE id = 10", no_parameters)
+    if result_is_ok(invalid_update): return err("YDBv1 FOREIGN KEY accepted an UPDATE to a missing parent key")
+    let valid_update_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(null_child.storage, null_child.wal, "UPDATE child_rows SET parent_id = 1 WHERE id = 10", no_parameters)?
+    if not option_is_some(valid_update_result.write_commit): return err("YDBv1 FOREIGN KEY blocked an UPDATE to an existing parent key")
+    let valid_updated: YazaDbWriteCommitV1 = option_unwrap(valid_update_result.write_commit)
+    let blocked_delete: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(valid_updated.storage, valid_updated.wal, "DELETE FROM parent_rows WHERE id = 1", no_parameters)
+    if result_is_ok(blocked_delete): return err("YDBv1 FOREIGN KEY RESTRICT did not block deletion of a referenced parent")
+    let child_delete_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(valid_updated.storage, valid_updated.wal, "DELETE FROM child_rows WHERE id = 10", no_parameters)?
+    if not option_is_some(child_delete_result.write_commit): return err("YDBv1 FOREIGN KEY smoke could not remove its referencing child")
+    let child_deleted: YazaDbWriteCommitV1 = option_unwrap(child_delete_result.write_commit)
+    let parent_delete_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(child_deleted.storage, child_deleted.wal, "DELETE FROM parent_rows WHERE id = 1", no_parameters)?
+    if not option_is_some(parent_delete_result.write_commit): return err("YDBv1 FOREIGN KEY RESTRICT incorrectly blocked an unreferenced parent")
+    let parent_deleted: YazaDbWriteCommitV1 = option_unwrap(parent_delete_result.write_commit)
+    let blocked_drop: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(parent_deleted.storage, parent_deleted.wal, "DROP TABLE parent_rows", no_parameters)
+    if result_is_ok(blocked_drop): return err("YDBv1 FOREIGN KEY did not block dropping a referenced parent table")
+    let child_drop_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(parent_deleted.storage, parent_deleted.wal, "DROP TABLE child_rows", no_parameters)?
+    if not option_is_some(child_drop_result.write_commit): return err("YDBv1 FOREIGN KEY smoke could not drop the child table and its constraint")
+    let child_dropped: YazaDbWriteCommitV1 = option_unwrap(child_drop_result.write_commit)
+    let parent_drop_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(child_dropped.storage, child_dropped.wal, "DROP TABLE parent_rows", no_parameters)?
+    if not option_is_some(parent_drop_result.write_commit): return err("YDBv1 FOREIGN KEY did not release the parent after dropping the child")
+    let parent_dropped: YazaDbWriteCommitV1 = option_unwrap(parent_drop_result.write_commit)
+    let final_wal_closed: Boolean = yaza_db_wal_log_close_v1(parent_dropped.wal)?
+    let final_storage_closed: Boolean = yaza_db_storage_close_v1(parent_dropped.storage)?
+    if not final_wal_closed or not final_storage_closed: return err("YDBv1 FOREIGN KEY smoke could not close its final database handles")
+    let removed: Boolean = remove(root, database_name)?
+    if not removed: return err("YDBv1 FOREIGN KEY smoke could not remove its temporary database")
+    let directory_synced: Boolean = sync_directory(root)?
+    let root_closed: Boolean = close(root)?
+    if not directory_synced or not root_closed: return err("YDBv1 FOREIGN KEY smoke could not close and sync its temporary root")
+    return ok(true)
+
+start:
+    let outcome: Result[Boolean, Text] = yazabase_sql_foreign_key_v1(arg(1))
+    if result_is_ok(outcome):
+        say "yazabase-sql-foreign-key-v1-ok"
+    else:
+        say result_unwrap_error(outcome)

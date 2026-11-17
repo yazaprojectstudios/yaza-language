@@ -1,0 +1,191 @@
+# Convert a bound INSERT plan into typed, null-aware rows for the storage layer.
+# This stage does not mutate pages or open a transaction.
+use "./sql_insert_bind_v1"
+use "./sql_executor_v1"
+use "./sql_literal_v1"
+use "./sql_lexer_v1"
+use "./sql_decimal_v1"
+use "./sql_date_v1"
+use "./sql_uuid_v1"
+use "./sql_temporal_v1"
+
+shape YazaSqlInsertMaterializedRowV1:
+    values: List[YazaSqlValueV1]
+    nulls: List[Boolean]
+
+shape YazaSqlInsertMaterializedV1:
+    table_id: Number
+    catalog_version: Number
+    columns: List[YazaSqlColumnSchemaV1]
+    rows: List[YazaSqlInsertMaterializedRowV1]
+
+fn yaza_sql_insert_materialize_cell_v1(source: Text, cell: YazaSqlBoundInsertCellV1, column: YazaSqlColumnSchemaV1, parameters: List[YazaSqlValueV1]) -> Result[YazaSqlValueV1, Text]:
+    if cell.column_ordinal != column.ordinal or cell.type_id != column.type_id or cell.start_byte < 0 or cell.end_byte <= cell.start_byte or cell.end_byte > text_length(source): return err("SQL INSERT bound cell does not match its target column or source span")
+    if cell.parameter_ordinal < -1: return err("SQL INSERT bound cell has an invalid parameter ordinal")
+    if cell.is_null_literal:
+        if cell.literal_kind != 1 or cell.parameter_ordinal != -1 or not column.nullable or not yaza_sql_executor_keyword_v1(source, cell.start_byte, cell.end_byte, "null"): return err("SQL INSERT NULL literal is inconsistent with its target column")
+        return yaza_sql_value_null_v1(column.type_id)
+    if cell.parameter_ordinal >= 0:
+        if cell.literal_kind != 5 or cell.parameter_ordinal >= list_count(parameters): return err("SQL INSERT parameter reference is outside the supplied values")
+        let parameter: YazaSqlValueV1 = list_get(parameters, cell.parameter_ordinal)
+        if not yaza_sql_executor_value_matches_v1(parameter, column.type_id): return err("SQL INSERT parameter type does not match the inferred target type")
+        if parameter.is_null and not column.nullable: return err("SQL INSERT NULL parameter targets a NOT NULL column")
+        if column.type_id == 10 and not parameter.is_null:
+            let parameter_decimal: YazaSqlDecimalV1 = yaza_sql_decimal_parse_v1(parameter.text_value, yaza_sql_value_decimal_precision_v1(parameter), yaza_sql_value_decimal_scale_v1(parameter))?
+            let target_decimal: YazaSqlDecimalV1 = yaza_sql_decimal_rescale_v1(parameter_decimal, column.precision, column.scale)?
+            return yaza_sql_value_decimal_v1(target_decimal)
+        return ok(parameter)
+    if cell.literal_kind == 3:
+        let literal: Result[Text, Text] = text_try_slice(source, cell.start_byte, cell.end_byte - cell.start_byte)
+        if not result_is_ok(literal): return err("SQL INSERT could not read its numeric literal")
+        if column.type_id == 2 or column.type_id == 3 or column.type_id == 4:
+            let parsed_integer: Result[Number, Text] = number_try_parse(result_unwrap(literal))
+            if not result_is_ok(parsed_integer): return err("SQL INSERT integer literal is invalid or out of range")
+            return yaza_sql_value_integer_v1(column.type_id, result_unwrap(parsed_integer))
+        if column.type_id == 6:
+            let parsed_float: Result[Float64, Text] = float64_try_parse(result_unwrap(literal))
+            if not result_is_ok(parsed_float): return err("SQL INSERT DOUBLE literal is invalid, non-finite, or out of range")
+            return ok(yaza_sql_value_double_v1(result_unwrap(parsed_float)))
+        if column.type_id == 10:
+            let parsed_decimal: YazaSqlDecimalV1 = yaza_sql_decimal_parse_v1(result_unwrap(literal), column.precision, column.scale)?
+            return yaza_sql_value_decimal_v1(parsed_decimal)
+        return err("SQL INSERT numeric literal has an unsupported target type")
+    if cell.literal_kind == 4:
+        if column.type_id == 11:
+            let decoded_date: Text = yaza_sql_decode_text_literal_v1(source, cell.start_byte, cell.end_byte)?
+            let date_days: Number = yaza_sql_date_parse_v1(decoded_date)?
+            return yaza_sql_value_integer_v1(11, date_days)
+        if column.type_id == 12:
+            let uuid_literal: Text = text_slice(source, cell.start_byte + 1, cell.end_byte - cell.start_byte - 2)
+            return yaza_sql_value_uuid_v1(uuid_literal)
+        if column.type_id == 13:
+            let decoded_time: Text = yaza_sql_decode_text_literal_v1(source, cell.start_byte, cell.end_byte)?
+            let time_micros: Number = yaza_sql_time_parse_v1(decoded_time)?
+            return yaza_sql_value_integer_v1(13, time_micros)
+        if column.type_id == 14:
+            let decoded_timestamp: Text = yaza_sql_decode_text_literal_v1(source, cell.start_byte, cell.end_byte)?
+            let timestamp_micros: Number = yaza_sql_timestamp_parse_v1(decoded_timestamp)?
+            return yaza_sql_value_integer_v1(14, timestamp_micros)
+        if column.type_id == 15:
+            let decoded_timestamptz: Text = yaza_sql_decode_text_literal_v1(source, cell.start_byte, cell.end_byte)?
+            let timestamptz_micros: Number = yaza_sql_timestamptz_parse_v1(decoded_timestamptz)?
+            return yaza_sql_value_integer_v1(15, timestamptz_micros)
+        if column.type_id != 9: return err("SQL INSERT text literal does not match its target type")
+        let decoded: Text = yaza_sql_decode_text_literal_v1(source, cell.start_byte, cell.end_byte)?
+        return ok(yaza_sql_value_text_v1(decoded))
+    if cell.literal_kind == 8:
+        if column.type_id != 16: return err("SQL INSERT BLOB literal does not match its target type")
+        let decoded_blob: Bytes = yaza_sql_decode_blob_literal_v1(source, cell.start_byte, cell.end_byte)?
+        return yaza_sql_value_blob_v1(decoded_blob)
+    if cell.literal_kind == 1:
+        if column.type_id != 1: return err("SQL INSERT Boolean literal does not match its target type")
+        if yaza_sql_executor_keyword_v1(source, cell.start_byte, cell.end_byte, "true"): return ok(yaza_sql_value_boolean_v1(true))
+        if yaza_sql_executor_keyword_v1(source, cell.start_byte, cell.end_byte, "false"): return ok(yaza_sql_value_boolean_v1(false))
+    return err("SQL INSERT bound cell contains an unsupported literal")
+
+fn yaza_sql_insert_materialize_default_v1(expression: Text, column: YazaSqlColumnSchemaV1) -> Result[YazaSqlValueV1, Text]:
+    if text_length(expression) < 1 or text_length(expression) > 4096: return err("SQL INSERT column DEFAULT literal is outside its bound")
+    let lexed: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(expression)
+    if not result_is_ok(lexed): return err("SQL INSERT column DEFAULT literal could not be lexed")
+    let tokens: List[YazaSqlTokenV1] = result_unwrap(lexed)
+    var literal: YazaSqlTokenV1 = YazaSqlTokenV1(0, 0, 0)
+    let token_count: Number = list_count(tokens)
+    if token_count == 2 and list_get(tokens, 1).kind == 0:
+        set literal = list_get(tokens, 0)
+    elif token_count == 3 and list_get(tokens, 0).kind == 7 and list_get(tokens, 1).kind == 3 and list_get(tokens, 2).kind == 0:
+        let sign: YazaSqlTokenV1 = list_get(tokens, 0)
+        let number: YazaSqlTokenV1 = list_get(tokens, 1)
+        if sign.end_byte - sign.start_byte != 1 or (text_byte(expression, sign.start_byte) != 43 and text_byte(expression, sign.start_byte) != 45): return err("SQL INSERT column DEFAULT sign is invalid")
+        set literal = YazaSqlTokenV1(3, sign.start_byte, number.end_byte)
+    else:
+        return err("SQL INSERT column DEFAULT must be one scalar literal")
+    let is_null: Boolean = literal.kind == 1 and yaza_sql_executor_keyword_v1(expression, literal.start_byte, literal.end_byte, "null")
+    if literal.kind != 1 and literal.kind != 3 and literal.kind != 4 and literal.kind != 8: return err("SQL INSERT column DEFAULT has an unsupported literal kind")
+    let cell: YazaSqlBoundInsertCellV1 = YazaSqlBoundInsertCellV1(column.ordinal, column.type_id, literal.kind, -1, literal.start_byte, literal.end_byte, is_null)
+    return yaza_sql_insert_materialize_cell_v1(expression, cell, column, List[YazaSqlValueV1]())
+
+fn yaza_sql_insert_materialize_column_default_v1(expression: Text, column: YazaSqlColumnSchemaV1) -> Result[YazaSqlValueV1, Text]:
+    if text_length(expression) == 0:
+        if not column.nullable: return err("SQL INSERT DEFAULT has no declared value for a NOT NULL column")
+        return yaza_sql_value_null_v1(column.type_id)
+    let value: YazaSqlValueV1 = yaza_sql_insert_materialize_default_v1(expression, column)?
+    if value.is_null and not column.nullable: return err("SQL INSERT DEFAULT NULL targets a NOT NULL column")
+    return ok(value)
+
+fn yaza_sql_materialize_insert_v1(plan: YazaSqlBoundInsertPlanV1, parameters: List[YazaSqlValueV1]) -> Result[YazaSqlInsertMaterializedV1, Text]:
+    let column_count: Number = list_count(plan.columns)
+    let input_width: Number = list_count(plan.input_column_ordinals)
+    let row_count: Number = list_count(plan.rows)
+    if plan.version != 1 or plan.catalog_version < 1 or plan.table_id < 1 or column_count < 1 or column_count > 1024 or list_count(plan.column_defaults) != column_count: return err("SQL INSERT materializer received an invalid plan header")
+    if input_width < 1 or input_width > column_count or row_count < 1 or row_count > 1024 or row_count * column_count > yaza_sql_executor_max_input_cells_v1(): return err("SQL INSERT materializer plan exceeds its bounded row or cell limits")
+    if text_length(plan.source) > yaza_sql_executor_max_input_text_bytes_v1(): return err("SQL INSERT source exceeds its bounded text limit")
+    if list_count(parameters) != list_count(plan.parameters) or list_count(parameters) > 4096: return err("SQL INSERT parameter count does not match the bound plan")
+    if (list_count(plan.parameters) == 0 and plan.parameter_style != 0) or (list_count(plan.parameters) > 0 and (plan.parameter_style < 1 or plan.parameter_style > 3)): return err("SQL INSERT parameter style does not match the bound plan")
+    var parameter_index: Number = 0
+    while parameter_index < list_count(plan.parameters):
+        let bound_parameter: YazaSqlBoundParameterV1 = list_get(plan.parameters, parameter_index)
+        if bound_parameter.ordinal != parameter_index or bound_parameter.style != plan.parameter_style or bound_parameter.type_id < 1 or not yaza_sql_executor_type_supported_v1(bound_parameter.type_id) or bound_parameter.occurrence_count < 1: return err("SQL INSERT bound parameter metadata is invalid")
+        set parameter_index = parameter_index + 1
+    var schema_index: Number = 0
+    while schema_index < column_count:
+        let column: YazaSqlColumnSchemaV1 = list_get(plan.columns, schema_index)
+        if column.ordinal != schema_index or text_length(column.name) == 0 or not yaza_sql_executor_type_supported_v1(column.type_id): return err("SQL INSERT materializer received an invalid catalog column")
+        if text_length(list_get(plan.column_defaults, schema_index)) > 4096: return err("SQL INSERT materializer received an oversized column DEFAULT literal")
+        set schema_index = schema_index + 1
+    var input_index: Number = 0
+    while input_index < input_width:
+        let ordinal: Number = list_get(plan.input_column_ordinals, input_index)
+        if ordinal < 0 or ordinal >= column_count: return err("SQL INSERT materializer input column is outside the schema")
+        var prior_index: Number = 0
+        while prior_index < input_index:
+            if list_get(plan.input_column_ordinals, prior_index) == ordinal: return err("SQL INSERT materializer input column list contains a duplicate")
+            set prior_index = prior_index + 1
+        set input_index = input_index + 1
+
+    let rows_created: Result[List[YazaSqlInsertMaterializedRowV1], Text] = list_try_new()
+    if not result_is_ok(rows_created): return err("SQL INSERT materializer could not allocate its row list")
+    let materialized_rows: List[YazaSqlInsertMaterializedRowV1] = result_unwrap(rows_created)
+    if not list_try_reserve(materialized_rows, row_count): return err("SQL INSERT materializer could not reserve its row list")
+    var row_index: Number = 0
+    while row_index < row_count:
+        let bound_row: YazaSqlBoundInsertRowV1 = list_get(plan.rows, row_index)
+        if list_count(bound_row.cells) != input_width: return err("SQL INSERT bound row width does not match its input columns")
+        let values_created: Result[List[YazaSqlValueV1], Text] = list_try_new()
+        let nulls_created: Result[List[Boolean], Text] = list_try_new()
+        let supplied_created: Result[List[Boolean], Text] = list_try_new()
+        if not result_is_ok(values_created) or not result_is_ok(nulls_created) or not result_is_ok(supplied_created): return err("SQL INSERT materializer could not allocate a row")
+        let values: List[YazaSqlValueV1] = result_unwrap(values_created)
+        let nulls: List[Boolean] = result_unwrap(nulls_created)
+        let supplied: List[Boolean] = result_unwrap(supplied_created)
+        if not list_try_reserve(values, column_count) or not list_try_reserve(nulls, column_count) or not list_try_reserve(supplied, column_count): return err("SQL INSERT materializer could not reserve a row")
+        set schema_index = 0
+        while schema_index < column_count:
+            let column: YazaSqlColumnSchemaV1 = list_get(plan.columns, schema_index)
+            if not list_try_push(values, yaza_sql_executor_value_v1(column.type_id, 0, 0.0, false, "")) or not list_try_push(nulls, false) or not list_try_push(supplied, false): return err("SQL INSERT materializer could not initialize a row")
+            set schema_index = schema_index + 1
+        set input_index = 0
+        while input_index < input_width:
+            let ordinal: Number = list_get(plan.input_column_ordinals, input_index)
+            let column: YazaSqlColumnSchemaV1 = list_get(plan.columns, ordinal)
+            let cell: YazaSqlBoundInsertCellV1 = list_get(bound_row.cells, input_index)
+            var value: YazaSqlValueV1 = yaza_sql_executor_value_v1(column.type_id, 0, 0.0, false, "")
+            if cell.literal_kind == 9:
+                if cell.column_ordinal != column.ordinal or cell.type_id != column.type_id or cell.parameter_ordinal != -1 or cell.is_null_literal or cell.start_byte < 0 or cell.end_byte <= cell.start_byte or cell.end_byte > text_length(plan.source) or not yaza_sql_executor_keyword_v1(plan.source, cell.start_byte, cell.end_byte, "default"):
+                    return err("SQL INSERT bound DEFAULT cell is inconsistent with its target column or source span")
+                let default_expression: Text = list_get(plan.column_defaults, ordinal)
+                set value = yaza_sql_insert_materialize_column_default_v1(default_expression, column)?
+            else:
+                set value = yaza_sql_insert_materialize_cell_v1(plan.source, cell, column, parameters)?
+            if not list_try_set(values, ordinal, value) or not list_try_set(nulls, ordinal, value.is_null) or not list_try_set(supplied, ordinal, true): return err("SQL INSERT materializer could not assign a row value")
+            set input_index = input_index + 1
+        set schema_index = 0
+        while schema_index < column_count:
+            if not list_get(supplied, schema_index):
+                let column: YazaSqlColumnSchemaV1 = list_get(plan.columns, schema_index)
+                let default_expression: Text = list_get(plan.column_defaults, schema_index)
+                let default_value: YazaSqlValueV1 = yaza_sql_insert_materialize_column_default_v1(default_expression, column)?
+                if not list_try_set(values, schema_index, default_value) or not list_try_set(nulls, schema_index, default_value.is_null): return err("SQL INSERT materializer could not apply a column DEFAULT")
+            set schema_index = schema_index + 1
+        if not list_try_push(materialized_rows, YazaSqlInsertMaterializedRowV1(values, nulls)): return err("SQL INSERT materializer could not append its row")
+        set row_index = row_index + 1
+    return ok(YazaSqlInsertMaterializedV1(plan.table_id, plan.catalog_version, plan.columns, materialized_rows))

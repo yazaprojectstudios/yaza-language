@@ -1,0 +1,101 @@
+use "../yazabase/catalog_init_v1"
+use "../yazabase/query_page_v1"
+use "../yazabase/sql_dispatch_v1"
+use "std/fs"
+
+fn yazabase_query_page_v1_check(root_path: Text) -> Result[Boolean, Text]:
+    let root: Number = root_open(root_path)?
+    let db_name: Text = "query-page-smoke.ydb"
+    let header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_from_text("query-page-uuid1"), 0, 1, 1, 0, 2, 1)
+    let empty_storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, db_name, header)?
+    let empty_closed: Boolean = yaza_db_storage_close_v1(empty_storage)?
+    if not empty_closed: return err("YDBv1 query-page fixture could not close its empty database")
+    let initialized: YazaDbCatalogBootstrapV1 = yaza_db_catalog_initialize_v1(root, db_name)?
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let created: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(initialized.storage, initialized.wal, "CREATE TABLE items (id BIGINT PRIMARY KEY, label TEXT NOT NULL)", no_parameters)?
+    if not option_is_some(created.write_commit): return err("YDBv1 query-page fixture could not create its table")
+    let create_commit: YazaDbWriteCommitV1 = option_unwrap(created.write_commit)
+    let inserted: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(create_commit.storage, create_commit.wal, "INSERT INTO items (id, label) VALUES (1, 'old-1'), (2, 'old-2'), (3, 'old-3'), (4, 'old-4'), (5, 'old-5')", no_parameters)?
+    if not option_is_some(inserted.write_commit): return err("YDBv1 query-page fixture could not seed its rows")
+    let insert_commit: YazaDbWriteCommitV1 = option_unwrap(inserted.write_commit)
+    let id_one: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 1)?
+    let id_five: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 5)?
+    let parameters: List[YazaSqlValueV1] = [id_one, id_five]
+    let source: Text = "SELECT id, label FROM items WHERE id >= $1 AND id <= $2"
+    let first: YazaDbQueryPageV1 = yaza_db_execute_select_page_v1(insert_commit.storage, insert_commit.wal, source, parameters, 2, none)?
+    if first.snapshot_ts != insert_commit.commit_ts or not first.has_more or not option_is_some(first.next_token): return err("YDBv1 query-page first page did not establish a fixed snapshot and continuation")
+    if list_count(first.query_result.columns) != 2 or list_count(first.query_result.rows) != 2: return err("YDBv1 query-page first page returned the wrong shape")
+    let first_row: List[YazaSqlValueV1] = list_get(first.query_result.rows, 0)
+    let second_row: List[YazaSqlValueV1] = list_get(first.query_result.rows, 1)
+    if list_get(first_row, 0).integer_value != 1 or list_get(first_row, 1).text_value != "old-1": return err("YDBv1 query-page first row is incorrect")
+    if list_get(second_row, 0).integer_value != 2 or list_get(second_row, 1).text_value != "old-2": return err("YDBv1 query-page second row is incorrect")
+    let first_token: YazaDbQueryPageTokenV1 = option_unwrap(first.next_token)
+    let encoded_token: Text = yaza_db_query_page_token_encode_v1(first_token)?
+    let decoded_token: YazaDbQueryPageTokenV1 = yaza_db_query_page_token_decode_v1(encoded_token)?
+    if decoded_token.version != first_token.version or not bytes_equal(decoded_token.db_uuid, first_token.db_uuid) or decoded_token.schema_fingerprint != first_token.schema_fingerprint or decoded_token.table_id != first_token.table_id or decoded_token.snapshot_ts != first_token.snapshot_ts or decoded_token.query_fingerprint != first_token.query_fingerprint or decoded_token.rows_emitted != first_token.rows_emitted or not bytes_equal(decoded_token.last_key, first_token.last_key): return err("YDBv1 query-page token serialization did not round-trip")
+    if result_is_ok(yaza_db_query_page_token_decode_v1("!")): return err("YDBv1 query-page token decoder accepted malformed Base64URL")
+    let id_four: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 4)?
+    let wrong_bound: List[YazaSqlValueV1] = [id_one, id_four]
+    if result_is_ok(yaza_db_execute_select_page_v1(insert_commit.storage, insert_commit.wal, source, wrong_bound, 2, some(first_token))): return err("YDBv1 query-page accepted a cursor with changed bind values")
+    if result_is_ok(yaza_db_execute_select_page_v1(insert_commit.storage, insert_commit.wal, "SELECT id, label FROM items ORDER BY label", no_parameters, 2, none)): return err("YDBv1 query-page accepted ORDER BY outside the clustered-key page profile")
+    if result_is_ok(yaza_db_execute_select_page_v1(insert_commit.storage, insert_commit.wal, "SELECT id FROM items ORDER BY id DESC", no_parameters, 2, none)): return err("YDBv1 query-page accepted descending order without a reverse cursor")
+    if result_is_ok(yaza_db_execute_select_page_v1(insert_commit.storage, insert_commit.wal, "SELECT COUNT(*) FROM items", no_parameters, 2, none)): return err("YDBv1 query-page accepted an aggregate projection")
+    if result_is_ok(yaza_db_execute_select_page_v1(insert_commit.storage, insert_commit.wal, "SELECT DISTINCT id FROM items", no_parameters, 2, none)): return err("YDBv1 query-page accepted DISTINCT outside its current cursor contract")
+    if result_is_ok(yaza_db_execute_select_page_v1(insert_commit.storage, insert_commit.wal, "SELECT id FROM items", no_parameters, 0, none)): return err("YDBv1 query-page accepted a zero page size")
+    if result_is_ok(yaza_db_execute_select_page_v1(insert_commit.storage, insert_commit.wal, "SELECT id FROM items", no_parameters, 257, none)): return err("YDBv1 query-page accepted a page size above its fixed maximum")
+
+    let updated: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(insert_commit.storage, insert_commit.wal, "UPDATE items SET label = 'new-3' WHERE id = 3", no_parameters)?
+    if not option_is_some(updated.write_commit): return err("YDBv1 query-page fixture could not update a row between page requests")
+    let update_commit: YazaDbWriteCommitV1 = option_unwrap(updated.write_commit)
+    let deleted: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(update_commit.storage, update_commit.wal, "DELETE FROM items WHERE id = 4", no_parameters)?
+    if not option_is_some(deleted.write_commit): return err("YDBv1 query-page fixture could not delete a row between page requests")
+    let delete_commit: YazaDbWriteCommitV1 = option_unwrap(deleted.write_commit)
+    let added: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(delete_commit.storage, delete_commit.wal, "INSERT INTO items (id, label) VALUES (6, 'new-6')", no_parameters)?
+    if not option_is_some(added.write_commit): return err("YDBv1 query-page fixture could not insert a row between page requests")
+    let final_commit: YazaDbWriteCommitV1 = option_unwrap(added.write_commit)
+
+    let second: YazaDbQueryPageV1 = yaza_db_execute_select_page_v1(final_commit.storage, final_commit.wal, source, parameters, 2, some(decoded_token))?
+    if second.snapshot_ts != first.snapshot_ts or not second.has_more or not option_is_some(second.next_token): return err("YDBv1 query-page continuation changed its snapshot after writes")
+    if list_count(second.query_result.rows) != 2: return err("YDBv1 query-page second page returned the wrong row count")
+    let third_row: List[YazaSqlValueV1] = list_get(second.query_result.rows, 0)
+    let fourth_row: List[YazaSqlValueV1] = list_get(second.query_result.rows, 1)
+    if list_get(third_row, 0).integer_value != 3 or list_get(third_row, 1).text_value != "old-3": return err("YDBv1 query-page did not preserve the pre-update value in its snapshot")
+    if list_get(fourth_row, 0).integer_value != 4 or list_get(fourth_row, 1).text_value != "old-4": return err("YDBv1 query-page did not preserve the pre-delete row in its snapshot")
+    let third: YazaDbQueryPageV1 = yaza_db_execute_select_page_v1(final_commit.storage, final_commit.wal, source, parameters, 2, second.next_token)?
+    if third.snapshot_ts != first.snapshot_ts or third.has_more or option_is_some(third.next_token): return err("YDBv1 query-page final page returned a continuation or changed its snapshot")
+    if list_count(third.query_result.rows) != 1 or list_get(list_get(third.query_result.rows, 0), 0).integer_value != 5: return err("YDBv1 query-page final row is incorrect")
+
+    let unfiltered_first: YazaDbQueryPageV1 = yaza_db_execute_select_page_v1(final_commit.storage, final_commit.wal, "SELECT id FROM items", no_parameters, 2, none)?
+    if not unfiltered_first.has_more or list_count(unfiltered_first.query_result.rows) != 2: return err("YDBv1 query-page no-filter path did not return a bounded first page")
+    let unfiltered_second: YazaDbQueryPageV1 = yaza_db_execute_select_page_v1(final_commit.storage, final_commit.wal, "SELECT id FROM items", no_parameters, 2, unfiltered_first.next_token)?
+    if not unfiltered_second.has_more or list_count(unfiltered_second.query_result.rows) != 2 or not option_is_some(unfiltered_second.next_token): return err("YDBv1 query-page no-filter continuation returned an incorrect middle page")
+    let unfiltered_third: YazaDbQueryPageV1 = yaza_db_execute_select_page_v1(final_commit.storage, final_commit.wal, "SELECT id FROM items", no_parameters, 2, unfiltered_second.next_token)?
+    if unfiltered_third.has_more or list_count(unfiltered_third.query_result.rows) != 1 or list_get(list_get(unfiltered_third.query_result.rows, 0), 0).integer_value != 6: return err("YDBv1 query-page no-filter final page returned an incorrect row")
+    let ordered_limited_source: Text = "SELECT id FROM items ORDER BY id LIMIT 3"
+    let ordered_limited_first: YazaDbQueryPageV1 = yaza_db_execute_select_page_v1(final_commit.storage, final_commit.wal, ordered_limited_source, no_parameters, 2, none)?
+    if not ordered_limited_first.has_more or list_count(ordered_limited_first.query_result.rows) != 2: return err("YDBv1 clustered ORDER BY/LIMIT first page has the wrong shape")
+    if list_get(list_get(ordered_limited_first.query_result.rows, 0), 0).integer_value != 1 or list_get(list_get(ordered_limited_first.query_result.rows, 1), 0).integer_value != 2: return err("YDBv1 clustered ORDER BY/LIMIT first page has the wrong rows")
+    let ordered_limited_second: YazaDbQueryPageV1 = yaza_db_execute_select_page_v1(final_commit.storage, final_commit.wal, ordered_limited_source, no_parameters, 2, ordered_limited_first.next_token)?
+    if ordered_limited_second.has_more or option_is_some(ordered_limited_second.next_token) or list_count(ordered_limited_second.query_result.rows) != 1 or list_get(list_get(ordered_limited_second.query_result.rows, 0), 0).integer_value != 3: return err("YDBv1 clustered ORDER BY/LIMIT did not stop at the global SQL LIMIT")
+    let zero_limit: YazaDbQueryPageV1 = yaza_db_execute_select_page_v1(final_commit.storage, final_commit.wal, "SELECT id FROM items LIMIT 0", no_parameters, 2, none)?
+    if zero_limit.has_more or option_is_some(zero_limit.next_token) or list_count(zero_limit.query_result.rows) != 0: return err("YDBv1 query-page LIMIT 0 returned rows or a continuation")
+    let wrong_database_uuid: Bytes = bytes_from_text("other-database-id")
+    let forged_token: YazaDbQueryPageTokenV1 = YazaDbQueryPageTokenV1(first_token.version, wrong_database_uuid, first_token.schema_fingerprint, first_token.table_id, first_token.snapshot_ts, first_token.query_fingerprint, first_token.rows_emitted, first_token.last_key)
+    if result_is_ok(yaza_db_execute_select_page_v1(final_commit.storage, final_commit.wal, source, parameters, 2, some(forged_token))): return err("YDBv1 query-page accepted a cursor from a different database")
+    let altered: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(final_commit.storage, final_commit.wal, "ALTER TABLE items ADD COLUMN note TEXT", no_parameters)?
+    if not option_is_some(altered.write_commit): return err("YDBv1 query-page fixture could not alter the table schema")
+    let alter_commit: YazaDbWriteCommitV1 = option_unwrap(altered.write_commit)
+    if result_is_ok(yaza_db_execute_select_page_v1(alter_commit.storage, alter_commit.wal, source, parameters, 2, some(first_token))): return err("YDBv1 query-page accepted a token from an older table schema")
+
+    let wal_closed: Boolean = yaza_db_wal_log_close_v1(alter_commit.wal)?
+    let storage_closed: Boolean = yaza_db_storage_close_v1(alter_commit.storage)?
+    if not wal_closed or not storage_closed: return err("YDBv1 query-page fixture could not close its final database handles")
+    let root_closed: Boolean = close(root)?
+    if not root_closed: return err("YDBv1 query-page fixture could not close its root handle")
+    return ok(true)
+
+start:
+    let outcome: Result[Boolean, Text] = yazabase_query_page_v1_check(arg(1))
+    if not result_is_ok(outcome): say result_unwrap_error(outcome)
+    elif result_unwrap(outcome): say "yazabase-query-page-v1-ok"
+    else: say "YDBv1 query-page fixture returned false"

@@ -1,0 +1,84 @@
+use "transport"
+
+# A scope borrows one exclusively used connection. Copies share the lifecycle.
+# Register `defer pg_scope_cleanup(scope)` immediately after pg_scope_begin.
+# Explicit commit/rollback report failures; cleanup closes an uncertain connection.
+shape PgTransactionScope:
+    handle: Number
+    timeout_ms: Number
+    lifecycle: TextList
+
+fn pg_scope_valid(scope: PgTransactionScope) -> Boolean:
+    if scope.handle <= 0 or scope.timeout_ms < 1 or scope.timeout_ms > 3600000:
+        return false
+    if list_count(scope.lifecycle) != 1:
+        return false
+    let state: Text = list_get(scope.lifecycle, 0)
+    return state == "active" or state == "committed" or state == "rolled_back" or state == "failed"
+
+fn pg_scope_is_active(scope: PgTransactionScope) -> Boolean:
+    return pg_scope_valid(scope) and list_get(scope.lifecycle, 0) == "active"
+
+fn pg_scope_invalidate(scope: PgTransactionScope) -> Number:
+    list_set(scope.lifecycle, 0, "failed")
+    # Do not send Terminate on an uncertain protocol stream or extend its deadline.
+    let closed: Number = net_close(scope.handle)
+    return 1
+
+fn pg_scope_begin(handle: Number, timeout_ms: Number) -> Result[PgTransactionScope, Text]:
+    let idle: Boolean = pg_transaction_require_idle(handle, timeout_ms)?
+    let lifecycle: TextList = text_list()
+    list_push(lifecycle, "active")
+    let scope: PgTransactionScope = PgTransactionScope(handle, timeout_ms, lifecycle)
+    let begun: Result[PgQueryResult, Text] = pg_query(handle, "BEGIN", timeout_ms)
+    if not result_is_ok(begun):
+        let invalidated: Number = pg_scope_invalidate(scope)
+        return err("postgres transaction scope: BEGIN outcome is unknown; connection closed")
+    if not pg_transaction_result_matches(result_unwrap(begun), "BEGIN", "in_transaction"):
+        let invalidated: Number = pg_scope_invalidate(scope)
+        return err("postgres transaction scope: BEGIN returned an invalid state; connection closed")
+    return ok(scope)
+
+fn pg_scope_query(scope: PgTransactionScope, sql: Text, parameters: PgParameters) -> Result[PgQueryResult, Text]:
+    if not pg_scope_is_active(scope):
+        return err("postgres transaction scope: scope is not active")
+    return pg_transaction_query(scope.handle, sql, parameters, scope.timeout_ms)
+
+fn pg_scope_commit(scope: PgTransactionScope) -> Result[Boolean, Text]:
+    if not pg_scope_is_active(scope):
+        return err("postgres transaction scope: scope is not active")
+    let committed: Result[Boolean, Text] = pg_transaction_commit(scope.handle, scope.timeout_ms)
+    if not result_is_ok(committed):
+        let invalidated: Number = pg_scope_invalidate(scope)
+        return err("postgres transaction scope: COMMIT could not be confirmed; connection closed; do not retry without an idempotency policy")
+    list_set(scope.lifecycle, 0, "committed")
+    return ok(true)
+
+fn pg_scope_rollback(scope: PgTransactionScope) -> Result[Boolean, Text]:
+    if not pg_scope_is_active(scope):
+        return err("postgres transaction scope: scope is not active")
+    let rolled_back: Result[Boolean, Text] = pg_transaction_rollback(scope.handle, scope.timeout_ms)
+    if not result_is_ok(rolled_back):
+        let invalidated: Number = pg_scope_invalidate(scope)
+        return err("postgres transaction scope: ROLLBACK failed; connection closed")
+    list_set(scope.lifecycle, 0, "rolled_back")
+    return ok(true)
+
+fn pg_scope_cleanup(scope: PgTransactionScope) -> Number:
+    if not pg_scope_valid(scope):
+        return 1
+    if list_get(scope.lifecycle, 0) == "failed":
+        return 1
+    if pg_scope_is_active(scope):
+        let rolled_back: Result[Boolean, Text] = pg_scope_rollback(scope)
+        if not result_is_ok(rolled_back):
+            let cleanup_fields: TextList = text_list()
+            list_push(cleanup_fields, "operation")
+            list_push(cleanup_fields, "ROLLBACK")
+            list_push(cleanup_fields, "connection")
+            list_push(cleanup_fields, "closed")
+            let logged: Number = log_event("error", "postgres_transaction_cleanup_failed", cleanup_fields)
+            if logged != 0:
+                return logged
+            return 1
+    return 0

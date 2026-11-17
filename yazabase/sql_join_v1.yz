@@ -1,0 +1,542 @@
+# Bounded materialization for equality, theta, and CROSS joins over two typed inputs.
+# The hash table narrows candidate comparisons; equality is always checked
+# after hashing, and all input/output/work limits remain enforced.
+use "./sql_executor_v1"
+
+shape YazaSqlJoinInputStatsV1:
+    cell_count: Number
+    text_byte_count: Number
+
+fn yaza_sql_join_validate_input_v1(table: YazaSqlMemoryTableV1) -> Result[YazaSqlJoinInputStatsV1, Text]:
+    if table.table_id <= 0 or table.catalog_version <= 0 or list_count(table.column_type_ids) == 0 or list_count(table.column_type_ids) > 1024:
+        return err("SQL JOIN received invalid input table metadata")
+    if list_count(table.rows) > 65536: return err("SQL JOIN input exceeds the 65536-row profile")
+    var cell_count: Number = 0
+    var text_byte_count: Number = 0
+    var type_index: Number = 0
+    while type_index < list_count(table.column_type_ids):
+        if not yaza_sql_executor_type_supported_v1(list_get(table.column_type_ids, type_index)):
+            return err("SQL JOIN input contains a type outside the exact scalar profile")
+        set type_index = type_index + 1
+    var row_index: Number = 0
+    while row_index < list_count(table.rows):
+        let row: List[YazaSqlValueV1] = list_get(table.rows, row_index)
+        if list_count(row) != list_count(table.column_type_ids): return err("SQL JOIN input row width does not match its schema")
+        set cell_count = cell_count + list_count(row)
+        if cell_count > yaza_sql_executor_max_input_cells_v1(): return err("SQL JOIN inputs exceed the bounded source-cell budget")
+        var cell_index: Number = 0
+        while cell_index < list_count(row):
+            let value: YazaSqlValueV1 = list_get(row, cell_index)
+            let type_id: Number = list_get(table.column_type_ids, cell_index)
+            if not yaza_sql_executor_value_matches_v1(value, type_id): return err("SQL JOIN input row contains a value that does not match its schema")
+            if type_id == 9 and not value.is_null:
+                let byte_count: Number = text_length(value.text_value)
+                if byte_count > yaza_sql_executor_max_text_value_bytes_v1(): return err("SQL JOIN text value exceeds the bounded value-size limit")
+                set text_byte_count = text_byte_count + byte_count
+                if text_byte_count > yaza_sql_executor_max_input_text_bytes_v1(): return err("SQL JOIN inputs exceed the bounded variable-width source budget")
+            elif type_id == 16 and not value.is_null:
+                let byte_count: Number = bytes_length(value.bytes_value)
+                if byte_count > 67108864: return err("SQL JOIN BLOB value exceeds the 64 MiB value-size limit")
+                set text_byte_count = text_byte_count + byte_count
+                if text_byte_count > yaza_sql_executor_max_input_text_bytes_v1(): return err("SQL JOIN inputs exceed the bounded variable-width source budget")
+            set cell_index = cell_index + 1
+        set row_index = row_index + 1
+    return ok(YazaSqlJoinInputStatsV1(cell_count, text_byte_count))
+
+fn yaza_sql_join_row_text_bytes_v1(row: List[YazaSqlValueV1]) -> Number:
+    var total: Number = 0
+    var index: Number = 0
+    while index < list_count(row):
+        let value: YazaSqlValueV1 = list_get(row, index)
+        if value.type_id == 9 and not value.is_null: set total = total + text_length(value.text_value)
+        elif value.type_id == 16 and not value.is_null: set total = total + bytes_length(value.bytes_value)
+        set index = index + 1
+    return total
+
+fn yaza_sql_join_key_hash_v1(value: YazaSqlValueV1, seed: Number) -> Number:
+    let modulus: Number = 2147483647
+    let multiplier: Number = 257 + seed % 65521
+    let quotient_multiplier: Number = 257 + (seed / 65521) % 65521
+    if value.type_id == 1:
+        if value.boolean_value: return (multiplier + seed + 1) % modulus
+        return (seed + 1) % modulus
+    if value.type_id == 2 or value.type_id == 3 or value.type_id == 4 or value.type_id == 11 or value.type_id == 13 or value.type_id == 14 or value.type_id == 15:
+        let remainder: Number = value.integer_value % modulus
+        let quotient: Number = value.integer_value / modulus
+        let raw_hash: Number = multiplier * remainder + quotient_multiplier * quotient + seed
+        let normalized_hash: Number = raw_hash % modulus
+        return (normalized_hash + modulus) % modulus
+    if value.type_id == 6:
+        if value.float_value == 0.0: return (seed + 3) % modulus
+        let bits: Number = float64_bits(value.float_value)
+        let remainder: Number = bits % modulus
+        let quotient: Number = bits / modulus
+        let raw_hash: Number = multiplier * remainder + quotient_multiplier * quotient + seed
+        let normalized_hash: Number = raw_hash % modulus
+        return (normalized_hash + modulus) % modulus
+    if value.type_id == 9 or value.type_id == 12:
+        var hash_value: Number = (seed + 2166136261) % modulus
+        var byte_index: Number = 0
+        while byte_index < text_length(value.text_value):
+            set hash_value = (hash_value * multiplier + text_byte(value.text_value, byte_index) + 1) % modulus
+            set byte_index = byte_index + 1
+        return hash_value
+    if value.type_id == 16:
+        var hash_value: Number = (seed + 2166136261) % modulus
+        var byte_index: Number = 0
+        while byte_index < bytes_length(value.bytes_value):
+            set hash_value = (hash_value * multiplier + bytes_get(value.bytes_value, byte_index) + 1) % modulus
+            set byte_index = byte_index + 1
+        return hash_value
+    return 0
+
+fn yaza_sql_join_memory_normalized_v1(plan: YazaSqlBoundPlanV1, left: YazaSqlMemoryTableV1, right: YazaSqlMemoryTableV1, output_table_id: Number, reverse_output_order: Boolean) -> Result[YazaSqlMemoryTableV1, Text]:
+    if plan.right_table_id <= 0 or left.table_id != plan.table_id or right.table_id != plan.right_table_id or left.catalog_version != plan.catalog_version or right.catalog_version != plan.catalog_version:
+        return err("SQL JOIN plan and input table snapshots do not match")
+    if list_count(plan.operators) < 3: return err("SQL JOIN plan is missing its join operator")
+    let join_operator: YazaSqlLogicalOperatorV1 = list_get(plan.operators, 2)
+    if join_operator.kind != yaza_sql_operator_inner_join_v1() and join_operator.kind != yaza_sql_operator_left_join_v1() and join_operator.kind != yaza_sql_operator_full_join_v1(): return err("SQL JOIN plan has an unsupported join kind")
+    if plan.join_comparison_operator != 1 or join_operator.limit != 1 or join_operator.input_index != 0 or join_operator.table_id != plan.right_table_id or join_operator.item_start != plan.join_left_column_ordinal or join_operator.item_count != plan.join_right_column_ordinal: return err("SQL JOIN operator does not match its bound equality plan")
+    let full_outer: Boolean = join_operator.kind == yaza_sql_operator_full_join_v1()
+    let left_outer: Boolean = join_operator.kind == yaza_sql_operator_left_join_v1() or full_outer
+    if plan.left_column_count != list_count(left.column_type_ids) or plan.right_column_count != list_count(right.column_type_ids):
+        return err("SQL JOIN plan column boundaries do not match input schemas")
+    if plan.join_left_column_ordinal < 0 or plan.join_left_column_ordinal >= plan.left_column_count or plan.join_right_column_ordinal < 0 or plan.join_right_column_ordinal >= plan.right_column_count:
+        return err("SQL JOIN plan key ordinals are outside input schemas")
+    let left_key_type: Number = list_get(left.column_type_ids, plan.join_left_column_ordinal)
+    let right_key_type: Number = list_get(right.column_type_ids, plan.join_right_column_ordinal)
+    if left_key_type != right_key_type: return err("SQL JOIN key types do not match")
+    let left_stats: YazaSqlJoinInputStatsV1 = yaza_sql_join_validate_input_v1(left)?
+    let right_stats: YazaSqlJoinInputStatsV1 = yaza_sql_join_validate_input_v1(right)?
+    if left_stats.cell_count + right_stats.cell_count > yaza_sql_executor_max_input_cells_v1(): return err("SQL JOIN inputs exceed the combined source-cell budget")
+    if left_stats.text_byte_count + right_stats.text_byte_count > yaza_sql_executor_max_input_text_bytes_v1(): return err("SQL JOIN inputs exceed the combined variable-width source budget")
+    let hash_text_work: Number = left_stats.text_byte_count + right_stats.text_byte_count
+    if hash_text_work > yaza_sql_executor_max_work_units_v1(): return err("SQL JOIN exceeds the bounded hash-key work budget")
+    if left.join_work_units < 0 or left.join_work_units > yaza_sql_executor_max_work_units_v1() - hash_text_work:
+        return err("SQL JOIN chain exceeds the shared hash-work budget")
+    let random_seed_result: Result[Bytes, Text] = secure_random_bytes_try(4)
+    if not result_is_ok(random_seed_result): return err("SQL JOIN could not obtain a secure hash seed")
+    let random_seed_bytes: Bytes = result_unwrap(random_seed_result)
+    var hash_seed: Number = 0
+    var seed_byte_index: Number = 0
+    while seed_byte_index < bytes_length(random_seed_bytes):
+        set hash_seed = (hash_seed * 256 + bytes_get(random_seed_bytes, seed_byte_index)) % 2147483647
+        set seed_byte_index = seed_byte_index + 1
+    if left_key_type == 6:
+        var float_row_index: Number = 0
+        while float_row_index < list_count(left.rows):
+            let left_float_key: YazaSqlValueV1 = list_get(list_get(left.rows, float_row_index), plan.join_left_column_ordinal)
+            if not left_float_key.is_null and yaza_sql_executor_float_is_nan_v1(left_float_key.float_value):
+                return err("SQL JOIN does not accept NaN join keys")
+            set float_row_index = float_row_index + 1
+        set float_row_index = 0
+        while float_row_index < list_count(right.rows):
+            let right_float_key: YazaSqlValueV1 = list_get(list_get(right.rows, float_row_index), plan.join_right_column_ordinal)
+            if not right_float_key.is_null and yaza_sql_executor_float_is_nan_v1(right_float_key.float_value):
+                return err("SQL JOIN does not accept NaN join keys")
+            set float_row_index = float_row_index + 1
+
+    let bucket_count: Number = list_count(right.rows) * 2 + 1
+    let bucket_created: Result[List[Number], Text] = list_try_new()
+    let next_created: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(bucket_created) or not result_is_ok(next_created): return err("SQL JOIN could not allocate its bounded hash table")
+    let bucket_heads: List[Number] = result_unwrap(bucket_created)
+    let right_next: List[Number] = result_unwrap(next_created)
+    if not list_try_reserve(bucket_heads, bucket_count) or not list_try_reserve(right_next, list_count(right.rows)):
+        return err("SQL JOIN could not reserve its bounded hash table")
+    var hash_index: Number = 0
+    while hash_index < bucket_count:
+        if not list_try_push(bucket_heads, 0): return err("SQL JOIN could not initialize its hash buckets")
+        set hash_index = hash_index + 1
+    set hash_index = 0
+    while hash_index < list_count(right.rows):
+        if not list_try_push(right_next, 0): return err("SQL JOIN could not initialize its hash chains")
+        let right_key: YazaSqlValueV1 = list_get(list_get(right.rows, hash_index), plan.join_right_column_ordinal)
+        if not right_key.is_null:
+            let bucket: Number = yaza_sql_join_key_hash_v1(right_key, hash_seed) % bucket_count
+            if not list_try_set(right_next, hash_index, list_get(bucket_heads, bucket)) or not list_try_set(bucket_heads, bucket, hash_index + 1):
+                return err("SQL JOIN could not link a hash bucket")
+        set hash_index = hash_index + 1
+
+    var matched_right: List[Boolean] = List[Boolean]()
+    if full_outer:
+        let matched_right_created: Result[List[Boolean], Text] = list_try_new()
+        if not result_is_ok(matched_right_created): return err("SQL FULL JOIN could not allocate right-side match tracking")
+        set matched_right = result_unwrap(matched_right_created)
+        if not list_try_reserve(matched_right, list_count(right.rows)): return err("SQL FULL JOIN could not reserve right-side match tracking")
+        var matched_index: Number = 0
+        while matched_index < list_count(right.rows):
+            if not list_try_push(matched_right, false): return err("SQL FULL JOIN could not initialize right-side match tracking")
+            set matched_index = matched_index + 1
+
+    let types_created: Result[List[Number], Text] = list_try_new()
+    let rows_created: Result[List[List[YazaSqlValueV1]], Text] = list_try_new()
+    if not result_is_ok(types_created) or not result_is_ok(rows_created): return err("SQL JOIN could not allocate its bounded output")
+    let output_types: List[Number] = result_unwrap(types_created)
+    let output_rows: List[List[YazaSqlValueV1]] = result_unwrap(rows_created)
+    let combined_column_count: Number = plan.left_column_count + plan.right_column_count
+    if not list_try_reserve(output_types, combined_column_count) or not list_try_reserve(output_rows, 256): return err("SQL JOIN could not reserve its output")
+    var type_index: Number = 0
+    if reverse_output_order:
+        while type_index < list_count(right.column_type_ids):
+            if not list_try_push(output_types, list_get(right.column_type_ids, type_index)): return err("SQL RIGHT JOIN could not append original left schema types")
+            set type_index = type_index + 1
+        set type_index = 0
+        while type_index < list_count(left.column_type_ids):
+            if not list_try_push(output_types, list_get(left.column_type_ids, type_index)): return err("SQL RIGHT JOIN could not append original right schema types")
+            set type_index = type_index + 1
+    else:
+        while type_index < list_count(left.column_type_ids):
+            if not list_try_push(output_types, list_get(left.column_type_ids, type_index)): return err("SQL JOIN could not append left schema types")
+            set type_index = type_index + 1
+        set type_index = 0
+        while type_index < list_count(right.column_type_ids):
+            if not list_try_push(output_types, list_get(right.column_type_ids, type_index)): return err("SQL JOIN could not append right schema types")
+            set type_index = type_index + 1
+
+    var output_text_byte_count: Number = 0
+    var candidate_pairs: Number = 0
+    var left_index: Number = 0
+    while left_index < list_count(left.rows):
+        let left_row: List[YazaSqlValueV1] = list_get(left.rows, left_index)
+        let left_key: YazaSqlValueV1 = list_get(left_row, plan.join_left_column_ordinal)
+        var left_matched: Boolean = false
+        if not left_key.is_null:
+            let bucket: Number = yaza_sql_join_key_hash_v1(left_key, hash_seed) % bucket_count
+            var right_entry: Number = list_get(bucket_heads, bucket)
+            while right_entry > 0:
+                let right_index: Number = right_entry - 1
+                let right_row: List[YazaSqlValueV1] = list_get(right.rows, right_index)
+                let right_key: YazaSqlValueV1 = list_get(right_row, plan.join_right_column_ordinal)
+                set candidate_pairs = candidate_pairs + 1
+                if candidate_pairs > yaza_sql_executor_max_work_units_v1() - hash_text_work - left.join_work_units:
+                    return err("SQL JOIN exceeds the bounded hash-probe work budget")
+                if not right_key.is_null and yaza_sql_executor_compare_values_v1(plan.source, left_key, right_key) == 0:
+                    set left_matched = true
+                    if full_outer and not list_try_set(matched_right, right_index, true): return err("SQL FULL JOIN could not mark a matched right row")
+                    if list_count(output_rows) >= 65536 or (list_count(output_rows) + 1) * combined_column_count > yaza_sql_executor_max_input_cells_v1():
+                        return err("SQL JOIN output exceeds the bounded row or cell budget")
+                    let next_text_bytes: Number = output_text_byte_count + yaza_sql_join_row_text_bytes_v1(left_row) + yaza_sql_join_row_text_bytes_v1(right_row)
+                    if next_text_bytes > yaza_sql_executor_max_input_text_bytes_v1(): return err("SQL JOIN output exceeds the bounded text-memory budget")
+                    let joined_row_created: Result[List[YazaSqlValueV1], Text] = list_try_new()
+                    if not result_is_ok(joined_row_created): return err("SQL JOIN could not allocate a joined row")
+                    let joined_row: List[YazaSqlValueV1] = result_unwrap(joined_row_created)
+                    if not list_try_reserve(joined_row, combined_column_count): return err("SQL JOIN could not reserve a joined row")
+                    var cell_index: Number = 0
+                    if reverse_output_order:
+                        while cell_index < list_count(right_row):
+                            if not list_try_push(joined_row, list_get(right_row, cell_index)): return err("SQL RIGHT JOIN could not append an original left row value")
+                            set cell_index = cell_index + 1
+                        set cell_index = 0
+                        while cell_index < list_count(left_row):
+                            if not list_try_push(joined_row, list_get(left_row, cell_index)): return err("SQL RIGHT JOIN could not append an original right row value")
+                            set cell_index = cell_index + 1
+                    else:
+                        while cell_index < list_count(left_row):
+                            if not list_try_push(joined_row, list_get(left_row, cell_index)): return err("SQL JOIN could not copy a left row value")
+                            set cell_index = cell_index + 1
+                        set cell_index = 0
+                        while cell_index < list_count(right_row):
+                            if not list_try_push(joined_row, list_get(right_row, cell_index)): return err("SQL JOIN could not copy a right row value")
+                            set cell_index = cell_index + 1
+                    if not list_try_push(output_rows, joined_row): return err("SQL JOIN could not append a joined row")
+                    set output_text_byte_count = next_text_bytes
+                set right_entry = list_get(right_next, right_index)
+        if left_outer and not left_matched:
+            if list_count(output_rows) >= 65536 or (list_count(output_rows) + 1) * combined_column_count > yaza_sql_executor_max_input_cells_v1():
+                return err("SQL LEFT JOIN output exceeds the bounded row or cell budget")
+            let next_text_bytes: Number = output_text_byte_count + yaza_sql_join_row_text_bytes_v1(left_row)
+            if next_text_bytes > yaza_sql_executor_max_input_text_bytes_v1(): return err("SQL LEFT JOIN output exceeds the bounded text-memory budget")
+            let joined_row_created: Result[List[YazaSqlValueV1], Text] = list_try_new()
+            if not result_is_ok(joined_row_created): return err("SQL LEFT JOIN could not allocate an unmatched row")
+            let joined_row: List[YazaSqlValueV1] = result_unwrap(joined_row_created)
+            if not list_try_reserve(joined_row, combined_column_count): return err("SQL LEFT JOIN could not reserve an unmatched row")
+            var cell_index: Number = 0
+            var right_column_index: Number = 0
+            if reverse_output_order:
+                while right_column_index < list_count(right.column_type_ids):
+                    let null_value: YazaSqlValueV1 = yaza_sql_value_null_v1(list_get(right.column_type_ids, right_column_index))?
+                    if not list_try_push(joined_row, null_value): return err("SQL RIGHT JOIN could not append a null-extended original left value")
+                    set right_column_index = right_column_index + 1
+                while cell_index < list_count(left_row):
+                    if not list_try_push(joined_row, list_get(left_row, cell_index)): return err("SQL RIGHT JOIN could not append an unmatched original right value")
+                    set cell_index = cell_index + 1
+            else:
+                while cell_index < list_count(left_row):
+                    if not list_try_push(joined_row, list_get(left_row, cell_index)): return err("SQL LEFT JOIN could not copy an unmatched left row")
+                    set cell_index = cell_index + 1
+                while right_column_index < list_count(right.column_type_ids):
+                    let null_value: YazaSqlValueV1 = yaza_sql_value_null_v1(list_get(right.column_type_ids, right_column_index))?
+                    if not list_try_push(joined_row, null_value): return err("SQL LEFT JOIN could not append a null-extended right value")
+                    set right_column_index = right_column_index + 1
+            if not list_try_push(output_rows, joined_row): return err("SQL LEFT JOIN could not append an unmatched row")
+            set output_text_byte_count = next_text_bytes
+        set left_index = left_index + 1
+    if full_outer:
+        var unmatched_right_index: Number = 0
+        while unmatched_right_index < list_count(right.rows):
+            if not list_get(matched_right, unmatched_right_index):
+                if list_count(output_rows) >= 65536 or (list_count(output_rows) + 1) * combined_column_count > yaza_sql_executor_max_input_cells_v1():
+                    return err("SQL FULL JOIN output exceeds the bounded row or cell budget")
+                let right_row: List[YazaSqlValueV1] = list_get(right.rows, unmatched_right_index)
+                let next_text_bytes: Number = output_text_byte_count + yaza_sql_join_row_text_bytes_v1(right_row)
+                if next_text_bytes > yaza_sql_executor_max_input_text_bytes_v1(): return err("SQL FULL JOIN output exceeds the bounded text-memory budget")
+                let joined_row_created: Result[List[YazaSqlValueV1], Text] = list_try_new()
+                if not result_is_ok(joined_row_created): return err("SQL FULL JOIN could not allocate an unmatched right row")
+                let joined_row: List[YazaSqlValueV1] = result_unwrap(joined_row_created)
+                if not list_try_reserve(joined_row, combined_column_count): return err("SQL FULL JOIN could not reserve an unmatched right row")
+                var left_column_index: Number = 0
+                while left_column_index < list_count(left.column_type_ids):
+                    let null_value: YazaSqlValueV1 = yaza_sql_value_null_v1(list_get(left.column_type_ids, left_column_index))?
+                    if not list_try_push(joined_row, null_value): return err("SQL FULL JOIN could not append a null-extended left value")
+                    set left_column_index = left_column_index + 1
+                var right_column_index: Number = 0
+                while right_column_index < list_count(right_row):
+                    if not list_try_push(joined_row, list_get(right_row, right_column_index)): return err("SQL FULL JOIN could not append an unmatched right value")
+                    set right_column_index = right_column_index + 1
+                if not list_try_push(output_rows, joined_row): return err("SQL FULL JOIN could not append an unmatched right row")
+                set output_text_byte_count = next_text_bytes
+            set unmatched_right_index = unmatched_right_index + 1
+    return ok(YazaSqlMemoryTableV1(output_table_id, plan.catalog_version, output_types, output_rows, left.join_work_units + hash_text_work + candidate_pairs))
+
+fn yaza_sql_join_memory_v1(plan: YazaSqlBoundPlanV1, left: YazaSqlMemoryTableV1, right: YazaSqlMemoryTableV1) -> Result[YazaSqlMemoryTableV1, Text]:
+    return yaza_sql_join_memory_normalized_v1(plan, left, right, plan.table_id, false)
+
+fn yaza_sql_join_inner_memory_v1(plan: YazaSqlBoundPlanV1, left: YazaSqlMemoryTableV1, right: YazaSqlMemoryTableV1) -> Result[YazaSqlMemoryTableV1, Text]:
+    if list_count(plan.operators) < 3 or list_get(plan.operators, 2).kind != yaza_sql_operator_inner_join_v1(): return err("SQL JOIN helper requires an INNER JOIN plan")
+    return yaza_sql_join_memory_v1(plan, left, right)
+
+fn yaza_sql_join_right_memory_v1(plan: YazaSqlBoundPlanV1, left: YazaSqlMemoryTableV1, right: YazaSqlMemoryTableV1) -> Result[YazaSqlMemoryTableV1, Text]:
+    if list_count(plan.operators) < 3 or list_get(plan.operators, 2).kind != yaza_sql_operator_right_join_v1() or plan.join_comparison_operator != 1 or list_get(plan.operators, 2).limit != 1:
+        return err("SQL JOIN helper requires a RIGHT JOIN plan")
+    if left.table_id != plan.table_id or right.table_id != plan.right_table_id or plan.left_column_count != list_count(left.column_type_ids) or plan.right_column_count != list_count(right.column_type_ids):
+        return err("SQL RIGHT JOIN plan and input schemas do not match")
+
+    let operators_result: Result[List[YazaSqlLogicalOperatorV1], Text] = list_try_new()
+    if not result_is_ok(operators_result): return err("SQL RIGHT JOIN could not allocate its normalized plan")
+    let swapped_operators: List[YazaSqlLogicalOperatorV1] = result_unwrap(operators_result)
+    if not list_try_reserve(swapped_operators, list_count(plan.operators)): return err("SQL RIGHT JOIN could not reserve its normalized plan")
+    var operator_index: Number = 0
+    while operator_index < list_count(plan.operators):
+        var operator: YazaSqlLogicalOperatorV1 = list_get(plan.operators, operator_index)
+        if operator_index == 0: set operator.table_id = plan.right_table_id
+        elif operator_index == 1: set operator.table_id = plan.table_id
+        elif operator_index == 2:
+            set operator.kind = yaza_sql_operator_left_join_v1()
+            set operator.table_id = plan.table_id
+            set operator.item_start = plan.join_right_column_ordinal
+            set operator.item_count = plan.join_left_column_ordinal
+        if not list_try_push(swapped_operators, operator): return err("SQL RIGHT JOIN could not construct its normalized plan")
+        set operator_index = operator_index + 1
+
+    let swapped_plan: YazaSqlBoundPlanV1 = YazaSqlBoundPlanV1(plan.version, plan.catalog_version, plan.right_table_id, plan.table_id, plan.right_column_count, plan.left_column_count, plan.join_right_column_ordinal, plan.join_left_column_ordinal, plan.join_comparison_operator, plan.join_stages, plan.source, plan.distinct, plan.projections, plan.group_by_columns, plan.order_by, plan.expressions, plan.subqueries, plan.subquery_parameter_ordinals, plan.having_start_index, plan.having_root, plan.parameters, swapped_operators, plan.where_root, plan.root_operator, plan.has_limit, plan.limit, plan.parameter_style)
+    return yaza_sql_join_memory_normalized_v1(swapped_plan, right, left, plan.table_id, true)
+
+fn yaza_sql_join_theta_memory_v1(plan: YazaSqlBoundPlanV1, left: YazaSqlMemoryTableV1, right: YazaSqlMemoryTableV1) -> Result[YazaSqlMemoryTableV1, Text]:
+    if plan.version != 1 or plan.right_table_id <= 0 or left.table_id != plan.table_id or right.table_id != plan.right_table_id or left.catalog_version != plan.catalog_version or right.catalog_version != plan.catalog_version:
+        return err("SQL theta JOIN plan and input snapshots do not match")
+    if list_count(plan.operators) < 3: return err("SQL theta JOIN plan is missing its join operator")
+    let join_operator: YazaSqlLogicalOperatorV1 = list_get(plan.operators, 2)
+    if join_operator.kind != yaza_sql_operator_theta_join_v1() or join_operator.input_index != 0 or join_operator.expression_root != 1 or join_operator.table_id != plan.right_table_id or join_operator.item_start != plan.join_left_column_ordinal or join_operator.item_count != plan.join_right_column_ordinal or join_operator.limit != plan.join_comparison_operator or plan.join_comparison_operator < 2 or plan.join_comparison_operator > 6:
+        return err("SQL theta JOIN operator does not match its bound predicate")
+    if plan.left_column_count != list_count(left.column_type_ids) or plan.right_column_count != list_count(right.column_type_ids) or plan.left_column_count + plan.right_column_count > 1024:
+        return err("SQL theta JOIN plan column boundaries do not match input schemas")
+    if plan.join_left_column_ordinal < 0 or plan.join_left_column_ordinal >= plan.left_column_count or plan.join_right_column_ordinal < 0 or plan.join_right_column_ordinal >= plan.right_column_count:
+        return err("SQL theta JOIN key ordinals are outside input schemas")
+    let left_key_type: Number = list_get(left.column_type_ids, plan.join_left_column_ordinal)
+    let right_key_type: Number = list_get(right.column_type_ids, plan.join_right_column_ordinal)
+    if left_key_type != right_key_type or (plan.join_comparison_operator > 2 and left_key_type == 1) or not yaza_sql_executor_type_supported_v1(left_key_type):
+        return err("SQL theta JOIN columns do not support the bound comparison")
+    let left_stats: YazaSqlJoinInputStatsV1 = yaza_sql_join_validate_input_v1(left)?
+    let right_stats: YazaSqlJoinInputStatsV1 = yaza_sql_join_validate_input_v1(right)?
+    if left_stats.cell_count + right_stats.cell_count > yaza_sql_executor_max_input_cells_v1() or left_stats.text_byte_count + right_stats.text_byte_count > yaza_sql_executor_max_input_text_bytes_v1():
+        return err("SQL theta JOIN inputs exceed the combined source budget")
+
+    if left_key_type == 6:
+        var float_row_index: Number = 0
+        while float_row_index < list_count(left.rows):
+            let left_float_key: YazaSqlValueV1 = list_get(list_get(left.rows, float_row_index), plan.join_left_column_ordinal)
+            if not left_float_key.is_null and yaza_sql_executor_float_is_nan_v1(left_float_key.float_value):
+                return err("SQL theta JOIN does not accept NaN join keys")
+            set float_row_index = float_row_index + 1
+        set float_row_index = 0
+        while float_row_index < list_count(right.rows):
+            let right_float_key: YazaSqlValueV1 = list_get(list_get(right.rows, float_row_index), plan.join_right_column_ordinal)
+            if not right_float_key.is_null and yaza_sql_executor_float_is_nan_v1(right_float_key.float_value):
+                return err("SQL theta JOIN does not accept NaN join keys")
+            set float_row_index = float_row_index + 1
+
+    let left_row_count: Number = list_count(left.rows)
+    let right_row_count: Number = list_count(right.rows)
+    var pair_count: Number = 0
+    if right_row_count > 0:
+        if left_row_count > yaza_sql_executor_max_work_units_v1() / right_row_count:
+            return err("SQL theta JOIN exceeds the 100-million comparison work bound")
+        set pair_count = left_row_count * right_row_count
+    var work_units: Number = pair_count
+    if (left_key_type == 9 or left_key_type == 16) and pair_count > 0:
+        var left_key_text_bytes: Number = 0
+        var right_key_text_bytes: Number = 0
+        var key_row_index: Number = 0
+        while key_row_index < left_row_count:
+            let key_value: YazaSqlValueV1 = list_get(list_get(left.rows, key_row_index), plan.join_left_column_ordinal)
+            if not key_value.is_null:
+                if left_key_type == 9: set left_key_text_bytes = left_key_text_bytes + text_length(key_value.text_value)
+                else: set left_key_text_bytes = left_key_text_bytes + bytes_length(key_value.bytes_value)
+            set key_row_index = key_row_index + 1
+        set key_row_index = 0
+        while key_row_index < right_row_count:
+            let key_value: YazaSqlValueV1 = list_get(list_get(right.rows, key_row_index), plan.join_right_column_ordinal)
+            if not key_value.is_null:
+                if right_key_type == 9: set right_key_text_bytes = right_key_text_bytes + text_length(key_value.text_value)
+                else: set right_key_text_bytes = right_key_text_bytes + bytes_length(key_value.bytes_value)
+            set key_row_index = key_row_index + 1
+        set work_units = work_units + left_key_text_bytes * right_row_count + right_key_text_bytes * left_row_count
+    if work_units > yaza_sql_executor_max_work_units_v1():
+        return err("SQL theta JOIN exceeds the bounded comparison-byte work budget")
+
+    let types_created: Result[List[Number], Text] = list_try_new()
+    let rows_created: Result[List[List[YazaSqlValueV1]], Text] = list_try_new()
+    if not result_is_ok(types_created) or not result_is_ok(rows_created): return err("SQL theta JOIN could not allocate its bounded output")
+    let output_types: List[Number] = result_unwrap(types_created)
+    let output_rows: List[List[YazaSqlValueV1]] = result_unwrap(rows_created)
+    let combined_column_count: Number = plan.left_column_count + plan.right_column_count
+    if not list_try_reserve(output_types, combined_column_count) or not list_try_reserve(output_rows, 256): return err("SQL theta JOIN could not reserve its output")
+    var column_index: Number = 0
+    while column_index < list_count(left.column_type_ids):
+        if not list_try_push(output_types, list_get(left.column_type_ids, column_index)): return err("SQL theta JOIN could not append left schema types")
+        set column_index = column_index + 1
+    set column_index = 0
+    while column_index < list_count(right.column_type_ids):
+        if not list_try_push(output_types, list_get(right.column_type_ids, column_index)): return err("SQL theta JOIN could not append right schema types")
+        set column_index = column_index + 1
+
+    var output_text_byte_count: Number = 0
+    var left_index: Number = 0
+    while left_index < left_row_count:
+        let left_row: List[YazaSqlValueV1] = list_get(left.rows, left_index)
+        let left_key: YazaSqlValueV1 = list_get(left_row, plan.join_left_column_ordinal)
+        var right_index: Number = 0
+        while right_index < right_row_count:
+            let right_row: List[YazaSqlValueV1] = list_get(right.rows, right_index)
+            let right_key: YazaSqlValueV1 = list_get(right_row, plan.join_right_column_ordinal)
+            if not left_key.is_null and not right_key.is_null and yaza_sql_executor_apply_comparison_v1(yaza_sql_executor_compare_values_v1(plan.source, left_key, right_key), plan.join_comparison_operator):
+                if list_count(output_rows) >= 65536 or (list_count(output_rows) + 1) * combined_column_count > yaza_sql_executor_max_input_cells_v1():
+                    return err("SQL theta JOIN output exceeds the bounded row or cell budget")
+                let next_text_bytes: Number = output_text_byte_count + yaza_sql_join_row_text_bytes_v1(left_row) + yaza_sql_join_row_text_bytes_v1(right_row)
+                if next_text_bytes > yaza_sql_executor_max_input_text_bytes_v1(): return err("SQL theta JOIN output exceeds the bounded text-memory budget")
+                let joined_row_created: Result[List[YazaSqlValueV1], Text] = list_try_new()
+                if not result_is_ok(joined_row_created): return err("SQL theta JOIN could not allocate a joined row")
+                let joined_row: List[YazaSqlValueV1] = result_unwrap(joined_row_created)
+                if not list_try_reserve(joined_row, combined_column_count): return err("SQL theta JOIN could not reserve a joined row")
+                var value_index: Number = 0
+                while value_index < list_count(left_row):
+                    if not list_try_push(joined_row, list_get(left_row, value_index)): return err("SQL theta JOIN could not append a left value")
+                    set value_index = value_index + 1
+                set value_index = 0
+                while value_index < list_count(right_row):
+                    if not list_try_push(joined_row, list_get(right_row, value_index)): return err("SQL theta JOIN could not append a right value")
+                    set value_index = value_index + 1
+                if not list_try_push(output_rows, joined_row): return err("SQL theta JOIN could not append a joined row")
+                set output_text_byte_count = next_text_bytes
+            set right_index = right_index + 1
+        set left_index = left_index + 1
+    return ok(YazaSqlMemoryTableV1(plan.table_id, plan.catalog_version, output_types, output_rows, work_units))
+
+fn yaza_sql_join_cross_memory_v1(plan: YazaSqlBoundPlanV1, left: YazaSqlMemoryTableV1, right: YazaSqlMemoryTableV1) -> Result[YazaSqlMemoryTableV1, Text]:
+    if plan.version != 1 or plan.right_table_id <= 0 or left.table_id != plan.table_id or right.table_id != plan.right_table_id or left.catalog_version != plan.catalog_version or right.catalog_version != plan.catalog_version:
+        return err("SQL CROSS JOIN plan and input snapshots do not match")
+    if list_count(plan.operators) < 3: return err("SQL CROSS JOIN plan is missing its join operator")
+    let join_operator: YazaSqlLogicalOperatorV1 = list_get(plan.operators, 2)
+    if join_operator.kind != yaza_sql_operator_cross_join_v1() or join_operator.input_index != 0 or join_operator.expression_root != 1 or join_operator.table_id != plan.right_table_id or join_operator.item_start != -1 or join_operator.item_count != -1 or join_operator.limit != 0 or plan.join_left_column_ordinal != -1 or plan.join_right_column_ordinal != -1 or plan.join_comparison_operator != 0:
+        return err("SQL CROSS JOIN operator does not match its bound plan")
+    if plan.left_column_count != list_count(left.column_type_ids) or plan.right_column_count != list_count(right.column_type_ids) or plan.left_column_count + plan.right_column_count != list_count(left.column_type_ids) + list_count(right.column_type_ids) or plan.left_column_count + plan.right_column_count > 1024:
+        return err("SQL CROSS JOIN plan column boundaries do not match input schemas")
+    let left_stats: YazaSqlJoinInputStatsV1 = yaza_sql_join_validate_input_v1(left)?
+    let right_stats: YazaSqlJoinInputStatsV1 = yaza_sql_join_validate_input_v1(right)?
+    if left_stats.cell_count + right_stats.cell_count > yaza_sql_executor_max_input_cells_v1() or left_stats.text_byte_count + right_stats.text_byte_count > yaza_sql_executor_max_input_text_bytes_v1():
+        return err("SQL CROSS JOIN inputs exceed the bounded source-cell budget")
+    var pair_count: Number = 0
+    let left_row_count: Number = list_count(left.rows)
+    let right_row_count: Number = list_count(right.rows)
+    if right_row_count > 0:
+        if left_row_count > 65536 / right_row_count:
+            return err("SQL CROSS JOIN output exceeds the 65536-row profile")
+        set pair_count = left_row_count * right_row_count
+    if pair_count > yaza_sql_executor_max_work_units_v1():
+        return err("SQL CROSS JOIN exceeds the bounded Cartesian work budget")
+    if left.join_work_units < 0 or left.join_work_units > yaza_sql_executor_max_work_units_v1() - pair_count:
+        return err("SQL JOIN chain exceeds the shared Cartesian work budget")
+    let combined_column_count: Number = plan.left_column_count + plan.right_column_count
+    if pair_count > 0 and pair_count > yaza_sql_executor_max_input_cells_v1() / combined_column_count:
+        return err("SQL CROSS JOIN output exceeds the bounded cell budget")
+    let output_text_byte_count: Number = left_stats.text_byte_count * right_row_count + right_stats.text_byte_count * left_row_count
+    if output_text_byte_count > yaza_sql_executor_max_input_text_bytes_v1():
+        return err("SQL CROSS JOIN output exceeds the bounded text-memory budget")
+
+    let types_created: Result[List[Number], Text] = list_try_new()
+    let rows_created: Result[List[List[YazaSqlValueV1]], Text] = list_try_new()
+    if not result_is_ok(types_created) or not result_is_ok(rows_created): return err("SQL CROSS JOIN could not allocate its bounded output")
+    let output_types: List[Number] = result_unwrap(types_created)
+    let output_rows: List[List[YazaSqlValueV1]] = result_unwrap(rows_created)
+    if not list_try_reserve(output_types, combined_column_count) or not list_try_reserve(output_rows, pair_count): return err("SQL CROSS JOIN could not reserve its bounded output")
+    var column_index: Number = 0
+    while column_index < list_count(left.column_type_ids):
+        if not list_try_push(output_types, list_get(left.column_type_ids, column_index)): return err("SQL CROSS JOIN could not append left schema types")
+        set column_index = column_index + 1
+    set column_index = 0
+    while column_index < list_count(right.column_type_ids):
+        if not list_try_push(output_types, list_get(right.column_type_ids, column_index)): return err("SQL CROSS JOIN could not append right schema types")
+        set column_index = column_index + 1
+
+    var left_index: Number = 0
+    while left_index < left_row_count:
+        let left_row: List[YazaSqlValueV1] = list_get(left.rows, left_index)
+        var right_index: Number = 0
+        while right_index < right_row_count:
+            let right_row: List[YazaSqlValueV1] = list_get(right.rows, right_index)
+            let joined_row_created: Result[List[YazaSqlValueV1], Text] = list_try_new()
+            if not result_is_ok(joined_row_created): return err("SQL CROSS JOIN could not allocate a joined row")
+            let joined_row: List[YazaSqlValueV1] = result_unwrap(joined_row_created)
+            if not list_try_reserve(joined_row, combined_column_count): return err("SQL CROSS JOIN could not reserve a joined row")
+            var value_index: Number = 0
+            while value_index < list_count(left_row):
+                if not list_try_push(joined_row, list_get(left_row, value_index)): return err("SQL CROSS JOIN could not append a left value")
+                set value_index = value_index + 1
+            set value_index = 0
+            while value_index < list_count(right_row):
+                if not list_try_push(joined_row, list_get(right_row, value_index)): return err("SQL CROSS JOIN could not append a right value")
+                set value_index = value_index + 1
+            if not list_try_push(output_rows, joined_row): return err("SQL CROSS JOIN could not append a joined row")
+            set right_index = right_index + 1
+        set left_index = left_index + 1
+    return ok(YazaSqlMemoryTableV1(plan.table_id, plan.catalog_version, output_types, output_rows, left.join_work_units + pair_count))
+
+fn yaza_sql_join_dispatch_memory_v1(plan: YazaSqlBoundPlanV1, left: YazaSqlMemoryTableV1, right: YazaSqlMemoryTableV1) -> Result[YazaSqlMemoryTableV1, Text]:
+    if list_count(plan.operators) < 3: return err("SQL JOIN dispatcher received a plan without a JOIN operator")
+    if list_get(plan.operators, 2).kind == yaza_sql_operator_right_join_v1():
+        return yaza_sql_join_right_memory_v1(plan, left, right)
+    if list_get(plan.operators, 2).kind == yaza_sql_operator_cross_join_v1():
+        return yaza_sql_join_cross_memory_v1(plan, left, right)
+    if list_get(plan.operators, 2).kind == yaza_sql_operator_theta_join_v1():
+        return yaza_sql_join_theta_memory_v1(plan, left, right)
+    return yaza_sql_join_memory_v1(plan, left, right)
+
+fn yaza_sql_join_additional_memory_v1(plan: YazaSqlBoundPlanV1, stage: YazaSqlBoundJoinStageV1, left: YazaSqlMemoryTableV1, right: YazaSqlMemoryTableV1) -> Result[YazaSqlMemoryTableV1, Text]:
+    let equality_kind: Boolean = stage.join_kind == yaza_sql_operator_inner_join_v1() or stage.join_kind == yaza_sql_operator_left_join_v1() or stage.join_kind == yaza_sql_operator_right_join_v1() or stage.join_kind == yaza_sql_operator_full_join_v1()
+    let theta_kind: Boolean = stage.join_kind == yaza_sql_operator_theta_join_v1()
+    let cross_kind: Boolean = stage.join_kind == yaza_sql_operator_cross_join_v1()
+    if stage.table_id != right.table_id or (equality_kind and stage.comparison_operator != 1) or (theta_kind and (stage.comparison_operator < 2 or stage.comparison_operator > 6)) or (cross_kind and stage.comparison_operator != 0) or (not equality_kind and not theta_kind and not cross_kind):
+        return err("SQL additional JOIN stage has an invalid bounded join descriptor")
+    let operators_created: Result[List[YazaSqlLogicalOperatorV1], Text] = list_try_new()
+    if not result_is_ok(operators_created): return err("SQL additional JOIN could not allocate its stage plan")
+    let operators: List[YazaSqlLogicalOperatorV1] = result_unwrap(operators_created)
+    if not list_try_reserve(operators, 3): return err("SQL additional JOIN could not reserve its stage plan")
+    if not list_try_push(operators, YazaSqlLogicalOperatorV1(1, -1, left.table_id, -1, 0, 0, 0)):
+        return err("SQL additional JOIN could not append its accumulated-input scan")
+    if not list_try_push(operators, YazaSqlLogicalOperatorV1(1, -1, right.table_id, -1, 0, 0, 0)):
+        return err("SQL additional JOIN could not append its right-input scan")
+    if not list_try_push(operators, YazaSqlLogicalOperatorV1(stage.join_kind, 0, right.table_id, 1, stage.left_key_ordinal, stage.right_key_ordinal, stage.comparison_operator)):
+        return err("SQL additional JOIN could not append its hash-join operator")
+    let stage_plan: YazaSqlBoundPlanV1 = YazaSqlBoundPlanV1(plan.version, plan.catalog_version, left.table_id, right.table_id, list_count(left.column_type_ids), list_count(right.column_type_ids), stage.left_key_ordinal, stage.right_key_ordinal, stage.comparison_operator, List[YazaSqlBoundJoinStageV1](), plan.source, plan.distinct, plan.projections, plan.group_by_columns, plan.order_by, plan.expressions, plan.subqueries, plan.subquery_parameter_ordinals, plan.having_start_index, plan.having_root, plan.parameters, operators, plan.where_root, 2, plan.has_limit, plan.limit, plan.parameter_style)
+    return yaza_sql_join_dispatch_memory_v1(stage_plan, left, right)

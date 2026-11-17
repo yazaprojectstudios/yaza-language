@@ -1,0 +1,117 @@
+use "std/fs"
+use "../yazabase/btree_scan_v1"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/catalog_schema_v1"
+use "../yazabase/catalog_storage_v1"
+use "../yazabase/catalog_v1"
+use "../yazabase/catalog_snapshot_v1"
+use "../yazabase/index_catalog_v1"
+use "../yazabase/query_v1"
+use "../yazabase/sql_create_index_v1"
+use "../yazabase/sql_create_index_write_v1"
+use "../yazabase/sql_dispatch_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/wal_v1"
+
+fn yazabase_sql_create_index_resume_v1_check(root_path: Text) -> Result[Number, Text]:
+    let root: Number = root_open(root_path)?
+    let database_name: Text = "create-index-resume.ydb"
+    let empty_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_from_text("idx-resume-uuid1"), 0, 1, 1, 0, 2, 1)
+    let empty_storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, database_name, empty_header)?
+    let empty_closed: Boolean = yaza_db_storage_close_v1(empty_storage)?
+    if not empty_closed: return err("YDBv1 CREATE INDEX restart fixture could not close the empty database")
+    let initialized: YazaDbCatalogBootstrapV1 = yaza_db_catalog_initialize_v1(root, database_name)?
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let created: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(initialized.storage, initialized.wal, "CREATE TABLE restart_rows (id BIGINT PRIMARY KEY, category TEXT)", no_parameters)?
+
+    let source_parts_result: Result[TextList, Text] = text_list_try_new()
+    if not result_is_ok(source_parts_result): return err("YDBv1 CREATE INDEX restart fixture could not allocate SQL parts")
+    let source_parts: TextList = result_unwrap(source_parts_result)
+    if not list_try_reserve(source_parts, 1027) or not list_try_push(source_parts, "INSERT INTO restart_rows (id, category) VALUES "):
+        return err("YDBv1 CREATE INDEX restart fixture could not reserve its 513-row INSERT")
+    var row_id: Number = 0
+    var expected_group_2: Number = 0
+    while row_id < 513:
+        if row_id > 0 and not list_try_push(source_parts, ", "): return err("YDBv1 CREATE INDEX restart fixture could not add a row delimiter")
+        var category: Text = "NULL"
+        if row_id % 7 != 0:
+            set category = "'group-" + number_text(row_id % 5) + "'"
+            if row_id % 5 == 2: set expected_group_2 = expected_group_2 + 1
+        if not list_try_push(source_parts, "(" + number_text(row_id) + ", " + category + ")"):
+            return err("YDBv1 CREATE INDEX restart fixture could not add an INSERT row")
+        set row_id = row_id + 1
+    let insert_source: Text = text_try_join(source_parts, "")?
+    let inserted: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(created.storage, created.wal, insert_source, no_parameters)?
+
+    let create_source: Text = "CREATE INDEX restart_rows_category_idx ON restart_rows(category)"
+    let loaded: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(inserted.storage.file, inserted.storage.header)?
+    let parsed: YazaSqlCreateIndexAstV1 = yaza_sql_parse_create_index_v1(create_source)?
+    let plan: YazaSqlCreateIndexPlanV1 = yaza_sql_bind_create_index_v1(create_source, parsed, loaded.sql_snapshot)?
+    let table_index: Number = yaza_db_catalog_snapshot_table_index_v1(loaded.sql_snapshot.tables, plan.table_id)
+    if table_index < 0 or table_index >= list_count(loaded.root_page_ids) or table_index >= list_count(loaded.table_schema_versions):
+        return err("YDBv1 CREATE INDEX restart fixture could not resolve the source table")
+    let table_root: Number = list_get(loaded.root_page_ids, table_index)
+    let schema_version: Number = list_get(loaded.table_schema_versions, table_index)
+    let catalog: YazaDbCatalogRootV1 = yaza_db_catalog_storage_read_root_v1(inserted.storage.file, inserted.storage.header)?
+    let key_ordinals: List[Number] = yaza_db_query_clustered_key_ordinals_v1(inserted.storage.file, inserted.storage.header, catalog, plan.table_id, table_root, loaded.sql_snapshot.version, list_count(plan.table_columns))?
+    let entry_columns: List[YazaSqlColumnSchemaV1] = yaza_db_sql_create_index_entry_schema_v1(plan, key_ordinals)?
+    let entry_key_ordinals: List[Number] = yaza_db_sql_create_index_entry_key_ordinals_v1(entry_columns)?
+    let building: YazaDbSqlCreateIndexStateV1 = yaza_db_sql_create_index_prepare_v1(inserted.storage, inserted.wal, plan, loaded)?
+    if building.index_kind != yaza_db_catalog_index_kind_secondary_building_v1(): return err("YDBv1 CREATE INDEX restart fixture did not publish BUILDING state")
+    let cursor_result: Result[Bytes, Text] = bytes_try_new_zeroed(2048)
+    if not result_is_ok(cursor_result): return err("YDBv1 CREATE INDEX restart fixture could not allocate its cursor")
+    let cursor: Bytes = result_unwrap(cursor_result)
+    let batch: YazaDbSqlCreateIndexBatchV1 = yaza_db_sql_create_index_build_batch_v1(building.storage, building.wal, plan, table_root, schema_version, key_ordinals, entry_columns, entry_key_ordinals, building.root_page_id, building.storage.header.next_commit_ts - 1, cursor, 0)?
+    if batch.row_count != 512 or batch.inserted_count != 512: return err("YDBv1 CREATE INDEX did not commit exactly 512 entries in its first batch")
+    let batch_wal_closed: Boolean = yaza_db_wal_log_close_v1(batch.wal)?
+    let batch_storage_closed: Boolean = yaza_db_storage_close_v1(batch.storage)?
+    if not batch_wal_closed or not batch_storage_closed: return err("YDBv1 CREATE INDEX first-batch handles did not close")
+
+    let reopened: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, database_name)?
+    let index_rows: List[YazaDbRowV1] = yaza_db_index_catalog_rows_v1(reopened.storage.file, reopened.storage.header, reopened.storage.header.next_commit_ts - 1)?
+    var building_survived: Boolean = false
+    var index_row_index: Number = 0
+    while index_row_index < list_count(index_rows) and not building_survived:
+        let row: YazaDbRowV1 = list_get(index_rows, index_row_index)
+        if list_get(row.values, 2).text_value == "restart_rows_category_idx" and list_get(row.values, 4).integer_value == yaza_db_catalog_index_kind_secondary_building_v1():
+            set building_survived = list_get(row.values, 3).integer_value == building.root_page_id
+        set index_row_index = index_row_index + 1
+    if not building_survived: return err("YDBv1 CREATE INDEX BUILDING state did not survive restart")
+    let first_batch_rows: List[YazaDbRowV1] = yaza_db_btree_read_rows_for_schema_v1(reopened.storage.file, reopened.storage.header, building.root_page_id, entry_columns, 1, entry_key_ordinals, reopened.storage.header.next_commit_ts - 1, 65536)?
+    if list_count(first_batch_rows) != 512: return err("YDBv1 CREATE INDEX restart changed the committed first-batch entries")
+
+    let resumed: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(reopened.storage, reopened.wal, create_source, no_parameters)?
+    if resumed.statement_kind != yaza_db_sql_statement_kind_create_index_v1() or not option_is_some(resumed.write_commit):
+        return err("YDBv1 CREATE INDEX could not resume and activate its persisted BUILDING state")
+    let committed: YazaDbWriteCommitV1 = option_unwrap(resumed.write_commit)
+    let active_rows: List[YazaDbRowV1] = yaza_db_index_catalog_rows_v1(committed.storage.file, committed.storage.header, committed.storage.header.next_commit_ts - 1)?
+    var active: Boolean = false
+    var active_index: Number = 0
+    while active_index < list_count(active_rows) and not active:
+        let row: YazaDbRowV1 = list_get(active_rows, active_index)
+        if list_get(row.values, 2).text_value == "restart_rows_category_idx":
+            set active = list_get(row.values, 4).integer_value == yaza_db_catalog_index_kind_secondary_active_v1()
+        set active_index = active_index + 1
+    if not active: return err("YDBv1 CREATE INDEX resumed build did not publish ACTIVE state")
+    let final_entries: List[YazaDbRowV1] = yaza_db_btree_read_rows_for_schema_v1(committed.storage.file, committed.storage.header, building.root_page_id, entry_columns, 1, entry_key_ordinals, committed.storage.header.next_commit_ts - 1, 65536)?
+    if list_count(final_entries) != 513: return err("YDBv1 CREATE INDEX resume lost or duplicated a source entry")
+    let selected: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(committed.storage, committed.wal, "SELECT id FROM restart_rows WHERE category = 'group-2'", no_parameters)?
+    if not option_is_some(selected.query_result) or list_count(option_unwrap(selected.query_result).rows) != expected_group_2:
+        return err("YDBv1 CREATE INDEX resumed equality lookup returned the wrong rows")
+    let explain: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(selected.storage, selected.wal, "EXPLAIN SELECT id FROM restart_rows WHERE category = 'group-2'", no_parameters)?
+    if not option_is_some(explain.explain_text) or text_find(option_unwrap(explain.explain_text), "Physical: SecondaryIndexRangeScan(index=restart_rows_category_idx") < 0:
+        return err("YDBv1 CREATE INDEX resumed profile did not select its index")
+    let final_wal_closed: Boolean = yaza_db_wal_log_close_v1(explain.wal)?
+    let final_storage_closed: Boolean = yaza_db_storage_close_v1(explain.storage)?
+    let root_closed: Boolean = close(root)?
+    if not final_wal_closed or not final_storage_closed or not root_closed:
+        return err("YDBv1 CREATE INDEX restart fixture could not close final handles")
+    return ok(513)
+
+start:
+    if arg_count() != 1:
+        say "Usage: yazabase-sql-create-index-resume-v1-smoke <directory>"
+        exit(2)
+    let outcome: Result[Number, Text] = yazabase_sql_create_index_resume_v1_check(arg(1))
+    if not result_is_ok(outcome): say result_unwrap_error(outcome)
+    else: say "yazabase-sql-create-index-resume-v1-ok rows=" + number_text(result_unwrap(outcome))

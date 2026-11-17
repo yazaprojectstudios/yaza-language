@@ -1,0 +1,125 @@
+use "std/fs"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/sql_dispatch_v1"
+
+fn yaza_db_overflow_sql_v1_check(root_path: Text) -> Result[Number, Text]:
+    let root: Number = root_open(root_path)?
+    let database_name: Text = "overflow-sql-smoke.ydb"
+    let initial_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_from_text("overflow-db-uuid"), 0, 1, 1, 0, 2, 1)
+    let empty_storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, database_name, initial_header)?
+    let empty_storage_closed: Boolean = yaza_db_storage_close_v1(empty_storage)?
+    if not empty_storage_closed: return err("YDBv1 overflow SQL fixture could not close its empty database")
+
+    let initialized: YazaDbCatalogBootstrapV1 = yaza_db_catalog_initialize_v1(root, database_name)?
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let create_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(initialized.storage, initialized.wal, "CREATE TABLE documents (id BIGINT PRIMARY KEY, body TEXT NOT NULL, note TEXT NOT NULL)", no_parameters)?
+    if not option_is_some(create_result.write_commit): return err("YDBv1 overflow SQL fixture CREATE TABLE did not commit")
+    let created: YazaDbWriteCommitV1 = option_unwrap(create_result.write_commit)
+    let created_wal_closed: Boolean = yaza_db_wal_log_close_v1(created.wal)?
+    let created_storage_closed: Boolean = yaza_db_storage_close_v1(created.storage)?
+    if not created_wal_closed or not created_storage_closed: return err("YDBv1 overflow SQL fixture could not close its schema transaction")
+
+    let after_create: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, database_name)?
+    let body: Text = text_try_repeat("z", 5000)?
+    let id_value: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 1)?
+    let body_value: YazaSqlValueV1 = yaza_sql_value_text_v1(body)
+    let note_value: YazaSqlValueV1 = yaza_sql_value_text_v1("before")
+    let insert_parameters: List[YazaSqlValueV1] = [id_value, body_value, note_value]
+    let insert_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(after_create.storage, after_create.wal, "INSERT INTO documents (id, body, note) VALUES ($1, $2, $3)", insert_parameters)?
+    if not option_is_some(insert_result.write_commit): return err("YDBv1 overflow SQL fixture INSERT did not commit")
+    let inserted: YazaDbWriteCommitV1 = option_unwrap(insert_result.write_commit)
+
+    let select_before_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(inserted.storage, inserted.wal, "SELECT body, note FROM documents WHERE id = 1", no_parameters)?
+    if not option_is_some(select_before_result.query_result): return err("YDBv1 overflow SQL fixture SELECT returned no result")
+    let select_before: YazaSqlQueryResultV1 = option_unwrap(select_before_result.query_result)
+    if list_count(select_before.rows) != 1 or list_get(list_get(select_before.rows, 0), 0).text_value != body or list_get(list_get(select_before.rows, 0), 1).text_value != "before": return err("YDBv1 SQL point lookup did not hydrate the external TEXT value")
+    let scalar_aggregate_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(inserted.storage, inserted.wal, "SELECT SUM(id) FROM documents", no_parameters)?
+    if not option_is_some(scalar_aggregate_result.query_result) or list_get(list_get(option_unwrap(scalar_aggregate_result.query_result).rows, 0), 0).integer_value != 1: return err("YDBv1 numeric streaming aggregate changed on a row with external TEXT")
+    let text_filter_parameters: List[YazaSqlValueV1] = [yaza_sql_value_text_v1(body)]
+    let text_filter_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(scalar_aggregate_result.storage, scalar_aggregate_result.wal, "SELECT COUNT(*) FROM documents WHERE body = $1", text_filter_parameters)?
+    if not option_is_some(text_filter_result.query_result) or list_get(list_get(option_unwrap(text_filter_result.query_result).rows, 0), 0).integer_value != 1: return err("YDBv1 text-filtered aggregate did not materialize its external TEXT value")
+    let text_aggregate_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(text_filter_result.storage, text_filter_result.wal, "SELECT MIN(body) FROM documents", no_parameters)?
+    if not option_is_some(text_aggregate_result.query_result) or list_get(list_get(option_unwrap(text_aggregate_result.query_result).rows, 0), 0).text_value != body: return err("YDBv1 TEXT streaming aggregate did not hydrate its external value")
+
+    let note_update: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(text_aggregate_result.storage, text_aggregate_result.wal, "UPDATE documents SET note = 'after' WHERE id = 1", no_parameters)?
+    if not option_is_some(note_update.write_commit): return err("YDBv1 overflow SQL fixture update of a different column did not commit")
+    let updated: YazaDbWriteCommitV1 = option_unwrap(note_update.write_commit)
+    let replacement_body: Text = text_try_repeat("r", 9000)?
+    let replacement_parameters: List[YazaSqlValueV1] = [yaza_sql_value_text_v1(replacement_body)]
+    let body_update: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(updated.storage, updated.wal, "UPDATE documents SET body = $1 WHERE id = 1", replacement_parameters)?
+    if not option_is_some(body_update.write_commit): return err("YDBv1 SQL UPDATE did not commit a replacement external TEXT chain")
+    let replaced: YazaDbWriteCommitV1 = option_unwrap(body_update.write_commit)
+    let select_replaced_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(replaced.storage, replaced.wal, "SELECT body, note FROM documents WHERE id = 1", no_parameters)?
+    if not option_is_some(select_replaced_result.query_result): return err("YDBv1 overflow SQL fixture SELECT after replacement returned no result")
+    let select_replaced: YazaSqlQueryResultV1 = option_unwrap(select_replaced_result.query_result)
+    if list_count(select_replaced.rows) != 1 or list_get(list_get(select_replaced.rows, 0), 0).text_value != replacement_body or list_get(list_get(select_replaced.rows, 0), 1).text_value != "after": return err("YDBv1 SQL UPDATE did not hydrate the replacement external TEXT chain")
+    let old_snapshot: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(replaced.storage, replaced.wal, "SELECT body, note FROM documents WHERE id = 1", no_parameters, updated.commit_ts, 0, List[YazaDbTxnStatusV1]())?
+    if list_count(old_snapshot.rows) != 1 or list_get(list_get(old_snapshot.rows, 0), 0).text_value != body or list_get(list_get(old_snapshot.rows, 0), 1).text_value != "after": return err("YDBv1 SQL UPDATE replacement did not preserve the prior external TEXT snapshot")
+
+    let inline_update: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(replaced.storage, replaced.wal, "UPDATE documents SET body = 'small' WHERE id = 1", no_parameters)?
+    if not option_is_some(inline_update.write_commit): return err("YDBv1 SQL UPDATE could not replace external TEXT with inline TEXT")
+    let inlined: YazaDbWriteCommitV1 = option_unwrap(inline_update.write_commit)
+    let replacement_snapshot: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(inlined.storage, inlined.wal, "SELECT body FROM documents WHERE id = 1", no_parameters, replaced.commit_ts, 0, List[YazaDbTxnStatusV1]())?
+    if list_count(replacement_snapshot.rows) != 1 or list_get(list_get(replacement_snapshot.rows, 0), 0).text_value != replacement_body: return err("YDBv1 SQL UPDATE to inline TEXT discarded the prior external TEXT snapshot")
+    let select_inline_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(inlined.storage, inlined.wal, "SELECT body FROM documents WHERE id = 1", no_parameters)?
+    if not option_is_some(select_inline_result.query_result) or list_get(list_get(option_unwrap(select_inline_result.query_result).rows, 0), 0).text_value != "small": return err("YDBv1 SQL UPDATE did not publish the inline TEXT replacement")
+    let updated_wal_closed: Boolean = yaza_db_wal_log_close_v1(inlined.wal)?
+    let updated_storage_closed: Boolean = yaza_db_storage_close_v1(inlined.storage)?
+    if not updated_wal_closed or not updated_storage_closed: return err("YDBv1 overflow SQL fixture could not close its updated database")
+
+    let reopened: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, database_name)?
+    let select_reopened_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(reopened.storage, reopened.wal, "SELECT body, note FROM documents WHERE id = 1", no_parameters)?
+    if not option_is_some(select_reopened_result.query_result): return err("YDBv1 overflow SQL fixture reopen SELECT returned no result")
+    let select_reopened: YazaSqlQueryResultV1 = option_unwrap(select_reopened_result.query_result)
+    if list_count(select_reopened.rows) != 1 or list_get(list_get(select_reopened.rows, 0), 0).text_value != "small" or list_get(list_get(select_reopened.rows, 0), 1).text_value != "after": return err("YDBv1 inline TEXT replacement did not survive database close/reopen and recovery")
+    let old_snapshot_after_reopen: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(reopened.storage, reopened.wal, "SELECT body FROM documents WHERE id = 1", no_parameters, updated.commit_ts, 0, List[YazaDbTxnStatusV1]())?
+    if list_count(old_snapshot_after_reopen.rows) != 1 or list_get(list_get(old_snapshot_after_reopen.rows, 0), 0).text_value != body: return err("YDBv1 historical overflow TEXT did not survive close/reopen and recovery")
+    let deleted: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(reopened.storage, reopened.wal, "DELETE FROM documents WHERE id = 1", no_parameters)?
+    if not option_is_some(deleted.write_commit): return err("YDBv1 overflow SQL fixture DELETE did not commit")
+    let deleted_commit: YazaDbWriteCommitV1 = option_unwrap(deleted.write_commit)
+    let empty_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(deleted_commit.storage, deleted_commit.wal, "SELECT body FROM documents", no_parameters)?
+    if not option_is_some(empty_result.query_result) or list_count(option_unwrap(empty_result.query_result).rows) != 0: return err("YDBv1 SQL DELETE left the external-TEXT row visible")
+
+    let drop_snapshot: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(deleted_commit.storage.file, deleted_commit.storage.header)?
+    var documents_index: Number = 0
+    while documents_index < list_count(drop_snapshot.sql_snapshot.tables) and list_get(drop_snapshot.sql_snapshot.tables, documents_index).name != "documents":
+        set documents_index = documents_index + 1
+    if documents_index >= list_count(drop_snapshot.sql_snapshot.tables): return err("YDBv1 overflow SQL fixture could not locate documents before DROP")
+    let documents: YazaSqlTableSchemaV1 = list_get(drop_snapshot.sql_snapshot.tables, documents_index)
+    let documents_root: Number = list_get(drop_snapshot.root_page_ids, documents_index)
+    let primary_plan: YazaDbBtreeReclaimPlanV1 = yaza_db_btree_reclaim_plan_v1(deleted_commit.storage.file, deleted_commit.storage.header, documents_root)?
+    let primary_keys: List[Number] = yaza_db_query_parse_key_ordinals_v1("0", list_count(documents.columns))?
+    let overflow_plan: YazaDbOverflowReclaimPlanV1 = yaza_db_overflow_reclaim_plan_table_v1(deleted_commit.storage.root, deleted_commit.wal.db_uuid, deleted_commit.wal.next_lsn, deleted_commit.storage.file, deleted_commit.storage.header, primary_plan, documents.columns, list_get(drop_snapshot.table_schema_versions, documents_index), primary_keys)?
+    if list_count(overflow_plan.page_ids) != 2: return err("YDBv1 DROP TABLE fixture did not collect both replaced historical overflow chains")
+    let free_before_drop: Number = yaza_db_allocator_count_free_pages_v1(deleted_commit.storage, yaza_db_storage_preallocated_page_count_v1())?
+    let drop_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(empty_result.storage, empty_result.wal, "DROP TABLE documents", no_parameters)?
+    if not option_is_some(drop_result.write_commit): return err("YDBv1 DROP TABLE did not commit after overflow-text history")
+    let dropped: YazaDbWriteCommitV1 = option_unwrap(drop_result.write_commit)
+    let free_after_drop: Number = yaza_db_allocator_count_free_pages_v1(dropped.storage, yaza_db_storage_preallocated_page_count_v1())?
+    if free_after_drop != free_before_drop + list_count(primary_plan.page_ids) + list_count(overflow_plan.page_ids): return err("YDBv1 DROP TABLE did not reclaim its row and overflow pages exactly")
+    let missing_after_drop: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(dropped.storage, dropped.wal, "SELECT body FROM documents", no_parameters)
+    if result_is_ok(missing_after_drop): return err("YDBv1 DROP TABLE left the overflow table queryable")
+    let drop_wal_closed: Boolean = yaza_db_wal_log_close_v1(dropped.wal)?
+    let drop_storage_closed: Boolean = yaza_db_storage_close_v1(dropped.storage)?
+    if not drop_wal_closed or not drop_storage_closed: return err("YDBv1 overflow SQL fixture could not close its dropped database")
+    let after_drop_reopen: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, database_name)?
+    let reopened_snapshot: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(after_drop_reopen.storage.file, after_drop_reopen.storage.header)?
+    var reopened_documents_index: Number = 0
+    while reopened_documents_index < list_count(reopened_snapshot.sql_snapshot.tables) and list_get(reopened_snapshot.sql_snapshot.tables, reopened_documents_index).name != "documents":
+        set reopened_documents_index = reopened_documents_index + 1
+    if reopened_documents_index < list_count(reopened_snapshot.sql_snapshot.tables): return err("YDBv1 DROP TABLE catalog state did not survive reopen")
+    let free_after_drop_reopen: Number = yaza_db_allocator_count_free_pages_v1(after_drop_reopen.storage, yaza_db_storage_preallocated_page_count_v1())?
+    if free_after_drop_reopen != free_after_drop: return err("YDBv1 DROP TABLE overflow reclamation did not survive reopen")
+    let reopened_wal_closed: Boolean = yaza_db_wal_log_close_v1(after_drop_reopen.wal)?
+    let reopened_storage_closed: Boolean = yaza_db_storage_close_v1(after_drop_reopen.storage)?
+    if not reopened_wal_closed or not reopened_storage_closed: return err("YDBv1 overflow SQL fixture could not close its recovered database")
+    let root_closed: Boolean = close(root)?
+    if not root_closed: return err("YDBv1 overflow SQL fixture root handle did not close")
+    return ok(14005)
+
+start:
+    let outcome: Result[Number, Text] = yaza_db_overflow_sql_v1_check(arg(1))
+    if result_is_ok(outcome):
+        say "yazabase-overflow-sql-v1-ok bytes=" + number_text(result_unwrap(outcome))
+    else:
+        say result_unwrap_error(outcome)

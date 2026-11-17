@@ -1,0 +1,133 @@
+use "std/fs"
+use "../yazabase/allocator_v1"
+use "../yazabase/btree_reclaim_v1"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/catalog_snapshot_v1"
+use "../yazabase/checkpoint_v1"
+use "../yazabase/index_catalog_v1"
+use "../yazabase/sql_create_table_v1"
+use "../yazabase/sql_dispatch_v1"
+use "../yazabase/sql_drop_table_v1"
+use "../yazabase/storage_v1"
+
+fn yazabase_sql_drop_find_table_v1(snapshot: YazaSqlCatalogSnapshotV1, name: Text) -> Number:
+    var index: Number = 0
+    while index < list_count(snapshot.tables):
+        if list_get(snapshot.tables, index).name == name: return index
+        set index = index + 1
+    return -1
+
+fn yazabase_sql_drop_table_v1_check(root_path: Text) -> Result[Boolean, Text]:
+    let parsed_create_if_not_exists: Result[YazaSqlCreateTableAstV1, Text] = yaza_sql_parse_create_table_v1("CREATE TABLE IF NOT EXISTS drop_rows (id BIGINT PRIMARY KEY, note TEXT)")
+    if not result_is_ok(parsed_create_if_not_exists): return err("YDBv1 CREATE TABLE parser rejected IF NOT EXISTS")
+    let malformed_create_if_not_exists: Result[YazaSqlCreateTableAstV1, Text] = yaza_sql_parse_create_table_v1("CREATE TABLE IF EXISTS drop_rows (id BIGINT PRIMARY KEY)")
+    if result_is_ok(malformed_create_if_not_exists): return err("YDBv1 CREATE TABLE parser accepted an incomplete IF NOT EXISTS clause")
+    let parsed_name: Result[Text, Text] = yaza_sql_parse_drop_table_v1("DROP TABLE drop_rows;")
+    if not result_is_ok(parsed_name) or result_unwrap(parsed_name) != "drop_rows": return err("YDBv1 DROP TABLE parser did not normalize a valid one-table statement")
+    let parsed_if_exists: Result[Text, Text] = yaza_sql_parse_drop_table_v1("DROP TABLE IF EXISTS drop_rows;")
+    if not result_is_ok(parsed_if_exists) or result_unwrap(parsed_if_exists) != "drop_rows": return err("YDBv1 DROP TABLE parser did not normalize IF EXISTS")
+    if result_is_ok(yaza_sql_parse_drop_table_v1("DROP TABLE drop_rows; SELECT 1")) or result_is_ok(yaza_sql_parse_drop_table_v1("DROP TABLE sys.drop_rows")):
+        return err("YDBv1 DROP TABLE parser accepted a multi-statement or qualified name")
+    if result_is_ok(yaza_sql_parse_drop_table_v1("DROP TABLE IF drop_rows")):
+        return err("YDBv1 DROP TABLE parser accepted an incomplete IF EXISTS clause")
+
+    let root: Number = root_open(root_path)?
+    let db_name: Text = "drop-table-smoke.ydb"
+    let header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_from_text("drop-table-uuid1"), 0, 1, 1, 0, 2, 1)
+    let empty: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, db_name, header)?
+    let empty_closed: Boolean = yaza_db_storage_close_v1(empty)?
+    if not empty_closed: return err("YDBv1 DROP TABLE fixture could not close the empty database")
+    let initialized: YazaDbCatalogBootstrapV1 = yaza_db_catalog_initialize_v1(root, db_name)?
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+
+    let keep_create: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(initialized.storage, initialized.wal, "CREATE TABLE keep_rows (id BIGINT PRIMARY KEY, note TEXT)", no_parameters)?
+    if not option_is_some(keep_create.write_commit): return err("YDBv1 DROP TABLE fixture could not create the surviving table")
+    let drop_create: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(keep_create.storage, keep_create.wal, "CREATE TABLE IF NOT EXISTS drop_rows (id BIGINT PRIMARY KEY, note TEXT)", no_parameters)?
+    if not option_is_some(drop_create.write_commit): return err("YDBv1 DROP TABLE fixture could not create its target table")
+    let existing_create_if_not_exists: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(drop_create.storage, drop_create.wal, "CREATE TABLE IF NOT EXISTS drop_rows (id BIGINT PRIMARY KEY, note TEXT)", no_parameters)?
+    if option_is_some(existing_create_if_not_exists.write_commit) or existing_create_if_not_exists.storage.header.next_commit_ts != drop_create.storage.header.next_commit_ts or existing_create_if_not_exists.wal.next_lsn != drop_create.wal.next_lsn:
+        return err("YDBv1 CREATE TABLE IF NOT EXISTS changed database state for an existing table")
+    let insert_keep: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(existing_create_if_not_exists.storage, existing_create_if_not_exists.wal, "INSERT INTO keep_rows (id, note) VALUES (1, 'preserved')", no_parameters)?
+    if not option_is_some(insert_keep.write_commit): return err("YDBv1 DROP TABLE fixture could not seed the surviving table")
+    let insert_drop: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(insert_keep.storage, insert_keep.wal, "INSERT INTO drop_rows (id, note) VALUES (7, 'remove')", no_parameters)?
+    if not option_is_some(insert_drop.write_commit): return err("YDBv1 DROP TABLE fixture could not seed the target table")
+    var bulk_sql: Text = "INSERT INTO drop_rows (id, note) VALUES "
+    var bulk_index: Number = 0
+    while bulk_index < 400:
+        if bulk_index > 0: set bulk_sql = bulk_sql + ", "
+        set bulk_sql = bulk_sql + "(" + number_text(1000 + bulk_index) + ", 'remove')"
+        set bulk_index = bulk_index + 1
+    let insert_drop_many: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(insert_drop.storage, insert_drop.wal, bulk_sql, no_parameters)?
+    if not option_is_some(insert_drop_many.write_commit): return err("YDBv1 DROP TABLE fixture could not build a multi-leaf target tree")
+    let index_built: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(insert_drop_many.storage, insert_drop_many.wal, "CREATE INDEX drop_rows_note_idx ON drop_rows(note)", no_parameters)?
+    if not option_is_some(index_built.write_commit): return err("YDBv1 DROP TABLE fixture could not build a secondary index")
+    let indexed_drop_many: YazaDbWriteCommitV1 = option_unwrap(index_built.write_commit)
+    if result_is_ok(yaza_db_execute_statement_v1(indexed_drop_many.storage, indexed_drop_many.wal, "DROP TABLE sys_tables", no_parameters)):
+        return err("YDBv1 DROP TABLE permitted removal of a system catalog")
+    if result_is_ok(yaza_db_execute_statement_v1(indexed_drop_many.storage, indexed_drop_many.wal, "DROP TABLE missing_rows", no_parameters)):
+        return err("YDBv1 DROP TABLE silently accepted an unknown table")
+    let missing_if_exists: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(indexed_drop_many.storage, indexed_drop_many.wal, "DROP TABLE IF EXISTS missing_rows", no_parameters)?
+    if option_is_some(missing_if_exists.write_commit) or missing_if_exists.storage.header.next_commit_ts != indexed_drop_many.storage.header.next_commit_ts or missing_if_exists.wal.next_lsn != indexed_drop_many.wal.next_lsn:
+        return err("YDBv1 DROP TABLE IF EXISTS changed database state for a missing table")
+    let before_snapshot: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(indexed_drop_many.storage.file, indexed_drop_many.storage.header)?
+    let before_index: Number = yazabase_sql_drop_find_table_v1(before_snapshot.sql_snapshot, "drop_rows")
+    if before_index < 0: return err("YDBv1 DROP TABLE fixture could not locate the pre-drop schema")
+    let old_table_id: Number = list_get(before_snapshot.sql_snapshot.tables, before_index).table_id
+    let old_root_page_id: Number = list_get(before_snapshot.root_page_ids, before_index)
+    let reclaim_plan: YazaDbBtreeReclaimPlanV1 = yaza_db_btree_reclaim_plan_v1(indexed_drop_many.storage.file, indexed_drop_many.storage.header, old_root_page_id)?
+    var expected_reclaimed_pages: Number = list_count(reclaim_plan.page_ids)
+    if expected_reclaimed_pages < 3: return err("YDBv1 DROP TABLE fixture did not construct a multi-leaf user B+Tree")
+    let index_catalog_rows: List[YazaDbRowV1] = yaza_db_index_catalog_rows_v1(indexed_drop_many.storage.file, indexed_drop_many.storage.header, indexed_drop_many.storage.header.next_commit_ts - 1)?
+    var secondary_root_page_id: Number = 0
+    var index_row_index: Number = 0
+    while index_row_index < list_count(index_catalog_rows):
+        let index_row: YazaDbRowV1 = list_get(index_catalog_rows, index_row_index)
+        if list_get(index_row.values, 2).text_value == "drop_rows_note_idx":
+            if list_get(index_row.values, 4).integer_value != yaza_db_catalog_index_kind_secondary_active_v1(): return err("YDBv1 DROP TABLE fixture index did not reach ACTIVE")
+            set secondary_root_page_id = list_get(index_row.values, 3).integer_value
+        set index_row_index = index_row_index + 1
+    if secondary_root_page_id < 2: return err("YDBv1 DROP TABLE fixture could not find the secondary index root")
+    let index_reclaim_plan: YazaDbBtreeReclaimPlanV1 = yaza_db_btree_reclaim_plan_v1(indexed_drop_many.storage.file, indexed_drop_many.storage.header, secondary_root_page_id)?
+    set expected_reclaimed_pages = expected_reclaimed_pages + list_count(index_reclaim_plan.page_ids)
+    let free_before: Number = yaza_db_allocator_count_free_pages_v1(indexed_drop_many.storage, yaza_db_storage_preallocated_page_count_v1())?
+
+    let dropped: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(indexed_drop_many.storage, indexed_drop_many.wal, "DROP TABLE IF EXISTS drop_rows;", no_parameters)?
+    if dropped.statement_kind != yaza_db_sql_statement_kind_drop_table_v1() or not option_is_some(dropped.write_commit): return err("YDBv1 SQL dispatcher did not return the DROP TABLE commit")
+    let after_drop: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(dropped.storage.file, dropped.storage.header)?
+    if yazabase_sql_drop_find_table_v1(after_drop.sql_snapshot, "drop_rows") >= 0: return err("YDBv1 DROP TABLE left the target visible in the catalog")
+    if yazabase_sql_drop_find_table_v1(after_drop.sql_snapshot, "keep_rows") < 0: return err("YDBv1 DROP TABLE removed an unrelated table")
+    if after_drop.sql_snapshot.version != dropped.storage.header.next_commit_ts - 1: return err("YDBv1 DROP TABLE did not publish its catalog transaction")
+    let free_after: Number = yaza_db_allocator_count_free_pages_v1(dropped.storage, yaza_db_storage_preallocated_page_count_v1())?
+    if free_after != free_before + expected_reclaimed_pages: return err("YDBv1 DROP TABLE did not reclaim every validated user-tree page")
+    let missing_select: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(dropped.storage, dropped.wal, "SELECT id FROM drop_rows", no_parameters)
+    if result_is_ok(missing_select): return err("YDBv1 SQL binder still resolved the dropped table")
+    let preserved_select: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(dropped.storage, dropped.wal, "SELECT id, note FROM keep_rows WHERE id = 1", no_parameters)?
+    if not option_is_some(preserved_select.query_result) or list_count(option_unwrap(preserved_select.query_result).rows) != 1: return err("YDBv1 DROP TABLE damaged an unrelated table's rows")
+
+    let drop_wal_closed: Boolean = yaza_db_wal_log_close_v1(preserved_select.wal)?
+    let drop_storage_closed: Boolean = yaza_db_storage_close_v1(preserved_select.storage)?
+    if not drop_wal_closed or not drop_storage_closed: return err("YDBv1 DROP TABLE handles could not close")
+    let recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, db_name)?
+    let recovered_snapshot: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(recovered.storage.file, recovered.storage.header)?
+    if yazabase_sql_drop_find_table_v1(recovered_snapshot.sql_snapshot, "drop_rows") >= 0 or yazabase_sql_drop_find_table_v1(recovered_snapshot.sql_snapshot, "keep_rows") < 0:
+        return err("YDBv1 DROP TABLE catalog visibility did not survive close/reopen recovery")
+    let free_after_reopen: Number = yaza_db_allocator_count_free_pages_v1(recovered.storage, yaza_db_storage_preallocated_page_count_v1())?
+    if free_after_reopen != free_before + expected_reclaimed_pages: return err("YDBv1 DROP TABLE page reclamation did not survive close/reopen recovery")
+    let recreate: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(recovered.storage, recovered.wal, "CREATE TABLE drop_rows (id BIGINT PRIMARY KEY)", no_parameters)?
+    if not option_is_some(recreate.write_commit): return err("YDBv1 DROP TABLE did not release the unqualified name for recreation")
+    let recreated_snapshot: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(recreate.storage.file, recreate.storage.header)?
+    let recreated_index: Number = yazabase_sql_drop_find_table_v1(recreated_snapshot.sql_snapshot, "drop_rows")
+    if recreated_index < 0 or list_get(recreated_snapshot.sql_snapshot.tables, recreated_index).table_id <= old_table_id:
+        return err("YDBv1 DROP TABLE recreated the name with a reused table ID")
+
+    let recreated_wal_closed: Boolean = yaza_db_wal_log_close_v1(recreate.wal)?
+    let recreated_storage_closed: Boolean = yaza_db_storage_close_v1(recreate.storage)?
+    let root_closed: Boolean = close(root)?
+    if not recreated_wal_closed or not recreated_storage_closed or not root_closed: return err("YDBv1 DROP TABLE fixture could not close final handles")
+    return ok(true)
+
+start:
+    let outcome: Result[Boolean, Text] = yazabase_sql_drop_table_v1_check(arg(1))
+    if not result_is_ok(outcome): say result_unwrap_error(outcome)
+    elif result_unwrap(outcome): say "yazabase-sql-drop-table-v1-ok"
+    else: say "YDBv1 DROP TABLE fixture returned false"

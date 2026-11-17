@@ -1,0 +1,138 @@
+# Scheduler-driven PostgreSQL pool checkout, connection, query, and release.
+# Every Wait* outcome must be registered with pg_pool_query_async_wait before
+# the task-step callback returns YAZA_TASK_STEP_WAIT.
+use "async_pool_connection"
+use "async_query"
+use "protocol"
+use "pool"
+use "std/net/io"
+
+shape PgPoolQueryAsyncState:
+    phase: Number
+    connection_state: Option[PgPoolConnectAsyncState]
+    query_state: Option[PgAsyncQueryState]
+    connection: Number
+    sql: Text
+    parameters: Option[PgParameters]
+    query_timeout_ms: Number
+
+variant PgPoolQueryAsyncStep:
+    Progress(state: PgPoolQueryAsyncState)
+    WaitPool(state: PgPoolQueryAsyncState)
+    WaitConnect(state: PgPoolQueryAsyncState)
+    WaitRead(state: PgPoolQueryAsyncState)
+    WaitWrite(state: PgPoolQueryAsyncState)
+    Complete(result: PgQueryResult)
+
+fn pg_pool_query_async_state(phase: Number, connection_state: Option[PgPoolConnectAsyncState], query_state: Option[PgAsyncQueryState], connection: Number, sql: Text, parameters: Option[PgParameters], query_timeout_ms: Number) -> PgPoolQueryAsyncState:
+    return PgPoolQueryAsyncState(phase, connection_state, query_state, connection, sql, parameters, query_timeout_ms)
+
+fn pg_pool_query_async_begin(identity: Bytes, maximum: Number, acquire_timeout_ms: Number, idle_timeout_ms: Number, connection_timeout_ms: Number, query_timeout_ms: Number, host: Text, port: Number, username: Text, database: Text, password: SecretText, sql: Text) -> Result[PgPoolQueryAsyncState, Text]:
+    return pg_pool_query_async_begin_with_parameters(identity, maximum, acquire_timeout_ms, idle_timeout_ms, connection_timeout_ms, query_timeout_ms, host, port, username, database, password, sql, none)
+
+fn pg_pool_query_async_params_begin(identity: Bytes, maximum: Number, acquire_timeout_ms: Number, idle_timeout_ms: Number, connection_timeout_ms: Number, query_timeout_ms: Number, host: Text, port: Number, username: Text, database: Text, password: SecretText, sql: Text, parameters: PgParameters) -> Result[PgPoolQueryAsyncState, Text]:
+    return pg_pool_query_async_begin_with_parameters(identity, maximum, acquire_timeout_ms, idle_timeout_ms, connection_timeout_ms, query_timeout_ms, host, port, username, database, password, sql, some(parameters))
+
+fn pg_pool_query_async_begin_with_parameters(identity: Bytes, maximum: Number, acquire_timeout_ms: Number, idle_timeout_ms: Number, connection_timeout_ms: Number, query_timeout_ms: Number, host: Text, port: Number, username: Text, database: Text, password: SecretText, sql: Text, parameters: Option[PgParameters]) -> Result[PgPoolQueryAsyncState, Text]:
+    if query_timeout_ms < 1 or query_timeout_ms > 3600000:
+        let wiped: Boolean = secret_zeroize(password)
+        return err("postgres async pool query: query timeout must be between 1 and 3600000 milliseconds")
+    if option_is_some(parameters):
+        let prepared: Result[Bytes, Text] = pg_parameters_message(sql, option_unwrap(parameters))
+        if not result_is_ok(prepared):
+            let wiped: Boolean = secret_zeroize(password)
+            return err(result_unwrap_error(prepared))
+    else:
+        let prepared: Result[Bytes, Text] = pg_simple_query_message(sql)
+        if not result_is_ok(prepared):
+            let wiped: Boolean = secret_zeroize(password)
+            return err(result_unwrap_error(prepared))
+    let connecting: Result[PgPoolConnectAsyncState, Text] = pg_pool_connect_async_begin(identity, maximum, acquire_timeout_ms, idle_timeout_ms, connection_timeout_ms, host, port, username, database, password)
+    if not result_is_ok(connecting):
+        return err(result_unwrap_error(connecting))
+    return ok(pg_pool_query_async_state(0, some(result_unwrap(connecting)), none, 0, sql, parameters, query_timeout_ms))
+
+fn pg_pool_query_async_from_connection(state: PgPoolQueryAsyncState, step: PgPoolConnectAsyncStep) -> Result[PgPoolQueryAsyncStep, Text]:
+    match step:
+        Progress(connecting):
+            return ok(PgPoolQueryAsyncStep::Progress(pg_pool_query_async_state(0, some(connecting), none, 0, state.sql, state.parameters, state.query_timeout_ms)))
+        WaitPool(connecting):
+            return ok(PgPoolQueryAsyncStep::WaitPool(pg_pool_query_async_state(0, some(connecting), none, 0, state.sql, state.parameters, state.query_timeout_ms)))
+        WaitConnect(connecting):
+            return ok(PgPoolQueryAsyncStep::WaitConnect(pg_pool_query_async_state(0, some(connecting), none, 0, state.sql, state.parameters, state.query_timeout_ms)))
+        WaitRead(connecting):
+            return ok(PgPoolQueryAsyncStep::WaitRead(pg_pool_query_async_state(0, some(connecting), none, 0, state.sql, state.parameters, state.query_timeout_ms)))
+        WaitWrite(connecting):
+            return ok(PgPoolQueryAsyncStep::WaitWrite(pg_pool_query_async_state(0, some(connecting), none, 0, state.sql, state.parameters, state.query_timeout_ms)))
+        Complete(connection):
+            var begun: Result[PgAsyncQueryState, Text] = err("postgres async pool query: query initialization failed")
+            if option_is_some(state.parameters):
+                set begun = pg_query_async_with_parameters_begin(connection, state.sql, option_unwrap(state.parameters), state.query_timeout_ms)
+            else:
+                set begun = pg_query_async_begin(connection, state.sql, state.query_timeout_ms)
+            if not result_is_ok(begun):
+                let released: Boolean = pg_pool_release(connection, false)
+                return err(result_unwrap_error(begun))
+            return ok(PgPoolQueryAsyncStep::Progress(pg_pool_query_async_state(1, none, some(result_unwrap(begun)), connection, state.sql, state.parameters, state.query_timeout_ms)))
+
+fn pg_pool_query_async_step(state: PgPoolQueryAsyncState) -> Result[PgPoolQueryAsyncStep, Text]:
+    if task_or_request_cancelled():
+        let cancelled: Boolean = pg_pool_query_async_cancel(state)
+        return err("postgres async pool query: operation was cancelled")
+    if state.phase == 0:
+        if not option_is_some(state.connection_state) or option_is_some(state.query_state) or state.connection != 0 or state.query_timeout_ms < 1 or state.query_timeout_ms > 3600000:
+            let cancelled: Boolean = pg_pool_query_async_cancel(state)
+            return err("postgres async pool query: connection continuation is malformed")
+        let advanced: Result[PgPoolConnectAsyncStep, Text] = pg_pool_connect_async_step(option_unwrap(state.connection_state))
+        if not result_is_ok(advanced):
+            let cancelled: Boolean = pg_pool_connect_async_cancel(option_unwrap(state.connection_state))
+            return err(result_unwrap_error(advanced))
+        return pg_pool_query_async_from_connection(state, result_unwrap(advanced))
+    if state.phase == 1:
+        if option_is_some(state.connection_state) or not option_is_some(state.query_state) or state.connection <= 0 or state.query_timeout_ms < 1 or state.query_timeout_ms > 3600000:
+            let cancelled: Boolean = pg_pool_query_async_cancel(state)
+            return err("postgres async pool query: query continuation is malformed")
+        let advanced: Result[PgAsyncQueryStep, Text] = pg_query_async_step(option_unwrap(state.query_state))
+        if not result_is_ok(advanced):
+            let released: Boolean = pg_pool_release(state.connection, false)
+            return err(result_unwrap_error(advanced))
+        match result_unwrap(advanced):
+            Progress(query):
+                return ok(PgPoolQueryAsyncStep::Progress(pg_pool_query_async_state(1, none, some(query), state.connection, state.sql, state.parameters, state.query_timeout_ms)))
+            WaitRead(query):
+                return ok(PgPoolQueryAsyncStep::WaitRead(pg_pool_query_async_state(1, none, some(query), state.connection, state.sql, state.parameters, state.query_timeout_ms)))
+            WaitWrite(query):
+                return ok(PgPoolQueryAsyncStep::WaitWrite(pg_pool_query_async_state(1, none, some(query), state.connection, state.sql, state.parameters, state.query_timeout_ms)))
+            Complete(result):
+                var healthy: Boolean = false
+                match result.transaction_status:
+                    Idle:
+                        set healthy = true
+                    InTransaction:
+                        set healthy = false
+                    FailedTransaction:
+                        set healthy = false
+                if not pg_pool_release(state.connection, healthy):
+                    return err("postgres async pool query: pooled connection lease could not be released")
+                return ok(PgPoolQueryAsyncStep::Complete(result))
+    let cancelled: Boolean = pg_pool_query_async_cancel(state)
+    return err("postgres async pool query: continuation phase is unknown")
+
+# Call after any Wait* outcome. It delegates pool saturation waits and socket
+# readiness waits to their owning native registrations.
+fn pg_pool_query_async_wait(state: PgPoolQueryAsyncState, writable: Boolean) -> Result[Boolean, Text]:
+    if state.phase == 0 and option_is_some(state.connection_state) and not option_is_some(state.query_state):
+        return pg_pool_connect_async_wait(option_unwrap(state.connection_state), writable)
+    if state.phase == 1 and not option_is_some(state.connection_state) and option_is_some(state.query_state):
+        return pg_query_async_wait(option_unwrap(state.query_state), writable)
+    return err("postgres async pool query: readiness wait does not match a suspended continuation")
+
+fn pg_pool_query_async_cancel(state: PgPoolQueryAsyncState) -> Boolean:
+    if state.phase == 0 and option_is_some(state.connection_state):
+        return pg_pool_connect_async_cancel(option_unwrap(state.connection_state))
+    if state.phase == 1 and option_is_some(state.query_state) and state.connection > 0:
+        let closed: Number = net_close(state.connection)
+        let query_released: Boolean = pg_async_state_release(option_unwrap(state.query_state))
+        let pool_released: Boolean = pg_pool_release(state.connection, false)
+        return closed >= 0 and query_released and pool_released
+    return false

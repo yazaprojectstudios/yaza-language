@@ -1,0 +1,143 @@
+use "std/fs"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/catalog_snapshot_v1"
+use "../yazabase/query_v1"
+use "../yazabase/sql_alter_table_v1"
+use "../yazabase/sql_alter_table_write_v1"
+use "../yazabase/sql_dispatch_v1"
+
+fn yazabase_sql_alter_find_table_v1(snapshot: YazaSqlCatalogSnapshotV1, name: Text) -> Number:
+    var index: Number = 0
+    while index < list_count(snapshot.tables):
+        if list_get(snapshot.tables, index).name == name: return index
+        set index = index + 1
+    return -1
+
+fn yazabase_sql_alter_table_v1_check(root_path: Text) -> Result[Boolean, Text]:
+    let parsed: YazaSqlAlterTableAstV1 = yaza_sql_parse_alter_table_v1("ALTER TABLE documents ADD COLUMN detail TEXT NULL;")?
+    if parsed.type_id != 9 or parsed.table_name.part_count != 1 or parsed.column_name.part_count != 1: return err("YDBv1 ALTER TABLE parser returned incorrect column metadata")
+    if result_is_ok(yaza_sql_parse_alter_table_v1("ALTER TABLE documents ADD COLUMN detail TEXT NOT NULL")): return err("YDBv1 ALTER TABLE parser accepted NOT NULL without a DEFAULT")
+    let default_ast: YazaSqlAlterTableAstV1 = yaza_sql_parse_alter_table_v1("ALTER TABLE documents ADD COLUMN revision BIGINT NOT NULL DEFAULT 7")?
+    if default_ast.type_id != 4 or default_ast.nullable or default_ast.default_kind != 3: return err("YDBv1 ALTER TABLE parser returned incorrect DEFAULT metadata")
+    if result_is_ok(yaza_sql_parse_alter_table_v1("ALTER TABLE documents ADD COLUMN detail TEXT; SELECT 1")): return err("YDBv1 ALTER TABLE parser accepted multiple statements")
+
+    let root: Number = root_open(root_path)?
+    let db_name: Text = "alter-table-smoke.ydb"
+    let header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_from_text("alter-table-uuid"), 0, 1, 1, 0, 2, 1)
+    let empty: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, db_name, header)?
+    let empty_closed: Boolean = yaza_db_storage_close_v1(empty)?
+    if not empty_closed: return err("YDBv1 ALTER TABLE fixture could not close its empty database")
+    let initialized: YazaDbCatalogBootstrapV1 = yaza_db_catalog_initialize_v1(root, db_name)?
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let create: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(initialized.storage, initialized.wal, "CREATE TABLE documents (id BIGINT PRIMARY KEY, note TEXT)", no_parameters)?
+    if not option_is_some(create.write_commit): return err("YDBv1 ALTER TABLE fixture could not create its table")
+    let initial_insert: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(create.storage, create.wal, "INSERT INTO documents (id, note) VALUES (1, 'legacy')", no_parameters)?
+    if not option_is_some(initial_insert.write_commit): return err("YDBv1 ALTER TABLE fixture could not seed a legacy row")
+    let before_alter_ts: Number = option_unwrap(initial_insert.write_commit).commit_ts
+    let before_alter_snapshot: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(initial_insert.storage.file, initial_insert.storage.header)?
+    let before_index: Number = yazabase_sql_alter_find_table_v1(before_alter_snapshot.sql_snapshot, "documents")
+    if before_index < 0 or list_get(before_alter_snapshot.table_schema_versions, before_index) != 1: return err("YDBv1 ALTER TABLE fixture did not start at schema epoch 1")
+
+    if result_is_ok(yaza_db_execute_statement_v1(initial_insert.storage, initial_insert.wal, "ALTER TABLE missing ADD COLUMN detail TEXT", no_parameters)): return err("YDBv1 ALTER TABLE accepted an unknown table")
+    if result_is_ok(yaza_db_execute_statement_v1(initial_insert.storage, initial_insert.wal, "ALTER TABLE documents ADD COLUMN note TEXT", no_parameters)): return err("YDBv1 ALTER TABLE accepted a duplicate column")
+    if result_is_ok(yaza_db_execute_statement_v1(initial_insert.storage, initial_insert.wal, "ALTER TABLE sys_tables ADD COLUMN detail TEXT", no_parameters)): return err("YDBv1 ALTER TABLE accepted a system catalog target")
+    let alter: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(initial_insert.storage, initial_insert.wal, "ALTER TABLE documents ADD COLUMN detail TEXT", no_parameters)?
+    if alter.statement_kind != yaza_db_sql_statement_kind_alter_table_v1() or not option_is_some(alter.write_commit): return err("YDBv1 SQL dispatcher did not return an ALTER TABLE commit")
+    let after_alter: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(alter.storage.file, alter.storage.header)?
+    let documents_index: Number = yazabase_sql_alter_find_table_v1(after_alter.sql_snapshot, "documents")
+    if documents_index < 0 or list_get(after_alter.table_schema_versions, documents_index) != 2: return err("YDBv1 ALTER TABLE did not publish schema version 2")
+    let documents: YazaSqlTableSchemaV1 = list_get(after_alter.sql_snapshot.tables, documents_index)
+    if list_count(documents.columns) != 3 or list_get(documents.columns, 2).name != "detail" or not list_get(documents.columns, 2).nullable: return err("YDBv1 ALTER TABLE did not append the nullable column metadata")
+    if after_alter.sql_snapshot.version != option_unwrap(alter.write_commit).commit_ts: return err("YDBv1 ALTER TABLE did not advance the visible catalog version")
+
+    let stale_source: Text = "ALTER TABLE documents ADD COLUMN stale BIGINT"
+    let stale_ast: YazaSqlAlterTableAstV1 = yaza_sql_parse_alter_table_v1(stale_source)?
+    let stale_plan: YazaSqlAlterTablePlanV1 = yaza_sql_bind_alter_table_v1(stale_source, stale_ast, after_alter.sql_snapshot, after_alter.table_schema_versions)?
+    let second_alter: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(alter.storage, alter.wal, "ALTER TABLE documents ADD COLUMN revision BIGINT NOT NULL DEFAULT 7", no_parameters)?
+    if not option_is_some(second_alter.write_commit): return err("YDBv1 ALTER TABLE could not append a second nullable column")
+    let after_second_alter: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(second_alter.storage.file, second_alter.storage.header)?
+    let second_index: Number = yazabase_sql_alter_find_table_v1(after_second_alter.sql_snapshot, "documents")
+    if second_index < 0 or list_get(after_second_alter.table_schema_versions, second_index) != 3: return err("YDBv1 ALTER TABLE did not advance to schema epoch 3")
+    let second_documents: YazaSqlTableSchemaV1 = list_get(after_second_alter.sql_snapshot.tables, second_index)
+    if list_count(second_documents.columns) != 4 or list_get(second_documents.columns, 3).name != "revision" or list_get(second_documents.columns, 3).nullable or list_get(second_documents.columns, 3).default_expression != "7": return err("YDBv1 ALTER TABLE did not append the NOT NULL DEFAULT column")
+    if result_is_ok(yaza_db_sql_alter_table_write_v1(second_alter.storage, second_alter.wal, stale_plan)): return err("YDBv1 ALTER TABLE accepted a plan from a stale schema epoch")
+
+    let legacy_select: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(second_alter.storage, second_alter.wal, "SELECT id, note, detail, revision FROM documents WHERE id = 1", no_parameters)?
+    if not option_is_some(legacy_select.query_result): return err("YDBv1 ALTER TABLE legacy-row query returned no result")
+    let legacy_result: YazaSqlQueryResultV1 = option_unwrap(legacy_select.query_result)
+    if list_count(legacy_result.rows) != 1: return err("YDBv1 ALTER TABLE did not retain the pre-migration row")
+    let legacy_row: List[YazaSqlValueV1] = list_get(legacy_result.rows, 0)
+    if list_count(legacy_row) != 4 or list_get(legacy_row, 0).integer_value != 1 or list_get(legacy_row, 1).text_value != "legacy" or not list_get(legacy_row, 2).is_null or list_get(legacy_row, 3).is_null or list_get(legacy_row, 3).integer_value != 7: return err("YDBv1 ALTER TABLE did not synthesize nullable and DEFAULT suffixes for the epoch-1 row")
+    let empty_txn_statuses: List[YazaDbTxnStatusV1] = List[YazaDbTxnStatusV1]()
+    let historical: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(second_alter.storage, second_alter.wal, "SELECT id, note, detail, revision FROM documents WHERE id = 1", no_parameters, before_alter_ts, 0, empty_txn_statuses)?
+    if list_count(historical.rows) != 1 or not list_get(list_get(historical.rows, 0), 2).is_null or list_get(list_get(historical.rows, 0), 3).integer_value != 7: return err("YDBv1 ALTER TABLE historical lookup did not synthesize current-schema defaults for the epoch-1 row")
+
+    let new_insert: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(legacy_select.storage, legacy_select.wal, "INSERT INTO documents (id, note, detail, revision) VALUES (2, 'new', 'payload', 2)", no_parameters)?
+    if not option_is_some(new_insert.write_commit): return err("YDBv1 ALTER TABLE could not insert a full-width epoch-3 row")
+    let default_insert: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(new_insert.storage, new_insert.wal, "INSERT INTO documents (id, note) VALUES (3, 'defaulted')", no_parameters)?
+    if not option_is_some(default_insert.write_commit): return err("YDBv1 ALTER TABLE did not apply a NOT NULL DEFAULT to an omitted INSERT column")
+    let default_select: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(default_insert.storage, default_insert.wal, "SELECT detail, revision FROM documents WHERE id = 3", no_parameters)?
+    if not option_is_some(default_select.query_result): return err("YDBv1 ALTER TABLE defaulted INSERT query returned no result")
+    let default_rows: List[List[YazaSqlValueV1]] = option_unwrap(default_select.query_result).rows
+    if list_count(default_rows) != 1 or not list_get(list_get(default_rows, 0), 0).is_null or list_get(list_get(default_rows, 0), 1).integer_value != 7: return err("YDBv1 ALTER TABLE omitted INSERT did not retain the nullable and NOT NULL default values")
+    let remove_default_row: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(default_select.storage, default_select.wal, "DELETE FROM documents WHERE id = 3", no_parameters)?
+    if not option_is_some(remove_default_row.write_commit): return err("YDBv1 ALTER TABLE could not remove its defaulted INSERT probe row")
+    let update: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(remove_default_row.storage, remove_default_row.wal, "UPDATE documents SET detail = 'updated', revision = 3 WHERE id = 1", no_parameters)?
+    if not option_is_some(update.write_commit): return err("YDBv1 ALTER TABLE could not update an epoch-1 row into the current schema epoch")
+    let delete: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(update.storage, update.wal, "DELETE FROM documents WHERE id = 2", no_parameters)?
+    if not option_is_some(delete.write_commit): return err("YDBv1 ALTER TABLE could not delete an epoch-3 row")
+    let updated_select: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(delete.storage, delete.wal, "SELECT id, detail, revision FROM documents", no_parameters)?
+    if not option_is_some(updated_select.query_result): return err("YDBv1 ALTER TABLE UPDATE/DELETE query returned no result")
+    let updated_result: YazaSqlQueryResultV1 = option_unwrap(updated_select.query_result)
+    if list_count(updated_result.rows) != 1 or list_get(list_get(updated_result.rows, 0), 1).text_value != "updated" or list_get(list_get(updated_result.rows, 0), 2).integer_value != 3: return err("YDBv1 ALTER TABLE version-aware UPDATE/DELETE returned incorrect rows")
+
+    let wal_closed: Boolean = yaza_db_wal_log_close_v1(updated_select.wal)?
+    let storage_closed: Boolean = yaza_db_storage_close_v1(updated_select.storage)?
+    if not wal_closed or not storage_closed: return err("YDBv1 ALTER TABLE fixture could not close its first handles")
+    let reopened: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, db_name)?
+    let recovered_snapshot: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(reopened.storage.file, reopened.storage.header)?
+    let recovered_index: Number = yazabase_sql_alter_find_table_v1(recovered_snapshot.sql_snapshot, "documents")
+    if recovered_index < 0 or list_get(recovered_snapshot.table_schema_versions, recovered_index) != 3: return err("YDBv1 ALTER TABLE schema version did not survive recovery")
+    let recovered_select: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(reopened.storage, reopened.wal, "SELECT id, detail, revision FROM documents", no_parameters)?
+    if not option_is_some(recovered_select.query_result): return err("YDBv1 ALTER TABLE recovered query returned no result")
+    let recovered_rows: List[List[YazaSqlValueV1]] = option_unwrap(recovered_select.query_result).rows
+    if list_count(recovered_rows) != 1 or list_get(list_get(recovered_rows, 0), 1).text_value != "updated" or list_get(list_get(recovered_rows, 0), 2).integer_value != 3: return err("YDBv1 ALTER TABLE row epochs did not survive recovery")
+    let create_defaults: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(recovered_select.storage, recovered_select.wal, "CREATE TABLE alter_defaults (id BIGINT PRIMARY KEY)", no_parameters)?
+    if not option_is_some(create_defaults.write_commit): return err("YDBv1 ALTER DEFAULT fixture table could not be created")
+    let seed_defaults: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(create_defaults.storage, create_defaults.wal, "INSERT INTO alter_defaults (id) VALUES (1)", no_parameters)?
+    if not option_is_some(seed_defaults.write_commit): return err("YDBv1 ALTER DEFAULT fixture could not seed an old row")
+    let add_text_default: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(seed_defaults.storage, seed_defaults.wal, "ALTER TABLE alter_defaults ADD COLUMN note TEXT NOT NULL DEFAULT 'it''s seeded'", no_parameters)?
+    if not option_is_some(add_text_default.write_commit): return err("YDBv1 ALTER DEFAULT could not add a quoted TEXT default")
+    let add_integer_default: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(add_text_default.storage, add_text_default.wal, "ALTER TABLE alter_defaults ADD COLUMN delta BIGINT NOT NULL DEFAULT -7", no_parameters)?
+    if not option_is_some(add_integer_default.write_commit): return err("YDBv1 ALTER DEFAULT could not add a signed BIGINT default")
+    let add_null_default: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(add_integer_default.storage, add_integer_default.wal, "ALTER TABLE alter_defaults ADD COLUMN optional BIGINT DEFAULT NULL", no_parameters)?
+    if not option_is_some(add_null_default.write_commit): return err("YDBv1 ALTER DEFAULT could not add a nullable NULL default")
+    if result_is_ok(yaza_db_execute_statement_v1(add_null_default.storage, add_null_default.wal, "ALTER TABLE alter_defaults ADD COLUMN invalid BIGINT NOT NULL DEFAULT NULL", no_parameters)): return err("YDBv1 ALTER DEFAULT accepted NULL for a NOT NULL column")
+    let default_old_select: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(add_null_default.storage, add_null_default.wal, "SELECT note, delta, optional FROM alter_defaults WHERE id = 1", no_parameters)?
+    if not option_is_some(default_old_select.query_result): return err("YDBv1 ALTER DEFAULT old-row query returned no result")
+    let default_old_rows: List[List[YazaSqlValueV1]] = option_unwrap(default_old_select.query_result).rows
+    if list_count(default_old_rows) != 1 or list_get(list_get(default_old_rows, 0), 0).text_value != "it's seeded" or list_get(list_get(default_old_rows, 0), 1).integer_value != -7 or not list_get(list_get(default_old_rows, 0), 2).is_null: return err("YDBv1 ALTER DEFAULT did not synthesize typed values for an existing row")
+    let default_new_insert: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(default_old_select.storage, default_old_select.wal, "INSERT INTO alter_defaults (id) VALUES (2)", no_parameters)?
+    let default_new_select: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(default_new_insert.storage, default_new_insert.wal, "SELECT note, delta, optional FROM alter_defaults WHERE id = 2", no_parameters)?
+    if not option_is_some(default_new_select.query_result): return err("YDBv1 ALTER DEFAULT new-row query returned no result")
+    let default_new_rows: List[List[YazaSqlValueV1]] = option_unwrap(default_new_select.query_result).rows
+    if list_count(default_new_rows) != 1 or list_get(list_get(default_new_rows, 0), 0).text_value != "it's seeded" or list_get(list_get(default_new_rows, 0), 1).integer_value != -7 or not list_get(list_get(default_new_rows, 0), 2).is_null: return err("YDBv1 ALTER DEFAULT did not apply defaults to a new INSERT")
+    let defaults_wal_closed: Boolean = yaza_db_wal_log_close_v1(default_new_select.wal)?
+    let defaults_storage_closed: Boolean = yaza_db_storage_close_v1(default_new_select.storage)?
+    if not defaults_wal_closed or not defaults_storage_closed: return err("YDBv1 ALTER DEFAULT fixture could not close before reopen")
+    let defaults_reopened: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, db_name)?
+    let reopened_default_select: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(defaults_reopened.storage, defaults_reopened.wal, "SELECT note, delta, optional FROM alter_defaults WHERE id = 1", no_parameters)?
+    if not option_is_some(reopened_default_select.query_result): return err("YDBv1 ALTER DEFAULT reopened query returned no result")
+    let reopened_default_rows: List[List[YazaSqlValueV1]] = option_unwrap(reopened_default_select.query_result).rows
+    if list_count(reopened_default_rows) != 1 or list_get(list_get(reopened_default_rows, 0), 0).text_value != "it's seeded" or list_get(list_get(reopened_default_rows, 0), 1).integer_value != -7 or not list_get(list_get(reopened_default_rows, 0), 2).is_null: return err("YDBv1 ALTER DEFAULT metadata or virtual values did not survive recovery")
+    let final_wal_closed: Boolean = yaza_db_wal_log_close_v1(reopened_default_select.wal)?
+    let final_storage_closed: Boolean = yaza_db_storage_close_v1(reopened_default_select.storage)?
+    let root_closed: Boolean = close(root)?
+    if not final_wal_closed or not final_storage_closed or not root_closed: return err("YDBv1 ALTER TABLE fixture could not close final handles")
+    return ok(true)
+
+start:
+    let outcome: Result[Boolean, Text] = yazabase_sql_alter_table_v1_check(arg(1))
+    if not result_is_ok(outcome): say result_unwrap_error(outcome)
+    elif result_unwrap(outcome): say "yazabase-sql-alter-table-v1-ok"
+    else: say "YDBv1 ALTER TABLE fixture returned false"

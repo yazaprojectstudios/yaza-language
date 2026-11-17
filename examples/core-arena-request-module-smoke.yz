@@ -1,0 +1,241 @@
+shape RequestRecord:
+    value: Number
+
+variant RequestStatus:
+    Missing
+    Found(record: RequestRecord)
+
+fn route_length(route: Text) -> Result[Number, Text]:
+    arena_scope 512:
+        let temporary: Text = text_try_concat(route, "!")?
+        return ok(text_length(temporary) - 1)
+
+fn transform_request(route: Text, payload: Bytes) -> Result[Bytes, Text]:
+    let checked_route_length: Number = route_length(route)?
+    if checked_route_length == 0:
+        return err("route is required")
+    let copied_routes_result: Result[TextList, Text] = text_list_try_new()
+    let copied_routes: TextList = copied_routes_result?
+    let expected_route: Text = text_try_concat(route, "!")?
+    arena_scope 512:
+        let child_route: Text = text_try_concat(route, "!")?
+        if list_try_push(copied_routes, child_route) == false:
+            return err("could not copy route into its parent List")
+    let copied_route: Text = list_get(copied_routes, 0)
+    assert copied_route == expected_route
+    let route_bytes: Bytes = bytes_try_from_text(route)?
+    let separator: Bytes = bytes_try_from_number(58)?
+    let prefix: Bytes = bytes_try_concat(route_bytes, separator)?
+    return bytes_try_concat(prefix, payload)
+
+fn invalid_request_signature(route: Text) -> Number:
+    return text_length(route)
+
+fn transform_text_request(route: Text, payload: Bytes, separator: Text) -> Result[Text, Text]:
+    if bytes_length(payload) > 10000:
+        return number_try_text(bytes_length(payload))
+    if text_length(route) == 0:
+        return err("route is required")
+    let payload_length: Text = number_try_text(bytes_length(payload))?
+    let route_prefix: Text = text_try_concat(route, separator)?
+    let response: Text = text_try_concat(route_prefix, payload_length)?
+    return ok(response)
+
+fn try_numeric_text_request(route: Text, payload: Bytes) -> Result[Text, Text]:
+    if route == "int32-oom":
+        exhaust_request_arena()
+        let value: Int32 = int32_from_number(2147483647)
+        let formatted_result: Result[Text, Text] = int32_try_text(value)
+        let formatted: Text = formatted_result?
+        return ok(formatted)
+    if route == "float64-oom":
+        exhaust_request_arena()
+        let formatted_result: Result[Text, Text] = float64_try_text(1.25)
+        let formatted: Text = formatted_result?
+        return ok(formatted)
+    return err("unsupported numeric formatter route")
+
+fn try_bytes_concat_request(route: Text, left: Bytes, right: Bytes) -> Result[Bytes, Text]:
+    if text_length(route) == 0:
+        return err("route is required")
+    let response: Bytes = bytes_try_concat(left, right)?
+    return ok(response)
+
+fn try_bytes_from_text_request(route: Text, payload: Text, padding: Text) -> Result[Bytes, Text]:
+    if route != "copy":
+        return err("unsupported route")
+    let response: Bytes = bytes_try_from_text(payload)?
+    return ok(response)
+
+fn exhaust_request_arena() -> Unit:
+    var filling_large: Boolean = true
+    while filling_large:
+        let filler_large: Result[Bytes, Text] = bytes_try_from_text("0123456789abcdef")
+        if not result_is_ok(filler_large): set filling_large = false
+    var filling_small: Boolean = true
+    while filling_small:
+        let filler_small: Result[Bytes, Text] = bytes_try_from_number(1)
+        if not result_is_ok(filler_small): set filling_small = false
+
+fn try_bytes_primitives_request(route: Text, payload: Bytes) -> Result[Bytes, Text]:
+    if route == "number-oom":
+        exhaust_request_arena()
+        let constructed: Result[Bytes, Text] = bytes_try_from_number(12345)
+        let value: Bytes = constructed?
+        return ok(value)
+    if route == "slice-oom":
+        exhaust_request_arena()
+        let sliced: Bytes = bytes_try_slice(payload, 0, bytes_length(payload))?
+        return ok(sliced)
+    if route == "bounded-oom":
+        exhaust_request_arena()
+        let bounded_result: Result[Bytes, Text] = bytes_from_text_bounded(route, 64)
+        let bounded: Bytes = bounded_result?
+        return ok(bounded)
+    if route == "join-oom":
+        let created: Result[List[Bytes], Text] = list_try_new()
+        let values: List[Bytes] = created?
+        if list_try_push(values, payload) == false:
+            return err("Could not prepare Bytes List for request join")
+        exhaust_request_arena()
+        let joined_result: Result[Bytes, Text] = bytes_join(values)
+        let joined: Bytes = joined_result?
+        return ok(joined)
+    return err("unsupported Bytes primitive route")
+
+fn try_text_from_bytes_request(route: Text, payload: Bytes, padding: Text) -> Result[Text, Text]:
+    if route != "decode":
+        return err("unsupported route")
+    let response: Text = bytes_try_to_text(payload)?
+    return ok(response)
+
+fn try_list_request(route: Text, payload: Bytes) -> Result[Text, Text]:
+    if route == "list-from":
+        arena_scope 1:
+            let created_from_literal: Result[List[Number], Text] = list_try_from([7])
+            let values_from_literal: List[Number] = created_from_literal?
+            let count_text: Text = number_try_text(list_count(values_from_literal))?
+            assert count_text == "1"
+            return ok("unexpected list literal success")
+    if route == "set-oom":
+        let created_texts: Result[TextList, Text] = text_list_try_new()
+        let texts: TextList = created_texts?
+        if list_try_push(texts, "old") == false:
+            return err("Could not initialize request Text List")
+        var filling: Boolean = true
+        while filling:
+            let filler: Result[Bytes, Text] = bytes_try_from_text("0123456789abcdef")
+            if not result_is_ok(filler): set filling = false
+        if list_try_set(texts, 0, "replacement") == false:
+            return err("Could not update Text item in request List")
+        return ok("unexpected update success")
+    if route != "list":
+        return err("unsupported route")
+    let created: Result[List[Number], Text] = list_try_new()
+    let values: List[Number] = created?
+    if list_try_push(values, 7) == false:
+        return err("Could not append Number to request List")
+    return number_try_text(list_count(values))
+
+fn try_fallible_sum_request(route: Text, payload: Bytes) -> Result[Text, Text]:
+    if route == "some":
+        arena_scope 8:
+            let constructed: Result[Option[RequestRecord], Text] = some_try(RequestRecord(41))
+            let value: Option[RequestRecord] = constructed?
+            return ok(route)
+    if route == "ok":
+        arena_scope 8:
+            let constructed: Result[Result[RequestRecord, Text], Text] = ok_try(RequestRecord(41))
+            let value: Result[RequestRecord, Text] = constructed?
+            return ok(route)
+    if route == "err":
+        arena_scope 8:
+            let constructed: Result[Result[Number, RequestRecord], Text] = err_try(RequestRecord(41))
+            let value: Result[Number, RequestRecord] = constructed?
+            return ok(route)
+    if route == "variant":
+        arena_scope 1:
+            let constructed: Result[RequestStatus, Text] = variant_try(RequestStatus::Found(RequestRecord(41)))
+            let value: RequestStatus = constructed?
+            return ok(route)
+    return err("unsupported fallible sum route")
+
+fn try_list_get_result_request(route: Text, payload: Bytes) -> Result[Text, Text]:
+    if route != "list-get":
+        return err("unsupported route")
+    let created: Result[List[RequestRecord], Text] = list_try_from([RequestRecord(41)])
+    let values: List[RequestRecord] = created?
+    arena_scope 1:
+        let fetched: Result[Option[RequestRecord], Text] = list_try_get_result(values, 0)
+        let maybe_record: Option[RequestRecord] = fetched?
+        let record: RequestRecord = option_unwrap(maybe_record)
+        assert record.value == 41
+        return ok(route)
+    return err("unreachable")
+
+fn try_text_join_request(route: Text, payload: Bytes) -> Result[Text, Text]:
+    let created: Result[TextList, Text] = text_list_try_new()
+    let values: TextList = created?
+    if list_try_push(values, "left") == false: return err("Could not append first text item")
+    if list_try_push(values, "right") == false: return err("Could not append second text item")
+    if route == "oom":
+        var filling: Boolean = true
+        while filling and arena_storage_used() < arena_reserved():
+            let filler: Result[Bytes,Text] = bytes_try_from_text("0123456789abcdef")
+            if not result_is_ok(filler): set filling = false
+    if route != "ok" and route != "oom":
+        return err("unsupported route")
+    return text_try_join(values, "/")
+
+fn try_text_allocations_request(route: Text, payload: Bytes) -> Result[Text, Text]:
+    let trimmed_route: Text = text_try_trim(route)?
+    if trimmed_route == "oom":
+        var filling: Boolean = true
+        while filling and arena_storage_used() < arena_reserved():
+            let filler: Result[Bytes, Text] = bytes_try_from_text("0123456789abcdef")
+            if not result_is_ok(filler): set filling = false
+        let exhausted_parts: TextList = text_try_split("one:two", ":")?
+        return text_try_join(exhausted_parts, "/")
+    if trimmed_route == "oom-list":
+        var filling_list: Boolean = true
+        while filling_list and arena_storage_used() < arena_reserved():
+            let filler_list: Result[Bytes, Text] = bytes_try_from_text("0123456789abcdef")
+            if not result_is_ok(filler_list): set filling_list = false
+        let created_list: Result[TextList, Text] = text_list_try_new()
+        let values: TextList = created_list?
+        return text_try_join(values, "/")
+    if trimmed_route == "oom-slice":
+        arena_scope 1:
+            let sliced: Text = text_try_slice("slice allocation", 0, 16)?
+            assert sliced == "slice allocation"
+            return ok("unexpected slice success")
+    if trimmed_route == "oom-interpolate":
+        arena_scope 1:
+            let count: Number = 12345
+            let formatted_result: Result[Text, Text] = text_try_interpolate("count={count}")
+            let formatted: Text = formatted_result?
+            assert formatted == "count=12345"
+            return ok("unexpected interpolation success")
+    if trimmed_route == "bad-split":
+        let invalid_parts: TextList = text_try_split("one", "")?
+        return text_try_join(invalid_parts, "/")
+
+    let route_parts: TextList = text_try_split(trimmed_route, "/")?
+    if list_count(route_parts) == 0:
+        return err("route is required")
+    let body_text: Text = bytes_try_to_text(payload)?
+    let trimmed_body: Text = text_try_trim(body_text)?
+    let body_lines: TextList = text_try_lines(trimmed_body)?
+    let joined_body: Text = text_try_join(body_lines, ":")?
+    let prefix: Text = text_try_concat(list_get(route_parts, 0), ":")?
+    return text_try_concat(prefix, joined_body)
+
+fn try_secure_random_request(route: Text, payload: Bytes) -> Result[Bytes, Text]:
+    if route == "invalid":
+        return secure_random_bytes_try(-1)
+    if route != "random":
+        return err("unsupported route")
+    return secure_random_bytes_try(bytes_length(payload))
+
+start:
+    say "module start is not called by the host"

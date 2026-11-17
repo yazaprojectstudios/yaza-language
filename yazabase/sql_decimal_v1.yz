@@ -1,0 +1,445 @@
+# Exact fixed-point decimal primitives for the YazaBase SQL profile.
+# Values use a signed 128-bit two's-complement coefficient in 16 bytes and a
+# separate declared precision/scale. This module is independent of the SQL
+# value/row types so its arithmetic and canonicalization can be verified first.
+
+shape YazaSqlDecimalV1:
+    coefficient: Bytes
+    precision: Number
+    scale: Number
+
+fn yaza_sql_decimal_width_v1() -> Number:
+    return 16
+
+fn yaza_sql_decimal_max_precision_v1() -> Number:
+    return 38
+
+fn yaza_sql_decimal_parameters_valid_v1(precision: Number, scale: Number) -> Boolean:
+    return precision >= 1 and precision <= yaza_sql_decimal_max_precision_v1() and scale >= 0 and scale <= precision
+
+fn yaza_sql_decimal_bytes_zero_v1(value: Bytes) -> Boolean:
+    if bytes_length(value) != yaza_sql_decimal_width_v1(): return false
+    var index: Number = 0
+    while index < yaza_sql_decimal_width_v1():
+        if bytes_get(value, index) != 0: return false
+        set index = index + 1
+    return true
+
+fn yaza_sql_decimal_value_zero_v1(value: YazaSqlDecimalV1) -> Result[Boolean, Text]:
+    let magnitude: Bytes = yaza_sql_decimal_magnitude_v1(value.coefficient)?
+    return ok(yaza_sql_decimal_bytes_zero_v1(magnitude))
+
+fn yaza_sql_decimal_magnitude_v1(coefficient: Bytes) -> Result[Bytes, Text]:
+    if bytes_length(coefficient) != yaza_sql_decimal_width_v1(): return err("YazaBase DECIMAL coefficient must be exactly 16 bytes")
+    let copied_result: Result[Bytes, Text] = bytes_try_new_zeroed(yaza_sql_decimal_width_v1())
+    if not result_is_ok(copied_result): return err(result_unwrap_error(copied_result))
+    let magnitude: Bytes = result_unwrap(copied_result)
+    var index: Number = 0
+    while index < yaza_sql_decimal_width_v1():
+        if not bytes_try_set(magnitude, index, bytes_get(coefficient, index)): return err("YazaBase DECIMAL magnitude copy failed")
+        set index = index + 1
+    if bytes_get(coefficient, 0) < 128: return ok(magnitude)
+    set index = 0
+    while index < yaza_sql_decimal_width_v1():
+        if not bytes_try_set(magnitude, index, 255 - bytes_get(magnitude, index)): return err("YazaBase DECIMAL magnitude negation failed")
+        set index = index + 1
+    var carry: Number = 1
+    set index = yaza_sql_decimal_width_v1() - 1
+    while index >= 0 and carry > 0:
+        let next_byte: Number = bytes_get(magnitude, index) + carry
+        if not bytes_try_set(magnitude, index, next_byte % 256): return err("YazaBase DECIMAL magnitude negation failed")
+        set carry = next_byte / 256
+        set index = index - 1
+    if carry != 0: return err("YazaBase DECIMAL coefficient is outside signed 128-bit range")
+    return ok(magnitude)
+
+fn yaza_sql_decimal_from_magnitude_v1(magnitude: Bytes, negative: Boolean, precision: Number, scale: Number) -> Result[YazaSqlDecimalV1, Text]:
+    if bytes_length(magnitude) != yaza_sql_decimal_width_v1() or not yaza_sql_decimal_parameters_valid_v1(precision, scale): return err("YazaBase DECIMAL construction has invalid width, precision, or scale")
+    let copied_result: Result[Bytes, Text] = bytes_try_new_zeroed(yaza_sql_decimal_width_v1())
+    if not result_is_ok(copied_result): return err(result_unwrap_error(copied_result))
+    let coefficient: Bytes = result_unwrap(copied_result)
+    var index: Number = 0
+    while index < yaza_sql_decimal_width_v1():
+        if not bytes_try_set(coefficient, index, bytes_get(magnitude, index)): return err("YazaBase DECIMAL coefficient copy failed")
+        set index = index + 1
+    if negative and not yaza_sql_decimal_bytes_zero_v1(magnitude):
+        set index = 0
+        while index < yaza_sql_decimal_width_v1():
+            if not bytes_try_set(coefficient, index, 255 - bytes_get(coefficient, index)): return err("YazaBase DECIMAL signed encoding failed")
+            set index = index + 1
+        var carry: Number = 1
+        set index = yaza_sql_decimal_width_v1() - 1
+        while index >= 0 and carry > 0:
+            let next_byte: Number = bytes_get(coefficient, index) + carry
+            if not bytes_try_set(coefficient, index, next_byte % 256): return err("YazaBase DECIMAL signed encoding failed")
+            set carry = next_byte / 256
+            set index = index - 1
+        if carry != 0: return err("YazaBase DECIMAL coefficient is outside signed 128-bit range")
+    let result_value: YazaSqlDecimalV1 = YazaSqlDecimalV1(coefficient, precision, scale)
+    let valid: Result[Boolean, Text] = yaza_sql_decimal_validate_v1(result_value)
+    if not result_is_ok(valid): return err(result_unwrap_error(valid))
+    return ok(result_value)
+
+fn yaza_sql_decimal_digit_count_magnitude_v1(magnitude: Bytes) -> Result[Number, Text]:
+    if bytes_length(magnitude) != yaza_sql_decimal_width_v1(): return err("YazaBase DECIMAL digit count received an invalid coefficient")
+    let quotient_result: Result[Bytes, Text] = bytes_try_new_zeroed(yaza_sql_decimal_width_v1())
+    if not result_is_ok(quotient_result): return err(result_unwrap_error(quotient_result))
+    let quotient: Bytes = result_unwrap(quotient_result)
+    var index: Number = 0
+    while index < yaza_sql_decimal_width_v1():
+        if not bytes_try_set(quotient, index, bytes_get(magnitude, index)): return err("YazaBase DECIMAL digit counter copy failed")
+        set index = index + 1
+    if yaza_sql_decimal_bytes_zero_v1(quotient): return ok(1)
+    var digit_count: Number = 0
+    while not yaza_sql_decimal_bytes_zero_v1(quotient):
+        var remainder: Number = 0
+        set index = 0
+        while index < yaza_sql_decimal_width_v1():
+            let dividend: Number = remainder * 256 + bytes_get(quotient, index)
+            if not bytes_try_set(quotient, index, dividend / 10): return err("YazaBase DECIMAL digit counter failed")
+            set remainder = dividend % 10
+            set index = index + 1
+        set digit_count = digit_count + 1
+    return ok(digit_count)
+
+fn yaza_sql_decimal_validate_v1(value: YazaSqlDecimalV1) -> Result[Boolean, Text]:
+    if not yaza_sql_decimal_parameters_valid_v1(value.precision, value.scale): return err("YazaBase DECIMAL precision must be 1..38 and scale must be 0..precision")
+    if bytes_length(value.coefficient) != yaza_sql_decimal_width_v1(): return err("YazaBase DECIMAL coefficient must be exactly 16 bytes")
+    let magnitude: Bytes = yaza_sql_decimal_magnitude_v1(value.coefficient)?
+    let digit_count: Number = yaza_sql_decimal_digit_count_magnitude_v1(magnitude)?
+    if digit_count > value.precision: return err("YazaBase DECIMAL coefficient exceeds its declared precision")
+    return ok(true)
+
+fn yaza_sql_decimal_parse_v1(source: Text, precision: Number, scale: Number) -> Result[YazaSqlDecimalV1, Text]:
+    if not yaza_sql_decimal_parameters_valid_v1(precision, scale): return err("YazaBase DECIMAL precision must be 1..38 and scale must be 0..precision")
+    let source_length: Number = text_length(source)
+    if source_length < 1 or source_length > 256: return err("YazaBase DECIMAL literal length is outside its bound")
+    var cursor: Number = 0
+    var negative: Boolean = false
+    if text_byte(source, cursor) == 45 or text_byte(source, cursor) == 43:
+        set negative = text_byte(source, cursor) == 45
+        set cursor = cursor + 1
+    if cursor >= source_length: return err("YazaBase DECIMAL literal has no digits")
+    let magnitude_result: Result[Bytes, Text] = bytes_try_new_zeroed(yaza_sql_decimal_width_v1())
+    if not result_is_ok(magnitude_result): return err(result_unwrap_error(magnitude_result))
+    let magnitude: Bytes = result_unwrap(magnitude_result)
+    var seen_point: Boolean = false
+    var seen_digit: Boolean = false
+    var fractional_digits: Number = 0
+    while cursor < source_length:
+        let byte: Number = text_byte(source, cursor)
+        if byte == 46:
+            if seen_point: return err("YazaBase DECIMAL literal contains more than one decimal point")
+            set seen_point = true
+        elif byte >= 48 and byte <= 57:
+            set seen_digit = true
+            let digit: Number = byte - 48
+            if not seen_point or fractional_digits < scale:
+                var carry: Number = digit
+                var index: Number = yaza_sql_decimal_width_v1() - 1
+                while index >= 0:
+                    let product: Number = bytes_get(magnitude, index) * 10 + carry
+                    if not bytes_try_set(magnitude, index, product % 256): return err("YazaBase DECIMAL literal conversion failed")
+                    set carry = product / 256
+                    set index = index - 1
+                if carry != 0: return err("YazaBase DECIMAL literal exceeds signed 128-bit capacity")
+            elif digit != 0:
+                return err("YazaBase DECIMAL literal would lose non-zero fractional digits at the declared scale")
+            if seen_point: set fractional_digits = fractional_digits + 1
+        else:
+            return err("YazaBase DECIMAL literal accepts only an optional sign, digits, and one decimal point")
+        set cursor = cursor + 1
+    if not seen_digit: return err("YazaBase DECIMAL literal has no digits")
+    while fractional_digits < scale:
+        var carry: Number = 0
+        var index: Number = yaza_sql_decimal_width_v1() - 1
+        while index >= 0:
+            let product: Number = bytes_get(magnitude, index) * 10 + carry
+            if not bytes_try_set(magnitude, index, product % 256): return err("YazaBase DECIMAL scale padding failed")
+            set carry = product / 256
+            set index = index - 1
+        if carry != 0: return err("YazaBase DECIMAL scale padding exceeds signed 128-bit capacity")
+        set fractional_digits = fractional_digits + 1
+    return yaza_sql_decimal_from_magnitude_v1(magnitude, negative, precision, scale)
+
+fn yaza_sql_decimal_rescale_v1(value: YazaSqlDecimalV1, target_precision: Number, target_scale: Number) -> Result[YazaSqlDecimalV1, Text]:
+    if not yaza_sql_decimal_parameters_valid_v1(target_precision, target_scale): return err("YazaBase DECIMAL target precision or scale is invalid")
+    let validated: Boolean = yaza_sql_decimal_validate_v1(value)?
+    let magnitude: Bytes = yaza_sql_decimal_magnitude_v1(value.coefficient)?
+    if target_scale > value.scale:
+        var steps: Number = target_scale - value.scale
+        while steps > 0:
+            var carry: Number = 0
+            var index: Number = yaza_sql_decimal_width_v1() - 1
+            while index >= 0:
+                let product: Number = bytes_get(magnitude, index) * 10 + carry
+                if not bytes_try_set(magnitude, index, product % 256): return err("YazaBase DECIMAL rescale failed")
+                set carry = product / 256
+                set index = index - 1
+            if carry != 0: return err("YazaBase DECIMAL rescale overflow")
+            set steps = steps - 1
+    elif target_scale < value.scale:
+        var steps: Number = value.scale - target_scale
+        while steps > 0:
+            var remainder: Number = 0
+            var index: Number = 0
+            while index < yaza_sql_decimal_width_v1():
+                let dividend: Number = remainder * 256 + bytes_get(magnitude, index)
+                if not bytes_try_set(magnitude, index, dividend / 10): return err("YazaBase DECIMAL rescale failed")
+                set remainder = dividend % 10
+                set index = index + 1
+            if remainder != 0: return err("YazaBase DECIMAL rescale would lose non-zero digits")
+            set steps = steps - 1
+    return yaza_sql_decimal_from_magnitude_v1(magnitude, bytes_get(value.coefficient, 0) >= 128, target_precision, target_scale)
+
+fn yaza_sql_decimal_reversed_digits_v1(value: YazaSqlDecimalV1) -> Result[Bytes, Text]:
+    let validated: Boolean = yaza_sql_decimal_validate_v1(value)?
+    let magnitude: Bytes = yaza_sql_decimal_magnitude_v1(value.coefficient)?
+    let digits_result: Result[Bytes, Text] = bytes_try_new_zeroed(value.precision + 1)
+    if not result_is_ok(digits_result): return err(result_unwrap_error(digits_result))
+    let digits: Bytes = result_unwrap(digits_result)
+    if yaza_sql_decimal_bytes_zero_v1(magnitude):
+        if not bytes_try_set(digits, 0, 48): return err("YazaBase DECIMAL formatting failed")
+        return bytes_try_slice(digits, 0, 1)
+    let quotient_result: Result[Bytes, Text] = bytes_try_new_zeroed(yaza_sql_decimal_width_v1())
+    if not result_is_ok(quotient_result): return err(result_unwrap_error(quotient_result))
+    let quotient: Bytes = result_unwrap(quotient_result)
+    var index: Number = 0
+    while index < yaza_sql_decimal_width_v1():
+        if not bytes_try_set(quotient, index, bytes_get(magnitude, index)): return err("YazaBase DECIMAL formatting failed")
+        set index = index + 1
+    var digit_index: Number = 0
+    while not yaza_sql_decimal_bytes_zero_v1(quotient):
+        var remainder: Number = 0
+        set index = 0
+        while index < yaza_sql_decimal_width_v1():
+            let dividend: Number = remainder * 256 + bytes_get(quotient, index)
+            if not bytes_try_set(quotient, index, dividend / 10): return err("YazaBase DECIMAL formatting failed")
+            set remainder = dividend % 10
+            set index = index + 1
+        if digit_index >= bytes_length(digits) or not bytes_try_set(digits, digit_index, remainder + 48): return err("YazaBase DECIMAL formatting exceeded its precision bound")
+        set digit_index = digit_index + 1
+    let trimmed_digits: Bytes = bytes_try_slice(digits, 0, digit_index)?
+    return ok(trimmed_digits)
+
+fn yaza_sql_decimal_digit_at_v1(reversed_digits: Bytes, index: Number) -> Number:
+    if index < 0 or index >= bytes_length(reversed_digits): return 48
+    return bytes_get(reversed_digits, index)
+
+fn yaza_sql_decimal_to_text_v1(value: YazaSqlDecimalV1) -> Result[Text, Text]:
+    let digits: Bytes = yaza_sql_decimal_reversed_digits_v1(value)?
+    let digit_count: Number = bytes_length(digits)
+    var integer_digits: Number = digit_count - value.scale
+    if integer_digits < 1: set integer_digits = 1
+    let negative: Boolean = bytes_get(value.coefficient, 0) >= 128
+    var output_length: Number = integer_digits + value.scale
+    if value.scale > 0: set output_length = output_length + 1
+    if negative: set output_length = output_length + 1
+    let output_result: Result[Bytes, Text] = bytes_try_new_zeroed(output_length)
+    if not result_is_ok(output_result): return err(result_unwrap_error(output_result))
+    let output: Bytes = result_unwrap(output_result)
+    var out_index: Number = 0
+    if negative:
+        if not bytes_try_set(output, out_index, 45): return err("YazaBase DECIMAL formatting failed")
+        set out_index = out_index + 1
+    var output_integer_index: Number = integer_digits - 1
+    while output_integer_index >= 0:
+        let digit_position: Number = output_integer_index + value.scale
+        var digit: Number = yaza_sql_decimal_digit_at_v1(digits, digit_position)
+        if digit_position >= digit_count: set digit = 48
+        if not bytes_try_set(output, out_index, digit): return err("YazaBase DECIMAL integer formatting failed")
+        set out_index = out_index + 1
+        set output_integer_index = output_integer_index - 1
+    if value.scale > 0:
+        if not bytes_try_set(output, out_index, 46): return err("YazaBase DECIMAL point formatting failed")
+        set out_index = out_index + 1
+        var fractional_index: Number = 0
+        while fractional_index < value.scale:
+            let digit_position: Number = value.scale - fractional_index - 1
+            if not bytes_try_set(output, out_index, yaza_sql_decimal_digit_at_v1(digits, digit_position)): return err("YazaBase DECIMAL fractional formatting failed")
+            set out_index = out_index + 1
+            set fractional_index = fractional_index + 1
+    if out_index != output_length: return err("YazaBase DECIMAL formatting length is inconsistent")
+    return bytes_try_to_text(output)
+
+# Compare canonical DECIMAL strings emitted by yaza_sql_decimal_to_text_v1.
+# The canonical form has no leading integer zeroes (except zero itself), an
+# optional minus sign, and a fixed number of fractional digits. This avoids
+# reparsing and allocating coefficient buffers in SQL comparison loops.
+fn yaza_sql_decimal_compare_text_v1(left: Text, right: Text) -> Number:
+    let left_length: Number = text_length(left)
+    let right_length: Number = text_length(right)
+    var left_negative: Boolean = false
+    var right_negative: Boolean = false
+    var left_start: Number = 0
+    var right_start: Number = 0
+    if left_length > 0 and text_byte(left, 0) == 45:
+        set left_negative = true
+        set left_start = 1
+    if right_length > 0 and text_byte(right, 0) == 45:
+        set right_negative = true
+        set right_start = 1
+    if left_negative and not right_negative: return -1
+    if right_negative and not left_negative: return 1
+    var left_point: Number = left_length
+    var right_point: Number = right_length
+    var index: Number = left_start
+    while index < left_length:
+        if text_byte(left, index) == 46:
+            set left_point = index
+            break
+        set index = index + 1
+    set index = right_start
+    while index < right_length:
+        if text_byte(right, index) == 46:
+            set right_point = index
+            break
+        set index = index + 1
+    let left_integer_length: Number = left_point - left_start
+    let right_integer_length: Number = right_point - right_start
+    if left_integer_length < right_integer_length:
+        if left_negative: return 1
+        return -1
+    if left_integer_length > right_integer_length:
+        if left_negative: return -1
+        return 1
+    set index = 0
+    while index < left_integer_length:
+        let left_digit: Number = text_byte(left, left_start + index)
+        let right_digit: Number = text_byte(right, right_start + index)
+        if left_digit < right_digit:
+            if left_negative: return 1
+            return -1
+        if left_digit > right_digit:
+            if left_negative: return -1
+            return 1
+        set index = index + 1
+    let left_fraction_width: Number = left_length - left_point
+    let right_fraction_width: Number = right_length - right_point
+    var fraction_width: Number = left_fraction_width
+    if right_fraction_width > fraction_width: set fraction_width = right_fraction_width
+    set index = 1
+    while index < fraction_width:
+        var left_digit: Number = 48
+        var right_digit: Number = 48
+        if left_point + index < left_length: set left_digit = text_byte(left, left_point + index)
+        if right_point + index < right_length: set right_digit = text_byte(right, right_point + index)
+        if left_digit < right_digit:
+            if left_negative: return 1
+            return -1
+        if left_digit > right_digit:
+            if left_negative: return -1
+            return 1
+        set index = index + 1
+    return 0
+
+fn yaza_sql_decimal_compare_v1(left: YazaSqlDecimalV1, right: YazaSqlDecimalV1) -> Result[Number, Text]:
+    let left_validated: Boolean = yaza_sql_decimal_validate_v1(left)?
+    let right_validated: Boolean = yaza_sql_decimal_validate_v1(right)?
+    let left_negative: Boolean = bytes_get(left.coefficient, 0) >= 128
+    let right_negative: Boolean = bytes_get(right.coefficient, 0) >= 128
+    let left_zero: Boolean = yaza_sql_decimal_value_zero_v1(left)?
+    let right_zero: Boolean = yaza_sql_decimal_value_zero_v1(right)?
+    if left_zero and right_zero: return ok(0)
+    if left_negative and not right_negative: return ok(-1)
+    if not left_negative and right_negative: return ok(1)
+    let left_digits: Bytes = yaza_sql_decimal_reversed_digits_v1(left)?
+    let right_digits: Bytes = yaza_sql_decimal_reversed_digits_v1(right)?
+    let left_count: Number = bytes_length(left_digits)
+    let right_count: Number = bytes_length(right_digits)
+    let left_exponent: Number = left_count - left.scale
+    let right_exponent: Number = right_count - right.scale
+    var magnitude_order: Number = 0
+    if left_exponent < right_exponent: set magnitude_order = -1
+    elif left_exponent > right_exponent: set magnitude_order = 1
+    else:
+        var compare_length: Number = left_count
+        if right_count > compare_length: set compare_length = right_count
+        var significant_offset: Number = 0
+        while significant_offset < compare_length and magnitude_order == 0:
+            let left_digit: Number = yaza_sql_decimal_digit_at_v1(left_digits, left_count - significant_offset - 1)
+            let right_digit: Number = yaza_sql_decimal_digit_at_v1(right_digits, right_count - significant_offset - 1)
+            if left_digit < right_digit: set magnitude_order = -1
+            elif left_digit > right_digit: set magnitude_order = 1
+            set significant_offset = significant_offset + 1
+    if left_negative: set magnitude_order = 0 - magnitude_order
+    return ok(magnitude_order)
+
+fn yaza_sql_decimal_add_v1(left: YazaSqlDecimalV1, right: YazaSqlDecimalV1, result_precision: Number) -> Result[YazaSqlDecimalV1, Text]:
+    if left.scale != right.scale: return err("YazaBase DECIMAL addition requires aligned scales")
+    if not yaza_sql_decimal_parameters_valid_v1(result_precision, left.scale): return err("YazaBase DECIMAL addition result precision is invalid")
+    let left_validated: Boolean = yaza_sql_decimal_validate_v1(left)?
+    let right_validated: Boolean = yaza_sql_decimal_validate_v1(right)?
+    let output_result: Result[Bytes, Text] = bytes_try_new_zeroed(yaza_sql_decimal_width_v1())
+    if not result_is_ok(output_result): return err(result_unwrap_error(output_result))
+    let output: Bytes = result_unwrap(output_result)
+    var carry: Number = 0
+    var index: Number = yaza_sql_decimal_width_v1() - 1
+    while index >= 0:
+        let sum: Number = bytes_get(left.coefficient, index) + bytes_get(right.coefficient, index) + carry
+        if not bytes_try_set(output, index, sum % 256): return err("YazaBase DECIMAL addition failed")
+        set carry = sum / 256
+        set index = index - 1
+    let left_negative: Boolean = bytes_get(left.coefficient, 0) >= 128
+    let right_negative: Boolean = bytes_get(right.coefficient, 0) >= 128
+    let output_negative: Boolean = bytes_get(output, 0) >= 128
+    if left_negative == right_negative and output_negative != left_negative: return err("YazaBase DECIMAL signed 128-bit addition overflow")
+    let value: YazaSqlDecimalV1 = YazaSqlDecimalV1(output, result_precision, left.scale)
+    let validated: Boolean = yaza_sql_decimal_validate_v1(value)?
+    return ok(value)
+
+fn yaza_sql_decimal_add_common_scale_v1(left: YazaSqlDecimalV1, right: YazaSqlDecimalV1, result_precision: Number) -> Result[YazaSqlDecimalV1, Text]:
+    var result_scale: Number = left.scale
+    if right.scale > result_scale: set result_scale = right.scale
+    let aligned_left: YazaSqlDecimalV1 = yaza_sql_decimal_rescale_v1(left, result_precision, result_scale)?
+    let aligned_right: YazaSqlDecimalV1 = yaza_sql_decimal_rescale_v1(right, result_precision, result_scale)?
+    return yaza_sql_decimal_add_v1(aligned_left, aligned_right, result_precision)
+
+fn yaza_sql_decimal_subtract_v1(left: YazaSqlDecimalV1, right: YazaSqlDecimalV1, result_precision: Number) -> Result[YazaSqlDecimalV1, Text]:
+    if left.scale != right.scale: return err("YazaBase DECIMAL subtraction requires aligned scales")
+    let left_validated: Boolean = yaza_sql_decimal_validate_v1(left)?
+    let right_validated: Boolean = yaza_sql_decimal_validate_v1(right)?
+    let right_zero: Boolean = yaza_sql_decimal_value_zero_v1(right)?
+    if right_zero: return yaza_sql_decimal_add_v1(left, right, result_precision)
+    let negative_right_result: Result[Bytes, Text] = bytes_try_new_zeroed(yaza_sql_decimal_width_v1())
+    if not result_is_ok(negative_right_result): return err(result_unwrap_error(negative_right_result))
+    let negative_right: Bytes = result_unwrap(negative_right_result)
+    var index: Number = 0
+    while index < yaza_sql_decimal_width_v1():
+        if not bytes_try_set(negative_right, index, bytes_get(right.coefficient, index)): return err("YazaBase DECIMAL subtraction failed")
+        set index = index + 1
+    set index = 0
+    while index < yaza_sql_decimal_width_v1():
+        if not bytes_try_set(negative_right, index, 255 - bytes_get(negative_right, index)): return err("YazaBase DECIMAL subtraction failed")
+        set index = index + 1
+    var carry: Number = 1
+    set index = yaza_sql_decimal_width_v1() - 1
+    while index >= 0 and carry > 0:
+        let sum: Number = bytes_get(negative_right, index) + carry
+        if not bytes_try_set(negative_right, index, sum % 256): return err("YazaBase DECIMAL subtraction failed")
+        set carry = sum / 256
+        set index = index - 1
+    if carry != 0: return err("YazaBase DECIMAL subtraction negation overflow")
+    return yaza_sql_decimal_add_v1(left, YazaSqlDecimalV1(negative_right, right.precision, right.scale), result_precision)
+
+fn yaza_sql_decimal_subtract_common_scale_v1(left: YazaSqlDecimalV1, right: YazaSqlDecimalV1, result_precision: Number) -> Result[YazaSqlDecimalV1, Text]:
+    var result_scale: Number = left.scale
+    if right.scale > result_scale: set result_scale = right.scale
+    let aligned_left: YazaSqlDecimalV1 = yaza_sql_decimal_rescale_v1(left, result_precision, result_scale)?
+    let aligned_right: YazaSqlDecimalV1 = yaza_sql_decimal_rescale_v1(right, result_precision, result_scale)?
+    return yaza_sql_decimal_subtract_v1(aligned_left, aligned_right, result_precision)
+
+fn yaza_sql_decimal_order_key_v1(value: YazaSqlDecimalV1) -> Result[Bytes, Text]:
+    let validated: Boolean = yaza_sql_decimal_validate_v1(value)?
+    let key_result: Result[Bytes, Text] = bytes_try_new_zeroed(yaza_sql_decimal_width_v1())
+    if not result_is_ok(key_result): return err(result_unwrap_error(key_result))
+    let key: Bytes = result_unwrap(key_result)
+    var index: Number = 0
+    while index < yaza_sql_decimal_width_v1():
+        if not bytes_try_set(key, index, bytes_get(value.coefficient, index)): return err("YazaBase DECIMAL order-key copy failed")
+        set index = index + 1
+    let first: Number = bytes_get(key, 0)
+    var sortable_first: Number = first + 128
+    if first >= 128: set sortable_first = first - 128
+    if not bytes_try_set(key, 0, sortable_first): return err("YazaBase DECIMAL order-key sign transform failed")
+    return ok(key)

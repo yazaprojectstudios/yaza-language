@@ -1,0 +1,335 @@
+# Deterministic bounded corruption fuzz smoke for YDBv1 storage decoders.
+use "../yazabase/page_v1"
+use "../yazabase/catalog_v1"
+use "../yazabase/meta_free_v1"
+use "../yazabase/overflow_v1"
+use "../yazabase/wal_v1"
+use "../yazabase/checkpoint_v1"
+use "../yazabase/sql_binder_v1"
+use "../yazabase/sql_executor_v1"
+use "../yazabase/row_v1"
+use "../yazabase/catalog_schema_v1"
+use "../yazabase/index_catalog_v1"
+
+fn yaza_base_storage_fuzz_next_v1(state: Number) -> Number:
+    # Park-Miller has a full-period recurrence for non-zero seeds modulo this
+    # prime; the product remains safely within signed-64 Number range.
+    return (state * 48271) % 2147483647
+
+fn yaza_base_storage_fuzz_mutate_v1(input: Bytes, offset: Number, state: Number) -> Boolean:
+    if offset < 0 or offset >= bytes_length(input): return false
+    let delta: Number = (state / 257) % 255 + 1
+    let value: Number = (bytes_get(input, offset) + delta) % 256
+    return bytes_try_set(input, offset, value)
+
+fn yaza_base_storage_fuzz_reseal_page_v1(page: Bytes) -> Boolean:
+    let checksum: Number = bytes_ydbv1_checksum_zeroed_range(page, 8, 4)
+    return yaza_db_write_uint_le_v1(page, 8, checksum, 4)
+
+fn yaza_base_storage_fuzz_reseal_file_v1(file_header: Bytes) -> Boolean:
+    let checksum: Number = bytes_ydbv1_checksum_zeroed_range(file_header, 76, 4)
+    return yaza_db_write_uint_le_v1(file_header, 76, checksum, 4)
+
+fn yaza_base_storage_fuzz_reseal_wal_v1(record: Bytes) -> Boolean:
+    let checksum: Number = bytes_ydbv1_checksum_zeroed_range(record, 4, 4)
+    return yaza_db_write_uint_le_v1(record, 4, checksum, 4)
+
+fn yaza_base_storage_fuzz_file_header_v1(seed: Bytes, initial_state: Number) -> Result[Number, Text]:
+    var state: Number = initial_state
+    var iteration: Number = 0
+    while iteration < 128:
+        set state = yaza_base_storage_fuzz_next_v1(state)
+        var offset: Number = state % yaza_db_file_header_size_v1()
+        if iteration % 2 == 1: set offset = yaza_db_file_header_size_v1() + state % (yaza_db_page_size_v1() - yaza_db_file_header_size_v1())
+        let resealed: Bytes = bytes_try_slice(seed, 0, bytes_length(seed))?
+        if not yaza_base_storage_fuzz_mutate_v1(resealed, offset, state) or not yaza_base_storage_fuzz_reseal_file_v1(resealed): return err("YDBv1 file-header mutation or CRC reseal failed")
+        let decoded: Result[YazaDbFileHeaderV1, Text] = yaza_db_read_file_header_v1(resealed)
+        if result_is_ok(decoded):
+            let canonical: Bytes = yaza_db_write_file_header_v1(result_unwrap(decoded))?
+            if not bytes_equal(canonical, resealed): return err("YDBv1 file-header decoder accepted a non-canonical mutated image")
+        set iteration = iteration + 1
+    return ok(iteration)
+
+fn yaza_base_storage_fuzz_page_v1(seed: Bytes, initial_state: Number, expected_page_id: Number) -> Result[Number, Text]:
+    var state: Number = initial_state
+    var iteration: Number = 0
+    while iteration < 128:
+        set state = yaza_base_storage_fuzz_next_v1(state)
+        var offset: Number = state % 48
+        if iteration % 3 == 1: set offset = 48 + state % 16
+        if iteration % 3 == 2: set offset = yaza_db_page_size_v1() - 1 - state % 32
+        let resealed: Bytes = bytes_try_slice(seed, 0, bytes_length(seed))?
+        if not yaza_base_storage_fuzz_mutate_v1(resealed, offset, state) or not yaza_base_storage_fuzz_reseal_page_v1(resealed): return err("YDBv1 page mutation or CRC reseal failed")
+        let decoded: Result[YazaDbPageHeaderV1, Text] = yaza_db_page_header_decode_v1(resealed, expected_page_id)
+        if result_is_ok(decoded):
+            let header: YazaDbPageHeaderV1 = result_unwrap(decoded)
+            if (header.page_type == 1 or header.page_type == 2) and header.count > 0:
+                let ignored_slot: Result[YazaDbPageSlotV1, Text] = yaza_db_page_slot_v1(resealed, 0, expected_page_id)
+            if header.page_type == 3:
+                let overflow: Result[YazaDbOverflowPageV1, Text] = yaza_db_overflow_page_decode_v1(resealed, expected_page_id)
+                if result_is_ok(overflow):
+                    let accepted_overflow: YazaDbOverflowPageV1 = result_unwrap(overflow)
+                    if bytes_length(accepted_overflow.payload) > yaza_db_overflow_payload_capacity_v1(): return err("YDBv1 page fuzz returned an oversized OVERFLOW payload")
+            if header.page_type == 4:
+                let metadata: Result[YazaDbMetaPageV1, Text] = yaza_db_meta_page_decode_v1(resealed, expected_page_id)
+                if result_is_ok(metadata):
+                    let accepted_metadata: YazaDbMetaPageV1 = result_unwrap(metadata)
+                    if bytes_length(accepted_metadata.payload) > yaza_db_meta_page_max_payload_v1(): return err("YDBv1 page fuzz returned an oversized META payload")
+            if header.page_type == 5:
+                let ignored_bit: Result[Boolean, Text] = yaza_db_bitmap_page_bit_v1(resealed, 0, expected_page_id)
+            if header.page_type == 6:
+                let free_page: Result[YazaDbPageHeaderV1, Text] = yaza_db_free_page_validate_v1(resealed, expected_page_id)
+        set iteration = iteration + 1
+    return ok(iteration)
+
+fn yaza_base_storage_fuzz_catalog_root_v1(seed: Bytes, initial_state: Number, expected_page_id: Number) -> Result[Number, Text]:
+    var state: Number = initial_state
+    var iteration: Number = 0
+    while iteration < 128:
+        set state = yaza_base_storage_fuzz_next_v1(state)
+        var offset: Number = 0
+        if iteration < yaza_db_catalog_root_payload_size_v1():
+            set offset = yaza_db_page_size_v1() - yaza_db_catalog_root_payload_size_v1() + iteration
+        elif iteration < yaza_db_catalog_root_payload_size_v1() + 16:
+            set offset = yaza_db_page_size_v1() - yaza_db_catalog_root_payload_size_v1() - 16 + iteration - yaza_db_catalog_root_payload_size_v1()
+        elif iteration < yaza_db_catalog_root_payload_size_v1() + 40:
+            set offset = state % 48
+        elif iteration < yaza_db_catalog_root_payload_size_v1() + 56:
+            set offset = 48 + state % (yaza_db_page_size_v1() - 48 - yaza_db_catalog_root_payload_size_v1() - 16)
+        else:
+            set offset = yaza_db_page_size_v1() - 1 - (iteration - yaza_db_catalog_root_payload_size_v1() - 56)
+        let resealed: Bytes = bytes_try_slice(seed, 0, bytes_length(seed))?
+        if not yaza_base_storage_fuzz_mutate_v1(resealed, offset, state) or not yaza_base_storage_fuzz_reseal_page_v1(resealed): return err("YDBv1 catalog-root mutation or CRC reseal failed")
+        let decoded: Result[YazaDbCatalogRootV1, Text] = yaza_db_catalog_root_page_decode_v1(resealed, expected_page_id)
+        if result_is_ok(decoded):
+            let accepted: YazaDbCatalogRootV1 = result_unwrap(decoded)
+            let page_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(resealed, expected_page_id)?
+            let canonical: Bytes = yaza_db_catalog_root_page_encode_v1(expected_page_id, page_header.page_lsn, accepted)?
+            let round_trip: YazaDbCatalogRootV1 = yaza_db_catalog_root_page_decode_v1(canonical, expected_page_id)?
+            if accepted.sys_tables_root != round_trip.sys_tables_root or accepted.sys_columns_root != round_trip.sys_columns_root or accepted.sys_indexes_root != round_trip.sys_indexes_root or accepted.sys_constraints_root != round_trip.sys_constraints_root or accepted.next_object_id != round_trip.next_object_id or accepted.generation != round_trip.generation:
+                return err("YDBv1 catalog-root decoder did not preserve its validated descriptor on round trip")
+        set iteration = iteration + 1
+    return ok(iteration)
+
+fn yaza_base_storage_fuzz_overflow_ref_v1(seed: Bytes, initial_state: Number) -> Result[Number, Text]:
+    var state: Number = initial_state
+    var iteration: Number = 0
+    while iteration < 128:
+        set state = yaza_base_storage_fuzz_next_v1(state)
+        let offset: Number = state % bytes_length(seed)
+        let mutation: Bytes = bytes_try_slice(seed, 0, bytes_length(seed))?
+        if not yaza_base_storage_fuzz_mutate_v1(mutation, offset, state): return err("YDBv1 overflow-reference mutation failed")
+        let decoded: Result[YazaDbOverflowRefV1, Text] = yaza_db_overflow_ref_decode_v1(mutation)
+        if result_is_ok(decoded):
+            let canonical: Bytes = yaza_db_overflow_ref_encode_v1(result_unwrap(decoded))?
+            if not bytes_equal(canonical, mutation): return err("YDBv1 overflow reference decoder accepted a non-canonical mutated image")
+        set iteration = iteration + 1
+    return ok(iteration)
+
+fn yaza_base_storage_fuzz_overflow_page_v1(seed: Bytes, initial_state: Number, expected_page_id: Number) -> Result[Number, Text]:
+    var state: Number = initial_state
+    var iteration: Number = 0
+    while iteration < 128:
+        set state = yaza_base_storage_fuzz_next_v1(state)
+        var offset: Number = state % 48
+        if iteration % 2 == 1: set offset = yaza_db_page_size_v1() - 1 - state % 32
+        let resealed: Bytes = bytes_try_slice(seed, 0, bytes_length(seed))?
+        if not yaza_base_storage_fuzz_mutate_v1(resealed, offset, state) or not yaza_base_storage_fuzz_reseal_page_v1(resealed): return err("YDBv1 overflow-page mutation or CRC reseal failed")
+        let decoded: Result[YazaDbOverflowPageV1, Text] = yaza_db_overflow_page_decode_v1(resealed, expected_page_id)
+        if result_is_ok(decoded):
+            let overflow: YazaDbOverflowPageV1 = result_unwrap(decoded)
+            if overflow.header.page_type != 3 or bytes_length(overflow.payload) < 1 or bytes_length(overflow.payload) > yaza_db_overflow_payload_capacity_v1(): return err("YDBv1 overflow decoder returned a payload outside its page bounds")
+        set iteration = iteration + 1
+    return ok(iteration)
+
+fn yaza_base_storage_fuzz_wal_v1(seed: Bytes, initial_state: Number) -> Result[Number, Text]:
+    var state: Number = initial_state
+    var iteration: Number = 0
+    while iteration < 128:
+        set state = yaza_base_storage_fuzz_next_v1(state)
+        let offset: Number = state % bytes_length(seed)
+        let resealed: Bytes = bytes_try_slice(seed, 0, bytes_length(seed))?
+        if not yaza_base_storage_fuzz_mutate_v1(resealed, offset, state) or not yaza_base_storage_fuzz_reseal_wal_v1(resealed): return err("YDBv1 WAL mutation or CRC reseal failed")
+        let decoded: Result[YazaDbWalRecordV1, Text] = yaza_db_wal_decode_v1(resealed, 0)
+        if result_is_ok(decoded):
+            let canonical: Bytes = yaza_db_wal_encode_v1(result_unwrap(decoded))?
+            if not bytes_equal(canonical, resealed): return err("YDBv1 WAL decoder accepted a non-canonical mutated record")
+        set iteration = iteration + 1
+    return ok(iteration)
+
+fn yaza_base_storage_fuzz_checkpoint_begin_v1(seed: Bytes, initial_state: Number) -> Result[Number, Text]:
+    var state: Number = initial_state
+    var iteration: Number = 0
+    while iteration < 128:
+        set state = yaza_base_storage_fuzz_next_v1(state)
+        let offset: Number = state % bytes_length(seed)
+        let mutation: Bytes = bytes_try_slice(seed, 0, bytes_length(seed))?
+        if not yaza_base_storage_fuzz_mutate_v1(mutation, offset, state): return err("YDBv1 checkpoint-begin mutation failed")
+        let record: YazaDbWalRecordV1 = YazaDbWalRecordV1(0, 0, 0, yaza_db_wal_type_checkpoint_begin_v1(), 0, mutation)
+        let decoded: Result[YazaDbFileHeaderV1, Text] = yaza_db_checkpoint_begin_payload_decode_v1(record)
+        if result_is_ok(decoded):
+            let canonical: Bytes = yaza_db_checkpoint_begin_payload_encode_v1(result_unwrap(decoded))?
+            if not bytes_equal(canonical, mutation): return err("YDBv1 checkpoint-begin decoder accepted a non-canonical mutated payload")
+        set iteration = iteration + 1
+    return ok(iteration)
+
+fn yaza_base_storage_fuzz_checkpoint_end_v1(seed: Bytes, initial_state: Number) -> Result[Number, Text]:
+    var state: Number = initial_state
+    var iteration: Number = 0
+    while iteration < 128:
+        set state = yaza_base_storage_fuzz_next_v1(state)
+        let offset: Number = state % bytes_length(seed)
+        let mutation: Bytes = bytes_try_slice(seed, 0, bytes_length(seed))?
+        if not yaza_base_storage_fuzz_mutate_v1(mutation, offset, state): return err("YDBv1 checkpoint-end mutation failed")
+        let record: YazaDbWalRecordV1 = YazaDbWalRecordV1(1024, 0, 0, yaza_db_wal_type_checkpoint_end_v1(), 0, mutation)
+        let decoded: Result[YazaDbCheckpointSnapshotV1, Text] = yaza_db_checkpoint_end_payload_decode_v1(record)
+        if result_is_ok(decoded):
+            let snapshot: YazaDbCheckpointSnapshotV1 = result_unwrap(decoded)
+            let header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_from_text(""), 0, snapshot.next_txn_id, snapshot.next_commit_ts, snapshot.catalog_root, snapshot.page_count, 1)
+            let canonical: Bytes = yaza_db_checkpoint_end_payload_encode_v1(snapshot.begin_lsn, snapshot.redo_lsn, header)?
+            if not bytes_equal(canonical, mutation): return err("YDBv1 checkpoint-end decoder accepted a non-canonical mutated payload")
+        set iteration = iteration + 1
+    return ok(iteration)
+
+fn yaza_base_storage_fuzz_row_v1(seed: Bytes, columns: List[YazaSqlColumnSchemaV1], initial_state: Number) -> Result[Number, Text]:
+    var state: Number = initial_state
+    var iteration: Number = 0
+    while iteration < 128:
+        set state = yaza_base_storage_fuzz_next_v1(state)
+        let offset: Number = state % bytes_length(seed)
+        let mutation: Bytes = bytes_try_slice(seed, 0, bytes_length(seed))?
+        if not yaza_base_storage_fuzz_mutate_v1(mutation, offset, state): return err("YDBv1 row mutation failed")
+        let decoded: Result[YazaDbRowV1, Text] = yaza_db_row_decode_v1(mutation, columns)
+        if result_is_ok(decoded):
+            let row: YazaDbRowV1 = result_unwrap(decoded)
+            if list_count(row.values) != list_count(columns) or list_count(row.nulls) != list_count(columns): return err("YDBv1 row decoder returned a mismatched schema width")
+            if row.version_ts == yaza_db_row_version_min_signed_v1(): return err("YDBv1 row decoder accepted the reserved transaction tag")
+        set iteration = iteration + 1
+    return ok(iteration)
+
+fn yaza_base_storage_fuzz_index_values_equal_v1(left: List[YazaSqlValueV1], right: List[YazaSqlValueV1]) -> Boolean:
+    if list_count(left) != 7 or list_count(right) != 7: return false
+    var index: Number = 0
+    while index < 7:
+        let left_value: YazaSqlValueV1 = list_get(left, index)
+        let right_value: YazaSqlValueV1 = list_get(right, index)
+        if left_value.type_id != right_value.type_id: return false
+        if left_value.type_id == 1 and left_value.boolean_value != right_value.boolean_value: return false
+        if (left_value.type_id == 2 or left_value.type_id == 3 or left_value.type_id == 4) and left_value.integer_value != right_value.integer_value: return false
+        if left_value.type_id == 9 and left_value.text_value != right_value.text_value: return false
+        set index = index + 1
+    return true
+
+fn yaza_base_storage_fuzz_index_catalog_row_v1(seed: Bytes, columns: List[YazaSqlColumnSchemaV1], file_header: YazaDbFileHeaderV1, initial_state: Number) -> Result[Number, Text]:
+    var state: Number = initial_state
+    var iteration: Number = 0
+    var decoded_cases: Number = 0
+    var accepted_metadata_cases: Number = 0
+    var rejected_metadata_cases: Number = 0
+    while iteration < 128:
+        set state = yaza_base_storage_fuzz_next_v1(state)
+        let offset: Number = state % bytes_length(seed)
+        let mutation: Bytes = bytes_try_slice(seed, 0, bytes_length(seed))?
+        if not yaza_base_storage_fuzz_mutate_v1(mutation, offset, state): return err("YDBv1 sys_indexes-row mutation failed")
+        let decoded: Result[YazaDbRowV1, Text] = yaza_db_row_decode_v1(mutation, columns)
+        if result_is_ok(decoded):
+            set decoded_cases = decoded_cases + 1
+            let row: YazaDbRowV1 = result_unwrap(decoded)
+            let metadata: Result[Boolean, Text] = yaza_db_index_catalog_validate_row_metadata_v1(row, file_header, 1)
+            if result_is_ok(metadata):
+                set accepted_metadata_cases = accepted_metadata_cases + 1
+                if not result_unwrap(metadata): return err("YDBv1 sys_indexes metadata validator accepted a false success value")
+                let canonical: Bytes = yaza_db_row_encode_v1(row.values, row.nulls, columns, row.version_ts)?
+                let round_trip: YazaDbRowV1 = yaza_db_row_decode_v1(canonical, columns)?
+                if round_trip.version_ts != row.version_ts or round_trip.deleted or not yaza_base_storage_fuzz_index_values_equal_v1(round_trip.values, row.values): return err("YDBv1 sys_indexes row mutation did not preserve validated metadata through canonical encoding")
+            else:
+                set rejected_metadata_cases = rejected_metadata_cases + 1
+        set iteration = iteration + 1
+    if decoded_cases == 0 or accepted_metadata_cases == 0 or rejected_metadata_cases == 0: return err("YDBv1 sys_indexes mutation set did not exercise decode, metadata acceptance, and metadata rejection paths")
+    return ok(iteration)
+
+fn yaza_base_storage_decoder_fuzz_v1() -> Result[Number, Text]:
+    let uuid: Bytes = bytes_try_new_zeroed(16)?
+    let encoded_file_header: Bytes = yaza_db_write_file_header_v1(YazaDbFileHeaderV1(uuid, 17, 8, 9, 2, 3, 1))?
+    let file_cases: Number = yaza_base_storage_fuzz_file_header_v1(encoded_file_header, 1234567)?
+
+    let page_builder: Bytes = yaza_db_page_new_v1(2, 21, 1, 0)?
+    let slot_index: Number = yaza_db_page_add_slot_v1(page_builder, bytes_from_text("fuzz-key"), bytes_from_text("fuzz-row"))?
+    if slot_index != 0: return err("YDBv1 storage fuzz could not build its leaf-page seed")
+    let leaf_seed: Bytes = yaza_db_page_finalize_v1(page_builder)?
+    let leaf_cases: Number = yaza_base_storage_fuzz_page_v1(leaf_seed, 7654321, 2)?
+
+    let inner_builder: Bytes = yaza_db_page_new_v1(3, 21, 2, 1)?
+    if not yaza_db_page_set_upper_v1(inner_builder, 4): return err("YDBv1 storage fuzz could not build its INNER upper child")
+    let inner_pointer: Bytes = bytes_try_new_zeroed(8)?
+    if not yaza_db_write_uint_le_v1(inner_pointer, 0, 8, 8): return err("YDBv1 storage fuzz could not encode its INNER child pointer")
+    let inner_slot: Number = yaza_db_page_add_slot_v1(inner_builder, bytes_from_text("inner-key"), inner_pointer)?
+    if inner_slot != 0: return err("YDBv1 storage fuzz could not build its INNER slot")
+    let inner_seed: Bytes = yaza_db_page_finalize_v1(inner_builder)?
+    let inner_cases: Number = yaza_base_storage_fuzz_page_v1(inner_seed, 31415926, 3)?
+
+    let meta_seed: Bytes = yaza_db_meta_page_encode_v1(6, 21, 1, 1, bytes_from_text("meta-seed"))?
+    let meta_cases: Number = yaza_base_storage_fuzz_page_v1(meta_seed, 27182818, 6)?
+
+    let catalog_seed: Bytes = yaza_db_catalog_root_page_encode_v1(9, 21, YazaDbCatalogRootV1(2, 3, 4, 5, 6, 7, 0))?
+    let catalog_cases: Number = yaza_base_storage_fuzz_catalog_root_v1(catalog_seed, 14142135, 9)?
+
+    let bitmap_seed: Bytes = yaza_db_bitmap_page_new_mapped_v1(2, 21)?
+    let bitmap_cases: Number = yaza_base_storage_fuzz_page_v1(bitmap_seed, 16180339, 2)?
+
+    let free_seed: Bytes = yaza_db_free_page_encode_v1(7, 21)?
+    let free_cases: Number = yaza_base_storage_fuzz_page_v1(free_seed, 14142135, 7)?
+
+    let overflow_ref_seed: Bytes = yaza_db_overflow_ref_encode_v1(YazaDbOverflowRefV1(9, 8192, 0, 0))?
+    let overflow_ref_cases: Number = yaza_base_storage_fuzz_overflow_ref_v1(overflow_ref_seed, 24681357)?
+    let overflow_page_seed: Bytes = yaza_db_overflow_page_encode_v1(7, 21, 0, bytes_from_text("overflow-seed"))?
+    let overflow_page_cases: Number = yaza_base_storage_fuzz_overflow_page_v1(overflow_page_seed, 97531864, 7)?
+
+    let empty_payload: Bytes = bytes_from_text("")
+    let wal_seed: Bytes = yaza_db_wal_encode_v1(YazaDbWalRecordV1(0, 0, 0, yaza_db_wal_type_skip_v1(), 0, empty_payload))?
+    let wal_cases: Number = yaza_base_storage_fuzz_wal_v1(wal_seed, 10293847)?
+    let commit_payload: Bytes = yaza_db_wal_commit_payload_encode_v1(1)?
+    let commit_wal_seed: Bytes = yaza_db_wal_encode_v1(YazaDbWalRecordV1(0, 0, 1, yaza_db_wal_type_commit_v1(), 0, commit_payload))?
+    let commit_wal_cases: Number = yaza_base_storage_fuzz_wal_v1(commit_wal_seed, 8675309)?
+
+    let checkpoint_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(uuid, 17, 8, 9, 2, 3, 1)
+    let checkpoint_begin_seed: Bytes = yaza_db_checkpoint_begin_payload_encode_v1(checkpoint_header)?
+    let checkpoint_begin_cases: Number = yaza_base_storage_fuzz_checkpoint_begin_v1(checkpoint_begin_seed, 11235813)?
+    let checkpoint_end_redo_lsn: Number = yaza_db_wal_header_size_v1() + yaza_db_checkpoint_begin_payload_size_v1()
+    let checkpoint_end_seed: Bytes = yaza_db_checkpoint_end_payload_encode_v1(0, checkpoint_end_redo_lsn, checkpoint_header)?
+    let checkpoint_end_cases: Number = yaza_base_storage_fuzz_checkpoint_end_v1(checkpoint_end_seed, 22360679)?
+
+    let columns: List[YazaSqlColumnSchemaV1] = [YazaSqlColumnSchemaV1("id", 4, false, 0, 0, 0, ""), YazaSqlColumnSchemaV1("name", 9, false, 1, 0, 0, "")]
+    let id_value: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 42)?
+    let name_value: YazaSqlValueV1 = yaza_sql_value_text_v1("row-seed")
+    let values: List[YazaSqlValueV1] = [id_value, name_value]
+    let nulls: List[Boolean] = [false, false]
+    let row_seed: Bytes = yaza_db_row_encode_v1(values, nulls, columns, 1)?
+    let row_cases: Number = yaza_base_storage_fuzz_row_v1(row_seed, columns, 56473829)?
+
+    let index_columns: List[YazaSqlColumnSchemaV1] = yaza_db_catalog_table_schema_v1(3)?
+    let index_id_value: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 99)?
+    let index_table_value: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 12)?
+    let index_name_value: YazaSqlValueV1 = yaza_sql_value_text_v1("accounts_email_unique")
+    let index_root_value: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 4)?
+    let index_kind_value: YazaSqlValueV1 = yaza_sql_value_integer_v1(2, yaza_db_catalog_index_kind_secondary_active_v1())?
+    let index_unique_value: YazaSqlValueV1 = yaza_sql_value_boolean_v1(true)
+    let index_key_columns_value: YazaSqlValueV1 = yaza_sql_value_text_v1("email")
+    let index_values: List[YazaSqlValueV1] = [index_id_value, index_table_value, index_name_value, index_root_value, index_kind_value, index_unique_value, index_key_columns_value]
+    let index_nulls: List[Boolean] = [false, false, false, false, false, false, false]
+    let index_row_seed: Bytes = yaza_db_row_encode_v1(index_values, index_nulls, index_columns, 1)?
+    let index_file_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(uuid, 0, 8, 4, 1, 10, 1)
+    let index_catalog_cases: Number = yaza_base_storage_fuzz_index_catalog_row_v1(index_row_seed, index_columns, index_file_header, 13579113)?
+
+    return ok(file_cases + leaf_cases + inner_cases + meta_cases + catalog_cases + bitmap_cases + free_cases + overflow_ref_cases + overflow_page_cases + wal_cases + commit_wal_cases + checkpoint_begin_cases + checkpoint_end_cases + row_cases + index_catalog_cases)
+
+start:
+    let initial_used: Number = arena_used()
+    arena_scope 33554432:
+        let fuzzed: Result[Number, Text] = yaza_base_storage_decoder_fuzz_v1()
+        if not result_is_ok(fuzzed):
+            say result_unwrap_error(fuzzed)
+            exit(1)
+        if result_unwrap(fuzzed) != 1920: exit(1)
+    assert arena_used() == initial_used
+    say "yazabase-storage-decoder-fuzz-v1-ok cases=1920 formats=15"

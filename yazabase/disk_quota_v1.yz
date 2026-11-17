@@ -1,0 +1,128 @@
+# Per-database logical disk quota for the YDBv1 data file and UUID-scoped WAL.
+# The accounting reserves the logical data-file length and 64 MiB per WAL
+# segment, even though new WAL files grow physically only as records are added.
+# It does not measure physical blocks consumed by the host filesystem.
+use "std/fs"
+
+fn yaza_db_disk_quota_limit_v1() -> Result[Number, Text]:
+    let configured: Text = env_get("YAZA_DB_MAX_DISK_BYTES")
+    if text_length(configured) == 0: return ok(-1)
+    let parsed: Result[Number, Text] = number_try_parse(configured)
+    if not result_is_ok(parsed): return err("YAZA_DB_MAX_DISK_BYTES must be a positive base-10 integer")
+    let limit: Number = result_unwrap(parsed)
+    if limit < 1: return err("YAZA_DB_MAX_DISK_BYTES must be a positive base-10 integer")
+    return ok(limit)
+
+fn yaza_db_disk_quota_uuid_hex_v1(db_uuid: Bytes) -> Result[Text, Text]:
+    if bytes_length(db_uuid) != 16: return err("YDBv1 disk quota requires a 16-byte database UUID")
+    let digits: Text = "0123456789abcdef"
+    var hex: Text = ""
+    var index: Number = 0
+    while index < 16:
+        let value: Number = bytes_get(db_uuid, index)
+        set hex = hex + text_slice(digits, value / 16, 1) + text_slice(digits, value % 16, 1)
+        set index = index + 1
+    return ok(hex)
+
+fn yaza_db_disk_quota_wal_prefix_v1(db_uuid: Bytes) -> Result[Text, Text]:
+    let uuid_hex: Text = yaza_db_disk_quota_uuid_hex_v1(db_uuid)?
+    return ok("ydb-wal-" + uuid_hex + "-seg-")
+
+fn yaza_db_disk_quota_owner_name_v1(db_uuid: Bytes) -> Result[Text, Text]:
+    let uuid_hex: Text = yaza_db_disk_quota_uuid_hex_v1(db_uuid)?
+    return ok(".ydb-uuid-" + uuid_hex + ".owner")
+
+fn yaza_db_disk_quota_name_matches_v1(input: Bytes, offset: Number, length: Number, prefix: Text) -> Boolean:
+    let prefix_length: Number = text_length(prefix)
+    let suffix: Text = ".yzw"
+    let suffix_length: Number = text_length(suffix)
+    if length <= prefix_length + suffix_length: return false
+    if offset < 0 or length < 0 or offset > bytes_length(input) - length: return false
+    var index: Number = 0
+    while index < prefix_length:
+        if bytes_get(input, offset + index) != text_byte(prefix, index): return false
+        set index = index + 1
+    var suffix_index: Number = 0
+    while suffix_index < suffix_length:
+        if bytes_get(input, offset + length - suffix_length + suffix_index) != text_byte(suffix, suffix_index): return false
+        set suffix_index = suffix_index + 1
+    let digits_length: Number = length - prefix_length - suffix_length
+    if digits_length > 1 and bytes_get(input, offset + prefix_length) == 48: return false
+    var digit_index: Number = 0
+    while digit_index < digits_length:
+        let digit: Number = bytes_get(input, offset + prefix_length + digit_index)
+        if digit < 48 or digit > 57: return false
+        set digit_index = digit_index + 1
+    return true
+
+fn yaza_db_disk_quota_wal_segment_count_v1(root: Number, db_uuid: Bytes) -> Result[Number, Text]:
+    let prefix: Text = yaza_db_disk_quota_wal_prefix_v1(db_uuid)?
+    let names: Bytes = list_names(root)?
+    let names_length: Number = bytes_length(names)
+    var offset: Number = 0
+    var count: Number = 0
+    while offset < names_length:
+        var end: Number = offset
+        while end < names_length and bytes_get(names, end) != 0:
+            set end = end + 1
+        if end >= names_length: return err("YDB VFS directory listing is missing a name terminator")
+        if yaza_db_disk_quota_name_matches_v1(names, offset, end - offset, prefix):
+            set count = count + 1
+            if count > 16384: return err("YDBv1 WAL segment count exceeds the disk-quota accounting bound")
+        set offset = end + 1
+    return ok(count)
+
+fn yaza_db_disk_quota_current_wal_bytes_v1(root: Number, db_uuid: Bytes) -> Result[Number, Text]:
+    let segment_count: Number = yaza_db_disk_quota_wal_segment_count_v1(root, db_uuid)?
+    return ok(segment_count * 67108864)
+
+fn yaza_db_disk_quota_check_projected_v1(root: Number, db_uuid: Bytes, current_database_bytes: Number, additional_database_bytes: Number, additional_wal_segments: Number) -> Result[Boolean, Text]:
+    let limit_result: Result[Number, Text] = yaza_db_disk_quota_limit_v1()
+    if not result_is_ok(limit_result): return err(result_unwrap_error(limit_result))
+    let limit: Number = result_unwrap(limit_result)
+    if limit < 0: return ok(true)
+    if current_database_bytes < 0 or additional_database_bytes < 0 or additional_wal_segments < 0 or additional_wal_segments > 16384: return err("YDBv1 disk quota projection is outside its supported bounds")
+    let max_signed_bytes: Number = 9223372036854775807
+    if additional_database_bytes > max_signed_bytes - current_database_bytes: return err("YDBv1 disk quota projection exceeds signed file-size bounds")
+    let wal_bytes: Number = yaza_db_disk_quota_current_wal_bytes_v1(root, db_uuid)?
+    let additional_wal_bytes: Number = additional_wal_segments * 67108864
+    let projected_database_bytes: Number = current_database_bytes + additional_database_bytes
+    if additional_wal_bytes > max_signed_bytes - wal_bytes: return err("YDBv1 disk quota WAL projection exceeds signed file-size bounds")
+    let projected_wal_bytes: Number = wal_bytes + additional_wal_bytes
+    if projected_database_bytes > max_signed_bytes - projected_wal_bytes: return err("YDBv1 aggregate disk quota projection exceeds signed file-size bounds")
+    let projected_total: Number = projected_database_bytes + projected_wal_bytes
+    if projected_total > limit: return err("YDBv1 database disk quota would be exceeded (database plus UUID-scoped WAL logical bytes)")
+    return ok(true)
+
+fn yaza_db_disk_quota_check_wal_segment_create_v1(root: Number, db_uuid: Bytes) -> Result[Boolean, Text]:
+    let limit_result: Result[Number, Text] = yaza_db_disk_quota_limit_v1()
+    if not result_is_ok(limit_result): return err(result_unwrap_error(limit_result))
+    if result_unwrap(limit_result) < 0: return ok(true)
+    let owner_name: Text = yaza_db_disk_quota_owner_name_v1(db_uuid)?
+    let owner_file: Number = open_read(root, owner_name)?
+    let owner_length_result: Result[Number, Text] = file_size(owner_file)
+    if not result_is_ok(owner_length_result):
+        let ignored_close: Result[Boolean, Text] = close(owner_file)
+        return err(result_unwrap_error(owner_length_result))
+    let owner_length: Number = result_unwrap(owner_length_result)
+    if owner_length < 1 or owner_length > 255:
+        let ignored_close: Result[Boolean, Text] = close(owner_file)
+        return err("YDBv1 disk quota cannot resolve the database UUID owner record")
+    let owner_bytes_result: Result[Bytes, Text] = read_exact(owner_file, 0, owner_length)
+    let owner_closed_result: Result[Boolean, Text] = close(owner_file)
+    if not result_is_ok(owner_bytes_result): return err(result_unwrap_error(owner_bytes_result))
+    if not result_is_ok(owner_closed_result): return err(result_unwrap_error(owner_closed_result))
+    if not result_unwrap(owner_closed_result): return err("YDBv1 disk quota could not close the database UUID owner record")
+    let database_name_result: Option[Text] = bytes_to_text_checked(result_unwrap(owner_bytes_result))
+    if not option_is_some(database_name_result): return err("YDBv1 disk quota database owner name is not valid UTF-8")
+    let database_name: Text = option_unwrap(database_name_result)
+    let database_file: Number = open_read(root, database_name)?
+    let database_bytes_result: Result[Number, Text] = file_size(database_file)
+    if not result_is_ok(database_bytes_result):
+        let ignored_close: Result[Boolean, Text] = close(database_file)
+        return err(result_unwrap_error(database_bytes_result))
+    let database_closed_result: Result[Boolean, Text] = close(database_file)
+    if not result_is_ok(database_closed_result): return err(result_unwrap_error(database_closed_result))
+    if not result_unwrap(database_closed_result): return err("YDBv1 disk quota could not close the database file")
+    let database_bytes: Number = result_unwrap(database_bytes_result)
+    return yaza_db_disk_quota_check_projected_v1(root, db_uuid, database_bytes, 0, 1)

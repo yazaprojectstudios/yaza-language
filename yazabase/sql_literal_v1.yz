@@ -1,0 +1,114 @@
+# Shared decoding for SQL string literals used by persistent writes and key seeks.
+
+fn yaza_sql_literal_max_value_bytes_v1() -> Number:
+    return 65536
+
+fn yaza_sql_literal_utf8_continuation_v1(byte: Number) -> Boolean:
+    return byte >= 128 and byte <= 191
+
+fn yaza_sql_literal_utf8_valid_v1(source: Text, start_byte: Number, byte_length: Number) -> Boolean:
+    if start_byte < 0 or byte_length < 0 or start_byte > text_length(source) or byte_length > text_length(source) - start_byte: return false
+    var index: Number = 0
+    while index < byte_length:
+        let first: Number = text_byte(source, start_byte + index)
+        if first >= 1 and first <= 127:
+            set index = index + 1
+        elif first >= 194 and first <= 223:
+            if index + 1 >= byte_length: return false
+            if not yaza_sql_literal_utf8_continuation_v1(text_byte(source, start_byte + index + 1)): return false
+            set index = index + 2
+        elif first == 224:
+            if index + 2 >= byte_length: return false
+            let second: Number = text_byte(source, start_byte + index + 1)
+            if second < 160 or second > 191 or not yaza_sql_literal_utf8_continuation_v1(text_byte(source, start_byte + index + 2)): return false
+            set index = index + 3
+        elif (first >= 225 and first <= 236) or (first >= 238 and first <= 239):
+            if index + 2 >= byte_length: return false
+            if not yaza_sql_literal_utf8_continuation_v1(text_byte(source, start_byte + index + 1)) or not yaza_sql_literal_utf8_continuation_v1(text_byte(source, start_byte + index + 2)): return false
+            set index = index + 3
+        elif first == 237:
+            if index + 2 >= byte_length: return false
+            let second: Number = text_byte(source, start_byte + index + 1)
+            if second < 128 or second > 159 or not yaza_sql_literal_utf8_continuation_v1(text_byte(source, start_byte + index + 2)): return false
+            set index = index + 3
+        elif first == 240:
+            if index + 3 >= byte_length: return false
+            let second: Number = text_byte(source, start_byte + index + 1)
+            if second < 144 or second > 191 or not yaza_sql_literal_utf8_continuation_v1(text_byte(source, start_byte + index + 2)) or not yaza_sql_literal_utf8_continuation_v1(text_byte(source, start_byte + index + 3)): return false
+            set index = index + 4
+        elif first >= 241 and first <= 243:
+            if index + 3 >= byte_length: return false
+            if not yaza_sql_literal_utf8_continuation_v1(text_byte(source, start_byte + index + 1)) or not yaza_sql_literal_utf8_continuation_v1(text_byte(source, start_byte + index + 2)) or not yaza_sql_literal_utf8_continuation_v1(text_byte(source, start_byte + index + 3)): return false
+            set index = index + 4
+        elif first == 244:
+            if index + 3 >= byte_length: return false
+            let second: Number = text_byte(source, start_byte + index + 1)
+            if second < 128 or second > 143 or not yaza_sql_literal_utf8_continuation_v1(text_byte(source, start_byte + index + 2)) or not yaza_sql_literal_utf8_continuation_v1(text_byte(source, start_byte + index + 3)): return false
+            set index = index + 4
+        else:
+            return false
+    return true
+
+fn yaza_sql_decode_text_literal_v1(source: Text, start_byte: Number, end_byte: Number) -> Result[Text, Text]:
+    if start_byte < 0 or end_byte <= start_byte or end_byte > text_length(source) or end_byte - start_byte < 2: return err("SQL text literal span is invalid")
+    if text_byte(source, start_byte) != 39 or text_byte(source, end_byte - 1) != 39: return err("SQL text literal is missing its quotes")
+    let encoded_length: Number = end_byte - start_byte - 2
+    if encoded_length > yaza_sql_literal_max_value_bytes_v1(): return err("SQL text value exceeds its bounded limit")
+    let content_end: Number = end_byte - 1
+    var source_index: Number = start_byte + 1
+    var decoded_length: Number = 0
+    var has_escaped_quote: Boolean = false
+    while source_index < content_end:
+        let byte: Number = text_byte(source, source_index)
+        if byte == 39:
+            if source_index + 1 >= content_end or text_byte(source, source_index + 1) != 39: return err("SQL text literal contains an unescaped quote")
+            set has_escaped_quote = true
+            set source_index = source_index + 2
+        else:
+            set source_index = source_index + 1
+        set decoded_length = decoded_length + 1
+    if not yaza_sql_literal_utf8_valid_v1(source, start_byte + 1, encoded_length): return err("SQL text literal is not valid non-NUL UTF-8 text")
+    if not has_escaped_quote: return text_try_slice(source, start_byte + 1, decoded_length)
+
+    let output: Bytes = bytes_try_new_zeroed(decoded_length)?
+    set source_index = start_byte + 1
+    var output_index: Number = 0
+    while source_index < content_end:
+        let byte: Number = text_byte(source, source_index)
+        if byte == 39:
+            if not bytes_try_set(output, output_index, 39): return err("SQL text literal could not be decoded")
+            set source_index = source_index + 2
+        else:
+            if not bytes_try_set(output, output_index, byte): return err("SQL text literal could not be decoded")
+            set source_index = source_index + 1
+        set output_index = output_index + 1
+    let decoded: Result[Text, Text] = bytes_try_to_text(output)
+    if not result_is_ok(decoded): return err("SQL text literal is not valid UTF-8 text")
+    return ok(result_unwrap(decoded))
+
+fn yaza_sql_literal_hex_value_v1(byte: Number) -> Number:
+    if byte >= 48 and byte <= 57: return byte - 48
+    if byte >= 65 and byte <= 70: return byte - 55
+    if byte >= 97 and byte <= 102: return byte - 87
+    return -1
+
+fn yaza_sql_decode_blob_literal_v1(source: Text, start_byte: Number, end_byte: Number) -> Result[Bytes, Text]:
+    let source_length: Number = text_length(source)
+    if start_byte < 0 or end_byte < start_byte or end_byte > source_length or end_byte - start_byte < 3:
+        return err("SQL BLOB literal span is invalid")
+    let prefix: Number = text_byte(source, start_byte)
+    if (prefix != 88 and prefix != 120) or text_byte(source, start_byte + 1) != 39 or text_byte(source, end_byte - 1) != 39:
+        return err("SQL BLOB literal must use X'hex' syntax")
+    let hex_length: Number = end_byte - start_byte - 3
+    if hex_length % 2 != 0: return err("SQL BLOB literal requires an even number of hexadecimal digits")
+    let byte_length: Number = hex_length / 2
+    if byte_length > 65536: return err("SQL BLOB literal exceeds its 64 KiB inline-literal limit")
+    let output: Bytes = bytes_try_new_zeroed(byte_length)?
+    var index: Number = 0
+    while index < byte_length:
+        let high: Number = yaza_sql_literal_hex_value_v1(text_byte(source, start_byte + 2 + index * 2))
+        let low: Number = yaza_sql_literal_hex_value_v1(text_byte(source, start_byte + 3 + index * 2))
+        if high < 0 or low < 0: return err("SQL BLOB literal contains a non-hexadecimal digit")
+        if not bytes_try_set(output, index, high * 16 + low): return err("SQL BLOB literal could not be decoded into bytes")
+        set index = index + 1
+    return ok(output)

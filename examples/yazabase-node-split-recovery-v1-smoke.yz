@@ -1,0 +1,257 @@
+use "std/fs"
+use "../yazabase/allocator_v1"
+use "../yazabase/checkpoint_v1"
+use "../yazabase/page_v1"
+use "../yazabase/page_wal_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/wal_v1"
+
+shape YazaDbNodeSplitRecoverySeedV1:
+    storage: YazaDbStorageHandleV1
+    wal: YazaDbWalLogV1
+    txn_id: Number
+    prev_lsn: Number
+    left_page_id: Number
+    right_page_id: Number
+    before_image: Bytes
+
+shape YazaDbNodeSplitRecoveryPlanV1:
+    record_lsn: Number
+    split: YazaDbLeafSplitV1
+    pages: List[YazaDbWalNodeSplitPageV1]
+    payload: Bytes
+
+fn yazabase_node_split_make_page_v1(page_id: Number, page_lsn: Number) -> Result[Bytes, Text]:
+    let page: Bytes = yaza_db_page_new_v1(page_id, page_lsn, 1, 0)?
+    return yaza_db_page_finalize_v1(page)
+
+fn yazabase_node_split_seed_v1(root: Number, name: Text, db_uuid: Bytes, allocate_right: Boolean) -> Result[YazaDbNodeSplitRecoverySeedV1, Text]:
+    let initial: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(db_uuid, 0, 1, 1, 0, 2, 1)
+    let storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, name, initial)?
+    let wal: YazaDbWalLogV1 = yaza_db_wal_log_open_for_v1(root, db_uuid)?
+    let begin: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(wal, YazaDbWalRecordV1(0, 0, 1, yaza_db_wal_type_mtr_end_v1(), 0, bytes_from_text("")))?
+    let left_allocation: YazaDbPageSpaceChangeV1 = yaza_db_allocator_allocate_existing_v1(storage, begin.log, 1, begin.record.lsn)?
+    if left_allocation.page_id != 3: return err("YDBv1 NODE_SPLIT fixture expected the first data page to be page 3")
+    let source: Bytes = yaza_db_page_new_v1(left_allocation.page_id, left_allocation.record.lsn, 1, 0)?
+    let slot_a: Number = yaza_db_page_add_slot_v1(source, bytes_from_text("a"), bytes_from_text("row-a"))?
+    let slot_b: Number = yaza_db_page_add_slot_v1(source, bytes_from_text("b"), bytes_from_text("row-b"))?
+    let slot_c: Number = yaza_db_page_add_slot_v1(source, bytes_from_text("c"), bytes_from_text("row-c"))?
+    let slot_d: Number = yaza_db_page_add_slot_v1(source, bytes_from_text("d"), bytes_from_text("row-d"))?
+    if slot_a != 0 or slot_b != 1 or slot_c != 2 or slot_d != 3: return err("YDBv1 NODE_SPLIT fixture could not construct its source page")
+    let before_image: Bytes = yaza_db_page_finalize_v1(source)?
+    let wrote_source: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, before_image)?
+    if wrote_source != yaza_db_page_size_v1(): return err("YDBv1 NODE_SPLIT fixture could not persist its source page")
+    var output_wal: YazaDbWalLogV1 = left_allocation.wal
+    var output_prev_lsn: Number = left_allocation.record.lsn
+    var right_page_id: Number = 4
+    if allocate_right:
+        let right_allocation: YazaDbPageSpaceChangeV1 = yaza_db_allocator_allocate_existing_v1(storage, output_wal, 1, output_prev_lsn)?
+        if right_allocation.page_id != right_page_id: return err("YDBv1 NODE_SPLIT fixture allocated an unexpected right page")
+        set output_wal = right_allocation.wal
+        set output_prev_lsn = right_allocation.record.lsn
+    return ok(YazaDbNodeSplitRecoverySeedV1(storage, output_wal, 1, output_prev_lsn, left_allocation.page_id, right_page_id, before_image))
+
+fn yazabase_node_split_plan_v1(seed: YazaDbNodeSplitRecoverySeedV1) -> Result[YazaDbNodeSplitRecoveryPlanV1, Text]:
+    let page_count: Number = 2
+    let payload_size: Number = yaza_db_wal_node_split_payload_size_v1(page_count)
+    let record_length: Number = yaza_db_wal_header_size_v1() + payload_size
+    let record_lsn: Number = yaza_db_wal_record_lsn_for_append_v1(seed.wal, record_length)?
+    let split: YazaDbLeafSplitV1 = yaza_db_page_split_leaf_v1(seed.before_image, seed.right_page_id, record_lsn)?
+    var pages: List[YazaDbWalNodeSplitPageV1] = List[YazaDbWalNodeSplitPageV1]()
+    if not list_try_push(pages, YazaDbWalNodeSplitPageV1(seed.left_page_id, true, seed.before_image, split.left_page)): return err("YDBv1 NODE_SPLIT plan could not allocate its existing-page entry")
+    if not list_try_push(pages, YazaDbWalNodeSplitPageV1(seed.right_page_id, false, bytes_from_text(""), split.right_page)): return err("YDBv1 NODE_SPLIT plan could not allocate its new-page entry")
+    let payload: Bytes = yaza_db_wal_node_split_payload_encode_v1(record_lsn, pages)?
+    return ok(YazaDbNodeSplitRecoveryPlanV1(record_lsn, split, pages, payload))
+
+fn yazabase_node_split_check_page_v1(page: Bytes, page_id: Number, expected_first: Text, expected_count: Number) -> Result[Boolean, Text]:
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, page_id)?
+    if header.page_type != 1 or header.count != expected_count: return ok(false)
+    let first_key: Bytes = yaza_db_page_slot_key_v1(page, 0, page_id)?
+    return ok(bytes_to_text(first_key) == expected_first)
+
+fn yazabase_node_split_bitmap_allocated_v1(storage: YazaDbStorageHandleV1, page_id: Number) -> Result[Boolean, Text]:
+    let address: YazaDbBitmapAddressV1 = yaza_db_bitmap_address_v1(page_id)?
+    let bitmap: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, address.bitmap_page_id)?
+    return yaza_db_bitmap_page_bit_v1(bitmap, address.bit_index, address.bitmap_page_id)
+
+fn yazabase_node_split_max_recovery_check_v1(root: Number) -> Result[Boolean, Text]:
+    let db_uuid: Bytes = bytes_from_text("splitmaxpage-uid")
+    let initial: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(db_uuid, 0, 1, 1, 0, 2, 1)
+    let storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, "split-max-pages-smoke.ydb", initial)?
+    let wal: YazaDbWalLogV1 = yaza_db_wal_log_open_for_v1(root, db_uuid)?
+    let begin: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(wal, YazaDbWalRecordV1(0, 0, 1, yaza_db_wal_type_mtr_end_v1(), 0, bytes_from_text("")))?
+    var current_wal: YazaDbWalLogV1 = begin.log
+    var prev_lsn: Number = begin.record.lsn
+    var before_images: List[Bytes] = List[Bytes]()
+    var page_id: Number = 3
+    while page_id < 19:
+        let allocation: YazaDbPageSpaceChangeV1 = yaza_db_allocator_allocate_existing_v1(storage, current_wal, 1, prev_lsn)?
+        if allocation.page_id != page_id: return err("YDBv1 maximum NODE_SPLIT fixture allocated an unexpected page ID")
+        set current_wal = allocation.wal
+        set prev_lsn = allocation.record.lsn
+        let before_image: Bytes = yazabase_node_split_make_page_v1(page_id, allocation.record.lsn)?
+        let before_written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, before_image)?
+        if before_written != yaza_db_page_size_v1(): return err("YDBv1 maximum NODE_SPLIT fixture could not persist a before-image")
+        if not list_try_push(before_images, before_image): return err("YDBv1 maximum NODE_SPLIT fixture could not retain its before-images")
+        set page_id = page_id + 1
+
+    let record_length: Number = yaza_db_wal_header_size_v1() + yaza_db_wal_node_split_payload_size_v1(16)
+    let record_lsn: Number = yaza_db_wal_record_lsn_for_append_v1(current_wal, record_length)?
+    var pages: List[YazaDbWalNodeSplitPageV1] = List[YazaDbWalNodeSplitPageV1]()
+    set page_id = 3
+    var index: Number = 0
+    while page_id < 19:
+        let before_image: Bytes = list_get(before_images, index)
+        let after_image: Bytes = yazabase_node_split_make_page_v1(page_id, record_lsn)?
+        if not list_try_push(pages, YazaDbWalNodeSplitPageV1(page_id, true, before_image, after_image)): return err("YDBv1 maximum NODE_SPLIT fixture could not construct its page set")
+        set page_id = page_id + 1
+        set index = index + 1
+    let payload: Bytes = yaza_db_wal_node_split_payload_encode_v1(record_lsn, pages)?
+    let split: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(current_wal, YazaDbWalRecordV1(0, prev_lsn, 1, yaza_db_wal_type_node_split_v1(), 0, payload))?
+    if split.record.lsn != record_lsn: return err("YDBv1 maximum NODE_SPLIT fixture LSN prediction changed")
+    let first_after: Bytes = list_get(pages, 0).after_image
+    let partial_written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, first_after)?
+    if partial_written != yaza_db_page_size_v1(): return err("YDBv1 maximum NODE_SPLIT fixture could not simulate partial page persistence")
+    let commit_payload: Bytes = yaza_db_wal_commit_payload_encode_v1(1)?
+    let committed: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(split.log, YazaDbWalRecordV1(0, split.record.lsn, 1, yaza_db_wal_type_commit_v1(), 0, commit_payload))?
+    let wal_closed: Boolean = yaza_db_wal_log_close_v1(committed.log)?
+    let storage_closed: Boolean = yaza_db_storage_close_v1(storage)?
+    if not wal_closed or not storage_closed: return err("YDBv1 maximum NODE_SPLIT fixture could not close before recovery")
+
+    let recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "split-max-pages-smoke.ydb")?
+    if recovered.storage.header.next_commit_ts != 2: return err("YDBv1 maximum NODE_SPLIT recovery did not publish the committed transaction")
+    set page_id = 3
+    while page_id < 19:
+        let page: Bytes = yaza_db_storage_read_page_v1(recovered.storage.file, recovered.storage.header, page_id)?
+        let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, page_id)?
+        if header.page_lsn != record_lsn: return err("YDBv1 maximum NODE_SPLIT recovery did not redo every page image")
+        set page_id = page_id + 1
+    let checkpoint_lsn: Number = recovered.storage.header.checkpoint_lsn
+    let log_end: Number = recovered.wal.next_lsn
+    let recovered_wal_closed: Boolean = yaza_db_wal_log_close_v1(recovered.wal)?
+    let recovered_storage_closed: Boolean = yaza_db_storage_close_v1(recovered.storage)?
+    if not recovered_wal_closed or not recovered_storage_closed: return err("YDBv1 maximum NODE_SPLIT recovery handles could not close")
+    let reopened: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "split-max-pages-smoke.ydb")?
+    if reopened.applied_checkpoint_count != 0 or reopened.storage.header.checkpoint_lsn != checkpoint_lsn or reopened.wal.next_lsn != log_end: return err("YDBv1 maximum NODE_SPLIT recovery was not idempotent")
+    let reopened_wal_closed: Boolean = yaza_db_wal_log_close_v1(reopened.wal)?
+    let reopened_storage_closed: Boolean = yaza_db_storage_close_v1(reopened.storage)?
+    if not reopened_wal_closed or not reopened_storage_closed: return err("YDBv1 maximum NODE_SPLIT idempotence handles could not close")
+    return ok(true)
+
+fn yazabase_node_split_recovery_check_v1(root_path: Text) -> Result[Number, Text]:
+    let root: Number = root_open(root_path)?
+
+    # A committed split is only partially written at the simulated crash. Redo must finish both pages.
+    let committed_seed: YazaDbNodeSplitRecoverySeedV1 = yazabase_node_split_seed_v1(root, "split-committed-smoke.ydb", bytes_from_text("splitcommit-uuid"), true)?
+    let committed_plan: YazaDbNodeSplitRecoveryPlanV1 = yazabase_node_split_plan_v1(committed_seed)?
+    let committed_record: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(committed_seed.wal, YazaDbWalRecordV1(0, committed_seed.prev_lsn, committed_seed.txn_id, yaza_db_wal_type_node_split_v1(), 0, committed_plan.payload))?
+    if committed_record.record.lsn != committed_plan.record_lsn: return err("YDBv1 committed NODE_SPLIT fixture LSN prediction changed")
+    let partial_right_write: Number = yaza_db_storage_write_page_sync_v1(committed_seed.storage.file, committed_seed.storage.header, committed_plan.split.right_page)?
+    if partial_right_write != yaza_db_page_size_v1(): return err("YDBv1 committed NODE_SPLIT fixture could not persist its child page")
+    let commit_payload: Bytes = yaza_db_wal_commit_payload_encode_v1(1)?
+    let committed: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(committed_record.log, YazaDbWalRecordV1(0, committed_record.record.lsn, committed_seed.txn_id, yaza_db_wal_type_commit_v1(), 0, commit_payload))?
+    let committed_wal_closed: Boolean = yaza_db_wal_log_close_v1(committed.log)?
+    let committed_storage_closed: Boolean = yaza_db_storage_close_v1(committed_seed.storage)?
+    if not committed_wal_closed or not committed_storage_closed: return err("YDBv1 committed NODE_SPLIT fixture could not close before recovery")
+    let committed_recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "split-committed-smoke.ydb")?
+    let committed_left: Bytes = yaza_db_storage_read_page_v1(committed_recovered.storage.file, committed_recovered.storage.header, committed_seed.left_page_id)?
+    let committed_right: Bytes = yaza_db_storage_read_page_v1(committed_recovered.storage.file, committed_recovered.storage.header, committed_seed.right_page_id)?
+    let committed_left_ok: Boolean = yazabase_node_split_check_page_v1(committed_left, committed_seed.left_page_id, "a", 2)?
+    let committed_right_ok: Boolean = yazabase_node_split_check_page_v1(committed_right, committed_seed.right_page_id, "c", 2)?
+    if not committed_left_ok or not committed_right_ok or committed_recovered.storage.header.next_commit_ts != 2: return err("YDBv1 recovery did not redo a committed multi-page NODE_SPLIT")
+    let committed_checkpoint_lsn: Number = committed_recovered.storage.header.checkpoint_lsn
+    let committed_wal_end: Number = committed_recovered.wal.next_lsn
+    let committed_recovered_wal_closed: Boolean = yaza_db_wal_log_close_v1(committed_recovered.wal)?
+    let committed_recovered_storage_closed: Boolean = yaza_db_storage_close_v1(committed_recovered.storage)?
+    if not committed_recovered_wal_closed or not committed_recovered_storage_closed: return err("YDBv1 committed NODE_SPLIT recovery handles could not close")
+    let committed_again: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "split-committed-smoke.ydb")?
+    if committed_again.applied_checkpoint_count != 0 or committed_again.storage.header.checkpoint_lsn != committed_checkpoint_lsn or committed_again.wal.next_lsn != committed_wal_end: return err("YDBv1 committed NODE_SPLIT replay was not idempotent")
+    let committed_again_wal_closed: Boolean = yaza_db_wal_log_close_v1(committed_again.wal)?
+    let committed_again_storage_closed: Boolean = yaza_db_storage_close_v1(committed_again.storage)?
+    if not committed_again_wal_closed or not committed_again_storage_closed: return err("YDBv1 committed NODE_SPLIT idempotence handles could not close")
+
+    # The writer logs the complete page set before page writes; loser undo restores old pages and frees new pages.
+    let loser_seed: YazaDbNodeSplitRecoverySeedV1 = yazabase_node_split_seed_v1(root, "split-loser-smoke.ydb", bytes_from_text("splitloser-uuid1"), true)?
+    let loser_plan: YazaDbNodeSplitRecoveryPlanV1 = yazabase_node_split_plan_v1(loser_seed)?
+    let loser_append: YazaDbWalAppendV1 = yaza_db_storage_append_node_split_v1(loser_seed.storage, loser_seed.wal, loser_seed.txn_id, loser_seed.prev_lsn, loser_plan.pages)?
+    if loser_append.record.lsn != loser_plan.record_lsn: return err("YDBv1 loser NODE_SPLIT writer LSN prediction changed")
+    let loser_wal_closed: Boolean = yaza_db_wal_log_close_v1(loser_append.log)?
+    let loser_storage_closed: Boolean = yaza_db_storage_close_v1(loser_seed.storage)?
+    if not loser_wal_closed or not loser_storage_closed: return err("YDBv1 loser NODE_SPLIT fixture could not close before recovery")
+    let loser_recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "split-loser-smoke.ydb")?
+    let loser_left_offset: Number = yaza_db_storage_page_offset_v1(loser_seed.left_page_id)?
+    let loser_left: Bytes = read_exact(loser_recovered.storage.file, loser_left_offset, yaza_db_page_size_v1())?
+    let loser_left_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(loser_left, loser_seed.left_page_id)?
+    let loser_left_allocated: Boolean = yazabase_node_split_bitmap_allocated_v1(loser_recovered.storage, loser_seed.left_page_id)?
+    let loser_right_allocated: Boolean = yazabase_node_split_bitmap_allocated_v1(loser_recovered.storage, loser_seed.right_page_id)?
+    if loser_left_header.count != 4 or loser_left_header.page_lsn <= loser_plan.record_lsn or loser_left_allocated or loser_right_allocated or loser_recovered.applied_checkpoint_count != 1: return err("YDBv1 loser NODE_SPLIT undo did not restore the old page and release both allocations")
+    let loser_checkpoint_lsn: Number = loser_recovered.storage.header.checkpoint_lsn
+    let loser_wal_end: Number = loser_recovered.wal.next_lsn
+    let loser_recovered_wal_closed: Boolean = yaza_db_wal_log_close_v1(loser_recovered.wal)?
+    let loser_recovered_storage_closed: Boolean = yaza_db_storage_close_v1(loser_recovered.storage)?
+    if not loser_recovered_wal_closed or not loser_recovered_storage_closed: return err("YDBv1 loser NODE_SPLIT recovery handles could not close")
+    let loser_again: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "split-loser-smoke.ydb")?
+    if loser_again.applied_checkpoint_count != 0 or loser_again.storage.header.checkpoint_lsn != loser_checkpoint_lsn or loser_again.wal.next_lsn != loser_wal_end: return err("YDBv1 loser NODE_SPLIT recovery was not idempotent")
+    let loser_again_wal_closed: Boolean = yaza_db_wal_log_close_v1(loser_again.wal)?
+    let loser_again_storage_closed: Boolean = yaza_db_storage_close_v1(loser_again.storage)?
+    if not loser_again_wal_closed or not loser_again_storage_closed: return err("YDBv1 loser NODE_SPLIT idempotence handles could not close")
+
+    # A durable v3 CLR without its page writes must be replayed before recovery resumes allocation undo.
+    let resume_seed: YazaDbNodeSplitRecoverySeedV1 = yazabase_node_split_seed_v1(root, "split-clr-resume-smoke.ydb", bytes_from_text("splitresume-uuid"), true)?
+    let resume_plan: YazaDbNodeSplitRecoveryPlanV1 = yazabase_node_split_plan_v1(resume_seed)?
+    let resume_append: YazaDbWalAppendV1 = yaza_db_storage_append_node_split_v1(resume_seed.storage, resume_seed.wal, resume_seed.txn_id, resume_seed.prev_lsn, resume_plan.pages)?
+    let resume_clr_length: Number = yaza_db_wal_header_size_v1() + yaza_db_wal_node_split_compensation_payload_size_v1(1)
+    let resume_clr_lsn: Number = yaza_db_wal_record_lsn_for_append_v1(resume_append.log, resume_clr_length)?
+    let resume_image: Bytes = bytes_try_slice(resume_seed.before_image, 0, yaza_db_page_size_v1())?
+    if not yaza_db_write_uint_le_v1(resume_image, 0, resume_clr_lsn, 8): return err("YDBv1 NODE_SPLIT CLR-resume fixture could not stamp its restored image")
+    let resume_stamped_image: Bytes = yaza_db_page_finalize_v1(resume_image)?
+    let resume_clr_pages: List[YazaDbWalPageSetImageV1] = [YazaDbWalPageSetImageV1(resume_seed.left_page_id, resume_stamped_image)]
+    let resume_clr_payload: Bytes = yaza_db_wal_node_split_compensation_payload_encode_v1(resume_seed.prev_lsn, resume_append.record.lsn, resume_clr_lsn, resume_append.record.lsn, resume_clr_pages)?
+    let resume_clr: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(resume_append.log, YazaDbWalRecordV1(0, resume_append.record.lsn, resume_seed.txn_id, yaza_db_wal_type_compensation_v1(), 0, resume_clr_payload))?
+    if resume_clr.record.lsn != resume_clr_lsn: return err("YDBv1 NODE_SPLIT CLR-resume fixture LSN prediction changed")
+    let resume_wal_closed: Boolean = yaza_db_wal_log_close_v1(resume_clr.log)?
+    let resume_storage_closed: Boolean = yaza_db_storage_close_v1(resume_seed.storage)?
+    if not resume_wal_closed or not resume_storage_closed: return err("YDBv1 NODE_SPLIT CLR-resume fixture could not close before recovery")
+    let resume_recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "split-clr-resume-smoke.ydb")?
+    let resume_left_allocated: Boolean = yazabase_node_split_bitmap_allocated_v1(resume_recovered.storage, resume_seed.left_page_id)?
+    let resume_right_allocated: Boolean = yazabase_node_split_bitmap_allocated_v1(resume_recovered.storage, resume_seed.right_page_id)?
+    if resume_left_allocated or resume_right_allocated or resume_recovered.applied_checkpoint_count != 1: return err("YDBv1 startup did not replay the durable NODE_SPLIT CLR and finish page-allocation undo")
+    let resume_wal_end: Number = resume_recovered.wal.next_lsn
+    let resume_checkpoint_lsn: Number = resume_recovered.storage.header.checkpoint_lsn
+    let resume_recovered_wal_closed: Boolean = yaza_db_wal_log_close_v1(resume_recovered.wal)?
+    let resume_recovered_storage_closed: Boolean = yaza_db_storage_close_v1(resume_recovered.storage)?
+    if not resume_recovered_wal_closed or not resume_recovered_storage_closed: return err("YDBv1 NODE_SPLIT CLR-resume recovery handles could not close")
+    let resume_again: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "split-clr-resume-smoke.ydb")?
+    if resume_again.applied_checkpoint_count != 0 or resume_again.storage.header.checkpoint_lsn != resume_checkpoint_lsn or resume_again.wal.next_lsn != resume_wal_end: return err("YDBv1 NODE_SPLIT CLR-resume replay was not idempotent")
+    let resume_again_wal_closed: Boolean = yaza_db_wal_log_close_v1(resume_again.wal)?
+    let resume_again_storage_closed: Boolean = yaza_db_storage_close_v1(resume_again.storage)?
+    if not resume_again_wal_closed or not resume_again_storage_closed: return err("YDBv1 NODE_SPLIT CLR-resume idempotence handles could not close")
+
+    # An unallocated new child without a preceding PAGE_ALLOC must fail in analysis before any page redo.
+    let invalid_seed: YazaDbNodeSplitRecoverySeedV1 = yazabase_node_split_seed_v1(root, "split-invalid-allocation-smoke.ydb", bytes_from_text("splitinvalid-uid"), false)?
+    let invalid_plan: YazaDbNodeSplitRecoveryPlanV1 = yazabase_node_split_plan_v1(invalid_seed)?
+    let invalid_append: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(invalid_seed.wal, YazaDbWalRecordV1(0, invalid_seed.prev_lsn, invalid_seed.txn_id, yaza_db_wal_type_node_split_v1(), 0, invalid_plan.payload))?
+    let invalid_wal_closed: Boolean = yaza_db_wal_log_close_v1(invalid_append.log)?
+    let invalid_storage_closed: Boolean = yaza_db_storage_close_v1(invalid_seed.storage)?
+    if not invalid_wal_closed or not invalid_storage_closed: return err("YDBv1 invalid-allocation NODE_SPLIT fixture could not close before recovery")
+    let rejected_recovery: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_open_recovered_v1(root, "split-invalid-allocation-smoke.ydb")
+    if result_is_ok(rejected_recovery): return err("YDBv1 recovery accepted NODE_SPLIT without a preceding PAGE_ALLOC")
+    let untouched_storage: YazaDbStorageHandleV1 = yaza_db_storage_open_v1(root, "split-invalid-allocation-smoke.ydb")?
+    let untouched_page: Bytes = yaza_db_storage_read_page_v1(untouched_storage.file, untouched_storage.header, invalid_seed.left_page_id)?
+    if not bytes_equal(untouched_page, invalid_seed.before_image): return err("YDBv1 invalid NODE_SPLIT mutated a page before analysis rejected it")
+    let untouched_closed: Boolean = yaza_db_storage_close_v1(untouched_storage)?
+    if not untouched_closed: return err("YDBv1 invalid-allocation storage handle could not close")
+
+    let max_pages_recovered: Boolean = yazabase_node_split_max_recovery_check_v1(root)?
+    if not max_pages_recovered: return err("YDBv1 maximum page-set recovery fixture failed")
+
+    let ignored_root_close: Boolean = close(root)?
+    if not ignored_root_close: return err("YDBv1 NODE_SPLIT recovery fixture root close failed")
+    return ok(5)
+
+start:
+    let outcome: Result[Number, Text] = yazabase_node_split_recovery_check_v1(arg(1))
+    if result_is_ok(outcome):
+        say "yazabase-node-split-recovery-v1-ok cases=" + number_text(result_unwrap(outcome))
+    else:
+        say result_unwrap_error(outcome)

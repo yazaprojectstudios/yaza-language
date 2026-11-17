@@ -1,0 +1,170 @@
+use "std/fs"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/catalog_schema_v1"
+use "../yazabase/checkpoint_v1"
+use "../yazabase/page_v1"
+use "../yazabase/row_v1"
+use "../yazabase/storage_v1"
+
+fn yaza_base_catalog_init_v1_check(root_path: Text) -> Result[Number, Text]:
+    let root: Number = root_open(root_path)?
+    let uuid: Bytes = bytes_from_text("cat-init-uuid001")
+    let initial: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(uuid, 0, 1, 1, 0, 2, 1)
+    let created: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, "catalog-init-smoke.ydb", initial)?
+    let closed_created: Boolean = yaza_db_storage_close_v1(created)?
+    if not closed_created: return err("YDBv1 catalog init fixture could not close the empty database")
+
+    let partial: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "catalog-init-smoke.ydb")?
+    let bitmap: Bytes = yaza_db_storage_read_page_v1(partial.storage.file, partial.storage.header, 2)?
+    let bitmap_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(bitmap, 2)?
+    var page_id: Number = 3
+    while page_id <= 7:
+        let allocated: Boolean = yaza_db_bitmap_page_set_page_allocated_v1(bitmap, page_id, true, bitmap_header.page_lsn, 2)?
+        set page_id = page_id + 1
+    let bitmap_write: Number = yaza_db_storage_write_page_sync_v1(partial.storage.file, partial.storage.header, bitmap)?
+    if bitmap_write != yaza_db_page_size_v1(): return err("YDBv1 catalog init fixture could not reserve bootstrap pages")
+    let catalog: YazaDbCatalogRootV1 = YazaDbCatalogRootV1(3, 4, 5, 6, 1, 1, 0)
+    let first_image: YazaDbWalAppendV1 = yaza_db_catalog_bootstrap_append_page_image_v1(partial.storage, partial.wal, 3, 1, catalog)?
+    let partial_wal_closed: Boolean = yaza_db_wal_log_close_v1(first_image.log)?
+    let partial_storage_closed: Boolean = yaza_db_storage_close_v1(partial.storage)?
+    if not partial_wal_closed or not partial_storage_closed: return err("YDBv1 partial catalog init handles did not close")
+
+    let initialized: YazaDbCatalogBootstrapV1 = yaza_db_catalog_initialize_v1(root, "catalog-init-smoke.ydb")?
+    if not initialized.initialized: return err("YDBv1 catalog init did not install the missing catalog root")
+    if initialized.storage.header.catalog_root != 7 or initialized.storage.header.checkpoint_lsn <= 0: return err("YDBv1 catalog init did not publish its descriptor through a checkpoint")
+    if initialized.catalog.sys_tables_root != 3 or initialized.catalog.sys_columns_root != 4 or initialized.catalog.sys_indexes_root != 5 or initialized.catalog.sys_constraints_root != 6: return err("YDBv1 catalog init published incorrect system-catalog roots")
+    let root_pages: List[Number] = [3, 4, 5, 6]
+    let expected_counts: List[Number] = [4, 28, 4, 4]
+    var root_index: Number = 0
+    while root_index < list_count(root_pages):
+        let page: Bytes = yaza_db_storage_read_page_v1(initialized.storage.file, initialized.storage.header, list_get(root_pages, root_index))?
+        let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, list_get(root_pages, root_index))?
+        if header.page_type != 1 or header.count != list_get(expected_counts, root_index): return err("YDBv1 catalog init did not seed the expected system-catalog rows")
+        let row_schema: List[YazaSqlColumnSchemaV1] = yaza_db_catalog_table_schema_v1(root_index + 1)?
+        var stored_row_index: Number = 0
+        while stored_row_index < header.count:
+            let stored_slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(page, stored_row_index, list_get(root_pages, root_index))?
+            let stored_row: YazaDbRowV1 = yaza_db_row_decode_v1(stored_slot.payload, row_schema)?
+            if stored_row.version_ts != 1: return err("YDBv1 catalog seed row is not visible at the bootstrap commit timestamp")
+            set stored_row_index = stored_row_index + 1
+        set root_index = root_index + 1
+    let tables_page: Bytes = yaza_db_storage_read_page_v1(initialized.storage.file, initialized.storage.header, 3)?
+    let tables_schema: List[YazaSqlColumnSchemaV1] = yaza_db_catalog_table_schema_v1(1)?
+    let first_table_slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(tables_page, 0, 3)?
+    let first_table: YazaDbRowV1 = yaza_db_row_decode_v1(first_table_slot.payload, tables_schema)?
+    if first_table.version_ts != 1 or list_get(first_table.values, 0).integer_value != 1 or list_get(first_table.values, 1).text_value != "sys" or list_get(first_table.values, 2).text_value != "sys_tables" or list_get(first_table.values, 3).integer_value != 3: return err("YDBv1 sys_tables seed row did not round-trip from storage")
+    let columns_page: Bytes = yaza_db_storage_read_page_v1(initialized.storage.file, initialized.storage.header, 4)?
+    let columns_schema: List[YazaSqlColumnSchemaV1] = yaza_db_catalog_table_schema_v1(2)?
+    let first_column_slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(columns_page, 0, 4)?
+    let first_column: YazaDbRowV1 = yaza_db_row_decode_v1(first_column_slot.payload, columns_schema)?
+    if list_get(first_column.values, 0).integer_value != 1 or list_get(first_column.values, 1).integer_value != 0 or list_get(first_column.values, 2).text_value != "table_id" or list_get(first_column.values, 5).integer_value != 0: return err("YDBv1 sys_columns primary-key seed row did not round-trip from storage")
+    if initialized.catalog.next_object_id != 13 or initialized.storage.header.next_commit_ts != 2: return err("YDBv1 seeded system catalogs did not advance object and commit counters")
+    let installed_checkpoint: Number = initialized.storage.header.checkpoint_lsn
+    let installed_wal_end: Number = initialized.wal.next_lsn
+    let wal_closed: Boolean = yaza_db_wal_log_close_v1(initialized.wal)?
+    let storage_closed: Boolean = yaza_db_storage_close_v1(initialized.storage)?
+    if not wal_closed or not storage_closed: return err("YDBv1 catalog init handles did not close")
+
+    let repeated: YazaDbCatalogBootstrapV1 = yaza_db_catalog_initialize_v1(root, "catalog-init-smoke.ydb")?
+    if repeated.initialized or repeated.storage.header.catalog_root != 7 or repeated.storage.header.checkpoint_lsn != installed_checkpoint or repeated.wal.next_lsn != installed_wal_end: return err("YDBv1 catalog init was not idempotent")
+    let repeated_wal_closed: Boolean = yaza_db_wal_log_close_v1(repeated.wal)?
+    let repeated_storage_closed: Boolean = yaza_db_storage_close_v1(repeated.storage)?
+    if not repeated_wal_closed or not repeated_storage_closed: return err("YDBv1 repeated catalog init handles did not close")
+
+    let created_database: YazaDbCatalogBootstrapV1 = yaza_db_catalog_create_v1(root, "catalog-created-smoke.ydb")?
+    if not created_database.initialized or created_database.storage.header.catalog_root != 7 or bytes_length(created_database.storage.header.db_uuid) != 16:
+        return err("YDBv1 create did not produce a uniquely identified initialized database")
+    if bytes_equal(created_database.storage.header.db_uuid, uuid): return err("YDBv1 create reused a different database's identity")
+    let created_wal_closed: Boolean = yaza_db_wal_log_close_v1(created_database.wal)?
+    let created_storage_closed: Boolean = yaza_db_storage_close_v1(created_database.storage)?
+    if not created_wal_closed or not created_storage_closed: return err("YDBv1 create handles did not close")
+    let created_reopened: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "catalog-created-smoke.ydb")?
+    if created_reopened.storage.header.catalog_root != 7: return err("YDBv1 create did not persist its system catalog through reopen")
+    let created_catalog: YazaDbCatalogRootV1 = yaza_db_catalog_storage_read_root_v1(created_reopened.storage.file, created_reopened.storage.header)?
+    if created_catalog.sys_tables_root != 3 or created_catalog.sys_columns_root != 4 or created_catalog.sys_indexes_root != 5 or created_catalog.sys_constraints_root != 6:
+        return err("YDBv1 create published invalid system catalog roots")
+    let created_reopen_wal_closed: Boolean = yaza_db_wal_log_close_v1(created_reopened.wal)?
+    let created_reopen_storage_closed: Boolean = yaza_db_storage_close_v1(created_reopened.storage)?
+    if not created_reopen_wal_closed or not created_reopen_storage_closed: return err("YDBv1 create reopen handles did not close")
+    let duplicate_create: Result[YazaDbCatalogBootstrapV1, Text] = yaza_db_catalog_create_v1(root, "catalog-created-smoke.ydb")
+    if result_is_ok(duplicate_create):
+        let ignored_duplicate_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(result_unwrap(duplicate_create).wal)
+        let ignored_duplicate_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(result_unwrap(duplicate_create).storage)
+        return err("YDBv1 create replaced an existing database")
+    if result_unwrap_error(duplicate_create) != "YDBv1 database name already exists": return err("YDBv1 duplicate create did not report the existing database name")
+    let existing_after_duplicate: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "catalog-created-smoke.ydb")?
+    if existing_after_duplicate.storage.header.catalog_root != 7: return err("YDBv1 rejected duplicate create but damaged the existing database")
+    let existing_after_duplicate_wal_closed: Boolean = yaza_db_wal_log_close_v1(existing_after_duplicate.wal)?
+    let existing_after_duplicate_storage_closed: Boolean = yaza_db_storage_close_v1(existing_after_duplicate.storage)?
+    if not existing_after_duplicate_wal_closed or not existing_after_duplicate_storage_closed: return err("YDBv1 duplicate-create verification handles did not close")
+
+    let partial_uuid: Bytes = bytes_from_text("cat-partial-uuid")
+    let partial_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(partial_uuid, 0, 1, 1, 0, 2, 1)
+    let partial_created: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, "catalog-partial-smoke.ydb", partial_header)?
+    let partial_created_closed: Boolean = yaza_db_storage_close_v1(partial_created)?
+    if not partial_created_closed: return err("YDBv1 partial-reservation fixture could not close its empty database")
+    let partial_open: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "catalog-partial-smoke.ydb")?
+    let partial_bitmap: Bytes = yaza_db_storage_read_page_v1(partial_open.storage.file, partial_open.storage.header, 2)?
+    let partial_bitmap_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(partial_bitmap, 2)?
+    let partial_bit_set: Boolean = yaza_db_bitmap_page_set_page_allocated_v1(partial_bitmap, 3, true, partial_bitmap_header.page_lsn, 2)?
+    if not partial_bit_set: return err("YDBv1 partial-reservation fixture could not set its test bit")
+    let partial_bitmap_written: Number = yaza_db_storage_write_page_sync_v1(partial_open.storage.file, partial_open.storage.header, partial_bitmap)?
+    if partial_bitmap_written != yaza_db_page_size_v1(): return err("YDBv1 partial-reservation fixture could not persist its test bit")
+    let reservation_wal_closed: Boolean = yaza_db_wal_log_close_v1(partial_open.wal)?
+    let reservation_storage_closed: Boolean = yaza_db_storage_close_v1(partial_open.storage)?
+    if not reservation_wal_closed or not reservation_storage_closed: return err("YDBv1 partial-reservation fixture handles did not close")
+    let rejected_partial: Result[YazaDbCatalogBootstrapV1, Text] = yaza_db_catalog_initialize_v1(root, "catalog-partial-smoke.ydb")
+    if result_is_ok(rejected_partial):
+        let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(result_unwrap(rejected_partial).wal)
+        let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(result_unwrap(rejected_partial).storage)
+        return err("YDBv1 catalog init accepted a partially reserved root-page range")
+    if result_unwrap_error(rejected_partial) != "YDBv1 catalog bootstrap found a partially reserved root-page range": return err("YDBv1 catalog init rejected partial reservation for the wrong reason")
+
+    let unsafe_uuid: Bytes = bytes_from_text("cat-unsafe-id001")
+    let unsafe_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(unsafe_uuid, 0, 1, 1, 0, 2, 1)
+    let unsafe_created: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, "catalog-unlogged-smoke.ydb", unsafe_header)?
+    let unsafe_created_closed: Boolean = yaza_db_storage_close_v1(unsafe_created)?
+    if not unsafe_created_closed: return err("YDBv1 unlogged-page fixture could not close its empty database")
+    let unsafe_open: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "catalog-unlogged-smoke.ydb")?
+    let unsafe_bitmap: Bytes = yaza_db_storage_read_page_v1(unsafe_open.storage.file, unsafe_open.storage.header, 2)?
+    let unsafe_bitmap_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(unsafe_bitmap, 2)?
+    var unsafe_page_id: Number = 3
+    while unsafe_page_id <= 7:
+        let unsafe_bit: Boolean = yaza_db_bitmap_page_set_page_allocated_v1(unsafe_bitmap, unsafe_page_id, true, unsafe_bitmap_header.page_lsn, 2)?
+        if not unsafe_bit: return err("YDBv1 unlogged-page fixture could not reserve its test range")
+        set unsafe_page_id = unsafe_page_id + 1
+    let unsafe_bitmap_written: Number = yaza_db_storage_write_page_sync_v1(unsafe_open.storage.file, unsafe_open.storage.header, unsafe_bitmap)?
+    if unsafe_bitmap_written != yaza_db_page_size_v1(): return err("YDBv1 unlogged-page fixture could not persist its reservation")
+    let unlogged_root: Bytes = yaza_db_page_new_v1(3, 1, 1, 0)?
+    let unlogged_root_written: Number = yaza_db_storage_write_page_sync_v1(unsafe_open.storage.file, unsafe_open.storage.header, unlogged_root)?
+    if unlogged_root_written != yaza_db_page_size_v1(): return err("YDBv1 unlogged-page fixture could not write its non-bootstrap page")
+    let unsafe_wal_closed: Boolean = yaza_db_wal_log_close_v1(unsafe_open.wal)?
+    let unsafe_storage_closed: Boolean = yaza_db_storage_close_v1(unsafe_open.storage)?
+    if not unsafe_wal_closed or not unsafe_storage_closed: return err("YDBv1 unlogged-page fixture handles did not close")
+    let rejected_unlogged: Result[YazaDbCatalogBootstrapV1, Text] = yaza_db_catalog_initialize_v1(root, "catalog-unlogged-smoke.ydb")
+    if result_is_ok(rejected_unlogged):
+        let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(result_unwrap(rejected_unlogged).wal)
+        let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(result_unwrap(rejected_unlogged).storage)
+        return err("YDBv1 catalog init overwrote a reserved page without a bootstrap WAL image")
+    if result_unwrap_error(rejected_unlogged) != "YDBv1 catalog bootstrap refuses a reserved page without a bootstrap FULL_PAGE_IMAGE": return err("YDBv1 catalog init rejected an unlogged reserved page for the wrong reason")
+
+    let removed: Boolean = remove(root, "catalog-init-smoke.ydb")?
+    if not removed: return err("YDBv1 catalog init fixture could not remove its database")
+    let removed_partial: Boolean = remove(root, "catalog-partial-smoke.ydb")?
+    if not removed_partial: return err("YDBv1 catalog init fixture could not remove its partial-state database")
+    let removed_unlogged: Boolean = remove(root, "catalog-unlogged-smoke.ydb")?
+    if not removed_unlogged: return err("YDBv1 catalog init fixture could not remove its unlogged-page database")
+    let removed_created: Boolean = remove(root, "catalog-created-smoke.ydb")?
+    if not removed_created: return err("YDBv1 catalog init fixture could not remove its created database")
+    let directory_sync: Boolean = sync_directory(root)?
+    if not directory_sync: return err("YDBv1 catalog init fixture cleanup sync failed")
+    let root_closed: Boolean = close(root)?
+    if not root_closed: return err("YDBv1 catalog init fixture root did not close")
+    return ok(installed_wal_end)
+
+start:
+    let outcome: Result[Number, Text] = yaza_base_catalog_init_v1_check(arg(1))
+    if result_is_ok(outcome):
+        say "yazabase-catalog-init-v1-ok wal-end=" + number_text(result_unwrap(outcome))
+    else:
+        say result_unwrap_error(outcome)

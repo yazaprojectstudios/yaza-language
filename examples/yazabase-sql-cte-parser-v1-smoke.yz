@@ -1,0 +1,57 @@
+use "../yazabase/sql_cte_v1"
+
+fn yazabase_sql_cte_parser_smoke() -> Result[Boolean, Text]:
+    let simple_source: Text = "WITH active AS (SELECT id, name FROM users WHERE name = 'a)') SELECT name FROM active WHERE id > 1"
+    let simple_result: Result[YazaSqlCteQueryV1, Text] = yaza_sql_cte_parse_v1(simple_source)
+    if not result_is_ok(simple_result): return err(result_unwrap_error(simple_result))
+    let simple: YazaSqlCteQueryV1 = result_unwrap(simple_result)
+    if simple.recursive or list_count(simple.definitions) != 1: return err("SQL CTE parser lost simple definition metadata")
+    let simple_definition: YazaSqlCteDefinitionV1 = list_get(simple.definitions, 0)
+    if text_slice(simple_source, simple_definition.name_token.start_byte, simple_definition.name_token.end_byte - simple_definition.name_token.start_byte) != "active":
+        return err("SQL CTE parser returned the wrong definition name span")
+    if text_find(simple_definition.query, "WHERE name = 'a)'") < 0: return err("SQL CTE parser confused a parenthesis inside a string with the definition boundary")
+    if simple_definition.query_start_byte < 0 or simple_definition.query_end_byte <= simple_definition.query_start_byte:
+        return err("SQL CTE parser returned invalid body source spans")
+    if not text_starts_with(simple.main_query, "SELECT name FROM active"):
+        return err("SQL CTE parser returned the wrong outer query")
+
+    let chained_source: Text = "WITH first_rows (user_id, label) AS (SELECT id, name FROM users), second_rows AS (SELECT user_id FROM first_rows WHERE user_id > 0) SELECT user_id FROM second_rows"
+    let chained_result: Result[YazaSqlCteQueryV1, Text] = yaza_sql_cte_parse_v1(chained_source)
+    if not result_is_ok(chained_result): return err(result_unwrap_error(chained_result))
+    let chained: YazaSqlCteQueryV1 = result_unwrap(chained_result)
+    if list_count(chained.definitions) != 2: return err("SQL CTE parser did not preserve multiple ordered definitions")
+    let first_definition: YazaSqlCteDefinitionV1 = list_get(chained.definitions, 0)
+    let second_definition: YazaSqlCteDefinitionV1 = list_get(chained.definitions, 1)
+    if list_count(first_definition.column_names) != 2 or list_count(second_definition.column_names) != 0:
+        return err("SQL CTE parser mishandled optional column aliases")
+    if text_slice(chained_source, first_definition.name_token.start_byte, first_definition.name_token.end_byte - first_definition.name_token.start_byte) != "first_rows":
+        return err("SQL CTE parser reordered the first definition")
+    if text_slice(chained_source, second_definition.name_token.start_byte, second_definition.name_token.end_byte - second_definition.name_token.start_byte) != "second_rows":
+        return err("SQL CTE parser reordered the second definition")
+
+    let quoted_source: Text = "WITH \"daily rows\" (\"order id\") AS (SELECT id FROM orders) SELECT \"order id\" FROM \"daily rows\""
+    let quoted_result: Result[YazaSqlCteQueryV1, Text] = yaza_sql_cte_parse_v1(quoted_source)
+    if not result_is_ok(quoted_result): return err(result_unwrap_error(quoted_result))
+    let quoted: YazaSqlCteQueryV1 = result_unwrap(quoted_result)
+    if text_slice(quoted_source, list_get(quoted.definitions, 0).name_token.start_byte, list_get(quoted.definitions, 0).name_token.end_byte - list_get(quoted.definitions, 0).name_token.start_byte) != "\"daily rows\"":
+        return err("SQL CTE parser lost a quoted identifier token")
+
+    let recursive_result: Result[YazaSqlCteQueryV1, Text] = yaza_sql_cte_parse_v1("WITH RECURSIVE tree AS (SELECT id FROM nodes) SELECT id FROM tree")
+    if not result_is_ok(recursive_result) or not result_unwrap(recursive_result).recursive:
+        return err("SQL CTE parser did not mark RECURSIVE for the binder's explicit support gate")
+
+    if result_is_ok(yaza_sql_cte_parse_v1("WITH broken AS SELECT id FROM users SELECT id FROM broken")):
+        return err("SQL CTE parser accepted a missing query parenthesis")
+    if result_is_ok(yaza_sql_cte_parse_v1("WITH broken (id,) AS (SELECT id FROM users) SELECT id FROM broken")):
+        return err("SQL CTE parser accepted a trailing comma in a column-alias list")
+    if result_is_ok(yaza_sql_cte_parse_v1("WITH broken AS (SELECT id FROM users)")):
+        return err("SQL CTE parser accepted a missing outer SELECT")
+    if result_is_ok(yaza_sql_cte_parse_v1("WITH first_rows AS (SELECT id FROM users), SELECT id FROM first_rows")):
+        return err("SQL CTE parser accepted an empty CTE definition after a comma")
+    return ok(true)
+
+start:
+    let outcome: Result[Boolean, Text] = yazabase_sql_cte_parser_smoke()
+    if not result_is_ok(outcome): say result_unwrap_error(outcome)
+    elif result_unwrap(outcome): say "yazabase-sql-cte-parser-ok"
+    else: say "SQL CTE parser fixture returned false"

@@ -1,0 +1,843 @@
+# Bounded SQL set-operation parsing and result combination for Phase 3.
+use "./sql_executor_v1"
+use "./sql_binder_v1"
+use "./sql_lexer_v1"
+use "./sql_parser_v2"
+
+shape YazaSqlSetOperatorV1:
+    kind: Number
+    all: Boolean
+
+shape YazaSqlSetOrderTermV1:
+    token: YazaSqlTokenV1
+    ordinal: Number
+    by_ordinal: Boolean
+    descending: Boolean
+
+shape YazaSqlSetQueryPartsV1:
+    branches: List[Text]
+    branch_start_bytes: List[Number]
+    operators: List[YazaSqlSetOperatorV1]
+    has_parameters: Boolean
+    order_terms: List[YazaSqlSetOrderTermV1]
+    has_limit: Boolean
+    limit: Number
+
+shape YazaSqlSetFinalModifiersV1:
+    order_terms: List[YazaSqlSetOrderTermV1]
+    has_limit: Boolean
+    limit: Number
+
+shape YazaSqlSetHashTableV1:
+    slots: List[Number]
+    capacity: Number
+
+shape YazaSqlSetLookupV1:
+    found: Boolean
+    slot: Number
+
+shape YazaSqlSetPreparedBranchV1:
+    source: Text
+    parameters: List[YazaSqlValueV1]
+
+fn yaza_sql_set_append_text_v1(current: Text, addition: Text) -> Result[Text, Text]:
+    return text_try_concat(current, addition)
+
+fn yaza_sql_set_positional_ordinal_v1(source: Text, token: YazaSqlTokenV1) -> Number:
+    if token.kind != 5 or token.end_byte - token.start_byte < 2 or text_byte(source, token.start_byte) != 36:
+        return -1
+    var value: Number = 0
+    var offset: Number = token.start_byte + 1
+    while offset < token.end_byte:
+        let byte: Number = text_byte(source, offset)
+        if byte < 48 or byte > 57: return -1
+        if value > 409: return -1
+        set value = value * 10 + byte - 48
+        if value > 4096: return -1
+        set offset = offset + 1
+    if value < 1: return -1
+    return value - 1
+
+fn yaza_sql_set_find_parameter_name_v1(names: List[Text], name: Text) -> Number:
+    var index: Number = 0
+    while index < list_count(names):
+        if list_get(names, index) == name: return index
+        set index = index + 1
+    return -1
+
+fn yaza_sql_set_prepare_branches_v1(parts: YazaSqlSetQueryPartsV1, parameters: List[YazaSqlValueV1]) -> Result[List[YazaSqlSetPreparedBranchV1], Text]:
+    # CTE bind preparation represents each definition and the final query as a
+    # branch; 16 definitions therefore require a bounded 17-entry mapping.
+    if list_count(parts.branches) < 2 or list_count(parts.branches) > 17 or list_count(parts.operators) + 1 != list_count(parts.branches):
+        return err("SQL set parameter preparation received inconsistent branch metadata")
+    if list_count(parameters) > 4096: return err("SQL set query exceeds the 4096-parameter limit")
+    let branches_created: Result[List[YazaSqlSetPreparedBranchV1], Text] = list_try_new()
+    if not result_is_ok(branches_created): return err("SQL set query could not allocate prepared branch metadata")
+    let prepared_branches: List[YazaSqlSetPreparedBranchV1] = result_unwrap(branches_created)
+    if not list_try_reserve(prepared_branches, list_count(parts.branches)):
+        return err("SQL set query could not reserve prepared branch metadata")
+    let names_created: Result[List[Text], Text] = list_try_new()
+    if not result_is_ok(names_created): return err("SQL set query could not allocate named parameter metadata")
+    let global_names: List[Text] = result_unwrap(names_created)
+    let used_created: Result[List[Boolean], Text] = list_try_new()
+    if not result_is_ok(used_created): return err("SQL set query could not allocate parameter-use metadata")
+    let global_used: List[Boolean] = result_unwrap(used_created)
+    if not list_try_reserve(global_used, list_count(parameters)):
+        return err("SQL set query could not reserve parameter-use metadata")
+    var parameter_index: Number = 0
+    while parameter_index < list_count(parameters):
+        if not list_try_push(global_used, false): return err("SQL set query could not initialize parameter-use metadata")
+        set parameter_index = parameter_index + 1
+
+    var parameter_style: Number = 0
+    var anonymous_parameter_count: Number = 0
+    var branch_index: Number = 0
+    while branch_index < list_count(parts.branches):
+        let branch_source: Text = list_get(parts.branches, branch_index)
+        let lexed: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(branch_source)
+        if not result_is_ok(lexed): return err(result_unwrap_error(lexed))
+        let tokens: List[YazaSqlTokenV1] = result_unwrap(lexed)
+        let local_ordinals_created: Result[List[Number], Text] = list_try_new()
+        if not result_is_ok(local_ordinals_created): return err("SQL set query could not allocate branch parameter mapping")
+        let local_global_ordinals: List[Number] = result_unwrap(local_ordinals_created)
+        let local_parameters_created: Result[List[YazaSqlValueV1], Text] = list_try_new()
+        if not result_is_ok(local_parameters_created): return err("SQL set query could not allocate branch parameter values")
+        let local_parameters: List[YazaSqlValueV1] = result_unwrap(local_parameters_created)
+        var rewritten_source: Text = ""
+        var source_cursor: Number = 0
+        var token_index: Number = 0
+        while token_index < list_count(tokens) and list_get(tokens, token_index).kind != 0:
+            let token: YazaSqlTokenV1 = list_get(tokens, token_index)
+            if token.kind == 5:
+                let first_byte: Number = text_byte(branch_source, token.start_byte)
+                var style: Number = 0
+                var global_ordinal: Number = -1
+                if first_byte == 36:
+                    set style = 2
+                    set global_ordinal = yaza_sql_set_positional_ordinal_v1(branch_source, token)
+                    if global_ordinal < 0:
+                        return err("SQL set query positional parameters must be numbered from $1 through $4096")
+                    if global_ordinal >= list_count(parameters):
+                        return err("SQL set query bind value count does not include every positional parameter")
+                    list_set(global_used, global_ordinal, true)
+                elif first_byte == 63:
+                    set style = 1
+                    if anonymous_parameter_count >= 4096: return err("SQL set query exceeds the 4096-parameter limit")
+                    set global_ordinal = anonymous_parameter_count
+                    set anonymous_parameter_count = anonymous_parameter_count + 1
+                elif first_byte == 58:
+                    set style = 3
+                    let name: Text = text_slice(branch_source, token.start_byte + 1, token.end_byte - token.start_byte - 1)
+                    let existing_name: Number = yaza_sql_set_find_parameter_name_v1(global_names, name)
+                    if existing_name >= 0:
+                        set global_ordinal = existing_name
+                    else:
+                        if list_count(global_names) >= 4096: return err("SQL set query exceeds the 4096-parameter limit")
+                        set global_ordinal = list_count(global_names)
+                        if not list_try_push(global_names, name): return err("SQL set query could not store a named parameter")
+                else:
+                    return err("SQL set query contains an invalid bind parameter")
+                if parameter_style != 0 and parameter_style != style:
+                    return err("SQL set query cannot mix positional, anonymous, and named bind styles")
+                set parameter_style = style
+                if global_ordinal < 0 or global_ordinal >= list_count(parameters):
+                    return err("SQL set query bind value count does not match its placeholders")
+
+                var local_ordinal: Number = 0
+                while local_ordinal < list_count(local_global_ordinals) and list_get(local_global_ordinals, local_ordinal) != global_ordinal:
+                    set local_ordinal = local_ordinal + 1
+                if local_ordinal == list_count(local_global_ordinals):
+                    if not list_try_push(local_global_ordinals, global_ordinal): return err("SQL set query could not map a branch parameter")
+                    if not list_try_push(local_parameters, list_get(parameters, global_ordinal)):
+                        return err("SQL set query could not map a branch bind value")
+
+                let prefix: Text = text_slice(branch_source, source_cursor, token.start_byte - source_cursor)
+                let with_prefix: Result[Text, Text] = yaza_sql_set_append_text_v1(rewritten_source, prefix)
+                if not result_is_ok(with_prefix): return err(result_unwrap_error(with_prefix))
+                set rewritten_source = result_unwrap(with_prefix)
+                let local_number: Result[Text, Text] = number_try_text(local_ordinal + 1)
+                if not result_is_ok(local_number): return err("SQL set query could not format a branch parameter")
+                let replacement: Result[Text, Text] = text_try_concat("$", result_unwrap(local_number))
+                if not result_is_ok(replacement): return err("SQL set query could not rewrite a branch parameter")
+                let with_replacement: Result[Text, Text] = yaza_sql_set_append_text_v1(rewritten_source, result_unwrap(replacement))
+                if not result_is_ok(with_replacement): return err(result_unwrap_error(with_replacement))
+                set rewritten_source = result_unwrap(with_replacement)
+                set source_cursor = token.end_byte
+            set token_index = token_index + 1
+
+        let suffix: Text = text_slice(branch_source, source_cursor, text_length(branch_source) - source_cursor)
+        let with_suffix: Result[Text, Text] = yaza_sql_set_append_text_v1(rewritten_source, suffix)
+        if not result_is_ok(with_suffix): return err(result_unwrap_error(with_suffix))
+        set rewritten_source = result_unwrap(with_suffix)
+        if not list_try_push(prepared_branches, YazaSqlSetPreparedBranchV1(rewritten_source, local_parameters)):
+            return err("SQL set query could not append a prepared branch")
+        set branch_index = branch_index + 1
+
+    if parameter_style == 0 and list_count(parameters) != 0:
+        return err("SQL set query received bind values but has no placeholders")
+    if parameter_style == 1 and anonymous_parameter_count != list_count(parameters):
+        return err("SQL set query anonymous bind value count does not match its placeholders")
+    if parameter_style == 3 and list_count(global_names) != list_count(parameters):
+        return err("SQL set query named bind value count does not match its distinct names")
+    if parameter_style == 2:
+        var used_index: Number = 0
+        while used_index < list_count(global_used):
+            if not list_get(global_used, used_index):
+                return err("SQL set query positional parameters must be contiguous and all bind values must be used")
+            set used_index = used_index + 1
+    return ok(prepared_branches)
+
+fn yaza_sql_set_operator_kind_v1(source: Text, tokens: List[YazaSqlTokenV1], index: Number) -> Number:
+    if yaza_sql_v2_is_keyword(source, tokens, index, "UNION"): return 1
+    if yaza_sql_v2_is_keyword(source, tokens, index, "INTERSECT"): return 2
+    if yaza_sql_v2_is_keyword(source, tokens, index, "EXCEPT"): return 3
+    return 0
+
+fn yaza_sql_set_parse_unsigned_v1(source: Text, token: YazaSqlTokenV1, maximum: Number, label: Text) -> Result[Number, Text]:
+    if token.kind != 3 or token.end_byte <= token.start_byte:
+        return err("SQL set parser expected an unsigned integer for " + label)
+    var value: Number = 0
+    var offset: Number = token.start_byte
+    while offset < token.end_byte:
+        let byte: Number = text_byte(source, offset)
+        if byte < 48 or byte > 57: return err("SQL set parser requires an unsigned integer for " + label)
+        set value = value * 10 + byte - 48
+        if value > maximum: return err("SQL set parser " + label + " exceeds its bounded profile")
+        set offset = offset + 1
+    return ok(value)
+
+fn yaza_sql_set_parse_final_modifiers_v1(source: Text, tokens: List[YazaSqlTokenV1], start_index: Number) -> Result[YazaSqlSetFinalModifiersV1, Text]:
+    let order_created: Result[List[YazaSqlSetOrderTermV1], Text] = list_try_new()
+    if not result_is_ok(order_created): return err("SQL set parser could not allocate ORDER BY metadata")
+    let order_terms: List[YazaSqlSetOrderTermV1] = result_unwrap(order_created)
+    var cursor: Number = start_index
+    if yaza_sql_v2_is_keyword(source, tokens, cursor, "ORDER"):
+        set cursor = cursor + 1
+        if not yaza_sql_v2_is_keyword(source, tokens, cursor, "BY"):
+            return err("SQL set parser expected BY after the final ORDER")
+        set cursor = cursor + 1
+        var done: Boolean = false
+        while not done:
+            if cursor >= list_count(tokens) or list_get(tokens, cursor).kind == 0:
+                return err("SQL set parser expected an ORDER BY output name or ordinal")
+            let token: YazaSqlTokenV1 = list_get(tokens, cursor)
+            var term: YazaSqlSetOrderTermV1 = YazaSqlSetOrderTermV1(token, -1, false, false)
+            if token.kind == 3:
+                let ordinal_result: Result[Number, Text] = yaza_sql_set_parse_unsigned_v1(source, token, 1024, "ORDER BY ordinal")
+                if not result_is_ok(ordinal_result): return err(result_unwrap_error(ordinal_result))
+                let ordinal: Number = result_unwrap(ordinal_result)
+                if ordinal < 1: return err("SQL set parser ORDER BY ordinal must start at 1")
+                set term = YazaSqlSetOrderTermV1(token, ordinal - 1, true, false)
+                set cursor = cursor + 1
+            elif token.kind == 1 or token.kind == 2:
+                let name_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, cursor, false)
+                if not result_is_ok(name_result): return err(result_unwrap_error(name_result))
+                let name: YazaSqlNameV2 = result_unwrap(name_result)
+                if name.part_count != 1: return err("SQL set ORDER BY accepts output names only; qualified names are not supported")
+                set term = YazaSqlSetOrderTermV1(name.first_token, -1, false, false)
+                set cursor = cursor + name.consumed_tokens
+            else:
+                return err("SQL set parser expected an ORDER BY output name or ordinal")
+            if yaza_sql_v2_is_keyword(source, tokens, cursor, "DESC"):
+                set term = YazaSqlSetOrderTermV1(term.token, term.ordinal, term.by_ordinal, true)
+                set cursor = cursor + 1
+            elif yaza_sql_v2_is_keyword(source, tokens, cursor, "ASC"):
+                set cursor = cursor + 1
+            if list_count(order_terms) >= 1024: return err("SQL set query exceeds the 1024-term ORDER BY limit")
+            if not list_try_push(order_terms, term): return err("SQL set parser could not append ORDER BY metadata")
+            if yaza_sql_v2_is_symbol(source, tokens, cursor, 44):
+                set cursor = cursor + 1
+            else:
+                set done = true
+
+    var has_limit: Boolean = false
+    var limit: Number = 0
+    if yaza_sql_v2_is_keyword(source, tokens, cursor, "LIMIT"):
+        set has_limit = true
+        set cursor = cursor + 1
+        if cursor >= list_count(tokens) or list_get(tokens, cursor).kind == 0:
+            return err("SQL set parser expected an integer after LIMIT")
+        let limit_result: Result[Number, Text] = yaza_sql_set_parse_unsigned_v1(source, list_get(tokens, cursor), 1000000, "LIMIT")
+        if not result_is_ok(limit_result): return err(result_unwrap_error(limit_result))
+        set limit = result_unwrap(limit_result)
+        set cursor = cursor + 1
+
+    if yaza_sql_v2_is_symbol(source, tokens, cursor, 59):
+        set cursor = cursor + 1
+    if cursor >= list_count(tokens) or list_get(tokens, cursor).kind != 0:
+        return err("SQL set parser found unsupported syntax after the final ORDER BY/LIMIT")
+    return ok(YazaSqlSetFinalModifiersV1(order_terms, has_limit, limit))
+
+fn yaza_sql_set_split_v1(source: Text) -> Result[YazaSqlSetQueryPartsV1, Text]:
+    let lexed: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(source)
+    if not result_is_ok(lexed): return err(result_unwrap_error(lexed))
+    let tokens: List[YazaSqlTokenV1] = result_unwrap(lexed)
+    let branches_created: Result[List[Text], Text] = list_try_new()
+    if not result_is_ok(branches_created): return err("SQL set parser could not allocate query branches")
+    let branches: List[Text] = result_unwrap(branches_created)
+    let branch_starts_created: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(branch_starts_created): return err("SQL set parser could not allocate branch source locations")
+    let branch_start_bytes: List[Number] = result_unwrap(branch_starts_created)
+    let operators_created: Result[List[YazaSqlSetOperatorV1], Text] = list_try_new()
+    if not result_is_ok(operators_created): return err("SQL set parser could not allocate operator metadata")
+    let operators: List[YazaSqlSetOperatorV1] = result_unwrap(operators_created)
+
+    var cursor: Number = 0
+    var depth: Number = 0
+    var branch_start: Number = 0
+    var has_parameters: Boolean = false
+    var modifier_before_set: Boolean = false
+    var modifier_started: Boolean = false
+    var modifier_token_index: Number = -1
+    var saw_terminator: Boolean = false
+    while cursor < list_count(tokens) and list_get(tokens, cursor).kind != 0:
+        let token: YazaSqlTokenV1 = list_get(tokens, cursor)
+        if token.kind == 5: set has_parameters = true
+        if yaza_sql_v2_is_symbol(source, tokens, cursor, 40):
+            set depth = depth + 1
+        elif yaza_sql_v2_is_symbol(source, tokens, cursor, 41):
+            set depth = depth - 1
+            if depth < 0: return err("SQL set parser found an unmatched closing parenthesis")
+        elif depth == 0:
+            if yaza_sql_v2_is_symbol(source, tokens, cursor, 59):
+                set saw_terminator = true
+            elif yaza_sql_v2_is_keyword(source, tokens, cursor, "ORDER") or yaza_sql_v2_is_keyword(source, tokens, cursor, "LIMIT"):
+                if list_count(operators) == 0:
+                    set modifier_before_set = true
+                elif not modifier_started:
+                    set modifier_started = true
+                    set modifier_token_index = cursor
+            let found_kind: Number = yaza_sql_set_operator_kind_v1(source, tokens, cursor)
+            if found_kind != 0:
+                if saw_terminator: return err("SQL set operator cannot follow a statement terminator")
+                if modifier_before_set: return err("SQL set branch ORDER BY/LIMIT is not supported; use final set-query modifiers")
+                if modifier_started: return err("SQL set operator cannot follow final ORDER BY/LIMIT modifiers")
+                if list_count(operators) >= 15: return err("SQL set query exceeds the 16-branch limit")
+                if token.start_byte <= branch_start:
+                    return err("SQL set operator has an empty left query branch")
+                if not list_try_push(branches, text_slice(source, branch_start, token.start_byte - branch_start)):
+                    return err("SQL set parser could not append a query branch")
+                if not list_try_push(branch_start_bytes, branch_start):
+                    return err("SQL set parser could not retain a branch source location")
+                var all: Boolean = false
+                var next_index: Number = cursor + 1
+                if yaza_sql_v2_is_keyword(source, tokens, next_index, "ALL"):
+                    set all = true
+                    set next_index = next_index + 1
+                elif yaza_sql_v2_is_keyword(source, tokens, next_index, "DISTINCT"):
+                    set next_index = next_index + 1
+                if not list_try_push(operators, YazaSqlSetOperatorV1(found_kind, all)):
+                    return err("SQL set parser could not append operator metadata")
+                if next_index >= list_count(tokens) or list_get(tokens, next_index).kind == 0:
+                    return err("SQL set operator has an empty right query branch")
+                set branch_start = list_get(tokens, next_index - 1).end_byte
+                set cursor = next_index - 1
+        set cursor = cursor + 1
+
+    if depth != 0: return err("SQL set parser found an unmatched opening parenthesis")
+    if list_count(operators) == 0:
+        return ok(YazaSqlSetQueryPartsV1(branches, branch_start_bytes, operators, has_parameters, List[YazaSqlSetOrderTermV1](), false, 0))
+    if modifier_before_set: return err("SQL set branch ORDER BY/LIMIT is not supported; use final set-query modifiers")
+    var branch_end: Number = text_length(source)
+    var order_terms: List[YazaSqlSetOrderTermV1] = List[YazaSqlSetOrderTermV1]()
+    var has_limit: Boolean = false
+    var limit: Number = 0
+    if modifier_started:
+        set branch_end = list_get(tokens, modifier_token_index).start_byte
+        let modifiers: Result[YazaSqlSetFinalModifiersV1, Text] = yaza_sql_set_parse_final_modifiers_v1(source, tokens, modifier_token_index)
+        if not result_is_ok(modifiers): return err(result_unwrap_error(modifiers))
+        set order_terms = result_unwrap(modifiers).order_terms
+        set has_limit = result_unwrap(modifiers).has_limit
+        set limit = result_unwrap(modifiers).limit
+    if branch_start >= branch_end: return err("SQL set query has an empty final branch")
+    if not list_try_push(branches, text_slice(source, branch_start, branch_end - branch_start)):
+        return err("SQL set parser could not append the final query branch")
+    if not list_try_push(branch_start_bytes, branch_start):
+        return err("SQL set parser could not retain the final branch source location")
+    if list_count(branches) != list_count(operators) + 1 or list_count(branch_start_bytes) != list_count(branches):
+        return err("SQL set parser produced inconsistent branch metadata")
+    return ok(YazaSqlSetQueryPartsV1(branches, branch_start_bytes, operators, has_parameters, order_terms, has_limit, limit))
+
+fn yaza_sql_set_mix_v1(hash_value: Number, value: Number) -> Number:
+    let modulus: Number = 1000000007
+    var normalized: Number = value % modulus
+    if normalized < 0: set normalized = normalized + modulus
+    return (hash_value * 257 + normalized + 1) % modulus
+
+fn yaza_sql_set_hash_row_v1(row: List[YazaSqlValueV1]) -> Result[Number, Text]:
+    if list_count(row) == 0 or list_count(row) > 1024: return err("SQL set operation received an invalid row width")
+    var hash_value: Number = 216613626
+    var column_index: Number = 0
+    while column_index < list_count(row):
+        let value: YazaSqlValueV1 = list_get(row, column_index)
+        if value.source_literal: return err("SQL set operation received a non-materialized output value")
+        set hash_value = yaza_sql_set_mix_v1(hash_value, value.type_id)
+        if value.is_null:
+            set hash_value = yaza_sql_set_mix_v1(hash_value, 1)
+        else:
+            set hash_value = yaza_sql_set_mix_v1(hash_value, 2)
+            if value.type_id == 1:
+                if value.boolean_value: set hash_value = yaza_sql_set_mix_v1(hash_value, 1)
+                else: set hash_value = yaza_sql_set_mix_v1(hash_value, 0)
+            elif value.type_id == 2 or value.type_id == 3 or value.type_id == 4 or value.type_id == 11 or value.type_id == 13 or value.type_id == 14 or value.type_id == 15:
+                set hash_value = yaza_sql_set_mix_v1(hash_value, value.integer_value)
+            elif value.type_id == 6:
+                if yaza_sql_executor_float_is_nan_v1(value.float_value):
+                    set hash_value = yaza_sql_set_mix_v1(hash_value, 3)
+                else:
+                    set hash_value = yaza_sql_set_mix_v1(hash_value, 4)
+                    var bits: Number = float64_bits(value.float_value)
+                    if value.float_value == 0.0: set bits = 0
+                    set hash_value = yaza_sql_set_mix_v1(hash_value, bits)
+            elif value.type_id == 9 or value.type_id == 12:
+                var byte_index: Number = 0
+                while byte_index < text_length(value.text_value):
+                    set hash_value = yaza_sql_set_mix_v1(hash_value, text_byte(value.text_value, byte_index))
+                    set byte_index = byte_index + 1
+            elif value.type_id == 16:
+                var byte_index: Number = 0
+                while byte_index < bytes_length(value.bytes_value):
+                    set hash_value = yaza_sql_set_mix_v1(hash_value, bytes_get(value.bytes_value, byte_index))
+                    set byte_index = byte_index + 1
+            else:
+                return err("SQL set operation received an unsupported scalar type")
+        set column_index = column_index + 1
+    return ok(hash_value)
+
+fn yaza_sql_set_rows_equal_v1(left: List[YazaSqlValueV1], right: List[YazaSqlValueV1]) -> Boolean:
+    if list_count(left) != list_count(right): return false
+    var index: Number = 0
+    while index < list_count(left):
+        let left_value: YazaSqlValueV1 = list_get(left, index)
+        let right_value: YazaSqlValueV1 = list_get(right, index)
+        if left_value.type_id != right_value.type_id: return false
+        if left_value.is_null != right_value.is_null: return false
+        if not left_value.is_null:
+            if left_value.type_id == 1:
+                if left_value.boolean_value != right_value.boolean_value: return false
+            elif left_value.type_id == 2 or left_value.type_id == 3 or left_value.type_id == 4 or left_value.type_id == 11 or left_value.type_id == 13 or left_value.type_id == 14 or left_value.type_id == 15:
+                if left_value.integer_value != right_value.integer_value: return false
+            elif left_value.type_id == 6:
+                let left_is_nan: Boolean = yaza_sql_executor_float_is_nan_v1(left_value.float_value)
+                let right_is_nan: Boolean = yaza_sql_executor_float_is_nan_v1(right_value.float_value)
+                if left_is_nan or right_is_nan:
+                    if left_is_nan != right_is_nan: return false
+                elif left_value.float_value != right_value.float_value:
+                    return false
+            elif left_value.type_id == 9 or left_value.type_id == 12:
+                if text_compare(left_value.text_value, right_value.text_value) != 0: return false
+            elif left_value.type_id == 16:
+                if yaza_sql_executor_compare_bytes_v1(left_value.bytes_value, right_value.bytes_value) != 0: return false
+            else:
+                return false
+        set index = index + 1
+    return true
+
+fn yaza_sql_set_hash_table_v1(expected_rows: Number) -> Result[YazaSqlSetHashTableV1, Text]:
+    if expected_rows < 0 or expected_rows > 65536: return err("SQL set hash table size exceeds its row bound")
+    var capacity: Number = 2
+    var target_capacity: Number = expected_rows * 2
+    if target_capacity < 2: set target_capacity = 2
+    while capacity < target_capacity:
+        set capacity = capacity * 2
+    let slots_created: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(slots_created): return err("SQL set operation could not allocate its hash table")
+    let slots: List[Number] = result_unwrap(slots_created)
+    if not list_try_reserve(slots, capacity): return err("SQL set operation could not reserve its hash table")
+    var index: Number = 0
+    while index < capacity:
+        if not list_try_push(slots, 0): return err("SQL set operation could not initialize its hash table")
+        set index = index + 1
+    return ok(YazaSqlSetHashTableV1(slots, capacity))
+
+fn yaza_sql_set_lookup_v1(table: YazaSqlSetHashTableV1, rows: List[List[YazaSqlValueV1]], candidate: List[YazaSqlValueV1]) -> Result[YazaSqlSetLookupV1, Text]:
+    let hashed: Number = yaza_sql_set_hash_row_v1(candidate)?
+    var probe: Number = 0
+    var probe_limit: Number = table.capacity
+    if probe_limit > 128: set probe_limit = 128
+    while probe < probe_limit:
+        let slot: Number = (hashed + probe) % table.capacity
+        let entry: Number = list_get(table.slots, slot)
+        if entry == 0: return ok(YazaSqlSetLookupV1(false, slot))
+        if entry < 1 or entry > list_count(rows): return err("SQL set operation hash slot references an invalid row")
+        if yaza_sql_set_rows_equal_v1(list_get(rows, entry - 1), candidate): return ok(YazaSqlSetLookupV1(true, slot))
+        set probe = probe + 1
+    return err("SQL set operation exceeded its 128-probe collision bound")
+
+fn yaza_sql_set_index_row_v1(table: YazaSqlSetHashTableV1, rows: List[List[YazaSqlValueV1]], row_index: Number) -> Result[Boolean, Text]:
+    if row_index < 0 or row_index >= list_count(rows): return err("SQL set operation cannot index an invalid source row")
+    let row: List[YazaSqlValueV1] = list_get(rows, row_index)
+    let lookup: YazaSqlSetLookupV1 = yaza_sql_set_lookup_v1(table, rows, row)?
+    if lookup.found: return ok(false)
+    if not list_try_set(table.slots, lookup.slot, row_index + 1): return err("SQL set operation could not update its hash table")
+    return ok(true)
+
+fn yaza_sql_set_contains_v1(table: YazaSqlSetHashTableV1, rows: List[List[YazaSqlValueV1]], candidate: List[YazaSqlValueV1]) -> Result[Boolean, Text]:
+    let lookup: YazaSqlSetLookupV1 = yaza_sql_set_lookup_v1(table, rows, candidate)?
+    return ok(lookup.found)
+
+fn yaza_sql_set_add_unique_v1(table: YazaSqlSetHashTableV1, rows: List[List[YazaSqlValueV1]], candidate: List[YazaSqlValueV1]) -> Result[Boolean, Text]:
+    let lookup: YazaSqlSetLookupV1 = yaza_sql_set_lookup_v1(table, rows, candidate)?
+    if lookup.found: return ok(false)
+    if list_count(rows) >= 65536: return err("SQL set operation output exceeds its 65536-row bound")
+    if not list_try_push(rows, candidate): return err("SQL set operation could not append a unique result row")
+    if not list_try_set(table.slots, lookup.slot, list_count(rows)): return err("SQL set operation could not update its output hash table")
+    return ok(true)
+
+fn yaza_sql_set_validate_results_v1(left: YazaSqlQueryResultV1, right: YazaSqlQueryResultV1) -> Result[Boolean, Text]:
+    let column_count: Number = list_count(left.columns)
+    if column_count == 0 or column_count > 1024 or list_count(right.columns) != column_count:
+        return err("SQL set-operation branches must return the same non-empty number of columns")
+    var column_index: Number = 0
+    while column_index < column_count:
+        if list_get(left.columns, column_index).type_id != list_get(right.columns, column_index).type_id:
+            return err("SQL set-operation branch column types must match exactly")
+        set column_index = column_index + 1
+    let combined_rows: Number = list_count(left.rows) + list_count(right.rows)
+    if combined_rows > 65536 or combined_rows * column_count > 1048576:
+        return err("SQL set-operation input exceeds its combined row or cell bound")
+    var text_bytes: Number = 0
+    var result_index: Number = 0
+    while result_index < 2:
+        var row_index: Number = 0
+        var rows: List[List[YazaSqlValueV1]] = left.rows
+        if result_index == 1: set rows = right.rows
+        while row_index < list_count(rows):
+            let row: List[YazaSqlValueV1] = list_get(rows, row_index)
+            if list_count(row) != column_count: return err("SQL set-operation branch returned a row with an invalid width")
+            set column_index = 0
+            while column_index < column_count:
+                let value: YazaSqlValueV1 = list_get(row, column_index)
+                if value.type_id != list_get(left.columns, column_index).type_id or value.source_literal:
+                    return err("SQL set-operation row values do not match their output schema")
+                if (value.type_id == 9 or value.type_id == 16) and not value.is_null:
+                    let length: Number = yaza_sql_value_variable_length_v1(value)?
+                    if length > 67108864 - text_bytes: return err("SQL set-operation variable-width input exceeds its 64 MiB bound")
+                    set text_bytes = text_bytes + length
+                set column_index = column_index + 1
+            set row_index = row_index + 1
+        set result_index = result_index + 1
+    return ok(true)
+
+fn yaza_sql_set_result_text_bytes_v1(result: YazaSqlQueryResultV1) -> Result[Number, Text]:
+    var total_text_bytes: Number = 0
+    var row_index: Number = 0
+    while row_index < list_count(result.rows):
+        let row: List[YazaSqlValueV1] = list_get(result.rows, row_index)
+        if list_count(row) != list_count(result.columns): return err("SQL set-operation result row width is invalid during resource accounting")
+        var column_index: Number = 0
+        while column_index < list_count(row):
+            let value: YazaSqlValueV1 = list_get(row, column_index)
+            if (value.type_id == 9 or value.type_id == 16) and not value.is_null:
+                let byte_count: Number = yaza_sql_value_variable_length_v1(value)?
+                if byte_count > 67108864 - total_text_bytes: return err("SQL set-operation result exceeds its bounded variable-width byte profile")
+                set total_text_bytes = total_text_bytes + byte_count
+            set column_index = column_index + 1
+        set row_index = row_index + 1
+    return ok(total_text_bytes)
+
+fn yaza_sql_set_combine_all_v1(left: YazaSqlQueryResultV1, right: YazaSqlQueryResultV1, operation: YazaSqlSetOperatorV1, output: List[List[YazaSqlValueV1]]) -> Result[Boolean, Text]:
+    if operation.kind != 2 and operation.kind != 3:
+        return err("SQL multiset operation received an unsupported operator")
+    let right_index: YazaSqlSetHashTableV1 = yaza_sql_set_hash_table_v1(list_count(right.rows))?
+    let unique_rows_created: Result[List[List[YazaSqlValueV1]], Text] = list_try_new()
+    if not result_is_ok(unique_rows_created): return err("SQL multiset operation could not allocate right-side row keys")
+    let unique_rows: List[List[YazaSqlValueV1]] = result_unwrap(unique_rows_created)
+    let counts_created: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(counts_created): return err("SQL multiset operation could not allocate right-side multiplicities")
+    let counts: List[Number] = result_unwrap(counts_created)
+    if not list_try_reserve(unique_rows, list_count(right.rows)) or not list_try_reserve(counts, list_count(right.rows)):
+        return err("SQL multiset operation could not reserve right-side multiplicities")
+
+    var row_index: Number = 0
+    while row_index < list_count(right.rows):
+        let candidate: List[YazaSqlValueV1] = list_get(right.rows, row_index)
+        let lookup: YazaSqlSetLookupV1 = yaza_sql_set_lookup_v1(right_index, unique_rows, candidate)?
+        if lookup.found:
+            let entry: Number = list_get(right_index.slots, lookup.slot)
+            if entry < 1 or entry > list_count(counts): return err("SQL multiset hash slot references an invalid multiplicity")
+            let count: Number = list_get(counts, entry - 1)
+            if count >= 65536: return err("SQL multiset multiplicity exceeds the combined-row bound")
+            if not list_try_set(counts, entry - 1, count + 1): return err("SQL multiset operation could not update a row multiplicity")
+        else:
+            if not list_try_push(unique_rows, candidate): return err("SQL multiset operation could not index a right-side row")
+            if not list_try_push(counts, 1): return err("SQL multiset operation could not initialize a row multiplicity")
+            if not list_try_set(right_index.slots, lookup.slot, list_count(unique_rows)):
+                return err("SQL multiset operation could not publish a row key")
+        set row_index = row_index + 1
+
+    set row_index = 0
+    while row_index < list_count(left.rows):
+        let candidate: List[YazaSqlValueV1] = list_get(left.rows, row_index)
+        let lookup: YazaSqlSetLookupV1 = yaza_sql_set_lookup_v1(right_index, unique_rows, candidate)?
+        var remaining: Number = 0
+        var has_right_match: Boolean = lookup.found
+        if lookup.found:
+            let entry: Number = list_get(right_index.slots, lookup.slot)
+            if entry < 1 or entry > list_count(counts): return err("SQL multiset hash slot references an invalid multiplicity")
+            set remaining = list_get(counts, entry - 1)
+        if has_right_match and remaining > 0:
+            if operation.kind == 2:
+                if not list_try_push(output, candidate): return err("SQL INTERSECT ALL could not append a result row")
+            let entry: Number = list_get(right_index.slots, lookup.slot)
+            if not list_try_set(counts, entry - 1, remaining - 1): return err("SQL multiset operation could not consume a row multiplicity")
+        elif operation.kind == 3:
+            if not list_try_push(output, candidate): return err("SQL EXCEPT ALL could not append a result row")
+        set row_index = row_index + 1
+    return ok(true)
+
+fn yaza_sql_set_combine_with_prior_v1(left: YazaSqlQueryResultV1, right: YazaSqlQueryResultV1, operation: YazaSqlSetOperatorV1, statement_prior_work_units: Number) -> Result[YazaSqlQueryResultV1, Text]:
+    if statement_prior_work_units < 0 or statement_prior_work_units > yaza_sql_executor_max_work_units_v1(): return err("SQL set operation prior statement work is outside its bound")
+    let validated: Boolean = yaza_sql_set_validate_results_v1(left, right)?
+    if not validated: return err("SQL set-operation branch validation failed")
+    let total_rows: Number = list_count(left.rows) + list_count(right.rows)
+    if total_rows > 65536: return err("SQL set operation input exceeds the 65536-row bound")
+    if left.work_units < 0 or right.work_units < 0 or left.work_units > yaza_sql_executor_max_work_units_v1() - statement_prior_work_units or right.work_units > yaza_sql_executor_max_work_units_v1() - statement_prior_work_units - left.work_units:
+        return err("SQL set operation branches exceed the remaining statement work budget")
+    let branch_work: Number = left.work_units + right.work_units
+    let combine_work: Number = total_rows * (list_count(left.columns) + 1)
+    if combine_work > yaza_sql_executor_max_work_units_v1() - statement_prior_work_units - branch_work:
+        return err("SQL set operation exceeds the statement-wide work budget")
+    if left.auxiliary_rows < 0 or right.auxiliary_rows < 0 or left.auxiliary_cells < 0 or right.auxiliary_cells < 0 or left.auxiliary_text_bytes < 0 or right.auxiliary_text_bytes < 0:
+        return err("SQL set operation received invalid branch materialization counters")
+    let auxiliary_rows: Number = left.auxiliary_rows + right.auxiliary_rows + total_rows
+    let input_cells: Number = total_rows * list_count(left.columns)
+    let auxiliary_cells: Number = left.auxiliary_cells + right.auxiliary_cells + input_cells
+    if auxiliary_rows > 65536 or auxiliary_cells > yaza_sql_executor_max_input_cells_v1():
+        return err("SQL set operation intermediates exceed the statement-wide materialization budget")
+    let left_text_bytes: Number = yaza_sql_set_result_text_bytes_v1(left)?
+    let right_text_bytes: Number = yaza_sql_set_result_text_bytes_v1(right)?
+    let auxiliary_text_bytes: Number = left.auxiliary_text_bytes + right.auxiliary_text_bytes + left_text_bytes + right_text_bytes
+    if auxiliary_text_bytes > 67108864:
+        return err("SQL set operation intermediates exceed the statement-wide Text budget")
+    let output_created: Result[List[List[YazaSqlValueV1]], Text] = list_try_new()
+    if not result_is_ok(output_created): return err("SQL set operation could not allocate its output rows")
+    let output: List[List[YazaSqlValueV1]] = result_unwrap(output_created)
+    if operation.kind == 1 and operation.all:
+        if not list_try_reserve(output, total_rows): return err("SQL UNION ALL could not reserve its output rows")
+        var row_index: Number = 0
+        while row_index < list_count(left.rows):
+            if not list_try_push(output, list_get(left.rows, row_index)): return err("SQL UNION ALL could not append its left rows")
+            set row_index = row_index + 1
+        set row_index = 0
+        while row_index < list_count(right.rows):
+            if not list_try_push(output, list_get(right.rows, row_index)): return err("SQL UNION ALL could not append its right rows")
+            set row_index = row_index + 1
+    elif operation.all and (operation.kind == 2 or operation.kind == 3):
+        if not list_try_reserve(output, total_rows): return err("SQL multiset operation could not reserve its output rows")
+        let combined: Boolean = yaza_sql_set_combine_all_v1(left, right, operation, output)?
+        if not combined: return err("SQL multiset operation failed")
+    elif operation.kind == 1:
+        let output_index: YazaSqlSetHashTableV1 = yaza_sql_set_hash_table_v1(total_rows)?
+        var row_index: Number = 0
+        while row_index < list_count(left.rows):
+            let added: Boolean = yaza_sql_set_add_unique_v1(output_index, output, list_get(left.rows, row_index))?
+            set row_index = row_index + 1
+        set row_index = 0
+        while row_index < list_count(right.rows):
+            let added: Boolean = yaza_sql_set_add_unique_v1(output_index, output, list_get(right.rows, row_index))?
+            set row_index = row_index + 1
+    elif operation.kind == 2 or operation.kind == 3:
+        let right_index: YazaSqlSetHashTableV1 = yaza_sql_set_hash_table_v1(list_count(right.rows))?
+        var row_index: Number = 0
+        while row_index < list_count(right.rows):
+            let indexed: Boolean = yaza_sql_set_index_row_v1(right_index, right.rows, row_index)?
+            set row_index = row_index + 1
+        let output_index: YazaSqlSetHashTableV1 = yaza_sql_set_hash_table_v1(list_count(left.rows))?
+        set row_index = 0
+        while row_index < list_count(left.rows):
+            let candidate: List[YazaSqlValueV1] = list_get(left.rows, row_index)
+            let contains: Boolean = yaza_sql_set_contains_v1(right_index, right.rows, candidate)?
+            var should_emit: Boolean = contains
+            if operation.kind == 3: set should_emit = not contains
+            if should_emit:
+                let added: Boolean = yaza_sql_set_add_unique_v1(output_index, output, candidate)?
+            set row_index = row_index + 1
+    else:
+        return err("SQL set operation has an unknown operator")
+    return ok(YazaSqlQueryResultV1(left.columns, output, branch_work + combine_work, auxiliary_rows, auxiliary_cells, auxiliary_text_bytes))
+
+fn yaza_sql_set_combine_v1(left: YazaSqlQueryResultV1, right: YazaSqlQueryResultV1, operation: YazaSqlSetOperatorV1) -> Result[YazaSqlQueryResultV1, Text]:
+    return yaza_sql_set_combine_with_prior_v1(left, right, operation, 0)
+
+fn yaza_sql_set_operator_precedence_v1(kind: Number) -> Number:
+    if kind == 2: return 2
+    if kind == 1 or kind == 3: return 1
+    return 0
+
+fn yaza_sql_set_reduce_top_with_prior_v1(values: List[YazaSqlQueryResultV1], value_count: Number, operators: List[YazaSqlSetOperatorV1], operator_count: Number, statement_prior_work_units: Number) -> Result[Boolean, Text]:
+    if value_count < 2 or operator_count < 1: return err("SQL set precedence reducer received an incomplete expression")
+    let left: YazaSqlQueryResultV1 = list_get(values, value_count - 2)
+    let right: YazaSqlQueryResultV1 = list_get(values, value_count - 1)
+    let operation: YazaSqlSetOperatorV1 = list_get(operators, operator_count - 1)
+    let combined: YazaSqlQueryResultV1 = yaza_sql_set_combine_with_prior_v1(left, right, operation, statement_prior_work_units)?
+    list_set(values, value_count - 2, combined)
+    return ok(true)
+
+fn yaza_sql_set_reduce_top_v1(values: List[YazaSqlQueryResultV1], value_count: Number, operators: List[YazaSqlSetOperatorV1], operator_count: Number) -> Result[Boolean, Text]:
+    return yaza_sql_set_reduce_top_with_prior_v1(values, value_count, operators, operator_count, 0)
+
+fn yaza_sql_set_evaluate_with_prior_v1(branch_results: List[YazaSqlQueryResultV1], source_operators: List[YazaSqlSetOperatorV1], statement_prior_work_units: Number) -> Result[YazaSqlQueryResultV1, Text]:
+    if statement_prior_work_units < 0 or statement_prior_work_units > yaza_sql_executor_max_work_units_v1(): return err("SQL set query prior statement work is outside its bound")
+    if list_count(branch_results) < 2 or list_count(branch_results) > 16 or list_count(source_operators) + 1 != list_count(branch_results):
+        return err("SQL set evaluator received inconsistent branch metadata")
+    let values_created: Result[List[YazaSqlQueryResultV1], Text] = list_try_new()
+    if not result_is_ok(values_created): return err("SQL set evaluator could not allocate its result stack")
+    let values: List[YazaSqlQueryResultV1] = result_unwrap(values_created)
+    if not list_try_reserve(values, list_count(branch_results)):
+        return err("SQL set evaluator could not reserve its result stack")
+    if not list_try_push(values, list_get(branch_results, 0)):
+        return err("SQL set evaluator could not initialize its result stack")
+    let operators_created: Result[List[YazaSqlSetOperatorV1], Text] = list_try_new()
+    if not result_is_ok(operators_created): return err("SQL set evaluator could not allocate its operator stack")
+    let operators: List[YazaSqlSetOperatorV1] = result_unwrap(operators_created)
+    if not list_try_reserve(operators, list_count(source_operators)):
+        return err("SQL set evaluator could not reserve its operator stack")
+    var value_count: Number = 1
+    var operator_count: Number = 0
+    var operator_index: Number = 0
+    while operator_index < list_count(source_operators):
+        let current: YazaSqlSetOperatorV1 = list_get(source_operators, operator_index)
+        let current_precedence: Number = yaza_sql_set_operator_precedence_v1(current.kind)
+        if current_precedence == 0: return err("SQL set evaluator received an unknown operator")
+        var reducing: Boolean = true
+        while reducing and operator_count > 0:
+            let top: YazaSqlSetOperatorV1 = list_get(operators, operator_count - 1)
+            if yaza_sql_set_operator_precedence_v1(top.kind) >= current_precedence:
+                let reduced: Boolean = yaza_sql_set_reduce_top_with_prior_v1(values, value_count, operators, operator_count, statement_prior_work_units)?
+                if not reduced: return err("SQL set evaluator could not reduce its operator stack")
+                set value_count = value_count - 1
+                set operator_count = operator_count - 1
+            else:
+                set reducing = false
+        if operator_count < list_count(operators):
+            list_set(operators, operator_count, current)
+        elif not list_try_push(operators, current):
+            return err("SQL set evaluator could not push an operator")
+        set operator_count = operator_count + 1
+        let next_branch: YazaSqlQueryResultV1 = list_get(branch_results, operator_index + 1)
+        if value_count < list_count(values):
+            list_set(values, value_count, next_branch)
+        elif not list_try_push(values, next_branch):
+            return err("SQL set evaluator could not push a branch result")
+        set value_count = value_count + 1
+        set operator_index = operator_index + 1
+    while operator_count > 0:
+        let reduced: Boolean = yaza_sql_set_reduce_top_with_prior_v1(values, value_count, operators, operator_count, statement_prior_work_units)?
+        if not reduced: return err("SQL set evaluator could not finish reducing operators")
+        set value_count = value_count - 1
+        set operator_count = operator_count - 1
+    if value_count != 1: return err("SQL set evaluator produced an invalid result-stack width")
+    return ok(list_get(values, 0))
+
+fn yaza_sql_set_evaluate_v1(branch_results: List[YazaSqlQueryResultV1], source_operators: List[YazaSqlSetOperatorV1]) -> Result[YazaSqlQueryResultV1, Text]:
+    return yaza_sql_set_evaluate_with_prior_v1(branch_results, source_operators, 0)
+
+fn yaza_sql_set_apply_final_modifiers_with_prior_v1(result: YazaSqlQueryResultV1, parts: YazaSqlSetQueryPartsV1, source: Text, statement_prior_work_units: Number) -> Result[YazaSqlQueryResultV1, Text]:
+    if statement_prior_work_units < 0 or statement_prior_work_units > yaza_sql_executor_max_work_units_v1() or result.work_units < 0 or result.work_units > yaza_sql_executor_max_work_units_v1() - statement_prior_work_units:
+        return err("SQL set modifiers prior query work exceeds the statement budget")
+    var copy_count: Number = list_count(result.rows)
+    if list_count(parts.order_terms) == 0 and parts.has_limit and parts.limit < copy_count:
+        set copy_count = parts.limit
+    var modifier_work_units: Number = copy_count * list_count(result.columns)
+    if modifier_work_units > yaza_sql_executor_max_work_units_v1() - statement_prior_work_units - result.work_units:
+        return err("SQL set final row-copy work exceeds the statement budget")
+    let rows_created: Result[List[List[YazaSqlValueV1]], Text] = list_try_new()
+    if not result_is_ok(rows_created): return err("SQL set modifiers could not allocate their row view")
+    let rows_copy: List[List[YazaSqlValueV1]] = result_unwrap(rows_created)
+    if not list_try_reserve(rows_copy, copy_count):
+        return err("SQL set modifiers could not reserve their row view")
+    var copy_index: Number = 0
+    while copy_index < copy_count:
+        if not list_try_push(rows_copy, list_get(result.rows, copy_index)):
+            return err("SQL set modifiers could not copy a result row")
+        set copy_index = copy_index + 1
+
+    var order_by: List[YazaSqlBoundOrderTermV1] = List[YazaSqlBoundOrderTermV1]()
+    if list_count(parts.order_terms) > 0:
+        let order_created: Result[List[YazaSqlBoundOrderTermV1], Text] = list_try_new()
+        if not result_is_ok(order_created): return err("SQL set query could not allocate bound ORDER BY terms")
+        set order_by = result_unwrap(order_created)
+        if not list_try_reserve(order_by, list_count(parts.order_terms)):
+            return err("SQL set query could not reserve bound ORDER BY terms")
+        var term_index: Number = 0
+        while term_index < list_count(parts.order_terms):
+            let term: YazaSqlSetOrderTermV1 = list_get(parts.order_terms, term_index)
+            var projection_ordinal: Number = term.ordinal
+            if not term.by_ordinal:
+                set projection_ordinal = -1
+                var matches: Number = 0
+                var column_index: Number = 0
+                while column_index < list_count(result.columns):
+                    let projection: YazaSqlBoundProjectionV1 = list_get(result.columns, column_index)
+                    if yaza_sql_bind_v1_identifier_matches(source, term.token, projection.output_name):
+                        set projection_ordinal = column_index
+                        set matches = matches + 1
+                    set column_index = column_index + 1
+                if matches == 0: return err("SQL set ORDER BY name is not present in the output columns")
+                if matches > 1: return err("SQL set ORDER BY name is ambiguous in the output columns")
+            if projection_ordinal < 0 or projection_ordinal >= list_count(result.columns):
+                return err("SQL set ORDER BY ordinal is outside the output width")
+            if not list_try_push(order_by, YazaSqlBoundOrderTermV1(projection_ordinal, term.descending)):
+                return err("SQL set query could not append a bound ORDER BY term")
+            set term_index = term_index + 1
+
+        var row_count: Number = list_count(result.rows)
+        var sort_levels: Number = 0
+        while row_count > 1:
+            set row_count = (row_count + 1) / 2
+            set sort_levels = sort_levels + 1
+        var text_terms: Number = 0
+        var max_text_bytes: Number = 0
+        var order_index: Number = 0
+        while order_index < list_count(order_by):
+            let order_term: YazaSqlBoundOrderTermV1 = list_get(order_by, order_index)
+            if list_get(result.columns, order_term.projection_ordinal).type_id == 9 or list_get(result.columns, order_term.projection_ordinal).type_id == 16:
+                set text_terms = text_terms + 1
+                var row_index: Number = 0
+                while row_index < list_count(result.rows):
+                    let value: YazaSqlValueV1 = list_get(list_get(result.rows, row_index), order_term.projection_ordinal)
+                    if not value.is_null:
+                        let text_bytes: Number = yaza_sql_value_variable_length_v1(value)?
+                        if value.type_id == 9 and text_bytes > yaza_sql_executor_max_text_value_bytes_v1():
+                            return err("SQL set ORDER BY text value exceeds the bounded value-size limit")
+                        if text_bytes > max_text_bytes: set max_text_bytes = text_bytes
+                    set row_index = row_index + 1
+            set order_index = order_index + 1
+        let comparison_bound: Number = 4 * list_count(result.rows) * (sort_levels + 1)
+        let work_bound: Number = comparison_bound * list_count(order_by) + comparison_bound * text_terms * (2 * max_text_bytes + 1)
+        if work_bound > yaza_sql_executor_max_work_units_v1() - statement_prior_work_units - result.work_units - modifier_work_units:
+            return err("SQL set ORDER BY exceeds the remaining statement work budget")
+        set modifier_work_units = modifier_work_units + work_bound
+        let sort_plan: YazaSqlBoundPlanV1 = YazaSqlBoundPlanV1(1, 0, 0, 0, 0, 0, -1, -1, 0, List[YazaSqlBoundJoinStageV1](), source, false, result.columns, List[Number](), order_by, List[YazaSqlBoundExpressionNodeV1](), List[Text](), List[List[Number]](), -1, -1, List[YazaSqlBoundParameterV1](), List[YazaSqlLogicalOperatorV1](), -1, -1, false, 0, 0)
+        yaza_sql_executor_sort_rows_v1(sort_plan, YazaSqlRowsHandleV1(rows_copy))
+
+    var rows: List[List[YazaSqlValueV1]] = rows_copy
+    if parts.has_limit and list_count(rows) > parts.limit:
+        let limit_copy_work: Number = parts.limit * list_count(result.columns)
+        if limit_copy_work > yaza_sql_executor_max_work_units_v1() - statement_prior_work_units - result.work_units - modifier_work_units:
+            return err("SQL set LIMIT copy exceeds the remaining statement work budget")
+        set modifier_work_units = modifier_work_units + limit_copy_work
+        let limited_created: Result[List[List[YazaSqlValueV1]], Text] = list_try_new()
+        if not result_is_ok(limited_created): return err("SQL set LIMIT could not allocate its output")
+        let limited: List[List[YazaSqlValueV1]] = result_unwrap(limited_created)
+        if not list_try_reserve(limited, parts.limit): return err("SQL set LIMIT could not reserve its output")
+        var row_index: Number = 0
+        while row_index < parts.limit:
+            if not list_try_push(limited, list_get(rows, row_index)):
+                return err("SQL set LIMIT could not append an output row")
+            set row_index = row_index + 1
+        set rows = limited
+    let input_text_bytes: Number = yaza_sql_set_result_text_bytes_v1(result)?
+    let retained_rows: Number = result.auxiliary_rows + list_count(result.rows)
+    let retained_cells: Number = result.auxiliary_cells + list_count(result.rows) * list_count(result.columns)
+    let retained_text_bytes: Number = result.auxiliary_text_bytes + input_text_bytes
+    if retained_rows < result.auxiliary_rows or retained_rows > 65536 or retained_cells < result.auxiliary_cells or retained_cells > yaza_sql_executor_max_input_cells_v1() or retained_text_bytes < result.auxiliary_text_bytes or retained_text_bytes > yaza_sql_executor_max_input_text_bytes_v1():
+        return err("SQL set final modifiers exceed the statement-wide materialization budget")
+    let total_work: Number = result.work_units + modifier_work_units
+    if total_work < result.work_units or total_work > yaza_sql_executor_max_work_units_v1() - statement_prior_work_units:
+        return err("SQL set final modifiers exceed the statement-wide work budget")
+    return ok(YazaSqlQueryResultV1(result.columns, rows, total_work, retained_rows, retained_cells, retained_text_bytes))
+
+fn yaza_sql_set_apply_final_modifiers_v1(result: YazaSqlQueryResultV1, parts: YazaSqlSetQueryPartsV1, source: Text) -> Result[YazaSqlQueryResultV1, Text]:
+    return yaza_sql_set_apply_final_modifiers_with_prior_v1(result, parts, source, 0)

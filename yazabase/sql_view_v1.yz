@@ -1,0 +1,181 @@
+# Bounded CREATE/DROP VIEW parsing and CREATE VIEW binding.
+# Persistence and query expansion are separate stages; these plans are inert
+# until the catalog migration and transaction contract are implemented.
+use "./catalog_schema_v1"
+use "./sql_binder_v1"
+use "./sql_create_table_v1"
+use "./sql_lexer_v1"
+use "./sql_parser_v2"
+use "./sql_parser_v3"
+
+shape YazaSqlCreateViewAstV1:
+    version: Number
+    start_byte: Number
+    end_byte: Number
+    view_name: YazaSqlNameV2
+    definition_start_byte: Number
+    definition_end_byte: Number
+
+shape YazaSqlDropViewAstV1:
+    version: Number
+    if_exists: Boolean
+    view_name: Text
+
+shape YazaSqlCreateViewPlanV1:
+    version: Number
+    catalog_version: Number
+    view_name: Text
+    definition: Text
+    dependency_table_id: Number
+    output_columns: List[YazaSqlColumnSchemaV1]
+
+fn yaza_sql_parse_create_view_v1(source: Text) -> Result[YazaSqlCreateViewAstV1, Text]:
+    if text_length(source) < 1 or text_length(source) > 65536:
+        return err("SQL CREATE VIEW source must contain 1 through 65536 bytes")
+    let lexed: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(source)
+    if not result_is_ok(lexed): return err(result_unwrap_error(lexed))
+    let tokens: List[YazaSqlTokenV1] = result_unwrap(lexed)
+    if list_count(tokens) < 6: return err("SQL CREATE VIEW parser received an invalid token stream")
+    if not yaza_sql_v2_is_keyword(source, tokens, 0, "CREATE"):
+        return err(yaza_sql_v2_parse_error(source, tokens, 0, "SQL parser expected CREATE at byte "))
+    if not yaza_sql_v2_is_keyword(source, tokens, 1, "VIEW"):
+        return err(yaza_sql_v2_parse_error(source, tokens, 1, "SQL parser expected VIEW after CREATE at byte "))
+    var name_cursor: Number = 2
+    if yaza_sql_v2_is_keyword(source, tokens, name_cursor, "IF"):
+        if not yaza_sql_v2_is_keyword(source, tokens, name_cursor + 1, "NOT"):
+            return err(yaza_sql_v2_parse_error(source, tokens, name_cursor + 1, "SQL CREATE VIEW expected NOT after IF at byte "))
+        if not yaza_sql_v2_is_keyword(source, tokens, name_cursor + 2, "EXISTS"):
+            return err(yaza_sql_v2_parse_error(source, tokens, name_cursor + 2, "SQL CREATE VIEW expected EXISTS after IF NOT at byte "))
+        set name_cursor = name_cursor + 3
+    let name_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, name_cursor, false)
+    if not result_is_ok(name_result): return err(yaza_sql_v2_parse_error(source, tokens, name_cursor, "SQL CREATE VIEW expected one view name at byte "))
+    let name: YazaSqlNameV2 = result_unwrap(name_result)
+    if name.part_count != 1 or name.first_token.kind != 1:
+        return err(yaza_sql_v2_parse_error(source, tokens, name_cursor, "SQL CREATE VIEW supports one unquoted name only at byte "))
+    var cursor: Number = name_cursor + name.consumed_tokens
+    if not yaza_sql_v2_is_keyword(source, tokens, cursor, "AS"):
+        return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE VIEW expected AS after its name at byte "))
+    set cursor = cursor + 1
+    if not yaza_sql_v2_is_keyword(source, tokens, cursor, "SELECT"):
+        return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE VIEW definition must begin with SELECT at byte "))
+    let definition_start: Number = list_get(tokens, cursor).start_byte
+    let end_token_index: Number = list_count(tokens) - 2
+    if end_token_index < cursor: return err("SQL CREATE VIEW definition is empty")
+    var definition_end_index: Number = end_token_index
+    if yaza_sql_v2_is_symbol(source, tokens, definition_end_index, 59):
+        set definition_end_index = definition_end_index - 1
+    if definition_end_index < cursor:
+        return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL CREATE VIEW definition is empty at byte "))
+    let definition_end: Number = list_get(tokens, definition_end_index).end_byte
+    if definition_end <= definition_start or definition_end - definition_start > 65536:
+        return err("SQL CREATE VIEW definition exceeds its bounded source length")
+    let definition_result: Result[Text, Text] = text_try_slice(source, definition_start, definition_end - definition_start)
+    if not result_is_ok(definition_result): return err("SQL CREATE VIEW could not retain its SELECT definition")
+    let parsed_select: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(result_unwrap(definition_result))
+    if not result_is_ok(parsed_select): return err("SQL CREATE VIEW definition is not a supported SELECT: " + result_unwrap_error(parsed_select))
+    return ok(YazaSqlCreateViewAstV1(1, list_get(tokens, 0).start_byte, list_get(tokens, end_token_index).end_byte, name, definition_start, definition_end))
+
+fn yaza_sql_parse_drop_view_v1(source: Text) -> Result[YazaSqlDropViewAstV1, Text]:
+    if text_length(source) < 1 or text_length(source) > 4096:
+        return err("SQL DROP VIEW source must contain 1 through 4096 bytes")
+    let lexed: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(source)
+    if not result_is_ok(lexed): return err(result_unwrap_error(lexed))
+    let tokens: List[YazaSqlTokenV1] = result_unwrap(lexed)
+    if list_count(tokens) < 3: return err("SQL DROP VIEW parser received an invalid token stream")
+    if not yaza_sql_v2_is_keyword(source, tokens, 0, "DROP"):
+        return err(yaza_sql_v2_parse_error(source, tokens, 0, "SQL parser expected DROP at byte "))
+    if not yaza_sql_v2_is_keyword(source, tokens, 1, "VIEW"):
+        return err(yaza_sql_v2_parse_error(source, tokens, 1, "SQL parser expected VIEW after DROP at byte "))
+    var cursor: Number = 2
+    var if_exists: Boolean = false
+    if yaza_sql_v2_is_keyword(source, tokens, cursor, "IF"):
+        if not yaza_sql_v2_is_keyword(source, tokens, cursor + 1, "EXISTS"):
+            return err(yaza_sql_v2_parse_error(source, tokens, cursor + 1, "SQL DROP VIEW expected EXISTS after IF at byte "))
+        set if_exists = true
+        set cursor = cursor + 2
+    let name_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, cursor, false)
+    if not result_is_ok(name_result): return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL DROP VIEW expected one view name at byte "))
+    let name: YazaSqlNameV2 = result_unwrap(name_result)
+    if name.part_count != 1 or name.first_token.kind != 1:
+        return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL DROP VIEW supports one unquoted name only at byte "))
+    set cursor = cursor + name.consumed_tokens
+    if yaza_sql_v2_is_symbol(source, tokens, cursor, 59): set cursor = cursor + 1
+    if cursor >= list_count(tokens) or list_get(tokens, cursor).kind != 0:
+        return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser supports one statement; unexpected token at byte "))
+    let normalized_name: Result[Text, Text] = yaza_sql_create_table_identifier_v1(source, name.first_token)
+    if not result_is_ok(normalized_name): return err(result_unwrap_error(normalized_name))
+    return ok(YazaSqlDropViewAstV1(1, if_exists, result_unwrap(normalized_name)))
+
+fn yaza_sql_bind_create_view_v1(source: Text, create: YazaSqlCreateViewAstV1, catalog: YazaSqlCatalogSnapshotV1) -> Result[YazaSqlCreateViewPlanV1, Text]:
+    if create.version != 1 or create.start_byte < 0 or create.end_byte <= create.start_byte or create.end_byte > text_length(source):
+        return err("SQL CREATE VIEW binder received an invalid AST version or source span")
+    if create.definition_start_byte < create.start_byte or create.definition_end_byte <= create.definition_start_byte or create.definition_end_byte > create.end_byte:
+        return err("SQL CREATE VIEW binder received an invalid SELECT definition span")
+    if catalog.version < 1 or list_count(catalog.tables) > yaza_db_catalog_max_table_records_v1():
+        return err("SQL CREATE VIEW catalog snapshot is outside its bounded profile")
+    let name_result: Result[Text, Text] = yaza_sql_create_table_identifier_v1(source, create.view_name.first_token)
+    if not result_is_ok(name_result): return err(result_unwrap_error(name_result))
+    let view_name: Text = result_unwrap(name_result)
+    var table_index: Number = 0
+    while table_index < list_count(catalog.tables):
+        if list_get(catalog.tables, table_index).name == view_name:
+            return err("SQL CREATE VIEW name already exists in the current catalog")
+        set table_index = table_index + 1
+    let definition_result: Result[Text, Text] = text_try_slice(source, create.definition_start_byte, create.definition_end_byte - create.definition_start_byte)
+    if not result_is_ok(definition_result): return err("SQL CREATE VIEW binder could not read its SELECT definition")
+    let definition: Text = result_unwrap(definition_result)
+    let select_result: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(definition)
+    if not result_is_ok(select_result): return err("SQL CREATE VIEW definition is not a supported SELECT: " + result_unwrap_error(select_result))
+    let select: YazaSqlSelectAstV3 = result_unwrap(select_result)
+    if select.distinct or select.join_type != 0 or list_count(select.additional_joins) != 0 or select.has_having or list_count(select.group_by) != 0:
+        return err("SQL CREATE VIEW v1 supports a single-table SELECT without DISTINCT, JOIN, GROUP BY, or HAVING")
+    var projection_index: Number = 0
+    while projection_index < list_count(select.projections):
+        if list_get(select.projections, projection_index).name.wildcard:
+            return err("SQL CREATE VIEW v1 requires explicit projected columns; SELECT * is not supported")
+        set projection_index = projection_index + 1
+    let bound_result: Result[YazaSqlBoundPlanV1, Text] = yaza_sql_bind_select_v1(definition, select, catalog)
+    if not result_is_ok(bound_result): return err("SQL CREATE VIEW SELECT does not bind: " + result_unwrap_error(bound_result))
+    let bound: YazaSqlBoundPlanV1 = result_unwrap(bound_result)
+    if bound.table_id <= yaza_db_catalog_system_table_id_max_v1():
+        return err("SQL CREATE VIEW v1 cannot depend on a system catalog")
+    if list_count(bound.join_stages) != 0 or list_count(bound.subqueries) != 0:
+        return err("SQL CREATE VIEW v1 supports one physical source table and no subqueries")
+    if list_count(bound.parameters) != 0 or bound.parameter_style != 0:
+        return err("SQL CREATE VIEW definitions cannot contain bind parameters")
+    if list_count(bound.projections) < 1 or list_count(bound.projections) > 898:
+        return err("SQL CREATE VIEW output schema is outside its bounded column count")
+    let outputs_result: Result[List[YazaSqlColumnSchemaV1], Text] = list_try_new()
+    if not result_is_ok(outputs_result): return err(result_unwrap_error(outputs_result))
+    let outputs: List[YazaSqlColumnSchemaV1] = result_unwrap(outputs_result)
+    if not list_try_reserve(outputs, list_count(bound.projections)):
+        return err("SQL CREATE VIEW could not reserve output schema metadata")
+    var output_index: Number = 0
+    while output_index < list_count(bound.projections):
+        let projection: YazaSqlBoundProjectionV1 = list_get(bound.projections, output_index)
+        if text_length(projection.output_name) < 1 or text_length(projection.output_name) > 128:
+            return err("SQL CREATE VIEW output column name is outside its 128-byte bound")
+        var prior_index: Number = 0
+        while prior_index < output_index:
+            if list_get(bound.projections, prior_index).output_name == projection.output_name:
+                return err("SQL CREATE VIEW output column names must be unique")
+            set prior_index = prior_index + 1
+        if not list_try_push(outputs, YazaSqlColumnSchemaV1(projection.output_name, projection.type_id, projection.nullable, output_index, projection.precision, projection.scale, "")):
+            return err("SQL CREATE VIEW could not append its output schema")
+        set output_index = output_index + 1
+    return ok(YazaSqlCreateViewPlanV1(1, catalog.version, view_name, definition, bound.table_id, outputs))
+
+fn yaza_sql_create_view_plan_valid_v1(plan: YazaSqlCreateViewPlanV1) -> Boolean:
+    if plan.version != 1 or plan.catalog_version < 1 or plan.dependency_table_id <= yaza_db_catalog_system_table_id_max_v1(): return false
+    if text_length(plan.view_name) < 1 or text_length(plan.view_name) > 128 or text_length(plan.definition) < 1 or text_length(plan.definition) > 65536: return false
+    if list_count(plan.output_columns) < 1 or list_count(plan.output_columns) > 898: return false
+    var index: Number = 0
+    while index < list_count(plan.output_columns):
+        let column: YazaSqlColumnSchemaV1 = list_get(plan.output_columns, index)
+        if column.ordinal != index or text_length(column.name) < 1 or text_length(column.name) > 128 or not yaza_sql_bind_v1_type_name_supported(column.type_id): return false
+        var prior_index: Number = 0
+        while prior_index < index:
+            if list_get(plan.output_columns, prior_index).name == column.name: return false
+            set prior_index = prior_index + 1
+        set index = index + 1
+    return true

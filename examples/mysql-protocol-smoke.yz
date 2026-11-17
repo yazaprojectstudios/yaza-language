@@ -1,0 +1,121 @@
+use "std/mysql/protocol"
+
+start:
+    # 1. Little-endian integer encoding / decoding
+    let u16_enc: Result[Bytes, Text] = mysql_u16_le(3306)
+    assert result_is_ok(u16_enc)
+    let u16_b: Bytes = result_unwrap(u16_enc)
+    assert bytes_length(u16_b) == 2
+    assert bytes_get(u16_b, 0) == 234
+    assert bytes_get(u16_b, 1) == 12
+    let u16_dec: Result[Number, Text] = mysql_read_u16_le(u16_b, 0)
+    assert result_is_ok(u16_dec)
+    assert result_unwrap(u16_dec) == 3306
+
+    let u24_enc: Result[Bytes, Text] = mysql_u24_le(16777215)
+    assert result_is_ok(u24_enc)
+    let u24_b: Bytes = result_unwrap(u24_enc)
+    assert bytes_length(u24_b) == 3
+    assert bytes_get(u24_b, 0) == 255
+    assert bytes_get(u24_b, 1) == 255
+    assert bytes_get(u24_b, 2) == 255
+    let u24_dec: Result[Number, Text] = mysql_read_u24_le(u24_b, 0)
+    assert result_is_ok(u24_dec)
+    assert result_unwrap(u24_dec) == 16777215
+
+    let u32_enc: Result[Bytes, Text] = mysql_u32_le(305419896)
+    assert result_is_ok(u32_enc)
+    let u32_b: Bytes = result_unwrap(u32_enc)
+    assert bytes_length(u32_b) == 4
+    let u32_dec: Result[Number, Text] = mysql_read_u32_le(u32_b, 0)
+    assert result_is_ok(u32_dec)
+    assert result_unwrap(u32_dec) == 305419896
+
+    # 2. Length-encoded integer (LEB)
+    let len_small: Result[Bytes, Text] = mysql_encode_lenenc_int(42)
+    assert result_is_ok(len_small)
+    assert bytes_length(result_unwrap(len_small)) == 1
+    let dec_small: Result[MysqlLenencInt, Text] = mysql_read_lenenc_int(result_unwrap(len_small), 0)
+    assert result_is_ok(dec_small)
+    assert result_unwrap(dec_small).value == 42
+    assert not result_unwrap(dec_small).is_null
+
+    let len_med: Result[Bytes, Text] = mysql_encode_lenenc_int(1000)
+    assert result_is_ok(len_med)
+    assert bytes_length(result_unwrap(len_med)) == 3
+    assert bytes_get(result_unwrap(len_med), 0) == 252
+    let dec_med: Result[MysqlLenencInt, Text] = mysql_read_lenenc_int(result_unwrap(len_med), 0)
+    assert result_is_ok(dec_med)
+    assert result_unwrap(dec_med).value == 1000
+
+    let null_lenenc: Result[MysqlLenencInt, Text] = mysql_read_lenenc_int(bytes_from_number(251), 0)
+    assert result_is_ok(null_lenenc)
+    assert result_unwrap(null_lenenc).is_null
+
+    # 3. Packet framing
+    let pkt_res: Result[Bytes, Text] = mysql_packet(0, bytes_from_text("PING"))
+    assert result_is_ok(pkt_res)
+    let pkt: Bytes = result_unwrap(pkt_res)
+    assert bytes_length(pkt) == 8
+    let hdr_res: Result[MysqlPacketHeader, Text] = mysql_parse_packet_header(pkt, 0)
+    assert result_is_ok(hdr_res)
+    assert result_unwrap(hdr_res).payload_length == 4
+    assert result_unwrap(hdr_res).sequence_id == 0
+
+    # 4. Command packets
+    let query_pkt: Result[Bytes, Text] = mysql_com_query("SELECT 1", 0)
+    assert result_is_ok(query_pkt)
+    assert bytes_get(result_unwrap(query_pkt), 4) == 3
+
+    let ping_pkt: Result[Bytes, Text] = mysql_com_ping(0)
+    assert result_is_ok(ping_pkt)
+    assert bytes_get(result_unwrap(ping_pkt), 4) == 14
+
+    let quit_pkt: Result[Bytes, Text] = mysql_com_quit(0)
+    assert result_is_ok(quit_pkt)
+    assert bytes_get(result_unwrap(quit_pkt), 4) == 1
+
+    # 5. OK / ERR / EOF packets
+    # Synthesize OK packet: header 0, affected_rows 1, last_insert_id 42, status 2, warnings 0, info "OK"
+    var ok_body: Bytes = bytes_from_number(0)
+    set ok_body = bytes_concat(ok_body, bytes_from_number(1))
+    set ok_body = bytes_concat(ok_body, bytes_from_number(42))
+    set ok_body = bytes_concat(ok_body, bytes_concat(bytes_from_number(2), bytes_from_number(0)))
+    set ok_body = bytes_concat(ok_body, bytes_concat(bytes_from_number(0), bytes_from_number(0)))
+    set ok_body = bytes_concat(ok_body, bytes_from_text("OK"))
+    let ok_parsed: Result[MysqlOkPacket, Text] = mysql_parse_ok_packet(ok_body)
+    assert result_is_ok(ok_parsed)
+    assert result_unwrap(ok_parsed).affected_rows == 1
+    assert result_unwrap(ok_parsed).last_insert_id == 42
+    assert result_unwrap(ok_parsed).status_flags == 2
+    assert result_unwrap(ok_parsed).info == "OK"
+
+    # Synthesize ERR packet: header 255, code 1045, marker '#', sqlstate '28000', msg 'Access denied'
+    var err_body: Bytes = bytes_from_number(255)
+    set err_body = bytes_concat(err_body, result_unwrap(mysql_u16_le(1045)))
+    set err_body = bytes_concat(err_body, bytes_from_text("#28000Access denied"))
+    let err_parsed: Result[MysqlErrPacket, Text] = mysql_parse_err_packet(err_body)
+    assert result_is_ok(err_parsed)
+    assert result_unwrap(err_parsed).error_code == 1045
+    assert result_unwrap(err_parsed).sql_state == "28000"
+    assert result_unwrap(err_parsed).error_message == "Access denied"
+
+    # Synthesize EOF packet: header 254, warnings 0, status 2
+    var eof_body: Bytes = bytes_from_number(254)
+    set eof_body = bytes_concat(eof_body, result_unwrap(mysql_u16_le(0)))
+    set eof_body = bytes_concat(eof_body, result_unwrap(mysql_u16_le(2)))
+    let eof_parsed: Result[MysqlEofPacket, Text] = mysql_parse_eof_packet(eof_body)
+    assert result_is_ok(eof_parsed)
+    assert result_unwrap(eof_parsed).warnings == 0
+    assert result_unwrap(eof_parsed).status_flags == 2
+
+    # 6. Resultset text row decoding
+    # Row with two columns: "hello" and NULL (0xFB)
+    var row_bytes: Bytes = result_unwrap(mysql_encode_lenenc_string("hello"))
+    set row_bytes = bytes_concat(row_bytes, bytes_from_number(251))
+    let row_parsed: Result[MysqlRow, Text] = mysql_parse_text_row(row_bytes, 2)
+    assert result_is_ok(row_parsed)
+    let parsed_r: MysqlRow = result_unwrap(row_parsed)
+    assert list_get(parsed_r.cell_values, 0) == "hello"
+    assert list_get(parsed_r.cell_is_null, 0) == "false"
+    assert list_get(parsed_r.cell_is_null, 1) == "true"

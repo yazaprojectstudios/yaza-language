@@ -1,0 +1,112 @@
+use "std/fs"
+use "std/http"
+use "std/json"
+use "std/net"
+use "std/ybif"
+use "std/ywt"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/session_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/wal_v1"
+use "../yazabase/api_v1"
+
+fn api_async_bench_open(root_path: Text, db_name: Text) -> Result[YazaDbSessionV1, Text]:
+    let root_result: Result[Number, Text] = root_open(root_path)
+    if not result_is_ok(root_result): return err(result_unwrap_error(root_result))
+    let root: Number = result_unwrap(root_result)
+    let header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_from_text("db-api-uuid-0001"), 0, 1, 1, 0, 2, 1)
+    let empty_result: Result[YazaDbStorageHandleV1, Text] = yaza_db_storage_create_empty_v1(root, db_name, header)
+    if not result_is_ok(empty_result): return err(result_unwrap_error(empty_result))
+    let empty_storage: YazaDbStorageHandleV1 = result_unwrap(empty_result)
+    let empty_closed: Result[Boolean, Text] = yaza_db_storage_close_v1(empty_storage)
+    if not result_is_ok(empty_closed): return err(result_unwrap_error(empty_closed))
+    if not result_unwrap(empty_closed): return err("empty database close failed")
+
+    let initialized_result: Result[YazaDbCatalogBootstrapV1, Text] = yaza_db_catalog_initialize_v1(root, db_name)
+    if not result_is_ok(initialized_result): return err(result_unwrap_error(initialized_result))
+    let initialized: YazaDbCatalogBootstrapV1 = result_unwrap(initialized_result)
+    let wal_closed: Result[Boolean, Text] = yaza_db_wal_log_close_v1(initialized.wal)
+    let storage_closed: Result[Boolean, Text] = yaza_db_storage_close_v1(initialized.storage)
+    if not result_is_ok(wal_closed): return err(result_unwrap_error(wal_closed))
+    if not result_is_ok(storage_closed): return err(result_unwrap_error(storage_closed))
+    if not result_unwrap(wal_closed) or not result_unwrap(storage_closed): return err("catalog bootstrap handles did not close")
+    return yaza_db_session_open_v1(root, db_name)
+
+fn api_async_bench_sync_batch(session: YazaDbSessionV1, root_path: Text, db_name: Text, request: HttpRequest, secret: Text, state: YazaApiServerStateV1, count: Number) -> Number:
+    let started: Number = monotonic_ns()
+    var index: Number = 0
+    var checksum: Number = 0
+    while index < count:
+        let response_result: Result[YazaApiSessionResponseV1, Text] = yaza_api_route_request_state(session, root_path, db_name, request, secret, state)
+        if not result_is_ok(response_result): fail("sync API route failed: " + result_unwrap_error(response_result))
+        let response: YazaApiSessionResponseV1 = result_unwrap(response_result)
+        if response.response.status_code != 200: fail("sync API route returned non-200 status")
+        set checksum = checksum + response.response.status_code + bytes_length(response.response.body)
+        set index = index + 1
+    if checksum != count * (200 + bytes_length(bytes_from_text("{\"status\":\"alive\"}"))):
+        fail("sync API response checksum mismatch")
+    return monotonic_ns() - started
+
+fn api_async_bench_async_batch(session: YazaDbSessionV1, root_path: Text, db_name: Text, request: HttpRequest, secret: Text, state: YazaApiServerStateV1, count: Number) -> Number:
+    let started: Number = monotonic_ns()
+    var index: Number = 0
+    var checksum: Number = 0
+    while index < count:
+        let task: Task[Result[YazaApiSessionResponseV1, Text]] = spawn yaza_api_route_request_async(session, root_path, db_name, request, secret, state)
+        let response_result: Result[YazaApiSessionResponseV1, Text] = await task
+        if not result_is_ok(response_result): fail("async API route failed: " + result_unwrap_error(response_result))
+        let response: YazaApiSessionResponseV1 = result_unwrap(response_result)
+        if response.response.status_code != 200: fail("async API route returned non-200 status")
+        set checksum = checksum + response.response.status_code + bytes_length(response.response.body)
+        set index = index + 1
+    if checksum != count * (200 + bytes_length(bytes_from_text("{\"status\":\"alive\"}"))):
+        fail("async API response checksum mismatch")
+    return monotonic_ns() - started
+
+start:
+    if arg_count() < 1: fail("usage: yazabase-api-async-route-bench <empty-test-root>")
+    let root_path: Text = arg(1)
+    let db_name: Text = "api-async-route-bench.ydb"
+    let opened: Result[YazaDbSessionV1, Text] = api_async_bench_open(root_path, db_name)
+    if not result_is_ok(opened): fail("API benchmark database setup failed: " + result_unwrap_error(opened))
+    let session: YazaDbSessionV1 = result_unwrap(opened)
+    say "database session opened"
+    let state: YazaApiServerStateV1 = yaza_api_server_state_default(db_name)
+    let request: HttpRequest = HttpRequest("GET", "/livez", "", "application/json", "", "", "", 0, bytes_empty(), "")
+    let secret: Text = "route-benchmark-only-secret-32-bytes-min"
+    let iterations: Number = 10000
+    let samples: Number = 7
+
+    let warm_sync: Number = api_async_bench_sync_batch(session, root_path, db_name, request, secret, state, 1000)
+    let warm_async: Number = api_async_bench_async_batch(session, root_path, db_name, request, secret, state, 1000)
+    if warm_sync <= 0 or warm_async <= 0: fail("API route warmup timer returned an invalid duration")
+    say "route warmup complete"
+
+    var sync_total: Number = 0
+    var async_total: Number = 0
+    var sample: Number = 0
+    while sample < samples:
+        if sample == 0 or sample == 2 or sample == 4 or sample == 6:
+            set sync_total = sync_total + api_async_bench_sync_batch(session, root_path, db_name, request, secret, state, iterations)
+            set async_total = async_total + api_async_bench_async_batch(session, root_path, db_name, request, secret, state, iterations)
+        else:
+            set async_total = async_total + api_async_bench_async_batch(session, root_path, db_name, request, secret, state, iterations)
+            set sync_total = sync_total + api_async_bench_sync_batch(session, root_path, db_name, request, secret, state, iterations)
+        say "finished sample " + number_text(sample + 1)
+        set sample = sample + 1
+
+    let request_count: Number = iterations * samples
+    let sync_per_request: Number = sync_total / request_count
+    let async_per_request: Number = async_total / request_count
+    let sync_rate: Number = request_count * 1000000000 / sync_total
+    let async_rate: Number = request_count * 1000000000 / async_total
+    say "API route benchmark: GET /livez, persistent in-process session"
+    say "requests per mode: " + number_text(request_count)
+    say "sync ns/request: " + number_text(sync_per_request)
+    say "spawn/await ns/request: " + number_text(async_per_request)
+    say "sync routes/second: " + number_text(sync_rate)
+    say "spawn/await routes/second: " + number_text(async_rate)
+    let closed_result: Result[Boolean, Text] = yaza_db_session_close_v1(session)
+    if not result_is_ok(closed_result): fail("API benchmark session close failed: " + result_unwrap_error(closed_result))
+    let closed: Boolean = result_unwrap(closed_result)
+    if not closed: fail("API benchmark session close returned false")

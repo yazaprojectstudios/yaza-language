@@ -1,0 +1,330 @@
+# Reversible full-page payloads for single-page LEAF mutations.
+# Startup replay/undo is implemented; data-page sync is deferred to checkpoint.
+use "./page_v1"
+use "./wal_v1"
+use "./storage_v1"
+use "./allocator_v1"
+
+shape YazaDbWalLeafMutationV1:
+    operation: Number
+    page_id: Number
+    before_image: Bytes
+    after_image: Bytes
+
+shape YazaDbWalLeafMutationAppendV1:
+    append: YazaDbWalAppendV1
+    page_id: Number
+
+fn yaza_db_wal_leaf_mutation_header_size_v1() -> Number:
+    return 24
+
+fn yaza_db_wal_leaf_mutation_payload_size_v1() -> Number:
+    return yaza_db_wal_leaf_mutation_header_size_v1() + 2 * yaza_db_page_size_v1()
+
+fn yaza_db_wal_leaf_mutation_validate_delta_format_v1(format_version: Number, operation: Number, page_id: Number, record_lsn: Number, before_image: Bytes, after_image: Bytes) -> Result[Boolean, Text]:
+    if format_version != 1 and format_version != 2 and format_version != 3: return err("YDBv1 leaf mutation payload version is unsupported")
+    if format_version == 2 and operation != yaza_db_wal_type_leaf_update_v1(): return err("YDBv1 batched leaf mutation version is reserved for LEAF_UPDATE")
+    if format_version == 3 and operation != yaza_db_wal_type_leaf_insert_v1(): return err("YDBv1 grouped leaf mutation version is reserved for LEAF_INSERT")
+    if operation != yaza_db_wal_type_leaf_insert_v1() and operation != yaza_db_wal_type_leaf_update_v1() and operation != yaza_db_wal_type_leaf_delete_v1(): return err("YDBv1 leaf mutation operation is not INSERT, UPDATE, or DELETE")
+    if page_id < 2 or record_lsn < 1: return err("YDBv1 leaf mutation page ID or WAL LSN is invalid")
+    let before: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(before_image, page_id)?
+    let after: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(after_image, page_id)?
+    if before.page_type != 1 or before.level != 0 or after.page_type != 1 or after.level != 0: return err("YDBv1 leaf mutation images must both be level-zero LEAF pages")
+    if before.page_lsn >= record_lsn or after.page_lsn != record_lsn: return err("YDBv1 leaf mutation page LSNs do not match the WAL record")
+    if before.prefix_len != after.prefix_len or before.low_fence_len != after.low_fence_len or before.high_fence_len != after.high_fence_len: return err("YDBv1 leaf mutation cannot change the prefix or fence layout")
+    if before.prefix_len > 0:
+        let before_prefix: Bytes = bytes_try_slice(before_image, yaza_db_page_size_v1() - before.prefix_len, before.prefix_len)?
+        let after_prefix: Bytes = bytes_try_slice(after_image, yaza_db_page_size_v1() - after.prefix_len, after.prefix_len)?
+        if not bytes_equal(before_prefix, after_prefix): return err("YDBv1 leaf mutation cannot change its shared prefix")
+    if before.low_fence_len > 0:
+        let before_low: Bytes = bytes_try_slice(before_image, before.low_fence_offset, before.low_fence_len)?
+        let after_low: Bytes = bytes_try_slice(after_image, after.low_fence_offset, after.low_fence_len)?
+        if not bytes_equal(before_low, after_low): return err("YDBv1 leaf mutation cannot change its low fence")
+    if before.high_fence_len > 0:
+        let before_high: Bytes = bytes_try_slice(before_image, before.high_fence_offset, before.high_fence_len)?
+        let after_high: Bytes = bytes_try_slice(after_image, after.high_fence_offset, after.high_fence_len)?
+        if not bytes_equal(before_high, after_high): return err("YDBv1 leaf mutation cannot change its high fence")
+
+    if operation == yaza_db_wal_type_leaf_insert_v1() and format_version == 1 and after.count != before.count + 1: return err("YDBv1 LEAF_INSERT must add exactly one slot")
+    if operation == yaza_db_wal_type_leaf_insert_v1() and format_version == 3 and (after.count <= before.count or after.count - before.count > 900): return err("YDBv1 grouped LEAF_INSERT slot count is outside its bound")
+    if operation == yaza_db_wal_type_leaf_update_v1() and after.count != before.count: return err("YDBv1 LEAF_UPDATE cannot change the slot count")
+    if operation == yaza_db_wal_type_leaf_delete_v1() and before.count != after.count + 1: return err("YDBv1 LEAF_DELETE must remove exactly one slot")
+
+    var before_index: Number = 0
+    var after_index: Number = 0
+    var changed_slot: Boolean = false
+    var inserted_slots: Number = 0
+    var deleted_slots: Number = 0
+    while before_index < before.count and after_index < after.count:
+        let before_slot: YazaDbPageSlotV1 = yaza_db_page_slot_from_validated_header_v1(before_image, before, before_index)?
+        let after_slot: YazaDbPageSlotV1 = yaza_db_page_slot_from_validated_header_v1(after_image, after, after_index)?
+        let before_key: Bytes = yaza_db_page_slot_key_from_validated_header_v1(before_image, before, before_slot)?
+        let after_key: Bytes = yaza_db_page_slot_key_from_validated_header_v1(after_image, after, after_slot)?
+        let key_comparison: Number = yaza_db_compare_bytes_v1(before_key, after_key)
+        if key_comparison == 0:
+            if not bytes_equal(before_slot.payload, after_slot.payload):
+                if operation != yaza_db_wal_type_leaf_update_v1() or (format_version == 1 and changed_slot): return err("YDBv1 leaf mutation changes payload outside its allowed UPDATE slots")
+                set changed_slot = true
+            set before_index = before_index + 1
+            set after_index = after_index + 1
+        elif operation == yaza_db_wal_type_leaf_insert_v1():
+            if key_comparison > 0:
+                set inserted_slots = inserted_slots + 1
+                set after_index = after_index + 1
+            else:
+                return err("YDBv1 LEAF_INSERT removed or reordered an existing key")
+        elif operation == yaza_db_wal_type_leaf_delete_v1():
+            if key_comparison < 0:
+                set deleted_slots = deleted_slots + 1
+                set before_index = before_index + 1
+            else:
+                return err("YDBv1 LEAF_DELETE added or reordered a key")
+        else:
+            return err("YDBv1 LEAF_UPDATE cannot change a page key")
+    if operation == yaza_db_wal_type_leaf_insert_v1():
+        while after_index < after.count:
+            set inserted_slots = inserted_slots + 1
+            set after_index = after_index + 1
+        if before_index != before.count: return err("YDBv1 LEAF_INSERT omitted an existing key")
+        if format_version == 1 and inserted_slots != 1: return err("YDBv1 LEAF_INSERT must add exactly one key")
+        if format_version == 3 and (inserted_slots < 1 or inserted_slots > 900): return err("YDBv1 grouped LEAF_INSERT added-key count is outside its bound")
+    elif operation == yaza_db_wal_type_leaf_delete_v1():
+        while before_index < before.count:
+            set deleted_slots = deleted_slots + 1
+            set before_index = before_index + 1
+        if after_index != after.count or deleted_slots != 1: return err("YDBv1 LEAF_DELETE must remove exactly one key")
+    elif before_index != before.count or after_index != after.count:
+        return err("YDBv1 LEAF_UPDATE must preserve every page key")
+    if operation == yaza_db_wal_type_leaf_update_v1() and not changed_slot: return err("YDBv1 LEAF_UPDATE must change at least one row payload")
+    return ok(true)
+
+fn yaza_db_wal_leaf_mutation_validate_delta_v1(operation: Number, page_id: Number, record_lsn: Number, before_image: Bytes, after_image: Bytes) -> Result[Boolean, Text]:
+    return yaza_db_wal_leaf_mutation_validate_delta_format_v1(1, operation, page_id, record_lsn, before_image, after_image)
+
+fn yaza_db_wal_leaf_mutation_payload_encode_format_v1(format_version: Number, operation: Number, page_id: Number, record_lsn: Number, before_image: Bytes, after_image: Bytes) -> Result[Bytes, Text]:
+    let ignored_delta: Boolean = yaza_db_wal_leaf_mutation_validate_delta_format_v1(format_version, operation, page_id, record_lsn, before_image, after_image)?
+    let payload: Bytes = bytes_try_new_zeroed(yaza_db_wal_leaf_mutation_payload_size_v1())?
+    if not yaza_db_write_uint_le_v1(payload, 0, format_version, 2) or not yaza_db_write_uint_le_v1(payload, 2, operation, 2): return err("YDBv1 leaf mutation version or operation could not be encoded")
+    if not yaza_db_write_uint_le_v1(payload, 4, page_id, 8) or not yaza_db_write_uint_le_v1(payload, 12, yaza_db_page_size_v1(), 4): return err("YDBv1 leaf mutation page metadata could not be encoded")
+    if not yaza_db_write_uint_le_v1(payload, 16, 0, 4) or not yaza_db_write_uint_le_v1(payload, 20, 0, 4): return err("YDBv1 leaf mutation reserved fields could not be cleared")
+    let header_size: Number = yaza_db_wal_leaf_mutation_header_size_v1()
+    if not yaza_db_write_bytes_v1(payload, header_size, before_image): return err("YDBv1 leaf mutation before image could not be copied")
+    if not yaza_db_write_bytes_v1(payload, header_size + yaza_db_page_size_v1(), after_image): return err("YDBv1 leaf mutation after image could not be copied")
+    return ok(payload)
+
+fn yaza_db_wal_leaf_mutation_payload_encode_v1(operation: Number, page_id: Number, record_lsn: Number, before_image: Bytes, after_image: Bytes) -> Result[Bytes, Text]:
+    return yaza_db_wal_leaf_mutation_payload_encode_format_v1(1, operation, page_id, record_lsn, before_image, after_image)
+
+fn yaza_db_wal_leaf_mutation_payload_encode_batch_v2(operation: Number, page_id: Number, record_lsn: Number, before_image: Bytes, after_image: Bytes) -> Result[Bytes, Text]:
+    return yaza_db_wal_leaf_mutation_payload_encode_format_v1(2, operation, page_id, record_lsn, before_image, after_image)
+
+fn yaza_db_wal_leaf_mutation_payload_encode_group_v3(operation: Number, page_id: Number, record_lsn: Number, before_image: Bytes, after_image: Bytes) -> Result[Bytes, Text]:
+    return yaza_db_wal_leaf_mutation_payload_encode_format_v1(3, operation, page_id, record_lsn, before_image, after_image)
+
+fn yaza_db_wal_leaf_mutation_payload_decode_v1(record: YazaDbWalRecordV1) -> Result[YazaDbWalLeafMutationV1, Text]:
+    if record.rec_type != yaza_db_wal_type_leaf_insert_v1() and record.rec_type != yaza_db_wal_type_leaf_update_v1() and record.rec_type != yaza_db_wal_type_leaf_delete_v1(): return err("YDBv1 leaf mutation decoder requires LEAF_INSERT, LEAF_UPDATE, or LEAF_DELETE")
+    if record.txn_id < 1 or record.lsn < 1: return err("YDBv1 leaf mutation record requires a transaction ID and positive LSN")
+    if bytes_length(record.payload) != yaza_db_wal_leaf_mutation_payload_size_v1(): return err("YDBv1 leaf mutation payload length is invalid")
+    let version: Number = yaza_db_read_uint_le_v1(record.payload, 0, 2)?
+    let operation: Number = yaza_db_read_uint_le_v1(record.payload, 2, 2)?
+    let page_id: Number = yaza_db_read_uint_le_v1(record.payload, 4, 8)?
+    let image_size: Number = yaza_db_read_uint_le_v1(record.payload, 12, 4)?
+    let flags: Number = yaza_db_read_uint_le_v1(record.payload, 16, 4)?
+    let reserved: Number = yaza_db_read_uint_le_v1(record.payload, 20, 4)?
+    if (version != 1 and version != 2 and version != 3) or flags != 0 or reserved != 0: return err("YDBv1 leaf mutation version, flags, or reserved fields are invalid")
+    if operation != record.rec_type or image_size != yaza_db_page_size_v1(): return err("YDBv1 leaf mutation operation or image size does not match the WAL record")
+    let header_size: Number = yaza_db_wal_leaf_mutation_header_size_v1()
+    let before_image: Bytes = bytes_try_slice(record.payload, header_size, image_size)?
+    let after_image: Bytes = bytes_try_slice(record.payload, header_size + image_size, image_size)?
+    let ignored_delta: Boolean = yaza_db_wal_leaf_mutation_validate_delta_format_v1(version, operation, page_id, record.lsn, before_image, after_image)?
+    return ok(YazaDbWalLeafMutationV1(operation, page_id, before_image, after_image))
+
+fn yaza_db_storage_validate_leaf_page_allocated_v1(storage: YazaDbStorageHandleV1, page_id: Number) -> Result[Boolean, Text]:
+    if page_id < 2 or page_id >= storage.header.page_count: return err("YDBv1 leaf mutation page ID is outside the published database")
+    let address: YazaDbBitmapAddressV1 = yaza_db_bitmap_address_v1(page_id)?
+    if address.is_bitmap_page or address.bitmap_page_id >= storage.header.page_count: return err("YDBv1 leaf mutation cannot target a BITMAP or unmapped page")
+    let bitmap: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, address.bitmap_page_id)?
+    let allocated: Boolean = yaza_db_bitmap_page_bit_v1(bitmap, address.bit_index, address.bitmap_page_id)?
+    if not allocated: return err("YDBv1 leaf mutation target page is not allocated")
+    return ok(true)
+
+fn yaza_db_storage_validate_index_page_allocated_v1(storage: YazaDbStorageHandleV1, page_id: Number) -> Result[Boolean, Text]:
+    if page_id < 2 or page_id >= storage.header.page_count: return err("YDBv1 index page ID is outside the published database")
+    let address: YazaDbBitmapAddressV1 = yaza_db_bitmap_address_v1(page_id)?
+    if address.is_bitmap_page or address.bitmap_page_id >= storage.header.page_count: return err("YDBv1 index page cannot be a BITMAP or unmapped page")
+    let bitmap: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, address.bitmap_page_id)?
+    let allocated: Boolean = yaza_db_bitmap_page_bit_v1(bitmap, address.bit_index, address.bitmap_page_id)?
+    if not allocated: return err("YDBv1 index page is not allocated")
+    return ok(true)
+
+fn yaza_db_storage_redo_page_set_image_v1(storage: YazaDbStorageHandleV1, page_id: Number, record_lsn: Number, image: Bytes, wal_end_lsn: Number) -> Result[Boolean, Text]:
+    if record_lsn < 1 or record_lsn >= wal_end_lsn: return err("YDBv1 page-set redo LSN is outside the recovered WAL range")
+    let image_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(image, page_id)?
+    if image_header.page_lsn != record_lsn or (image_header.page_type != 1 and image_header.page_type != 2 and image_header.page_type != 4): return err("YDBv1 page-set redo image has an invalid type or page LSN")
+    let ignored_allocated: Boolean = yaza_db_storage_validate_index_page_allocated_v1(storage, page_id)?
+    let current: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, page_id)?
+    let current_header_result: Result[YazaDbPageHeaderV1, Text] = yaza_db_page_header_decode_v1(current, page_id)
+    if result_is_ok(current_header_result):
+        let current_header: YazaDbPageHeaderV1 = result_unwrap(current_header_result)
+        if current_header.page_lsn > record_lsn: return ok(true)
+        if current_header.page_lsn == record_lsn:
+            if not bytes_equal(current, image): return err("YDBv1 page LSN matches a page-set record but the bytes differ")
+            return ok(true)
+    let written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, image)?
+    if written != yaza_db_page_size_v1(): return err("YDBv1 page-set redo write was incomplete")
+    return ok(true)
+
+fn yaza_db_storage_redo_node_split_v1(storage: YazaDbStorageHandleV1, record: YazaDbWalRecordV1, wal_end_lsn: Number) -> Result[Boolean, Text]:
+    if record.rec_type != yaza_db_wal_type_node_split_v1(): return err("YDBv1 structural redo requires a NODE_SPLIT record")
+    if record.lsn < 1 or record.lsn > 9223372036854775807 - yaza_db_wal_header_size_v1() - bytes_length(record.payload): return err("YDBv1 NODE_SPLIT LSN overflows the supported range")
+    let record_end: Number = record.lsn + yaza_db_wal_header_size_v1() + bytes_length(record.payload)
+    if record_end > wal_end_lsn: return err("YDBv1 NODE_SPLIT extends beyond the recovered WAL end")
+    let split: YazaDbWalNodeSplitV1 = yaza_db_wal_node_split_payload_decode_v1(record)?
+    var index: Number = 0
+    while index < list_count(split.pages):
+        let page: YazaDbWalNodeSplitPageV1 = list_get(split.pages, index)
+        let applied: Boolean = yaza_db_storage_redo_page_set_image_v1(storage, page.page_id, record.lsn, page.after_image, wal_end_lsn)?
+        set index = index + 1
+    return ok(true)
+
+fn yaza_db_storage_redo_node_split_compensation_v1(storage: YazaDbStorageHandleV1, record: YazaDbWalRecordV1, wal_end_lsn: Number) -> Result[Boolean, Text]:
+    if record.rec_type != yaza_db_wal_type_compensation_v1(): return err("YDBv1 structural CLR redo requires a COMPENSATION record")
+    if record.lsn < 1 or record.lsn > 9223372036854775807 - yaza_db_wal_header_size_v1() - bytes_length(record.payload): return err("YDBv1 NODE_SPLIT CLR LSN overflows the supported range")
+    let record_end: Number = record.lsn + yaza_db_wal_header_size_v1() + bytes_length(record.payload)
+    if record_end > wal_end_lsn: return err("YDBv1 NODE_SPLIT CLR extends beyond the recovered WAL end")
+    let compensation: YazaDbWalNodeSplitCompensationV1 = yaza_db_wal_node_split_compensation_payload_decode_v1(record)?
+    var index: Number = 0
+    while index < list_count(compensation.pages):
+        let page: YazaDbWalPageSetImageV1 = list_get(compensation.pages, index)
+        let applied: Boolean = yaza_db_storage_redo_page_set_image_v1(storage, page.page_id, record.lsn, page.image, wal_end_lsn)?
+        set index = index + 1
+    return ok(true)
+
+fn yaza_db_storage_append_node_split_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, txn_id: Number, prev_lsn: Number, pages: List[YazaDbWalNodeSplitPageV1]) -> Result[YazaDbWalAppendV1, Text]:
+    if txn_id < 1 or prev_lsn < 0 or storage.root != wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid): return err("YDBv1 NODE_SPLIT writer requires a valid matching transaction and database")
+    let page_count: Number = list_count(pages)
+    if page_count < 2 or page_count > yaza_db_wal_node_split_max_pages_v1(): return err("YDBv1 NODE_SPLIT writer page count is outside its recovery bound")
+    let payload_size: Number = yaza_db_wal_node_split_payload_size_v1(page_count)
+    let record_length: Number = yaza_db_wal_header_size_v1() + payload_size
+    let record_lsn: Number = yaza_db_wal_record_lsn_for_append_v1(wal, record_length)?
+    let payload: Bytes = yaza_db_wal_node_split_payload_encode_v1(record_lsn, pages)?
+    var max_level: Number = 0
+    var index: Number = 0
+    while index < page_count:
+        let page: YazaDbWalNodeSplitPageV1 = list_get(pages, index)
+        let ignored_allocated: Boolean = yaza_db_storage_validate_index_page_allocated_v1(storage, page.page_id)?
+        if page.has_before_image:
+            let current: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, page.page_id)?
+            if not bytes_equal(current, page.before_image): return err("YDBv1 NODE_SPLIT before-image does not match the current durable page")
+        let after_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page.after_image, page.page_id)?
+        if after_header.page_type != 4 and after_header.level > max_level: set max_level = after_header.level
+        set index = index + 1
+    let input_record: YazaDbWalRecordV1 = YazaDbWalRecordV1(0, prev_lsn, txn_id, yaza_db_wal_type_node_split_v1(), 0, payload)
+    let appended: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(wal, input_record)?
+    if appended.record.lsn != record_lsn:
+        let ignored_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(appended.log)
+        return err("YDBv1 NODE_SPLIT WAL assigned an unexpected record LSN; reopen before reuse")
+    var level: Number = 0
+    while level <= max_level:
+        var image_phase: Number = 0
+        while image_phase < 2:
+            set index = 0
+            while index < page_count:
+                let page: YazaDbWalNodeSplitPageV1 = list_get(pages, index)
+                let after_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page.after_image, page.page_id)?
+                var should_write: Boolean = after_header.page_type != 4 and after_header.level == level
+                if image_phase == 0 and page.has_before_image: set should_write = false
+                if image_phase == 1 and not page.has_before_image: set should_write = false
+                if should_write:
+                    let written: Result[Number, Text] = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, page.after_image)
+                    if not result_is_ok(written) or result_unwrap(written) != yaza_db_page_size_v1():
+                        let ignored_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(appended.log)
+                        return err("YDBv1 NODE_SPLIT WAL is durable but a B+Tree page write failed; reopen to replay the page set")
+                set index = index + 1
+            set image_phase = image_phase + 1
+        set level = level + 1
+    set index = 0
+    while index < page_count:
+        let page: YazaDbWalNodeSplitPageV1 = list_get(pages, index)
+        let after_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page.after_image, page.page_id)?
+        if after_header.page_type == 4:
+            let written: Result[Number, Text] = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, page.after_image)
+            if not result_is_ok(written) or result_unwrap(written) != yaza_db_page_size_v1():
+                let ignored_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(appended.log)
+                return err("YDBv1 NODE_SPLIT WAL is durable but the META root publication failed; reopen to replay the page set")
+        set index = index + 1
+    return ok(appended)
+
+fn yaza_db_storage_redo_leaf_image_v1(storage: YazaDbStorageHandleV1, page_id: Number, record_lsn: Number, image: Bytes, wal_end_lsn: Number) -> Result[Boolean, Text]:
+    if record_lsn < 1 or record_lsn >= wal_end_lsn: return err("YDBv1 leaf redo LSN is outside the recovered WAL range")
+    let page_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(image, page_id)?
+    if page_header.page_type != 1 or page_header.level != 0 or page_header.page_lsn != record_lsn: return err("YDBv1 leaf redo image has an invalid type or page LSN")
+    let ignored_allocated: Boolean = yaza_db_storage_validate_leaf_page_allocated_v1(storage, page_id)?
+    let offset: Number = yaza_db_storage_page_offset_v1(page_id)?
+    let current: Bytes = read_exact(storage.file, offset, yaza_db_page_size_v1())?
+    let current_header_result: Result[YazaDbPageHeaderV1, Text] = yaza_db_page_header_decode_v1(current, page_id)
+    if result_is_ok(current_header_result):
+        let current_header: YazaDbPageHeaderV1 = result_unwrap(current_header_result)
+        if current_header.page_lsn > record_lsn: return ok(true)
+        if current_header.page_lsn == record_lsn:
+            if not bytes_equal(current, image): return err("YDBv1 leaf page LSN matches its WAL record but the bytes differ")
+            return ok(true)
+    let written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, image)?
+    if written != yaza_db_page_size_v1(): return err("YDBv1 leaf redo page write was incomplete")
+    return ok(true)
+
+fn yaza_db_storage_redo_leaf_mutation_v1(storage: YazaDbStorageHandleV1, record: YazaDbWalRecordV1, wal_end_lsn: Number) -> Result[Boolean, Text]:
+    if record.rec_type != yaza_db_wal_type_leaf_insert_v1() and record.rec_type != yaza_db_wal_type_leaf_update_v1() and record.rec_type != yaza_db_wal_type_leaf_delete_v1(): return err("YDBv1 leaf mutation redo requires a LEAF_INSERT, LEAF_UPDATE, or LEAF_DELETE record")
+    if record.lsn < 1 or record.lsn > 9223372036854775807 - yaza_db_wal_header_size_v1() - bytes_length(record.payload): return err("YDBv1 leaf mutation WAL LSN overflows the supported range")
+    let record_end: Number = record.lsn + yaza_db_wal_header_size_v1() + bytes_length(record.payload)
+    if record_end > wal_end_lsn: return err("YDBv1 leaf mutation record extends beyond the recovered WAL end")
+    let mutation: YazaDbWalLeafMutationV1 = yaza_db_wal_leaf_mutation_payload_decode_v1(record)?
+    let applied: Boolean = yaza_db_storage_redo_leaf_image_v1(storage, mutation.page_id, record.lsn, mutation.after_image, wal_end_lsn)?
+    return ok(applied)
+
+fn yaza_db_storage_redo_leaf_compensation_v1(storage: YazaDbStorageHandleV1, record: YazaDbWalRecordV1, wal_end_lsn: Number) -> Result[Boolean, Text]:
+    if record.lsn < 1 or record.lsn > 9223372036854775807 - yaza_db_wal_header_size_v1() - bytes_length(record.payload): return err("YDBv1 leaf CLR LSN overflows the supported range")
+    let record_end: Number = record.lsn + yaza_db_wal_header_size_v1() + bytes_length(record.payload)
+    if record_end > wal_end_lsn: return err("YDBv1 leaf CLR extends beyond the recovered WAL end")
+    let compensation: YazaDbWalLeafCompensationV1 = yaza_db_wal_leaf_compensation_payload_decode_v1(record)?
+    let applied: Boolean = yaza_db_storage_redo_leaf_image_v1(storage, compensation.page_id, record.lsn, compensation.image, wal_end_lsn)?
+    return ok(applied)
+
+fn yaza_db_storage_append_leaf_mutation_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, txn_id: Number, prev_lsn: Number, operation: Number, page_id: Number, key: Bytes, row_payload: Bytes) -> Result[YazaDbWalLeafMutationAppendV1, Text]:
+    if txn_id < 1 or prev_lsn < 0: return err("YDBv1 leaf mutation requires a valid transaction chain")
+    if storage.root != wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid): return err("YDBv1 leaf mutation WAL does not belong to this database")
+    if operation != yaza_db_wal_type_leaf_insert_v1() and operation != yaza_db_wal_type_leaf_update_v1() and operation != yaza_db_wal_type_leaf_delete_v1(): return err("YDBv1 leaf mutation operation is invalid")
+    let ignored_allocated: Boolean = yaza_db_storage_validate_leaf_page_allocated_v1(storage, page_id)?
+    let before_image: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, page_id)?
+    let before_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(before_image, page_id)?
+    if before_header.page_type != 1 or before_header.level != 0: return err("YDBv1 leaf mutation target is not a level-zero LEAF")
+    let payload_size: Number = yaza_db_wal_leaf_mutation_payload_size_v1()
+    let record_length: Number = yaza_db_wal_header_size_v1() + payload_size
+    let record_lsn: Number = yaza_db_wal_record_lsn_for_append_v1(wal, record_length)?
+    var after_image: Bytes = bytes_from_text("")
+    if operation == yaza_db_wal_type_leaf_insert_v1():
+        set after_image = yaza_db_page_insert_slot_v1(before_image, key, row_payload)?
+        if not yaza_db_write_uint_le_v1(after_image, 0, record_lsn, 8): return err("YDBv1 inserted leaf page LSN could not be stamped")
+        set after_image = yaza_db_page_finalize_v1(after_image)?
+    elif operation == yaza_db_wal_type_leaf_update_v1():
+        set after_image = yaza_db_page_replace_leaf_slot_v1(before_image, record_lsn, key, row_payload)?
+    else:
+        set after_image = yaza_db_page_delete_leaf_slot_v1(before_image, record_lsn, key)?
+    let payload: Bytes = yaza_db_wal_leaf_mutation_payload_encode_v1(operation, page_id, record_lsn, before_image, after_image)?
+    if bytes_length(payload) != payload_size: return err("YDBv1 leaf mutation payload length changed during encoding")
+    let input_record: YazaDbWalRecordV1 = YazaDbWalRecordV1(0, prev_lsn, txn_id, operation, 0, payload)
+    let appended: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(wal, input_record)?
+    if appended.record.lsn != record_lsn:
+        let ignored_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(appended.log)
+        return err("YDBv1 leaf mutation WAL assigned an unexpected page LSN; reopen before reuse")
+    # WAL append above is durable before this data write. Startup recovery redoes
+    # durable operations, and checkpoint publication syncs the data file before
+    # advancing the header, so per-mutation data sync is redundant here.
+    let written: Result[Number, Text] = yaza_db_storage_write_page_v1(storage.file, storage.header, after_image)
+    if not result_is_ok(written):
+        let ignored_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(appended.log)
+        return err("YDBv1 leaf mutation WAL is durable but its page write failed; reopen to replay it")
+    if result_unwrap(written) != yaza_db_page_size_v1():
+        let ignored_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(appended.log)
+        return err("YDBv1 leaf mutation WAL is durable but its page write was incomplete; reopen to replay it")
+    return ok(YazaDbWalLeafMutationAppendV1(appended, page_id))

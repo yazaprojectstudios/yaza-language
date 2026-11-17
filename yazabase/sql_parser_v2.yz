@@ -1,0 +1,303 @@
+# Phase 0 parser v2: bounded SELECT names, explicit AS aliases, one comparison,
+# optional ORDER BY, and a bounded literal LIMIT.
+use "sql_lexer_v1"
+
+shape YazaSqlNameV2:
+    first_token: YazaSqlTokenV1
+    second_token: YazaSqlTokenV1
+    third_token: YazaSqlTokenV1
+    part_count: Number
+    wildcard: Boolean
+    start_byte: Number
+    end_byte: Number
+    consumed_tokens: Number
+
+shape YazaSqlProjectionV2:
+    name: YazaSqlNameV2
+    aggregate_kind: Number
+    has_alias: Boolean
+    alias: YazaSqlTokenV1
+
+shape YazaSqlOrderTermV2:
+    name: YazaSqlNameV2
+    descending: Boolean
+
+shape YazaSqlSelectAstV2:
+    version: Number
+    start_byte: Number
+    end_byte: Number
+    distinct: Boolean
+    projections: List[YazaSqlProjectionV2]
+    table_name: YazaSqlNameV2
+    has_table_alias: Boolean
+    table_alias: YazaSqlTokenV1
+    has_where: Boolean
+    where_column: YazaSqlNameV2
+    where_operator: Number
+    where_value: YazaSqlTokenV1
+    order_by: List[YazaSqlOrderTermV2]
+    has_limit: Boolean
+    limit: Number
+
+fn yaza_sql_v2_is_keyword(source: Text, tokens: List[YazaSqlTokenV1], index: Number, keyword: Text) -> Boolean:
+    if index < 0 or index >= list_count(tokens): return false
+    let token: YazaSqlTokenV1 = list_get(tokens, index)
+    if token.kind != 1 or token.end_byte - token.start_byte != text_length(keyword): return false
+    var offset: Number = 0
+    while offset < text_length(keyword):
+        var actual: Number = text_byte(source, token.start_byte + offset)
+        let expected: Number = text_byte(keyword, offset)
+        if actual >= 97 and actual <= 122: set actual = actual - 32
+        if actual != expected: return false
+        set offset = offset + 1
+    return true
+
+fn yaza_sql_v2_is_symbol(source: Text, tokens: List[YazaSqlTokenV1], index: Number, symbol: Number) -> Boolean:
+    if index < 0 or index >= list_count(tokens): return false
+    let token: YazaSqlTokenV1 = list_get(tokens, index)
+    return token.end_byte - token.start_byte == 1 and text_byte(source, token.start_byte) == symbol
+
+fn yaza_sql_v2_parse_error(source: Text, tokens: List[YazaSqlTokenV1], index: Number, prefix: Text) -> Text:
+    if index < 0 or index >= list_count(tokens): return "SQL parser token cursor is invalid"
+    let token: YazaSqlTokenV1 = list_get(tokens, index)
+    let location_result: Result[YazaSqlSourceLocationV1, Text] = yaza_sql_v1_location(source, token.start_byte)
+    if not result_is_ok(location_result): return "SQL parser could not locate diagnostic"
+    let location: YazaSqlSourceLocationV1 = result_unwrap(location_result)
+    let byte_text: Result[Text, Text] = number_try_text(token.start_byte)
+    let line_text: Result[Text, Text] = number_try_text(location.line)
+    let column_text: Result[Text, Text] = number_try_text(location.column)
+    if not result_is_ok(byte_text) or not result_is_ok(line_text) or not result_is_ok(column_text):
+        return "SQL parser could not allocate a diagnostic"
+    var message: Result[Text, Text] = text_try_concat(prefix, result_unwrap(byte_text))
+    if not result_is_ok(message): return "SQL parser could not allocate a diagnostic"
+    set message = text_try_concat(result_unwrap(message), " (line ")
+    if not result_is_ok(message): return "SQL parser could not allocate a diagnostic"
+    set message = text_try_concat(result_unwrap(message), result_unwrap(line_text))
+    if not result_is_ok(message): return "SQL parser could not allocate a diagnostic"
+    set message = text_try_concat(result_unwrap(message), ", column ")
+    if not result_is_ok(message): return "SQL parser could not allocate a diagnostic"
+    set message = text_try_concat(result_unwrap(message), result_unwrap(column_text))
+    if not result_is_ok(message): return "SQL parser could not allocate a diagnostic"
+    set message = text_try_concat(result_unwrap(message), ")")
+    if not result_is_ok(message): return "SQL parser could not allocate a diagnostic"
+    return result_unwrap(message)
+
+fn yaza_sql_v2_comparison_code(source: Text, tokens: List[YazaSqlTokenV1], index: Number) -> Number:
+    if index < 0 or index >= list_count(tokens): return 0
+    let token: YazaSqlTokenV1 = list_get(tokens, index)
+    if token.kind != 7: return 0
+    let length: Number = token.end_byte - token.start_byte
+    let first: Number = text_byte(source, token.start_byte)
+    if length == 1:
+        if first == 61: return 1
+        if first == 60: return 3
+        if first == 62: return 5
+        return 0
+    if length == 2:
+        let second: Number = text_byte(source, token.start_byte + 1)
+        if first == 33 and second == 61: return 2
+        if first == 60 and second == 62: return 2
+        if first == 60 and second == 61: return 4
+        if first == 62 and second == 61: return 6
+    return 0
+
+fn yaza_sql_v2_parse_name(source: Text, tokens: List[YazaSqlTokenV1], index: Number, allow_star: Boolean) -> Result[YazaSqlNameV2, Text]:
+    let token_count: Number = list_count(tokens)
+    if index < 0 or index >= token_count:
+        return err("SQL parser token cursor is invalid")
+
+    let empty_token: YazaSqlTokenV1 = YazaSqlTokenV1(0, 0, 0)
+    let first: YazaSqlTokenV1 = list_get(tokens, index)
+    if first.kind == 7 and yaza_sql_v2_is_symbol(source, tokens, index, 42):
+        if not allow_star:
+            return err(yaza_sql_v2_parse_error(source, tokens, index, "SQL parser expected an identifier at byte "))
+        return ok(YazaSqlNameV2(empty_token, empty_token, empty_token, 0, true, first.start_byte, first.end_byte, 1))
+    if first.kind != 1 and first.kind != 2:
+        return err(yaza_sql_v2_parse_error(source, tokens, index, "SQL parser expected an identifier at byte "))
+
+    var second: YazaSqlTokenV1 = empty_token
+    var third: YazaSqlTokenV1 = empty_token
+    var part_count: Number = 1
+    var wildcard: Boolean = false
+    var name_end: Number = first.end_byte
+    var cursor: Number = index + 1
+    var parsing: Boolean = true
+    while parsing:
+        if not yaza_sql_v2_is_symbol(source, tokens, cursor, 46):
+            set parsing = false
+        else:
+            let next_index: Number = cursor + 1
+            if next_index >= token_count:
+                return err("SQL parser expected a name after '.' at end of input")
+            let next: YazaSqlTokenV1 = list_get(tokens, next_index)
+            if next.kind == 7 and yaza_sql_v2_is_symbol(source, tokens, next_index, 42):
+                if not allow_star:
+                    return err(yaza_sql_v2_parse_error(source, tokens, next_index, "SQL parser wildcard is not valid in this name at byte "))
+                set wildcard = true
+                set name_end = next.end_byte
+                set cursor = next_index + 1
+                set parsing = false
+            elif next.kind != 1 and next.kind != 2:
+                return err(yaza_sql_v2_parse_error(source, tokens, next_index, "SQL parser expected an identifier after '.' at byte "))
+            elif part_count >= 3:
+                return err(yaza_sql_v2_parse_error(source, tokens, next_index, "SQL parser qualified names support at most three parts at byte "))
+            else:
+                if part_count == 1:
+                    set second = next
+                else:
+                    set third = next
+                set part_count = part_count + 1
+                set name_end = next.end_byte
+                set cursor = next_index + 1
+
+    return ok(YazaSqlNameV2(first, second, third, part_count, wildcard, first.start_byte, name_end, cursor - index))
+
+fn yaza_sql_parse_select_v2(source: Text) -> Result[YazaSqlSelectAstV2, Text]:
+    let lexed: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(source)
+    if not result_is_ok(lexed): return err(result_unwrap_error(lexed))
+    let tokens: List[YazaSqlTokenV1] = result_unwrap(lexed)
+    let token_count: Number = list_count(tokens)
+    if token_count < 2: return err("SQL parser received an invalid token stream")
+
+    var cursor: Number = 0
+    if not yaza_sql_v2_is_keyword(source, tokens, cursor, "SELECT"):
+        return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected SELECT at byte "))
+    let first_token: YazaSqlTokenV1 = list_get(tokens, cursor)
+    set cursor = cursor + 1
+
+    var distinct: Boolean = false
+    if yaza_sql_v2_is_keyword(source, tokens, cursor, "DISTINCT"):
+        set distinct = true
+        set cursor = cursor + 1
+
+    let projections_result: Result[List[YazaSqlProjectionV2], Text] = list_try_new()
+    if not result_is_ok(projections_result): return err("SQL parser could not allocate the projection list")
+    var projections: List[YazaSqlProjectionV2] = result_unwrap(projections_result)
+    var projection_done: Boolean = false
+    while not projection_done:
+        if cursor >= token_count: return err("SQL parser expected a projection at end of input")
+        let name_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, cursor, true)
+        if not result_is_ok(name_result): return err(result_unwrap_error(name_result))
+        let name: YazaSqlNameV2 = result_unwrap(name_result)
+        set cursor = cursor + name.consumed_tokens
+
+        var has_alias: Boolean = false
+        var alias: YazaSqlTokenV1 = YazaSqlTokenV1(0, 0, 0)
+        if yaza_sql_v2_is_keyword(source, tokens, cursor, "AS"):
+            set cursor = cursor + 1
+            if cursor >= token_count: return err("SQL parser expected a projection alias at end of input")
+            set alias = list_get(tokens, cursor)
+            if alias.kind != 1 and alias.kind != 2:
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected an identifier alias at byte "))
+            set has_alias = true
+            set cursor = cursor + 1
+
+        if not list_try_push(projections, YazaSqlProjectionV2(name, 0, has_alias, alias)):
+            return err(yaza_sql_v2_parse_error(source, tokens, cursor - 1, "SQL parser projection limit or allocation failure at byte "))
+        if yaza_sql_v2_is_symbol(source, tokens, cursor, 44):
+            set cursor = cursor + 1
+        else:
+            set projection_done = true
+
+    if not yaza_sql_v2_is_keyword(source, tokens, cursor, "FROM"):
+        return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected FROM at byte "))
+    set cursor = cursor + 1
+    if cursor >= token_count: return err("SQL parser expected a table name at end of input")
+    let table_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, cursor, false)
+    if not result_is_ok(table_result): return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected a table name at byte "))
+    let table_name: YazaSqlNameV2 = result_unwrap(table_result)
+    set cursor = cursor + table_name.consumed_tokens
+
+    var has_table_alias: Boolean = false
+    var table_alias: YazaSqlTokenV1 = YazaSqlTokenV1(0, 0, 0)
+    if yaza_sql_v2_is_keyword(source, tokens, cursor, "AS"):
+        set cursor = cursor + 1
+        if cursor >= token_count: return err("SQL parser expected a table alias at end of input")
+        set table_alias = list_get(tokens, cursor)
+        if table_alias.kind != 1 and table_alias.kind != 2:
+            return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected an identifier alias at byte "))
+        set has_table_alias = true
+        set cursor = cursor + 1
+
+    var has_where: Boolean = false
+    var where_column: YazaSqlNameV2 = YazaSqlNameV2(YazaSqlTokenV1(0, 0, 0), YazaSqlTokenV1(0, 0, 0), YazaSqlTokenV1(0, 0, 0), 0, false, 0, 0, 0)
+    var where_operator: Number = 0
+    var where_value: YazaSqlTokenV1 = YazaSqlTokenV1(0, 0, 0)
+    if yaza_sql_v2_is_keyword(source, tokens, cursor, "WHERE"):
+        set has_where = true
+        set cursor = cursor + 1
+        if cursor >= token_count: return err("SQL parser expected a WHERE column at end of input")
+        let column_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, cursor, false)
+        if not result_is_ok(column_result): return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected a WHERE column at byte "))
+        set where_column = result_unwrap(column_result)
+        set cursor = cursor + where_column.consumed_tokens
+        set where_operator = yaza_sql_v2_comparison_code(source, tokens, cursor)
+        if where_operator == 0:
+            return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected a comparison operator at byte "))
+        set cursor = cursor + 1
+        if cursor >= token_count: return err("SQL parser expected a WHERE value at end of input")
+        set where_value = list_get(tokens, cursor)
+        if where_value.kind != 3 and where_value.kind != 4 and where_value.kind != 5:
+            if not yaza_sql_v2_is_keyword(source, tokens, cursor, "NULL") and not yaza_sql_v2_is_keyword(source, tokens, cursor, "TRUE") and not yaza_sql_v2_is_keyword(source, tokens, cursor, "FALSE"):
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected a literal or bind parameter at byte "))
+        set cursor = cursor + 1
+
+    let order_result: Result[List[YazaSqlOrderTermV2], Text] = list_try_new()
+    if not result_is_ok(order_result): return err("SQL parser could not allocate the ORDER BY list")
+    var order_by: List[YazaSqlOrderTermV2] = result_unwrap(order_result)
+    if yaza_sql_v2_is_keyword(source, tokens, cursor, "ORDER"):
+        set cursor = cursor + 1
+        if not yaza_sql_v2_is_keyword(source, tokens, cursor, "BY"):
+            return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected BY after ORDER at byte "))
+        set cursor = cursor + 1
+        var order_done: Boolean = false
+        while not order_done:
+            if cursor >= token_count: return err("SQL parser expected an ORDER BY column at end of input")
+            let name_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, cursor, false)
+            if not result_is_ok(name_result): return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected an ORDER BY column at byte "))
+            let order_name: YazaSqlNameV2 = result_unwrap(name_result)
+            set cursor = cursor + order_name.consumed_tokens
+            var descending: Boolean = false
+            if yaza_sql_v2_is_keyword(source, tokens, cursor, "DESC"):
+                set descending = true
+                set cursor = cursor + 1
+            elif yaza_sql_v2_is_keyword(source, tokens, cursor, "ASC"):
+                set cursor = cursor + 1
+            if not list_try_push(order_by, YazaSqlOrderTermV2(order_name, descending)):
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor - 1, "SQL parser order-list limit or allocation failure at byte "))
+            if yaza_sql_v2_is_symbol(source, tokens, cursor, 44):
+                set cursor = cursor + 1
+            else:
+                set order_done = true
+
+    var has_limit: Boolean = false
+    var limit_value: Number = 0
+    if yaza_sql_v2_is_keyword(source, tokens, cursor, "LIMIT"):
+        set has_limit = true
+        set cursor = cursor + 1
+        if cursor >= token_count: return err("SQL parser expected an integer LIMIT at end of input")
+        let limit_token: YazaSqlTokenV1 = list_get(tokens, cursor)
+        if limit_token.kind != 3:
+            return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected an integer LIMIT at byte "))
+        var digit_offset: Number = limit_token.start_byte
+        while digit_offset < limit_token.end_byte:
+            let digit_byte: Number = text_byte(source, digit_offset)
+            if digit_byte < 48 or digit_byte > 57:
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser LIMIT must be an unsigned integer at byte "))
+            let digit: Number = digit_byte - 48
+            if limit_value > 100000 or (limit_value == 100000 and digit > 0):
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser LIMIT exceeds 1000000 at byte "))
+            set limit_value = limit_value * 10 + digit
+            set digit_offset = digit_offset + 1
+        if limit_value > 1000000:
+            return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser LIMIT exceeds 1000000 at byte "))
+        set cursor = cursor + 1
+
+    var statement_end: Number = list_get(tokens, cursor - 1).end_byte
+    if yaza_sql_v2_is_symbol(source, tokens, cursor, 59):
+        set statement_end = list_get(tokens, cursor).end_byte
+        set cursor = cursor + 1
+    if cursor >= token_count or list_get(tokens, cursor).kind != 0:
+        return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser supports one statement; unexpected token at byte "))
+
+    return ok(YazaSqlSelectAstV2(2, first_token.start_byte, statement_end, distinct, projections, table_name, has_table_alias, table_alias, has_where, where_column, where_operator, where_value, order_by, has_limit, limit_value))

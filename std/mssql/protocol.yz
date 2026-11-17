@@ -1,0 +1,362 @@
+# Microsoft SQL Server TDS (Tabular Data Stream 7.4) wire protocol codecs.
+# Pure YAZA implementation of TDS headers, Prelogin, Login7, SQL Batch, and Token streams.
+
+shape TdsPacketHeader:
+    packet_type: Number
+    status: Number
+    length: Number
+    spid: Number
+    packet_id: Number
+    window: Number
+
+shape TdsPreloginOption:
+    token: Number
+    offset: Number
+    length: Number
+
+shape TdsColumnMetadata:
+    user_type: Number
+    flags: Number
+    type_id: Number
+    type_size: Number
+    name: Text
+
+shape TdsRow:
+    cell_values: TextList
+    cell_is_null: TextList
+
+shape TdsDoneToken:
+    status: Number
+    cur_cmd: Number
+    row_count: Number
+
+shape TdsErrorToken:
+    error_number: Number
+    state: Number
+    severity: Number
+    message: Text
+    server_name: Text
+    line_number: Number
+
+variant TdsTokenKind:
+    TokenColMetadata
+    TokenRow
+    TokenNbcRow
+    TokenDone
+    TokenError
+    TokenInfo
+    TokenEnvChange
+    TokenUnknown
+
+# TDS Packet types
+fn tds_type_sql_batch() -> Number:
+    return 1
+
+fn tds_type_rpc() -> Number:
+    return 3
+
+fn tds_type_response() -> Number:
+    return 4
+
+fn tds_type_prelogin() -> Number:
+    return 18
+
+fn tds_type_login7() -> Number:
+    return 16
+
+# TDS Status flags
+fn tds_status_normal() -> Number:
+    return 0
+
+fn tds_status_eom() -> Number:
+    return 1
+
+fn tds_status_reset() -> Number:
+    return 8
+
+# Endian helpers
+fn tds_u16_be(value: Number) -> Result[Bytes, Text]:
+    if value < 0 or value > 65535:
+        return err("TDS u16_be value out of range")
+    let b0: Number = (value / 256) % 256
+    let b1: Number = value % 256
+    return ok(bytes_concat(bytes_from_number(b0), bytes_from_number(b1)))
+
+fn tds_read_u16_be(payload: Bytes, offset: Number) -> Result[Number, Text]:
+    if offset < 0 or offset + 2 > bytes_length(payload):
+        return err("TDS buffer underflow reading u16_be")
+    let b0: Number = bytes_get(payload, offset)
+    let b1: Number = bytes_get(payload, offset + 1)
+    return ok(b0 * 256 + b1)
+
+fn tds_u16_le(value: Number) -> Result[Bytes, Text]:
+    if value < 0 or value > 65535:
+        return err("TDS u16_le value out of range")
+    let b0: Number = value % 256
+    let b1: Number = (value / 256) % 256
+    return ok(bytes_concat(bytes_from_number(b0), bytes_from_number(b1)))
+
+fn tds_read_u16_le(payload: Bytes, offset: Number) -> Result[Number, Text]:
+    if offset < 0 or offset + 2 > bytes_length(payload):
+        return err("TDS buffer underflow reading u16_le")
+    let b0: Number = bytes_get(payload, offset)
+    let b1: Number = bytes_get(payload, offset + 1)
+    return ok(b0 + b1 * 256)
+
+fn tds_u32_le(value: Number) -> Result[Bytes, Text]:
+    if value < 0 or value > 4294967295:
+        return err("TDS u32_le value out of range")
+    let b0: Number = value % 256
+    let b1: Number = (value / 256) % 256
+    let b2: Number = (value / 65536) % 256
+    let b3: Number = (value / 16777216) % 256
+    let p0: Bytes = bytes_concat(bytes_from_number(b0), bytes_from_number(b1))
+    let p1: Bytes = bytes_concat(bytes_from_number(b2), bytes_from_number(b3))
+    return ok(bytes_concat(p0, p1))
+
+fn tds_read_u32_le(payload: Bytes, offset: Number) -> Result[Number, Text]:
+    if offset < 0 or offset + 4 > bytes_length(payload):
+        return err("TDS buffer underflow reading u32_le")
+    let b0: Number = bytes_get(payload, offset)
+    let b1: Number = bytes_get(payload, offset + 1)
+    let b2: Number = bytes_get(payload, offset + 2)
+    let b3: Number = bytes_get(payload, offset + 3)
+    return ok(b0 + b1 * 256 + b2 * 65536 + b3 * 16777216)
+
+# String conversions for UTF-16LE
+# Multibyte UTF-8 decoding to UTF-16LE code units (supporting accented Latin, CJK, and Unicode)
+fn tds_encode_utf16le(text: Text) -> Bytes:
+    var result: Bytes = bytes_empty()
+    let len: Number = text_length(text)
+    var idx: Number = 0
+    while idx < len:
+        let b0: Number = text_byte(text, idx)
+        var cp: Number = b0
+        if b0 < 128:
+            set idx = idx + 1
+        elif b0 >= 192 and b0 < 224:
+            if idx + 1 < len:
+                let b1: Number = text_byte(text, idx + 1)
+                set cp = ((b0 - 192) * 64) + (b1 - 128)
+                set idx = idx + 2
+            else:
+                set idx = idx + 1
+        elif b0 >= 224 and b0 < 240:
+            if idx + 2 < len:
+                let b1: Number = text_byte(text, idx + 1)
+                let b2: Number = text_byte(text, idx + 2)
+                set cp = ((b0 - 224) * 4096) + ((b1 - 128) * 64) + (b2 - 128)
+                set idx = idx + 3
+            else:
+                set idx = idx + 1
+        else:
+            set idx = idx + 1
+        let lo: Number = cp % 256
+        let hi: Number = (cp / 256) % 256
+        set result = bytes_concat(result, bytes_concat(bytes_from_number(lo), bytes_from_number(hi)))
+    return result
+
+fn tds_decode_utf16le(payload: Bytes, offset: Number, char_count: Number) -> Result[Text, Text]:
+    let byte_count: Number = char_count * 2
+    if offset < 0 or offset + byte_count > bytes_length(payload):
+        return err("TDS buffer underflow decoding UTF-16LE string")
+    var out_bytes: Bytes = bytes_empty()
+    var idx: Number = 0
+    while idx < char_count:
+        let b0: Number = bytes_get(payload, offset + idx * 2)
+        let b1: Number = bytes_get(payload, offset + idx * 2 + 1)
+        let cp: Number = b0 + b1 * 256
+        if cp < 128:
+            set out_bytes = bytes_concat(out_bytes, bytes_from_number(cp))
+        elif cp < 2048:
+            let u0: Number = 192 + (cp / 64)
+            let u1: Number = 128 + (cp % 64)
+            set out_bytes = bytes_concat(out_bytes, bytes_concat(bytes_from_number(u0), bytes_from_number(u1)))
+        else:
+            let u0: Number = 224 + (cp / 4096)
+            let u1: Number = 128 + ((cp / 64) % 64)
+            let u2: Number = 128 + (cp % 64)
+            set out_bytes = bytes_concat(out_bytes, bytes_concat(bytes_from_number(u0), bytes_concat(bytes_from_number(u1), bytes_from_number(u2))))
+        set idx = idx + 1
+    let opt: Option[Text] = bytes_to_text_checked(out_bytes)
+    if not option_is_some(opt):
+        return err("TDS UTF-16LE decoded to invalid text")
+    return ok(option_unwrap(opt))
+
+# TDS 4-bit nibble swap XOR 0xA5 password scrambling
+fn tds_scramble_password(password: Text) -> Bytes:
+    let utf16: Bytes = tds_encode_utf16le(password)
+    var scrambled: Bytes = bytes_empty()
+    let len: Number = bytes_length(utf16)
+    var idx: Number = 0
+    while idx < len:
+        let b: Number = bytes_get(utf16, idx)
+        let low_nibble: Number = b % 16
+        let high_nibble: Number = (b / 16) % 16
+        let swapped: Number = low_nibble * 16 + high_nibble
+        # XOR 0xA5 (165)
+        var bit: Number = 1
+        var res_byte: Number = 0
+        var b_idx: Number = 0
+        var v1: Number = swapped
+        var v2: Number = 165
+        while b_idx < 8:
+            let bit1: Number = v1 % 2
+            let bit2: Number = v2 % 2
+            if bit1 != bit2:
+                set res_byte = res_byte + bit
+            set v1 = v1 / 2
+            set v2 = v2 / 2
+            set bit = bit * 2
+            set b_idx = b_idx + 1
+        set scrambled = bytes_concat(scrambled, bytes_from_number(res_byte))
+        set idx = idx + 1
+    return scrambled
+
+# TDS Packet framing
+fn tds_packet(packet_type: Number, status: Number, payload: Bytes, spid: Number, packet_id: Number) -> Result[Bytes, Text]:
+    let total_len: Number = bytes_length(payload) + 8
+    if total_len > 65535:
+        return err("TDS packet exceeds maximum 65535 bytes")
+    let len_res: Result[Bytes, Text] = tds_u16_be(total_len)
+    if not result_is_ok(len_res):
+        return err(result_unwrap_error(len_res))
+    let spid_res: Result[Bytes, Text] = tds_u16_be(spid)
+    if not result_is_ok(spid_res):
+        return err(result_unwrap_error(spid_res))
+    var header: Bytes = bytes_concat(bytes_from_number(packet_type), bytes_from_number(status))
+    set header = bytes_concat(header, result_unwrap(len_res))
+    set header = bytes_concat(header, result_unwrap(spid_res))
+    set header = bytes_concat(header, bytes_concat(bytes_from_number(packet_id), bytes_from_number(0)))
+    return ok(bytes_concat(header, payload))
+
+fn tds_parse_packet_header(packet: Bytes, offset: Number) -> Result[TdsPacketHeader, Text]:
+    if offset < 0 or offset + 8 > bytes_length(packet):
+        return err("TDS packet underflow reading header")
+    let p_type: Number = bytes_get(packet, offset)
+    let status: Number = bytes_get(packet, offset + 1)
+    let len_res: Result[Number, Text] = tds_read_u16_be(packet, offset + 2)
+    if not result_is_ok(len_res):
+        return err(result_unwrap_error(len_res))
+    let spid_res: Result[Number, Text] = tds_read_u16_be(packet, offset + 4)
+    if not result_is_ok(spid_res):
+        return err(result_unwrap_error(spid_res))
+    let p_id: Number = bytes_get(packet, offset + 6)
+    let win: Number = bytes_get(packet, offset + 7)
+    return ok(TdsPacketHeader(p_type, status, result_unwrap(len_res), result_unwrap(spid_res), p_id, win))
+
+# PRELOGIN Packet creation (Type 0x12)
+fn tds_prelogin_packet(spid: Number) -> Result[Bytes, Text]:
+    var table: Bytes = bytes_empty()
+    # Option 0: Version (9.0.0.0) -> offset 26, len 6
+    set table = bytes_concat(table, bytes_from_number(0))
+    set table = bytes_concat(table, result_unwrap(tds_u16_be(26)))
+    set table = bytes_concat(table, result_unwrap(tds_u16_be(6)))
+    # Option 1: Encryption (ENCRYPT_NOT_SUP = 2) -> offset 32, len 1
+    set table = bytes_concat(table, bytes_from_number(1))
+    set table = bytes_concat(table, result_unwrap(tds_u16_be(32)))
+    set table = bytes_concat(table, result_unwrap(tds_u16_be(1)))
+    # Option 2: InstOpt -> offset 33, len 1
+    set table = bytes_concat(table, bytes_from_number(2))
+    set table = bytes_concat(table, result_unwrap(tds_u16_be(33)))
+    set table = bytes_concat(table, result_unwrap(tds_u16_be(1)))
+    # Option 3: ThreadID -> offset 34, len 4
+    set table = bytes_concat(table, bytes_from_number(3))
+    set table = bytes_concat(table, result_unwrap(tds_u16_be(34)))
+    set table = bytes_concat(table, result_unwrap(tds_u16_be(4)))
+    # Option 4: MARS -> offset 38, len 1
+    set table = bytes_concat(table, bytes_from_number(4))
+    set table = bytes_concat(table, result_unwrap(tds_u16_be(38)))
+    set table = bytes_concat(table, result_unwrap(tds_u16_be(1)))
+    # Terminator
+    set table = bytes_concat(table, bytes_from_number(255))
+
+    # Data block:
+    # Version: 6 bytes (0x09, 0x00, 0x00, 0x00, 0x00, 0x00)
+    var data: Bytes = bytes_concat(bytes_concat(bytes_from_number(9), bytes_from_number(0)), bytes_concat(bytes_from_number(0), bytes_from_number(0)))
+    set data = bytes_concat(data, bytes_concat(bytes_from_number(0), bytes_from_number(0)))
+    # Encryption: 2 (ENCRYPT_NOT_SUP)
+    set data = bytes_concat(data, bytes_from_number(2))
+    # InstOpt: 0 (null terminated empty string)
+    set data = bytes_concat(data, bytes_from_number(0))
+    # ThreadID: 0,0,0,0
+    set data = bytes_concat(data, bytes_concat(bytes_concat(bytes_from_number(0), bytes_from_number(0)), bytes_concat(bytes_from_number(0), bytes_from_number(0))))
+    # MARS: 0
+    set data = bytes_concat(data, bytes_from_number(0))
+
+    let payload: Bytes = bytes_concat(table, data)
+    return tds_packet(18, 1, payload, spid, 1)
+
+# SQL Batch packet (Type 0x01)
+fn tds_sql_batch_packet(query: Text, spid: Number) -> Result[Bytes, Text]:
+    let sql_utf16: Bytes = tds_encode_utf16le(query)
+    # ALL_HEADERS descriptor (22 bytes)
+    # TotalLength (4B = 22), HeaderLength (4B = 18), HeaderType (2B = 2), TransDescriptor (8B = 0), ReqCount (4B = 1)
+    let total_h_len: Bytes = result_unwrap(tds_u32_le(22))
+    let head_len: Bytes = result_unwrap(tds_u32_le(18))
+    let head_type: Bytes = result_unwrap(tds_u16_le(2))
+    var trans_desc: Bytes = bytes_empty()
+    var t_idx: Number = 0
+    while t_idx < 8:
+        set trans_desc = bytes_concat(trans_desc, bytes_from_number(0))
+        set t_idx = t_idx + 1
+    let req_count: Bytes = result_unwrap(tds_u32_le(1))
+    var all_headers: Bytes = bytes_concat(total_h_len, head_len)
+    set all_headers = bytes_concat(all_headers, head_type)
+    set all_headers = bytes_concat(all_headers, trans_desc)
+    set all_headers = bytes_concat(all_headers, req_count)
+
+    let payload: Bytes = bytes_concat(all_headers, sql_utf16)
+    return tds_packet(1, 1, payload, spid, 1)
+
+# Response token parsing
+fn tds_token_kind(token_byte: Number) -> TdsTokenKind:
+    if token_byte == 129:
+        return TdsTokenKind::TokenColMetadata
+    if token_byte == 209:
+        return TdsTokenKind::TokenRow
+    if token_byte == 210:
+        return TdsTokenKind::TokenNbcRow
+    if token_byte == 253 or token_byte == 254 or token_byte == 255:
+        return TdsTokenKind::TokenDone
+    if token_byte == 170:
+        return TdsTokenKind::TokenError
+    if token_byte == 171:
+        return TdsTokenKind::TokenInfo
+    if token_byte == 227:
+        return TdsTokenKind::TokenEnvChange
+    return TdsTokenKind::TokenUnknown
+
+fn tds_parse_done_token(payload: Bytes, offset: Number) -> Result[TdsDoneToken, Text]:
+    if offset < 0 or offset + 12 > bytes_length(payload):
+        return err("TDS DONE token buffer underflow")
+    let st_res: Result[Number, Text] = tds_read_u16_le(payload, offset)
+    if not result_is_ok(st_res):
+        return err(result_unwrap_error(st_res))
+    let cmd_res: Result[Number, Text] = tds_read_u16_le(payload, offset + 2)
+    if not result_is_ok(cmd_res):
+        return err(result_unwrap_error(cmd_res))
+    let cnt_res: Result[Number, Text] = tds_read_u32_le(payload, offset + 4)
+    if not result_is_ok(cnt_res):
+        return err(result_unwrap_error(cnt_res))
+    return ok(TdsDoneToken(result_unwrap(st_res), result_unwrap(cmd_res), result_unwrap(cnt_res)))
+
+fn tds_parse_error_token(payload: Bytes, offset: Number) -> Result[TdsErrorToken, Text]:
+    if offset < 0 or offset + 10 > bytes_length(payload):
+        return err("TDS ERROR token buffer underflow")
+    let len_res: Result[Number, Text] = tds_read_u16_le(payload, offset)
+    if not result_is_ok(len_res):
+        return err(result_unwrap_error(len_res))
+    let num_res: Result[Number, Text] = tds_read_u32_le(payload, offset + 2)
+    if not result_is_ok(num_res):
+        return err(result_unwrap_error(num_res))
+    let state: Number = bytes_get(payload, offset + 6)
+    let severity: Number = bytes_get(payload, offset + 7)
+    let msg_len_res: Result[Number, Text] = tds_read_u16_le(payload, offset + 8)
+    if not result_is_ok(msg_len_res):
+        return err(result_unwrap_error(msg_len_res))
+    let msg_chars: Number = result_unwrap(msg_len_res)
+    let msg_res: Result[Text, Text] = tds_decode_utf16le(payload, offset + 10, msg_chars)
+    if not result_is_ok(msg_res):
+        return err(result_unwrap_error(msg_res))
+    return ok(TdsErrorToken(result_unwrap(num_res), state, severity, result_unwrap(msg_res), "server", 1))

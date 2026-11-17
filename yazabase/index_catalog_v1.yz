@@ -1,0 +1,72 @@
+# Validated current-snapshot reader for the provisional sys_indexes catalog.
+# BUILDING entries are durable recovery state and must never be treated as
+# queryable indexes.
+use "./btree_scan_v1"
+use "./catalog_schema_v1"
+use "./catalog_storage_v1"
+use "./catalog_v1"
+use "./page_v1"
+use "./row_v1"
+use "./sql_executor_v1"
+use "./storage_v1"
+
+fn yaza_db_index_catalog_validate_row_metadata_v1(row: YazaDbRowV1, file_header: YazaDbFileHeaderV1, visible_ts: Number) -> Result[Boolean, Text]:
+    if row.deleted or row.version_ts < 1 or row.version_ts > visible_ts or list_count(row.values) != 7 or list_count(row.nulls) != 7:
+        return err("YDBv1 sys_indexes row has invalid visibility or width")
+    var field: Number = 0
+    while field < 7:
+        if list_get(row.nulls, field): return err("YDBv1 sys_indexes contains NULL in a required field")
+        set field = field + 1
+    let index_id: YazaSqlValueV1 = list_get(row.values, 0)
+    let table_id: YazaSqlValueV1 = list_get(row.values, 1)
+    let name: YazaSqlValueV1 = list_get(row.values, 2)
+    let root_id: YazaSqlValueV1 = list_get(row.values, 3)
+    let kind: YazaSqlValueV1 = list_get(row.values, 4)
+    let unique: YazaSqlValueV1 = list_get(row.values, 5)
+    let key_columns: YazaSqlValueV1 = list_get(row.values, 6)
+    if index_id.type_id != 4 or table_id.type_id != 4 or name.type_id != 9 or root_id.type_id != 4 or kind.type_id != 2 or unique.type_id != 1 or key_columns.type_id != 9:
+        return err("YDBv1 sys_indexes value tags do not match the catalog schema")
+    if index_id.integer_value < 1 or table_id.integer_value < 1 or root_id.integer_value < 2 or root_id.integer_value >= file_header.page_count or text_length(name.text_value) < 1 or text_length(key_columns.text_value) < 1:
+        return err("YDBv1 sys_indexes contains an out-of-range identity or empty name/key")
+    if kind.integer_value != yaza_db_catalog_index_kind_primary_v1() and kind.integer_value != yaza_db_catalog_index_kind_secondary_active_v1() and kind.integer_value != yaza_db_catalog_index_kind_secondary_building_v1():
+        return err("YDBv1 sys_indexes contains an unsupported index kind")
+    if kind.integer_value == yaza_db_catalog_index_kind_primary_v1() and not unique.boolean_value:
+        return err("YDBv1 primary index metadata must be unique")
+    return ok(true)
+
+fn yaza_db_index_catalog_rows_v1(file: Number, file_header: YazaDbFileHeaderV1, visible_ts: Number) -> Result[List[YazaDbRowV1], Text]:
+    if file < 0 or file_header.page_count < 2 or visible_ts < 1 or visible_ts >= file_header.next_commit_ts:
+        return err("YDBv1 index catalog snapshot identity is invalid")
+    let catalog: YazaDbCatalogRootV1 = yaza_db_catalog_storage_read_root_v1(file, file_header)?
+    let columns: List[YazaSqlColumnSchemaV1] = yaza_db_catalog_table_schema_v1(3)?
+    let key_ordinals: List[Number] = [0]
+    let rows: List[YazaDbRowV1] = yaza_db_btree_read_rows_v1(file, file_header, catalog.sys_indexes_root, columns, key_ordinals, visible_ts, 4096)?
+    var row_index: Number = 0
+    while row_index < list_count(rows):
+        let row: YazaDbRowV1 = list_get(rows, row_index)
+        let metadata_valid: Boolean = yaza_db_index_catalog_validate_row_metadata_v1(row, file_header, visible_ts)?
+        if not metadata_valid: return err("YDBv1 sys_indexes row metadata validator returned false")
+        let index_id: YazaSqlValueV1 = list_get(row.values, 0)
+        let name: YazaSqlValueV1 = list_get(row.values, 2)
+        let root_id: YazaSqlValueV1 = list_get(row.values, 3)
+        let root_page: Bytes = yaza_db_storage_read_page_validated_file_v1(file, file_header, root_id.integer_value)?
+        let root_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(root_page, root_id.integer_value)?
+        if root_header.page_type != 1 and root_header.page_type != 2:
+            return err("YDBv1 sys_indexes root is not a B+Tree page")
+        var prior_index: Number = 0
+        while prior_index < row_index:
+            let prior: YazaDbRowV1 = list_get(rows, prior_index)
+            if list_get(prior.values, 0).integer_value == index_id.integer_value: return err("YDBv1 sys_indexes contains a duplicate index ID")
+            if list_get(prior.values, 2).text_value == name.text_value: return err("YDBv1 sys_indexes contains a duplicate index name")
+            set prior_index = prior_index + 1
+        set row_index = row_index + 1
+    return ok(rows)
+
+fn yaza_db_index_catalog_has_building_v1(file: Number, file_header: YazaDbFileHeaderV1, visible_ts: Number) -> Result[Boolean, Text]:
+    let rows: List[YazaDbRowV1] = yaza_db_index_catalog_rows_v1(file, file_header, visible_ts)?
+    var index: Number = 0
+    while index < list_count(rows):
+        let row: YazaDbRowV1 = list_get(rows, index)
+        if list_get(row.values, 4).integer_value == yaza_db_catalog_index_kind_secondary_building_v1(): return ok(true)
+        set index = index + 1
+    return ok(false)

@@ -1,0 +1,231 @@
+use "std/fs"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/sql_dispatch_v1"
+
+fn set_ops_contains_text_v1(rows: List[List[YazaSqlValueV1]], text_value: Text) -> Boolean:
+    var index: Number = 0
+    while index < list_count(rows):
+        let row: List[YazaSqlValueV1] = list_get(rows, index)
+        if list_count(row) == 1 and not list_get(row, 0).is_null and list_get(row, 0).text_value == text_value:
+            return true
+        set index = index + 1
+    return false
+
+fn set_ops_text_count_v1(rows: List[List[YazaSqlValueV1]], text_value: Text) -> Number:
+    var count: Number = 0
+    var index: Number = 0
+    while index < list_count(rows):
+        let row: List[YazaSqlValueV1] = list_get(rows, index)
+        if list_count(row) == 1 and not list_get(row, 0).is_null and list_get(row, 0).text_value == text_value:
+            set count = count + 1
+        set index = index + 1
+    return count
+
+fn set_ops_null_count_v1(rows: List[List[YazaSqlValueV1]]) -> Number:
+    var count: Number = 0
+    var index: Number = 0
+    while index < list_count(rows):
+        let row: List[YazaSqlValueV1] = list_get(rows, index)
+        if list_count(row) == 1 and list_get(row, 0).is_null:
+            set count = count + 1
+        set index = index + 1
+    return count
+
+fn set_ops_float_equivalence_v1() -> Text:
+    let columns: List[YazaSqlBoundProjectionV1] = [YazaSqlBoundProjectionV1(0, 6, true, "value", -1, -1, 0, 0, 0)]
+    let positive_zero: YazaSqlValueV1 = yaza_sql_value_double_v1(0.0)
+    let negative_zero: YazaSqlValueV1 = yaza_sql_value_double_v1(-0.0)
+    let first_nan: YazaSqlValueV1 = yaza_sql_value_double_v1(float64_from_bits(9221120237041090561))
+    let second_nan: YazaSqlValueV1 = yaza_sql_value_double_v1(float64_from_bits(9221120237041090562))
+    let finite_value: YazaSqlValueV1 = yaza_sql_value_double_v1(1.0)
+    if yaza_sql_executor_compare_values_v1("", first_nan, finite_value) <= 0 or yaza_sql_executor_compare_values_v1("", finite_value, first_nan) >= 0:
+        return "SQL Float64 ORDER BY comparator did not put NaN after finite values"
+    if yaza_sql_executor_compare_values_v1("", first_nan, second_nan) != 0:
+        return "SQL Float64 ORDER BY comparator did not equate NaN payloads"
+    let positive_zero_result: YazaSqlQueryResultV1 = YazaSqlQueryResultV1(columns, [[positive_zero]], 0, 0, 0, 0)
+    let negative_zero_result: YazaSqlQueryResultV1 = YazaSqlQueryResultV1(columns, [[negative_zero]], 0, 0, 0, 0)
+    let zero_union: Result[YazaSqlQueryResultV1, Text] = yaza_sql_set_combine_v1(positive_zero_result, negative_zero_result, YazaSqlSetOperatorV1(1, false))
+    if not result_is_ok(zero_union): return "Float64 UNION signed-zero operation failed"
+    if list_count(result_unwrap(zero_union).rows) != 1: return "Float64 UNION did not equate signed zero"
+    let zero_intersect: Result[YazaSqlQueryResultV1, Text] = yaza_sql_set_combine_v1(positive_zero_result, negative_zero_result, YazaSqlSetOperatorV1(2, false))
+    if not result_is_ok(zero_intersect): return "Float64 INTERSECT signed-zero operation failed"
+    if list_count(result_unwrap(zero_intersect).rows) != 1: return "Float64 INTERSECT did not equate signed zero"
+    let first_nan_result: YazaSqlQueryResultV1 = YazaSqlQueryResultV1(columns, [[first_nan]], 0, 0, 0, 0)
+    let second_nan_result: YazaSqlQueryResultV1 = YazaSqlQueryResultV1(columns, [[second_nan]], 0, 0, 0, 0)
+    let nan_union: Result[YazaSqlQueryResultV1, Text] = yaza_sql_set_combine_v1(first_nan_result, second_nan_result, YazaSqlSetOperatorV1(1, false))
+    if not result_is_ok(nan_union): return "Float64 UNION NaN operation failed"
+    if list_count(result_unwrap(nan_union).rows) != 1: return "Float64 UNION did not equate distinct NaN payloads"
+    let nan_intersect: Result[YazaSqlQueryResultV1, Text] = yaza_sql_set_combine_v1(first_nan_result, second_nan_result, YazaSqlSetOperatorV1(2, false))
+    if not result_is_ok(nan_intersect): return "Float64 INTERSECT NaN operation failed"
+    if list_count(result_unwrap(nan_intersect).rows) != 1: return "Float64 INTERSECT did not equate distinct NaN payloads"
+    let budget_columns: List[YazaSqlBoundProjectionV1] = [YazaSqlBoundProjectionV1(0, 4, true, "id", -1, -1, 0, 0, 0)]
+    let budget_value: YazaSqlValueV1 = YazaSqlValueV1(4, 1, 0.0, false, "", bytes_empty(), false, -1, -1, false)
+    let costly_left: YazaSqlQueryResultV1 = YazaSqlQueryResultV1(budget_columns, [[budget_value]], 40000000, 0, 0, 0)
+    let costly_right: YazaSqlQueryResultV1 = YazaSqlQueryResultV1(budget_columns, [[budget_value]], 40000000, 0, 0, 0)
+    let cumulative_budget_probe: Result[YazaSqlQueryResultV1, Text] = yaza_sql_set_combine_with_prior_v1(costly_left, costly_right, YazaSqlSetOperatorV1(1, true), 30000000)
+    if result_is_ok(cumulative_budget_probe): return "SQL set operation ignored prior statement work while preflighting branch work"
+    if not text_starts_with(result_unwrap_error(cumulative_budget_probe), "SQL set operation branches exceed the remaining statement work budget"):
+        return "SQL set operation rejected cumulative branch work outside its preflight check"
+    return ""
+
+fn yazabase_sql_set_ops_v1(root_path: Text) -> Result[Boolean, Text]:
+    let float_semantics_error: Text = set_ops_float_equivalence_v1()
+    if text_length(float_semantics_error) > 0: return err(float_semantics_error)
+    let root: Number = root_open(root_path)?
+    let db_name: Text = "set-ops-v1-smoke.ydb"
+    let header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_from_text("set-ops-uuid-v01"), 0, 1, 1, 0, 2, 1)
+    let empty_storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, db_name, header)?
+    let empty_closed: Boolean = yaza_db_storage_close_v1(empty_storage)?
+    if not empty_closed: return err("YDBv1 set-operation fixture could not close its empty database")
+    let initialized: YazaDbCatalogBootstrapV1 = yaza_db_catalog_initialize_v1(root, db_name)?
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+
+    let create_left: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(initialized.storage, initialized.wal, "CREATE TABLE set_left (id BIGINT PRIMARY KEY, value TEXT)", no_parameters)?
+    let create_right: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(create_left.storage, create_left.wal, "CREATE TABLE set_right (id BIGINT PRIMARY KEY, value TEXT)", no_parameters)?
+    let insert_left: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(create_right.storage, create_right.wal, "INSERT INTO set_left (id, value) VALUES (1, 'one'), (2, 'same'), (3, NULL), (4, 'UNION'), (5, 'same'), (6, 'same'), (7, NULL), (8, 'left-only')", no_parameters)?
+    if not option_is_some(insert_left.write_commit): return err("YDBv1 set-operation fixture could not insert its left rows")
+    let left_commit: YazaDbWriteCommitV1 = option_unwrap(insert_left.write_commit)
+    let insert_right: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(insert_left.storage, insert_left.wal, "INSERT INTO set_right (id, value) VALUES (10, 'same'), (11, 'two'), (12, NULL), (13, 'UNION'), (14, 'same'), (15, NULL), (16, 'right-only')", no_parameters)?
+    if not option_is_some(insert_right.write_commit): return err("YDBv1 set-operation fixture could not insert its right rows")
+    let right_commit: YazaDbWriteCommitV1 = option_unwrap(insert_right.write_commit)
+
+    let union_statement: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT value FROM set_left UNION SELECT value FROM set_right", no_parameters)?
+    if not option_is_some(union_statement.query_result): return err("YDBv1 UNION did not return a query result")
+    let union_rows: YazaSqlQueryResultV1 = option_unwrap(union_statement.query_result)
+    if list_count(union_rows.rows) != 7 or set_ops_null_count_v1(union_rows.rows) != 1:
+        return err("YDBv1 UNION did not remove duplicate values and duplicate NULLs")
+    if not set_ops_contains_text_v1(union_rows.rows, "one") or not set_ops_contains_text_v1(union_rows.rows, "same") or not set_ops_contains_text_v1(union_rows.rows, "two") or not set_ops_contains_text_v1(union_rows.rows, "UNION"):
+        return err("YDBv1 UNION lost a distinct text value")
+
+    let union_all: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT value FROM set_left UNION ALL SELECT value FROM set_right", no_parameters)?
+    if not option_is_some(union_all.query_result) or list_count(option_unwrap(union_all.query_result).rows) != 15 or set_ops_null_count_v1(option_unwrap(union_all.query_result).rows) != 4:
+        return err("YDBv1 UNION ALL did not preserve duplicate values")
+    let parameter_ten: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 10)?
+    let parameter_two: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 2)?
+    let numbered_parameters: List[YazaSqlValueV1] = [parameter_ten, parameter_two]
+    let numbered_union: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM set_left WHERE id = $2 UNION ALL SELECT id FROM set_right WHERE id = $1", numbered_parameters)?
+    if not option_is_some(numbered_union.query_result) or list_count(option_unwrap(numbered_union.query_result).rows) != 2:
+        return err("YDBv1 set query did not bind numbered parameters across branches")
+    let numbered_rows: List[List[YazaSqlValueV1]] = option_unwrap(numbered_union.query_result).rows
+    if list_get(list_get(numbered_rows, 0), 0).integer_value != 2 or list_get(list_get(numbered_rows, 1), 0).integer_value != 10:
+        return err("YDBv1 set query remapped numbered parameters to the wrong branches")
+    let anonymous_parameters: List[YazaSqlValueV1] = [parameter_two, parameter_ten]
+    let anonymous_union: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM set_left WHERE id = ? UNION ALL SELECT id FROM set_right WHERE id = ?", anonymous_parameters)?
+    if not option_is_some(anonymous_union.query_result) or list_count(option_unwrap(anonymous_union.query_result).rows) != 2:
+        return err("YDBv1 set query did not bind anonymous parameters in statement order")
+    let named_parameters: List[YazaSqlValueV1] = [parameter_two]
+    let named_union: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM set_left WHERE id = :chosen UNION ALL SELECT id FROM set_right WHERE id = :chosen", named_parameters)?
+    if not option_is_some(named_union.query_result) or list_count(option_unwrap(named_union.query_result).rows) != 1 or list_get(list_get(option_unwrap(named_union.query_result).rows, 0), 0).integer_value != 2:
+        return err("YDBv1 set query did not reuse a named parameter across branches")
+    let union_explicit_distinct: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT value FROM set_left UNION DISTINCT SELECT value FROM set_right", no_parameters)?
+    if not option_is_some(union_explicit_distinct.query_result) or list_count(option_unwrap(union_explicit_distinct.query_result).rows) != 7:
+        return err("YDBv1 UNION DISTINCT did not match default UNION semantics")
+    let chain: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT value FROM set_left UNION SELECT value FROM set_right UNION SELECT value FROM set_left", no_parameters)?
+    if not option_is_some(chain.query_result) or list_count(option_unwrap(chain.query_result).rows) != 7:
+        return err("YDBv1 UNION chain did not preserve distinct-set semantics")
+    let mixed_precedence: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM set_left WHERE id <= 2 UNION SELECT id FROM set_left WHERE id >= 2 AND id <= 3 INTERSECT SELECT id FROM set_left WHERE id = 3", no_parameters)?
+    if not option_is_some(mixed_precedence.query_result) or list_count(option_unwrap(mixed_precedence.query_result).rows) != 3:
+        return err("YDBv1 set evaluator did not give INTERSECT higher precedence")
+    let mixed_rows: List[List[YazaSqlValueV1]] = option_unwrap(mixed_precedence.query_result).rows
+    if list_get(list_get(mixed_rows, 0), 0).integer_value != 1 or list_get(list_get(mixed_rows, 1), 0).integer_value != 2 or list_get(list_get(mixed_rows, 2), 0).integer_value != 3:
+        return err("YDBv1 mixed set operators returned incorrect precedence results")
+    let except_left_associative: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM set_left WHERE id <= 3 EXCEPT SELECT id FROM set_left WHERE id = 2 EXCEPT SELECT id FROM set_left WHERE id = 3", no_parameters)?
+    if not option_is_some(except_left_associative.query_result) or list_count(option_unwrap(except_left_associative.query_result).rows) != 1 or list_get(list_get(option_unwrap(except_left_associative.query_result).rows, 0), 0).integer_value != 1:
+        return err("YDBv1 EXCEPT chains did not evaluate left to right")
+
+    let intersect_statement: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT value FROM set_left INTERSECT SELECT value FROM set_right", no_parameters)?
+    if not option_is_some(intersect_statement.query_result): return err("YDBv1 INTERSECT did not return a query result")
+    let intersect_rows: YazaSqlQueryResultV1 = option_unwrap(intersect_statement.query_result)
+    if list_count(intersect_rows.rows) != 3 or set_ops_null_count_v1(intersect_rows.rows) != 1 or not set_ops_contains_text_v1(intersect_rows.rows, "same") or not set_ops_contains_text_v1(intersect_rows.rows, "UNION"):
+        return err("YDBv1 INTERSECT returned incorrect set or NULL semantics")
+    let except_statement: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT value FROM set_left EXCEPT SELECT value FROM set_right", no_parameters)?
+    if not option_is_some(except_statement.query_result): return err("YDBv1 EXCEPT did not return a query result")
+    let except_rows: YazaSqlQueryResultV1 = option_unwrap(except_statement.query_result)
+    if list_count(except_rows.rows) != 2 or not set_ops_contains_text_v1(except_rows.rows, "one") or not set_ops_contains_text_v1(except_rows.rows, "left-only"):
+        return err("YDBv1 EXCEPT returned an incorrect result")
+
+    let intersect_all_statement: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT value FROM set_left INTERSECT ALL SELECT value FROM set_right", no_parameters)?
+    if not option_is_some(intersect_all_statement.query_result): return err("YDBv1 INTERSECT ALL did not return a query result")
+    let intersect_all_rows: List[List[YazaSqlValueV1]] = option_unwrap(intersect_all_statement.query_result).rows
+    if list_count(intersect_all_rows) != 5 or set_ops_text_count_v1(intersect_all_rows, "same") != 2 or set_ops_null_count_v1(intersect_all_rows) != 2 or set_ops_text_count_v1(intersect_all_rows, "UNION") != 1:
+        return err("YDBv1 INTERSECT ALL did not preserve the minimum duplicate multiplicities")
+    let except_all_statement: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT value FROM set_left EXCEPT ALL SELECT value FROM set_right", no_parameters)?
+    if not option_is_some(except_all_statement.query_result): return err("YDBv1 EXCEPT ALL did not return a query result")
+    let except_all_rows: List[List[YazaSqlValueV1]] = option_unwrap(except_all_statement.query_result).rows
+    if list_count(except_all_rows) != 3 or set_ops_text_count_v1(except_all_rows, "same") != 1 or not set_ops_contains_text_v1(except_all_rows, "one") or not set_ops_contains_text_v1(except_all_rows, "left-only") or set_ops_null_count_v1(except_all_rows) != 0 or set_ops_contains_text_v1(except_all_rows, "UNION"):
+        return err("YDBv1 EXCEPT ALL did not subtract duplicate multiplicities")
+
+    let empty_set: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT value FROM set_left WHERE id = 999 UNION SELECT value FROM set_right WHERE id = 999", no_parameters)?
+    if not option_is_some(empty_set.query_result) or list_count(option_unwrap(empty_set.query_result).rows) != 0:
+        return err("YDBv1 set operations did not handle empty branches")
+    if result_is_ok(yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM set_left UNION SELECT value FROM set_right", no_parameters)):
+        return err("YDBv1 set operations accepted incompatible output types")
+    if result_is_ok(yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM set_left UNION SELECT id, value FROM set_right", no_parameters)):
+        return err("YDBv1 set operations accepted different output widths")
+    let ordered_limited: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id AS key FROM set_left UNION ALL SELECT id AS key FROM set_right ORDER BY key DESC LIMIT 3", no_parameters)?
+    if not option_is_some(ordered_limited.query_result) or list_count(option_unwrap(ordered_limited.query_result).rows) != 3:
+        return err("YDBv1 set-level ORDER BY/LIMIT returned the wrong number of rows")
+    let ordered_limited_rows: List[List[YazaSqlValueV1]] = option_unwrap(ordered_limited.query_result).rows
+    if list_get(list_get(ordered_limited_rows, 0), 0).integer_value != 16 or list_get(list_get(ordered_limited_rows, 1), 0).integer_value != 15 or list_get(list_get(ordered_limited_rows, 2), 0).integer_value != 14:
+        return err("YDBv1 set-level ORDER BY did not sort the combined branches before LIMIT")
+    let ordinal_limited: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT value FROM set_left UNION SELECT value FROM set_right ORDER BY 1 LIMIT 2", no_parameters)?
+    if not option_is_some(ordinal_limited.query_result) or list_count(option_unwrap(ordinal_limited.query_result).rows) != 2:
+        return err("YDBv1 set-level ORDER BY ordinal/LIMIT failed")
+    let ordinal_rows: List[List[YazaSqlValueV1]] = option_unwrap(ordinal_limited.query_result).rows
+    if not list_get(list_get(ordinal_rows, 0), 0).is_null:
+        return err("YDBv1 set-level ORDER BY ordinal did not sort NULL first")
+    if list_get(list_get(ordinal_rows, 1), 0).text_value != "UNION":
+        return err("YDBv1 set-level ORDER BY ordinal returned unexpected second value: " + list_get(list_get(ordinal_rows, 1), 0).text_value)
+    let zero_limit: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM set_left UNION SELECT id FROM set_right ORDER BY 1 LIMIT 0", no_parameters)?
+    if not option_is_some(zero_limit.query_result) or list_count(option_unwrap(zero_limit.query_result).rows) != 0:
+        return err("YDBv1 set-level LIMIT 0 did not return an empty result")
+    let limit_only: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM set_left UNION ALL SELECT id FROM set_right LIMIT 2", no_parameters)?
+    if not option_is_some(limit_only.query_result) or list_count(option_unwrap(limit_only.query_result).rows) != 2:
+        return err("YDBv1 set-level LIMIT without ORDER BY returned the wrong number of rows")
+    if result_is_ok(yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM set_left UNION SELECT id FROM set_right ORDER BY missing_column", no_parameters)):
+        return err("YDBv1 set-level ORDER BY accepted a name outside the result schema")
+    if result_is_ok(yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM set_left ORDER BY id UNION SELECT id FROM set_right", no_parameters)):
+        return err("YDBv1 set operations accepted branch-local ORDER BY without parentheses")
+    if result_is_ok(yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM set_left WHERE id = $1 UNION SELECT id FROM set_right", no_parameters)):
+        return err("YDBv1 set operations accepted an unbound placeholder")
+    if result_is_ok(yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM set_left WHERE id = $1 UNION SELECT id FROM set_right", [parameter_two, parameter_ten])):
+        return err("YDBv1 set operations accepted an unused bind value")
+    if result_is_ok(yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM set_left WHERE id = $1 UNION SELECT id FROM set_right WHERE id = ?", [parameter_two, parameter_ten])):
+        return err("YDBv1 set operations accepted mixed bind parameter styles")
+    if result_is_ok(yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM set_left UNION", no_parameters)):
+        return err("YDBv1 parser accepted a UNION with an empty branch")
+
+    let historical_union: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(right_commit.storage, right_commit.wal, "SELECT value FROM set_left UNION SELECT value FROM set_right", no_parameters, left_commit.commit_ts, 0, List[YazaDbTxnStatusV1]())?
+    if list_count(historical_union.rows) != 5 or set_ops_contains_text_v1(historical_union.rows, "two"):
+        return err("YDBv1 historical UNION did not use a consistent snapshot across branches")
+    let historical_intersect: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(right_commit.storage, right_commit.wal, "SELECT value FROM set_left INTERSECT SELECT value FROM set_right", no_parameters, left_commit.commit_ts, 0, List[YazaDbTxnStatusV1]())?
+    if list_count(historical_intersect.rows) != 0:
+        return err("YDBv1 historical INTERSECT observed a later branch commit")
+    let historical_parameter_union: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(right_commit.storage, right_commit.wal, "SELECT value FROM set_left WHERE id = $1 UNION ALL SELECT value FROM set_right WHERE id = $1", [parameter_two], left_commit.commit_ts, 0, List[YazaDbTxnStatusV1]())?
+    if list_count(historical_parameter_union.rows) != 1 or list_get(list_get(historical_parameter_union.rows, 0), 0).text_value != "same":
+        return err("YDBv1 historical set query did not bind branches against the same snapshot")
+    let historical_ordered: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(right_commit.storage, right_commit.wal, "SELECT id FROM set_left UNION ALL SELECT id FROM set_right ORDER BY id DESC LIMIT 2", no_parameters, left_commit.commit_ts, 0, List[YazaDbTxnStatusV1]())?
+    if list_count(historical_ordered.rows) != 2 or list_get(list_get(historical_ordered.rows, 0), 0).integer_value != 8 or list_get(list_get(historical_ordered.rows, 1), 0).integer_value != 7:
+        return err("YDBv1 historical set ORDER BY/LIMIT did not use the combined snapshot result")
+
+    let wal_closed: Boolean = yaza_db_wal_log_close_v1(right_commit.wal)?
+    let storage_closed: Boolean = yaza_db_storage_close_v1(right_commit.storage)?
+    if not wal_closed or not storage_closed:
+        return err("YDBv1 set-operation fixture could not close its database")
+    let reopened: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, db_name)?
+    let reopened_union: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(reopened.storage, reopened.wal, "SELECT value FROM set_left UNION SELECT value FROM set_right", no_parameters)?
+    if not option_is_some(reopened_union.query_result) or list_count(option_unwrap(reopened_union.query_result).rows) != 7:
+        return err("YDBv1 UNION did not survive close and reopen")
+    let reopened_wal_closed: Boolean = yaza_db_wal_log_close_v1(reopened.wal)?
+    let reopened_storage_closed: Boolean = yaza_db_storage_close_v1(reopened.storage)?
+    if not reopened_wal_closed or not reopened_storage_closed:
+        return err("YDBv1 set-operation fixture could not close its recovered database")
+    return ok(true)
+
+start:
+    let root_path: Text = arg(1)
+    let result: Result[Boolean, Text] = yazabase_sql_set_ops_v1(root_path)
+    if not result_is_ok(result):
+        say result_unwrap_error(result)
+        exit(1)
+    say "yazabase-sql-set-ops-v1-ok"

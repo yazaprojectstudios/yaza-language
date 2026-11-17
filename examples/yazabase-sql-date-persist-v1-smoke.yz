@@ -1,0 +1,110 @@
+use "std/fs"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/session_v1"
+use "../yazabase/sql_date_v1"
+use "../yazabase/sql_dispatch_v1"
+use "../yazabase/sql_executor_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/wal_v1"
+
+fn yazabase_sql_date_persist_v1(root_path: Text) -> Result[Boolean, Text]:
+    let root: Number = root_open(root_path)?
+    let database_name: Text = "date-persist-smoke.ydb"
+    let header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_from_text("date-smoke-uuid1"), 0, 1, 1, 0, 2, 1)
+    let empty_storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, database_name, header)?
+    let empty_storage_closed: Boolean = yaza_db_storage_close_v1(empty_storage)?
+    if not empty_storage_closed: return err("YazaBase DATE fixture could not close its genesis database")
+    let initialized: YazaDbCatalogBootstrapV1 = yaza_db_catalog_initialize_v1(root, database_name)?
+    let initialized_wal_closed: Boolean = yaza_db_wal_log_close_v1(initialized.wal)?
+    let initialized_storage_closed: Boolean = yaza_db_storage_close_v1(initialized.storage)?
+    if not initialized_wal_closed or not initialized_storage_closed: return err("YazaBase DATE fixture could not close catalog bootstrap handles")
+
+    let opened: YazaDbSessionV1 = yaza_db_session_open_v1(root, database_name)?
+    var session: YazaDbSessionV1 = opened
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let create_result: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "CREATE TABLE date_values (id BIGINT PRIMARY KEY, event_date DATE NOT NULL, default_date DATE DEFAULT '1970-01-01')", no_parameters)?
+    set session = create_result.session
+    let insert_result: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "INSERT INTO date_values (id, event_date) VALUES (1, '2000-02-29'), (2, '1900-03-01'), (3, '0001-01-01'), (4, '9999-12-31')", no_parameters)?
+    set session = insert_result.session
+    let index_result: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "CREATE UNIQUE INDEX date_values_date_idx ON date_values(event_date)", no_parameters)?
+    set session = index_result.session
+
+    let invalid_parameter: Result[Number, Text] = yaza_sql_date_parse_v1("2024-02-30")
+    if result_is_ok(invalid_parameter): return err("YazaBase DATE bind codec accepted an invalid date")
+
+    let date_equal: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT id FROM date_values WHERE event_date = '2000-02-29'", no_parameters)?
+    set session = date_equal.session
+    if not option_is_some(date_equal.statement.query_result) or list_get(list_get(option_unwrap(date_equal.statement.query_result).rows, 0), 0).integer_value != 1:
+        return err("YazaBase DATE equality query returned the wrong indexed row")
+    let explain: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "EXPLAIN SELECT id FROM date_values WHERE event_date = '2000-02-29'", no_parameters)?
+    set session = explain.session
+    if not option_is_some(explain.statement.explain_text) or text_find(option_unwrap(explain.statement.explain_text), "SecondaryIndexRangeScan(index=date_values_date_idx") < 0:
+        return err("YazaBase DATE equality plan did not use its secondary index")
+
+    let bound_days: Number = yaza_sql_date_parse_v1("2000-02-29")?
+    let date_parameter: YazaSqlValueV1 = yaza_sql_value_integer_v1(11, bound_days)?
+    let date_parameters: List[YazaSqlValueV1] = [date_parameter]
+    let parameter_query: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT id FROM date_values WHERE event_date = $1", date_parameters)?
+    set session = parameter_query.session
+    if not option_is_some(parameter_query.statement.query_result) or list_get(list_get(option_unwrap(parameter_query.statement.query_result).rows, 0), 0).integer_value != 1:
+        return err("YazaBase typed DATE parameter returned the wrong row")
+
+    let ordered: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT event_date, default_date FROM date_values ORDER BY event_date", no_parameters)?
+    set session = ordered.session
+    if not option_is_some(ordered.statement.query_result): return err("YazaBase DATE ORDER BY returned no result")
+    let ordered_rows: List[List[YazaSqlValueV1]] = option_unwrap(ordered.statement.query_result).rows
+    if list_count(ordered_rows) != 4: return err("YazaBase DATE ORDER BY returned the wrong row count")
+    if list_get(list_get(ordered_rows, 0), 0).text_value != "0001-01-01" or list_get(list_get(ordered_rows, 1), 0).text_value != "1900-03-01" or list_get(list_get(ordered_rows, 2), 0).text_value != "2000-02-29" or list_get(list_get(ordered_rows, 3), 0).text_value != "9999-12-31":
+        return err("YazaBase DATE row encoding or sort order changed Gregorian chronology")
+    if list_get(list_get(ordered_rows, 3), 1).text_value != "1970-01-01": return err("YazaBase DATE literal DEFAULT was not materialized")
+
+    let range_count: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT COUNT(*) FROM date_values WHERE event_date < '2000-02-29'", no_parameters)?
+    set session = range_count.session
+    if not option_is_some(range_count.statement.query_result) or list_get(list_get(option_unwrap(range_count.statement.query_result).rows, 0), 0).integer_value != 2:
+        return err("YazaBase DATE less-than comparison returned an incorrect count")
+    let extremes: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT MIN(event_date), MAX(event_date) FROM date_values", no_parameters)?
+    set session = extremes.session
+    if not option_is_some(extremes.statement.query_result): return err("YazaBase DATE MIN/MAX returned no result")
+    let extreme_row: List[YazaSqlValueV1] = list_get(option_unwrap(extremes.statement.query_result).rows, 0)
+    if list_get(extreme_row, 0).text_value != "0001-01-01" or list_get(extreme_row, 1).text_value != "9999-12-31": return err("YazaBase DATE MIN/MAX lost the supported range endpoints")
+
+    let updated: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "UPDATE date_values SET event_date = '2000-03-01' WHERE id = 1", no_parameters)?
+    set session = updated.session
+    let updated_lookup: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT id FROM date_values WHERE event_date = '2000-03-01'", no_parameters)?
+    set session = updated_lookup.session
+    if not option_is_some(updated_lookup.statement.query_result) or list_get(list_get(option_unwrap(updated_lookup.statement.query_result).rows, 0), 0).integer_value != 1:
+        return err("YazaBase DATE indexed UPDATE did not replace its key")
+
+    let session_closed: Boolean = yaza_db_session_close_v1(session)?
+    if not session_closed: return err("YazaBase DATE fixture could not close before recovery")
+    let reopened_root: Number = root_open(root_path)?
+    var reopened: YazaDbSessionV1 = yaza_db_session_open_v1(reopened_root, database_name)?
+    let recovered: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(reopened, "SELECT event_date FROM date_values WHERE id = 1", no_parameters)?
+    set reopened = recovered.session
+    if not option_is_some(recovered.statement.query_result) or list_get(list_get(option_unwrap(recovered.statement.query_result).rows, 0), 0).text_value != "2000-03-01":
+        return err("YazaBase DATE did not survive close/reopen recovery")
+
+    let create_primary: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(reopened, "CREATE TABLE date_primary (event_date DATE PRIMARY KEY, label TEXT NOT NULL)", no_parameters)?
+    set reopened = create_primary.session
+    let insert_primary: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(reopened, "INSERT INTO date_primary (event_date, label) VALUES ('2024-02-29', 'leap')", no_parameters)?
+    set reopened = insert_primary.session
+    let primary_lookup: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(reopened, "SELECT label FROM date_primary WHERE event_date = '2024-02-29'", no_parameters)?
+    set reopened = primary_lookup.session
+    if not option_is_some(primary_lookup.statement.query_result) or list_get(list_get(option_unwrap(primary_lookup.statement.query_result).rows, 0), 0).text_value != "leap":
+        return err("YazaBase DATE clustered primary-key lookup failed")
+
+    let final_session_closed: Boolean = yaza_db_session_close_v1(reopened)?
+    if not final_session_closed: return err("YazaBase DATE fixture could not close its final session")
+    let cleanup_root: Number = root_open(root_path)?
+    let removed: Boolean = remove(cleanup_root, database_name)?
+    if not removed: return err("YazaBase DATE fixture could not remove its database")
+    let directory_synced: Boolean = sync_directory(cleanup_root)?
+    if not directory_synced: return err("YazaBase DATE fixture cleanup could not sync the directory")
+    let cleanup_root_closed: Boolean = close(cleanup_root)?
+    if not cleanup_root_closed: return err("YazaBase DATE fixture could not close its cleanup root")
+    return ok(true)
+
+start:
+    let outcome: Result[Boolean, Text] = yazabase_sql_date_persist_v1(arg(1))
+    if result_is_ok(outcome): say "yazabase-sql-date-persist-v1-ok"
+    else: say result_unwrap_error(outcome)

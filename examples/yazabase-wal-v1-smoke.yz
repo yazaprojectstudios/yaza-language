@@ -1,0 +1,277 @@
+use "std/fs"
+use "../yazabase/wal_v1"
+
+fn yaza_base_wal_v1_check(root_path: Text) -> Result[Number, Text]:
+    let payload: Bytes = bytes_from_text("page-before-after")
+    let commit_payload: Bytes = yaza_db_wal_commit_payload_encode_v1(1)?
+    let record: YazaDbWalRecordV1 = YazaDbWalRecordV1(4096, 128, 42, yaza_db_wal_type_leaf_update_v1(), 0, payload)
+    let encoded: Bytes = yaza_db_wal_encode_v1(record)?
+    if bytes_length(encoded) != yaza_db_wal_header_size_v1() + bytes_length(payload): return err("YDBv1 WAL encoded length is wrong")
+    let encoded_total_length: Number = yaza_db_read_uint_le_v1(encoded, 0, 4)?
+    let encoded_lsn: Number = yaza_db_read_uint_le_v1(encoded, 8, 8)?
+    let encoded_prev_lsn: Number = yaza_db_read_uint_le_v1(encoded, 16, 8)?
+    let encoded_txn_id: Number = yaza_db_read_uint_le_v1(encoded, 24, 8)?
+    let encoded_type: Number = yaza_db_read_uint_le_v1(encoded, 32, 1)?
+    let encoded_flags: Number = yaza_db_read_uint_le_v1(encoded, 33, 1)?
+    let encoded_reserved: Number = yaza_db_read_uint_le_v1(encoded, 34, 6)?
+    if encoded_total_length != bytes_length(encoded): return err("YDBv1 WAL total_len field is wrong")
+    if encoded_lsn != record.lsn: return err("YDBv1 WAL LSN field is wrong")
+    if encoded_prev_lsn != record.prev_lsn: return err("YDBv1 WAL prev_lsn field is wrong")
+    if encoded_txn_id != record.txn_id: return err("YDBv1 WAL transaction ID field is wrong")
+    if encoded_type != record.rec_type: return err("YDBv1 WAL record-type field is wrong")
+    if encoded_flags != record.flags: return err("YDBv1 WAL flags field is wrong")
+    if encoded_reserved != 0: return err("YDBv1 WAL reserved field is not zero")
+    let reserved_corrupted: Bytes = bytes_try_slice(encoded, 0, bytes_length(encoded))?
+    if not bytes_try_set(reserved_corrupted, 34, 1): return err("YDBv1 WAL reserved-field fixture could not be changed")
+    let reserved_checksum: Number = bytes_ydbv1_checksum_zeroed_range(reserved_corrupted, 4, 4)
+    if not yaza_db_write_uint_le_v1(reserved_corrupted, 4, reserved_checksum, 4): return err("YDBv1 WAL reserved-field fixture checksum could not be updated")
+    if result_is_ok(yaza_db_wal_decode_v1(reserved_corrupted, record.lsn)): return err("YDBv1 WAL decoder accepted a non-zero reserved byte")
+    let decoded: YazaDbWalRecordV1 = yaza_db_wal_decode_v1(encoded, 4096)?
+    if decoded.lsn != record.lsn or decoded.prev_lsn != record.prev_lsn or decoded.txn_id != record.txn_id: return err("YDBv1 WAL numeric fields changed during round trip")
+    if decoded.rec_type != record.rec_type or decoded.flags != 0 or not bytes_equal(decoded.payload, payload): return err("YDBv1 WAL type, flags, or payload changed during round trip")
+
+    let page_image: Bytes = yaza_db_page_new_v1(3, 128, 1, 0)?
+    let page_image_payload: Bytes = yaza_db_wal_page_image_payload_encode_v1(3, 128, page_image)?
+    let page_image_record: YazaDbWalRecordV1 = YazaDbWalRecordV1(128, 0, 0, yaza_db_wal_type_full_page_image_v1(), 0, page_image_payload)
+    let encoded_page_image: Bytes = yaza_db_wal_encode_v1(page_image_record)?
+    let decoded_page_image_record: YazaDbWalRecordV1 = yaza_db_wal_decode_v1(encoded_page_image, 128)?
+    let decoded_page_image: YazaDbWalPageImageV1 = yaza_db_wal_page_image_payload_decode_v1(decoded_page_image_record)?
+    if decoded_page_image.page_id != 3 or not bytes_equal(decoded_page_image.image, page_image): return err("YDBv1 FULL_PAGE_IMAGE did not round-trip")
+    let invalid_page_image_txn: YazaDbWalRecordV1 = YazaDbWalRecordV1(128, 0, 42, yaza_db_wal_type_full_page_image_v1(), 0, page_image_payload)
+    if result_is_ok(yaza_db_wal_encode_v1(invalid_page_image_txn)): return err("YDBv1 FULL_PAGE_IMAGE was accepted with a transaction ID")
+    let invalid_page_image_lsn: Result[Bytes, Text] = yaza_db_wal_page_image_payload_encode_v1(3, 127, page_image)
+    if result_is_ok(invalid_page_image_lsn): return err("YDBv1 FULL_PAGE_IMAGE accepted a page whose LSN differs from the record")
+
+    let commit_record: YazaDbWalRecordV1 = YazaDbWalRecordV1(8192, 4096, 42, yaza_db_wal_type_commit_v1(), 0, commit_payload)
+    let encoded_commit: Bytes = yaza_db_wal_encode_v1(commit_record)?
+    let decoded_commit: YazaDbWalRecordV1 = yaza_db_wal_decode_v1(encoded_commit, 8192)?
+    let decoded_commit_ts: Number = yaza_db_wal_commit_payload_decode_v1(decoded_commit)?
+    if decoded_commit_ts != 1: return err("YDBv1 COMMIT timestamp changed during WAL round trip")
+    let root_commit_payload: Bytes = yaza_db_wal_catalog_root_commit_payload_encode_v1(2, 7, 9)?
+    let root_commit_record: YazaDbWalRecordV1 = YazaDbWalRecordV1(12288, 8192, 43, yaza_db_wal_type_catalog_root_commit_v1(), 0, root_commit_payload)
+    let encoded_root_commit: Bytes = yaza_db_wal_encode_v1(root_commit_record)?
+    let decoded_root_commit_record: YazaDbWalRecordV1 = yaza_db_wal_decode_v1(encoded_root_commit, 12288)?
+    let decoded_root_commit: YazaDbWalCatalogRootCommitV1 = yaza_db_wal_catalog_root_commit_payload_decode_v1(decoded_root_commit_record)?
+    if decoded_root_commit.commit_ts != 2 or decoded_root_commit.previous_catalog_root != 7 or decoded_root_commit.new_catalog_root != 9: return err("YDBv1 COMMIT_CATALOG_ROOT payload changed during WAL round trip")
+    let decoded_root_commit_ts: Number = yaza_db_wal_commit_timestamp_v1(decoded_root_commit_record)?
+    if decoded_root_commit_ts != 2: return err("YDBv1 COMMIT_CATALOG_ROOT was not recognized as a commit record")
+    let invalid_root_commit_payload: Result[Bytes, Text] = yaza_db_wal_catalog_root_commit_payload_encode_v1(2, 7, 7)
+    if result_is_ok(invalid_root_commit_payload): return err("YDBv1 COMMIT_CATALOG_ROOT accepted an unchanged root")
+    let bad_root_commit: YazaDbWalRecordV1 = YazaDbWalRecordV1(12288, 8192, 43, yaza_db_wal_type_catalog_root_commit_v1(), 0, bytes_from_text(""))
+    if result_is_ok(yaza_db_wal_encode_v1(bad_root_commit)): return err("YDBv1 WAL encoder accepted a truncated COMMIT_CATALOG_ROOT")
+    let empty_commit: YazaDbWalRecordV1 = YazaDbWalRecordV1(8192, 4096, 42, yaza_db_wal_type_commit_v1(), 0, bytes_from_text(""))
+    if result_is_ok(yaza_db_wal_encode_v1(empty_commit)): return err("YDBv1 WAL encoder accepted a COMMIT without commit_ts")
+    let zero_commit_payload: Bytes = bytes_try_new_zeroed(yaza_db_wal_commit_payload_size_v1())?
+    let zero_commit: YazaDbWalRecordV1 = YazaDbWalRecordV1(8192, 4096, 42, yaza_db_wal_type_commit_v1(), 0, zero_commit_payload)
+    if result_is_ok(yaza_db_wal_encode_v1(zero_commit)): return err("YDBv1 WAL encoder accepted a zero COMMIT timestamp")
+    let zero_commit_bytes: Bytes = bytes_try_slice(encoded_commit, 0, bytes_length(encoded_commit))?
+    if not bytes_try_set(zero_commit_bytes, yaza_db_wal_header_size_v1(), 0): return err("YDBv1 zero-timestamp decoder fixture could not be changed")
+    let zero_commit_crc: Number = bytes_ydbv1_checksum_zeroed_range(zero_commit_bytes, 4, 4)
+    if not yaza_db_write_uint_le_v1(zero_commit_bytes, 4, zero_commit_crc, 4): return err("YDBv1 zero-timestamp fixture CRC could not be updated")
+    if result_is_ok(yaza_db_wal_decode_v1(zero_commit_bytes, 8192)): return err("YDBv1 WAL decoder accepted a zero COMMIT timestamp with a valid CRC")
+    let oversized_commit_bytes: Bytes = bytes_try_slice(encoded_commit, 0, bytes_length(encoded_commit))?
+    if not bytes_try_set(oversized_commit_bytes, yaza_db_wal_header_size_v1() + 7, 128): return err("YDBv1 oversized-timestamp decoder fixture could not be changed")
+    let oversized_commit_crc: Number = bytes_ydbv1_checksum_zeroed_range(oversized_commit_bytes, 4, 4)
+    if not yaza_db_write_uint_le_v1(oversized_commit_bytes, 4, oversized_commit_crc, 4): return err("YDBv1 oversized-timestamp fixture CRC could not be updated")
+    if result_is_ok(yaza_db_wal_decode_v1(oversized_commit_bytes, 8192)): return err("YDBv1 WAL decoder accepted a COMMIT timestamp outside the signed range with a valid CRC")
+    let truncated_commit_bytes: Bytes = bytes_try_slice(encoded_commit, 0, yaza_db_wal_header_size_v1())?
+    if not yaza_db_write_uint_le_v1(truncated_commit_bytes, 0, yaza_db_wal_header_size_v1(), 4): return err("YDBv1 truncated-COMMIT fixture length could not be updated")
+    if not yaza_db_write_uint_le_v1(truncated_commit_bytes, 4, 0, 4): return err("YDBv1 truncated-COMMIT fixture CRC could not be cleared")
+    let truncated_commit_crc: Number = bytes_ydbv1_checksum_zeroed_range(truncated_commit_bytes, 4, 4)
+    if not yaza_db_write_uint_le_v1(truncated_commit_bytes, 4, truncated_commit_crc, 4): return err("YDBv1 truncated-COMMIT fixture CRC could not be updated")
+    if result_is_ok(yaza_db_wal_decode_v1(truncated_commit_bytes, 8192)): return err("YDBv1 WAL decoder accepted a truncated COMMIT with a valid CRC")
+
+    let corrupted: Bytes = bytes_try_slice(encoded, 0, bytes_length(encoded))?
+    if not bytes_try_set(corrupted, yaza_db_wal_header_size_v1(), 0): return err("YDBv1 WAL CRC fixture could not be changed")
+    if result_is_ok(yaza_db_wal_decode_v1(corrupted, 4096)): return err("YDBv1 WAL decoder accepted a CRC mismatch")
+
+    let wrong_lsn: Result[YazaDbWalRecordV1, Text] = yaza_db_wal_decode_v1(encoded, 4097)
+    if result_is_ok(wrong_lsn): return err("YDBv1 WAL decoder accepted a physical LSN mismatch")
+    let trailing_byte: Bytes = bytes_try_new_zeroed(bytes_length(encoded) + 1)?
+    if not yaza_db_write_bytes_v1(trailing_byte, 0, encoded): return err("YDBv1 WAL trailing-byte fixture could not be copied")
+    if result_is_ok(yaza_db_wal_decode_v1(trailing_byte, 4096)): return err("YDBv1 WAL decoder accepted a total_len mismatch")
+
+    let crossing: YazaDbWalRecordV1 = YazaDbWalRecordV1(yaza_db_wal_segment_size_v1() - 20, 0, 1, yaza_db_wal_type_commit_v1(), 0, commit_payload)
+    if result_is_ok(yaza_db_wal_encode_v1(crossing)): return err("YDBv1 WAL encoder allowed a record to cross a segment boundary")
+    let bad_chain: YazaDbWalRecordV1 = YazaDbWalRecordV1(64, 64, 1, yaza_db_wal_type_commit_v1(), 0, commit_payload)
+    if result_is_ok(yaza_db_wal_encode_v1(bad_chain)): return err("YDBv1 WAL encoder accepted a non-prior prev_lsn")
+    let unknown_type: YazaDbWalRecordV1 = YazaDbWalRecordV1(64, 0, 1, 99, 0, bytes_from_text(""))
+    if result_is_ok(yaza_db_wal_encode_v1(unknown_type)): return err("YDBv1 WAL encoder accepted an unknown record type")
+    let invalid_flags: YazaDbWalRecordV1 = YazaDbWalRecordV1(64, 0, 1, yaza_db_wal_type_commit_v1(), 1, commit_payload)
+    if result_is_ok(yaza_db_wal_encode_v1(invalid_flags)): return err("YDBv1 WAL encoder accepted reserved flags")
+    let invalid_page_space_length: YazaDbWalRecordV1 = YazaDbWalRecordV1(64, 0, 1, yaza_db_wal_type_page_alloc_v1(), 0, bytes_from_text(""))
+    if result_is_ok(yaza_db_wal_encode_v1(invalid_page_space_length)): return err("YDBv1 WAL encoder accepted a truncated PAGE_ALLOC payload")
+    let page_space_payload: Bytes = bytes_try_new_zeroed(24)?
+    if not yaza_db_write_uint_le_v1(page_space_payload, 0, 1, 2) or not yaza_db_write_uint_le_v1(page_space_payload, 2, 1, 2): return err("YDBv1 PAGE_ALLOC fixture could not encode version and operation")
+    if not yaza_db_write_uint_le_v1(page_space_payload, 4, 3, 8) or not yaza_db_write_uint_le_v1(page_space_payload, 12, 2, 8) or not yaza_db_write_uint_le_v1(page_space_payload, 20, 1, 4): return err("YDBv1 PAGE_ALLOC fixture could not encode the bitmap address")
+    let page_space_at_zero: YazaDbWalRecordV1 = YazaDbWalRecordV1(0, 0, 1, yaza_db_wal_type_page_alloc_v1(), 0, page_space_payload)
+    if result_is_ok(yaza_db_wal_encode_v1(page_space_at_zero)): return err("YDBv1 WAL encoder accepted a page-space record that collides with the initial page LSN")
+    let valid_page_space: YazaDbWalRecordV1 = YazaDbWalRecordV1(64, 0, 1, yaza_db_wal_type_page_alloc_v1(), 0, page_space_payload)
+    let valid_page_space_bytes: Bytes = yaza_db_wal_encode_v1(valid_page_space)?
+    let wrong_page_space_bytes: Bytes = bytes_try_slice(valid_page_space_bytes, 0, bytes_length(valid_page_space_bytes))?
+    if not bytes_try_set(wrong_page_space_bytes, yaza_db_wal_header_size_v1() + 12, 3): return err("YDBv1 PAGE_ALLOC mapping fixture could not be changed")
+    let wrong_page_space_crc: Number = bytes_ydbv1_checksum_zeroed_range(wrong_page_space_bytes, 4, 4)
+    if not yaza_db_write_uint_le_v1(wrong_page_space_bytes, 4, wrong_page_space_crc, 4): return err("YDBv1 PAGE_ALLOC mapping fixture checksum could not be updated")
+    if result_is_ok(yaza_db_wal_decode_v1(wrong_page_space_bytes, 64)): return err("YDBv1 WAL decoder accepted a PAGE_ALLOC payload with a forged bitmap mapping")
+    let invalid_checkpoint: YazaDbWalRecordV1 = YazaDbWalRecordV1(64, 0, 1, yaza_db_wal_type_checkpoint_begin_v1(), 0, bytes_from_text(""))
+    if result_is_ok(yaza_db_wal_encode_v1(invalid_checkpoint)): return err("YDBv1 WAL encoder accepted a transaction-owned checkpoint record")
+    let bad_skip: YazaDbWalRecordV1 = YazaDbWalRecordV1(64, 0, 1, yaza_db_wal_type_skip_v1(), 0, bytes_from_text(""))
+    if result_is_ok(yaza_db_wal_encode_v1(bad_skip)): return err("YDBv1 WAL encoder accepted a transaction-owned SKIP record")
+
+    let oversized_payload: Bytes = bytes_try_new_zeroed(yaza_db_wal_max_record_size_v1() - yaza_db_wal_header_size_v1() + 1)?
+    let oversized: YazaDbWalRecordV1 = YazaDbWalRecordV1(128, 0, 1, yaza_db_wal_type_leaf_insert_v1(), 0, oversized_payload)
+    if result_is_ok(yaza_db_wal_encode_v1(oversized)): return err("YDBv1 WAL encoder accepted a record larger than its I/O bound")
+
+    let skip_record: YazaDbWalRecordV1 = YazaDbWalRecordV1(yaza_db_wal_segment_size_v1() - 40, 0, 0, yaza_db_wal_type_skip_v1(), 0, bytes_from_text(""))
+    let encoded_skip: Bytes = yaza_db_wal_encode_v1(skip_record)?
+    let decoded_skip: YazaDbWalRecordV1 = yaza_db_wal_decode_v1(encoded_skip, yaza_db_wal_segment_size_v1() - 40)?
+    if decoded_skip.rec_type != yaza_db_wal_type_skip_v1(): return err("YDBv1 WAL SKIP record failed to round-trip")
+
+    let root: Number = root_open(root_path)?
+    let segment: Number = create_exclusive(root, "wal-smoke.segment")?
+    let oversized_segment: Boolean = truncate(segment, yaza_db_wal_segment_size_v1() + 1)?
+    if not oversized_segment: return err("YDBv1 WAL fixture could not create an oversized segment")
+    let wrong_size: Result[Number, Text] = yaza_db_wal_write_segment_record_v1(segment, record)
+    if result_is_ok(wrong_size): return err("YDBv1 WAL writer accepted a segment beyond its logical capacity")
+    let sized: Boolean = truncate(segment, yaza_db_wal_segment_size_v1())?
+    if not sized: return err("YDBv1 WAL fixture could not size its legacy-format segment")
+    let segment_sync: Boolean = sync(segment)?
+    if not segment_sync: return err("YDBv1 WAL segment size sync failed")
+    let segment_written: Number = yaza_db_wal_write_segment_record_v1(segment, record)?
+    if segment_written != bytes_length(encoded): return err("YDBv1 WAL segment write length is wrong")
+    let record_sync: Boolean = sync(segment)?
+    if not record_sync: return err("YDBv1 WAL record sync failed")
+    let segment_record: YazaDbWalRecordV1 = yaza_db_wal_read_segment_record_v1(segment, 4096, 4096)?
+    if segment_record.lsn != record.lsn or segment_record.txn_id != record.txn_id or not bytes_equal(segment_record.payload, payload): return err("YDBv1 WAL segment read did not recover the written record")
+    let wrong_offset: Result[YazaDbWalRecordV1, Text] = yaza_db_wal_read_segment_record_v1(segment, 4096, 4097)
+    if result_is_ok(wrong_offset): return err("YDBv1 WAL segment reader accepted a mismatched expected offset")
+    let closed_segment: Boolean = close(segment)?
+    if not closed_segment: return err("YDBv1 WAL segment close failed")
+    let removed_segment: Boolean = remove(root, "wal-smoke.segment")?
+    if not removed_segment: return err("YDBv1 WAL segment fixture cleanup failed")
+
+    let log_file: Number = create_exclusive(root, "wal-log.segment")?
+    let log_sized: Boolean = truncate(log_file, yaza_db_wal_segment_size_v1())?
+    if not log_sized: return err("YDBv1 WAL log fixture could not size its segment")
+    let log_size_sync: Boolean = sync(log_file)?
+    if not log_size_sync: return err("YDBv1 WAL log segment size sync failed")
+    let log_directory_sync: Boolean = sync_directory(root)?
+    if not log_directory_sync: return err("YDBv1 WAL log directory sync failed")
+    let first_log_record: YazaDbWalRecordV1 = YazaDbWalRecordV1(0, 0, 42, yaza_db_wal_type_leaf_insert_v1(), 0, payload)
+    let wrong_append_lsn: Result[Number, Text] = yaza_db_wal_append_segment_record_durable_v1(log_file, 1, first_log_record)
+    if result_is_ok(wrong_append_lsn): return err("YDBv1 WAL appender accepted an LSN different from its recovered end")
+    let first_log_end: Number = yaza_db_wal_append_segment_record_durable_v1(log_file, 0, first_log_record)?
+    if first_log_end != yaza_db_wal_header_size_v1() + bytes_length(payload): return err("YDBv1 first durable WAL append returned the wrong end LSN")
+    let second_log_record: YazaDbWalRecordV1 = YazaDbWalRecordV1(first_log_end, 0, 42, yaza_db_wal_type_commit_v1(), 0, commit_payload)
+    let second_log_end: Number = yaza_db_wal_append_segment_record_durable_v1(log_file, first_log_end, second_log_record)?
+    let closed_log: Boolean = close(log_file)?
+    if not closed_log: return err("YDBv1 WAL log segment close failed")
+    let reopened_log: Number = open_rw(root, "wal-log.segment")?
+    let recovered_end: Number = yaza_db_wal_recover_segment_end_v1(reopened_log, 0)?
+    if recovered_end != second_log_end: return err("YDBv1 WAL recovery found the wrong durable end LSN")
+    let recovered_first: YazaDbWalRecordV1 = yaza_db_wal_read_segment_record_v1(reopened_log, 0, 0)?
+    let recovered_commit: YazaDbWalRecordV1 = yaza_db_wal_read_segment_record_v1(reopened_log, first_log_end, first_log_end)?
+    if recovered_first.rec_type != yaza_db_wal_type_leaf_insert_v1() or recovered_commit.rec_type != yaza_db_wal_type_commit_v1(): return err("YDBv1 WAL recovery returned records in the wrong order")
+    let nonzero_tail: Bytes = bytes_from_text("x")
+    let tail_corrupt_write: Number = write_exact(reopened_log, second_log_end + 8, nonzero_tail)?
+    if tail_corrupt_write != 1: return err("YDBv1 WAL non-zero-tail fixture write was incomplete")
+    let corrupt_tail_recovery: Result[Number, Text] = yaza_db_wal_recover_segment_end_v1(reopened_log, 0)
+    if result_is_ok(corrupt_tail_recovery): return err("YDBv1 WAL recovery accepted non-zero bytes after the valid log prefix")
+    let closed_reopened_log: Boolean = close(reopened_log)?
+    if not closed_reopened_log: return err("YDBv1 reopened WAL segment close failed")
+    let removed_log: Boolean = remove(root, "wal-log.segment")?
+    if not removed_log: return err("YDBv1 WAL log fixture cleanup failed")
+
+    let oversized_index_prefix: Text = yaza_db_wal_namespace_prefix_v1(yaza_db_wal_default_namespace_v1())?
+    let oversized_index_name: Text = oversized_index_prefix + "999999999999999999999999999999999999999999.yzw"
+    let oversized_index_file: Number = create_exclusive(root, oversized_index_name)?
+    let oversized_index_closed: Boolean = close(oversized_index_file)?
+    if not oversized_index_closed: return err("YDBv1 oversized segment-index fixture close failed")
+    let oversized_index_discovery: Result[Number, Text] = yaza_db_wal_segment_count_v1(root)
+    if result_is_ok(oversized_index_discovery): return err("YDBv1 WAL discovery accepted an overflowing segment index")
+    let removed_oversized_index: Boolean = remove(root, oversized_index_name)?
+    if not removed_oversized_index: return err("YDBv1 oversized segment-index fixture cleanup failed")
+    let index_cleanup_sync: Boolean = sync_directory(root)?
+    if not index_cleanup_sync: return err("YDBv1 oversized segment-index cleanup sync failed")
+    let empty_log_count: Number = yaza_db_wal_segment_count_v1(root)?
+    if empty_log_count != 0: return err("YDBv1 WAL segment discovery found a segment in an empty fixture root")
+    let managed_log: YazaDbWalLogV1 = yaza_db_wal_log_open_v1(root)?
+    if managed_log.segment_index != 0 or managed_log.next_lsn != 0: return err("YDBv1 WAL manager did not initialize its first segment at LSN zero")
+    let initial_segment_size: Number = file_size(managed_log.file)?
+    if initial_segment_size != 0: return err("YDBv1 new WAL segment did not start with an empty physical extent")
+    let first_managed_append: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(managed_log, first_log_record)?
+    let stale_writer_append: Result[YazaDbWalAppendV1, Text] = yaza_db_wal_log_append_v1(managed_log, second_log_record)
+    if result_is_ok(stale_writer_append): return err("YDBv1 WAL manager accepted a stale append state")
+    let second_managed_append: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(first_managed_append.log, second_log_record)?
+    let managed_end: Number = second_managed_append.log.next_lsn
+    let active_segment_size: Number = file_size(second_managed_append.log.file)?
+    if active_segment_size != managed_end: return err("YDBv1 active WAL physical length does not match its written record end")
+    let closed_managed_log: Boolean = yaza_db_wal_log_close_v1(second_managed_append.log)?
+    if not closed_managed_log: return err("YDBv1 managed WAL close failed")
+    let reopened_managed_log: YazaDbWalLogV1 = yaza_db_wal_log_open_v1(root)?
+    if reopened_managed_log.segment_index != 0 or reopened_managed_log.next_lsn != managed_end: return err("YDBv1 WAL manager did not recover its existing segment end")
+    let absolute_first: YazaDbWalRecordV1 = yaza_db_wal_read_record_at_v1(root, managed_log.db_uuid, first_managed_append.record.lsn, managed_end)?
+    let absolute_second: YazaDbWalRecordV1 = yaza_db_wal_read_record_at_v1(root, managed_log.db_uuid, second_managed_append.record.lsn, managed_end)?
+    if absolute_first.rec_type != first_managed_append.record.rec_type or absolute_first.txn_id != first_managed_append.record.txn_id or not bytes_equal(absolute_first.payload, first_managed_append.record.payload): return err("YDBv1 WAL absolute-LSN reader changed the first namespaced record")
+    if absolute_second.rec_type != second_managed_append.record.rec_type or absolute_second.txn_id != second_managed_append.record.txn_id or not bytes_equal(absolute_second.payload, second_managed_append.record.payload): return err("YDBv1 WAL absolute-LSN reader changed the second namespaced record")
+    let absolute_past_end: Result[YazaDbWalRecordV1, Text] = yaza_db_wal_read_record_at_v1(root, managed_log.db_uuid, managed_end, managed_end)
+    if result_is_ok(absolute_past_end): return err("YDBv1 WAL absolute-LSN reader accepted the recovered log end as a record")
+    let closed_reopened_managed_log: Boolean = yaza_db_wal_log_close_v1(reopened_managed_log)?
+    if not closed_reopened_managed_log: return err("YDBv1 reopened managed WAL close failed")
+
+    let checkpoint_uuid: Bytes = bytes_from_text("checkpoint-test1")
+    if bytes_length(checkpoint_uuid) != 16: return err("YDBv1 checkpoint-scan fixture namespace must be 16 bytes")
+    let checkpoint_name: Text = yaza_db_wal_segment_name_for_v1(0, checkpoint_uuid)?
+    let checkpoint_segment: Number = create_exclusive(root, checkpoint_name)?
+    let old_record: YazaDbWalRecordV1 = YazaDbWalRecordV1(0, 0, 0, yaza_db_wal_type_skip_v1(), 0, bytes_from_text(""))
+    let checkpoint_record: YazaDbWalRecordV1 = YazaDbWalRecordV1(yaza_db_wal_header_size_v1(), 0, 0, yaza_db_wal_type_checkpoint_end_v1(), 0, bytes_from_text(""))
+    let tail_record_lsn: Number = yaza_db_wal_header_size_v1() * 2
+    let tail_record: YazaDbWalRecordV1 = YazaDbWalRecordV1(tail_record_lsn, 0, 0, yaza_db_wal_type_skip_v1(), 0, bytes_from_text(""))
+    let old_record_written: Number = yaza_db_wal_write_segment_record_v1(checkpoint_segment, old_record)?
+    let checkpoint_record_written: Number = yaza_db_wal_write_segment_record_v1(checkpoint_segment, checkpoint_record)?
+    let tail_record_written: Number = yaza_db_wal_write_segment_record_v1(checkpoint_segment, tail_record)?
+    if old_record_written != yaza_db_wal_header_size_v1() or checkpoint_record_written != yaza_db_wal_header_size_v1() or tail_record_written != yaza_db_wal_header_size_v1(): return err("YDBv1 checkpoint-scan fixture record lengths are invalid")
+    let checkpoint_fixture_sync: Boolean = sync(checkpoint_segment)?
+    if not checkpoint_fixture_sync: return err("YDBv1 checkpoint-scan fixture sync failed")
+    let corrupt_length_bytes: Bytes = bytes_try_new_zeroed(4)?
+    if not yaza_db_write_uint_le_v1(corrupt_length_bytes, 0, yaza_db_wal_header_size_v1() + 1, 4): return err("YDBv1 checkpoint-scan fixture could not encode its corrupted record length")
+    let corrupt_old_prefix: Number = write_exact(checkpoint_segment, 0, corrupt_length_bytes)?
+    if corrupt_old_prefix != 4: return err("YDBv1 checkpoint-scan fixture could not corrupt its pre-checkpoint record")
+    let checkpoint_fixture_closed: Boolean = close(checkpoint_segment)?
+    if not checkpoint_fixture_closed: return err("YDBv1 checkpoint-scan fixture close failed")
+    let checkpoint_scan_end: Number = yaza_db_wal_recover_log_end_after_checkpoint_for_v1(root, 1, checkpoint_uuid, checkpoint_record.lsn)?
+    if checkpoint_scan_end != tail_record_lsn + yaza_db_wal_header_size_v1(): return err("YDBv1 checkpoint-seeded recovery did not find the valid WAL tail")
+    let full_scan_with_corrupt_prefix: Result[Number, Text] = yaza_db_wal_recover_log_end_for_v1(root, 1, checkpoint_uuid)
+    if result_is_ok(full_scan_with_corrupt_prefix): return err("YDBv1 full WAL scan unexpectedly accepted the corrupted pre-checkpoint record")
+    let removed_checkpoint_segment: Boolean = remove(root, checkpoint_name)?
+    if not removed_checkpoint_segment: return err("YDBv1 checkpoint-scan fixture cleanup failed")
+    let checkpoint_cleanup_sync: Boolean = sync_directory(root)?
+    if not checkpoint_cleanup_sync: return err("YDBv1 checkpoint-scan fixture cleanup sync failed")
+
+    let orphan_name: Text = yaza_db_wal_segment_name_v1(1)?
+    let orphan_segment: Number = create_exclusive(root, orphan_name)?
+    let orphan_size: Boolean = truncate(orphan_segment, yaza_db_wal_segment_size_v1())?
+    if not orphan_size: return err("YDBv1 orphan segment fixture could not set its physical size")
+    let orphan_sync: Boolean = sync(orphan_segment)?
+    if not orphan_sync: return err("YDBv1 orphan segment fixture sync failed")
+    let orphan_directory_sync: Boolean = sync_directory(root)?
+    if not orphan_directory_sync: return err("YDBv1 orphan segment directory sync failed")
+    let orphan_closed: Boolean = close(orphan_segment)?
+    if not orphan_closed: return err("YDBv1 orphan segment fixture close failed")
+    let gapped_count: Number = yaza_db_wal_segment_count_v1(root)?
+    if gapped_count != 2: return err("YDBv1 WAL discovery did not count both canonical segment names")
+    if result_is_ok(yaza_db_wal_recover_log_end_v1(root, gapped_count)): return err("YDBv1 WAL recovery accepted a segment after an unjustified gap")
+    let removed_orphan: Boolean = remove(root, orphan_name)?
+    if not removed_orphan: return err("YDBv1 orphan segment fixture cleanup failed")
+    let root_sync: Boolean = sync_directory(root)?
+    if not root_sync: return err("YDBv1 WAL fixture directory sync failed")
+    let closed_root: Boolean = close(root)?
+    if not closed_root: return err("YDBv1 WAL fixture root close failed")
+    return ok(bytes_length(encoded) + bytes_length(encoded_page_image) + segment_written)
+
+start:
+    let outcome: Result[Number, Text] = yaza_base_wal_v1_check(arg(1))
+    if result_is_ok(outcome):
+        say "yazabase-wal-v1-ok bytes=" + number_text(result_unwrap(outcome))
+    else:
+        say result_unwrap_error(outcome)

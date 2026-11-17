@@ -1,0 +1,268 @@
+# Bounded DROP TABLE support for user tables in the provisional YDBv1 catalog.
+# Catalog row tombstones and the table's clustered and secondary B+Tree pages
+# are reclaimed in one bounded transaction after structural preflight.
+use "./btree_scan_v1"
+use "./btree_reclaim_v1"
+use "./catalog_schema_v1"
+use "./catalog_snapshot_v1"
+use "./catalog_storage_v1"
+use "./catalog_v1"
+use "./key_codec_v1"
+use "./overflow_reclaim_v1"
+use "./page_v1"
+use "./query_v1"
+use "./row_v1"
+use "./sql_create_table_v1"
+use "./sql_create_table_write_v1"
+use "./sql_foreign_key_v1"
+use "./sql_lexer_v1"
+use "./sql_parser_v2"
+use "./storage_v1"
+use "./transaction_v1"
+use "./wal_v1"
+
+shape YazaDbSqlDropTargetV1:
+    page_id: Number
+    key: Bytes
+    tombstone_payload: Bytes
+
+fn yaza_sql_parse_drop_table_v1(source: Text) -> Result[Text, Text]:
+    let lexed: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(source)
+    if not result_is_ok(lexed): return err(result_unwrap_error(lexed))
+    let tokens: List[YazaSqlTokenV1] = result_unwrap(lexed)
+    if list_count(tokens) < 2: return err("SQL DROP TABLE parser received an invalid token stream")
+    if not yaza_sql_v2_is_keyword(source, tokens, 0, "DROP"): return err(yaza_sql_v2_parse_error(source, tokens, 0, "SQL parser expected DROP at byte "))
+    if not yaza_sql_v2_is_keyword(source, tokens, 1, "TABLE"): return err(yaza_sql_v2_parse_error(source, tokens, 1, "SQL parser expected TABLE after DROP at byte "))
+    var name_cursor: Number = 2
+    if yaza_sql_v2_is_keyword(source, tokens, name_cursor, "IF"):
+        if not yaza_sql_v2_is_keyword(source, tokens, name_cursor + 1, "EXISTS"):
+            return err(yaza_sql_v2_parse_error(source, tokens, name_cursor + 1, "SQL DROP TABLE expected EXISTS after IF at byte "))
+        set name_cursor = name_cursor + 2
+    let name_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, name_cursor, false)
+    if not result_is_ok(name_result): return err(yaza_sql_v2_parse_error(source, tokens, name_cursor, "SQL DROP TABLE expected a table name at byte "))
+    let name: YazaSqlNameV2 = result_unwrap(name_result)
+    if name.part_count != 1: return err(yaza_sql_v2_parse_error(source, tokens, name_cursor, "SQL DROP TABLE supports one-part table names only at byte "))
+    var cursor: Number = name_cursor + name.consumed_tokens
+    if yaza_sql_v2_is_symbol(source, tokens, cursor, 59): set cursor = cursor + 1
+    if cursor >= list_count(tokens) or list_get(tokens, cursor).kind != 0:
+        return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser supports one statement; unexpected token at byte "))
+    return yaza_sql_create_table_identifier_v1(source, name.first_token)
+
+fn yaza_db_sql_drop_table_add_target_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, row: YazaDbRowV1, columns: List[YazaSqlColumnSchemaV1], key_ordinals: List[Number], commit_ts: Number, targets: List[YazaDbSqlDropTargetV1]) -> Result[Boolean, Text]:
+    if row.deleted or row.version_ts < 1 or row.version_ts >= commit_ts: return err("YDBv1 DROP TABLE catalog row is not a current committed row")
+    if list_count(row.values) != list_count(columns) or list_count(row.nulls) != list_count(columns): return err("YDBv1 DROP TABLE catalog row does not match its schema")
+    let key: Bytes = yaza_db_key_encode_composite_v1(row.values, row.nulls, columns, key_ordinals)?
+    if bytes_length(key) < 1 or bytes_length(key) > 2048: return err("YDBv1 DROP TABLE catalog key is outside its bounded encoding")
+    let encoded: Bytes = yaza_db_row_encode_v1(row.values, row.nulls, columns, commit_ts)?
+    let tombstone: Bytes = yaza_db_row_set_deleted_v1(encoded, true)?
+    let seek: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(file, file_header, root_page_id, key)?
+    let page: Bytes = yaza_db_storage_read_page_v1(file, file_header, seek.leaf_page_id)?
+    let page_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, seek.leaf_page_id)?
+    let slot_index: Number = yaza_db_page_lower_bound_v1(page, key, seek.leaf_page_id)?
+    if slot_index >= page_header.count: return err("YDBv1 DROP TABLE catalog row disappeared during preflight")
+    let stored_key: Bytes = yaza_db_page_slot_key_v1(page, slot_index, seek.leaf_page_id)?
+    if not bytes_equal(stored_key, key): return err("YDBv1 DROP TABLE catalog row key changed during preflight")
+    if not list_try_push(targets, YazaDbSqlDropTargetV1(seek.leaf_page_id, key, tombstone)):
+        return err("YDBv1 DROP TABLE could not retain a preflighted catalog tombstone")
+    return ok(true)
+
+fn yaza_db_sql_drop_table_stage_matches_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, rows: List[YazaDbRowV1], columns: List[YazaSqlColumnSchemaV1], key_ordinals: List[Number], match_ordinal: Number, table_id: Number, commit_ts: Number, targets: List[YazaDbSqlDropTargetV1]) -> Result[Number, Text]:
+    if match_ordinal < 0 or match_ordinal >= list_count(columns) or list_get(columns, match_ordinal).type_id != 4:
+        return err("YDBv1 DROP TABLE catalog match column is not a non-NULL BIGINT")
+    var matched: Number = 0
+    var row_index: Number = 0
+    while row_index < list_count(rows):
+        let row: YazaDbRowV1 = list_get(rows, row_index)
+        if list_count(row.values) != list_count(columns) or list_count(row.nulls) != list_count(columns): return err("YDBv1 DROP TABLE encountered a malformed system-catalog row")
+        if not list_get(row.nulls, match_ordinal) and list_get(row.values, match_ordinal).integer_value == table_id:
+            let staged: Boolean = yaza_db_sql_drop_table_add_target_v1(file, file_header, root_page_id, row, columns, key_ordinals, commit_ts, targets)?
+            if not staged: return err("YDBv1 DROP TABLE could not stage a catalog row")
+            set matched = matched + 1
+        set row_index = row_index + 1
+    return ok(matched)
+
+fn yaza_db_sql_drop_table_close_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1) -> Unit:
+    let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(wal)
+    let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(storage)
+    return
+
+fn yaza_db_sql_drop_table_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, table_name: Text) -> Result[YazaDbWriteCommitV1, Text]:
+    if storage.root != wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid): return err("YDBv1 DROP TABLE storage and WAL handles belong to different databases")
+    let loaded: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(storage.file, storage.header)?
+    var table_index: Number = 0
+    while table_index < list_count(loaded.sql_snapshot.tables) and list_get(loaded.sql_snapshot.tables, table_index).name != table_name:
+        set table_index = table_index + 1
+    if table_index >= list_count(loaded.sql_snapshot.tables): return err("YDBv1 DROP TABLE target does not exist")
+    let table: YazaSqlTableSchemaV1 = list_get(loaded.sql_snapshot.tables, table_index)
+    if table.table_id <= yaza_db_catalog_system_table_id_max_v1(): return err("YDBv1 DROP TABLE cannot remove a system catalog")
+    let foreign_keys: List[YazaDbSqlForeignKeyV1] = yaza_db_sql_foreign_key_load_v1(storage.file, storage.header, loaded)?
+    var foreign_key_index: Number = 0
+    while foreign_key_index < list_count(foreign_keys):
+        let foreign_key: YazaDbSqlForeignKeyV1 = list_get(foreign_keys, foreign_key_index)
+        if foreign_key.referenced_table_id == table.table_id and foreign_key.table_id != table.table_id: return err("YDBv1 DROP TABLE is blocked by a dependent FOREIGN KEY; DROP the child table first")
+        set foreign_key_index = foreign_key_index + 1
+    var dependent_view_index: Number = 0
+    while dependent_view_index < list_count(loaded.views):
+        if list_get(loaded.views, dependent_view_index).dependency_table_id == table.table_id:
+            return err("YDBv1 DROP TABLE is blocked by a dependent view; DROP VIEW first")
+        set dependent_view_index = dependent_view_index + 1
+    if table_index >= list_count(loaded.root_page_ids) or table_index >= list_count(loaded.table_schema_versions): return err("YDBv1 DROP TABLE target has no catalog root or schema-version mapping")
+    let table_root_page_id: Number = list_get(loaded.root_page_ids, table_index)
+    let reclaim_plan: YazaDbBtreeReclaimPlanV1 = yaza_db_btree_reclaim_plan_v1(storage.file, storage.header, table_root_page_id)?
+    let table_data_pages: List[Number] = reclaim_plan.page_ids
+    let catalog: YazaDbCatalogRootV1 = yaza_db_catalog_storage_read_root_v1(storage.file, storage.header)?
+    if catalog.generation >= yaza_db_catalog_max_page_id_v1(): return err("YDBv1 DROP TABLE catalog generation space is exhausted")
+
+    let tables_schema: List[YazaSqlColumnSchemaV1] = yaza_db_catalog_table_schema_v1(1)?
+    let columns_schema: List[YazaSqlColumnSchemaV1] = yaza_db_catalog_table_schema_v1(2)?
+    let indexes_schema: List[YazaSqlColumnSchemaV1] = yaza_db_catalog_table_schema_v1(3)?
+    let constraints_schema: List[YazaSqlColumnSchemaV1] = yaza_db_catalog_table_schema_v1(4)?
+    let table_key_ordinals: List[Number] = [0]
+    let columns_key_ordinals: List[Number] = [0, 1]
+    let index_key_ordinals: List[Number] = [0]
+    let constraint_key_ordinals: List[Number] = [0]
+    let visible_ts: Number = loaded.sql_snapshot.version
+    let stored_tables: List[YazaDbRowV1] = yaza_db_catalog_snapshot_read_tree_v1(storage.file, storage.header, catalog.sys_tables_root, tables_schema, table_key_ordinals, visible_ts, yaza_db_catalog_max_table_records_v1())?
+    let stored_columns: List[YazaDbRowV1] = yaza_db_catalog_snapshot_read_tree_v1(storage.file, storage.header, catalog.sys_columns_root, columns_schema, columns_key_ordinals, visible_ts, yaza_db_catalog_max_column_rows_v1())?
+    let stored_indexes: List[YazaDbRowV1] = yaza_db_catalog_snapshot_read_tree_v1(storage.file, storage.header, catalog.sys_indexes_root, indexes_schema, index_key_ordinals, visible_ts, 4096)?
+    let stored_constraints: List[YazaDbRowV1] = yaza_db_catalog_snapshot_read_tree_v1(storage.file, storage.header, catalog.sys_constraints_root, constraints_schema, constraint_key_ordinals, visible_ts, 4096)?
+    let targets_result: Result[List[YazaDbSqlDropTargetV1], Text] = list_try_new()
+    if not result_is_ok(targets_result): return err(result_unwrap_error(targets_result))
+    let targets: List[YazaDbSqlDropTargetV1] = result_unwrap(targets_result)
+    if not list_try_reserve(targets, 7169): return err("YDBv1 DROP TABLE could not reserve bounded catalog tombstones")
+    let commit_ts: Number = storage.header.next_commit_ts
+    if commit_ts < 2: return err("YDBv1 DROP TABLE requires an initialized committed catalog")
+
+    let column_count: Number = yaza_db_sql_drop_table_stage_matches_v1(storage.file, storage.header, catalog.sys_columns_root, stored_columns, columns_schema, columns_key_ordinals, 0, table.table_id, commit_ts, targets)?
+    if column_count != list_count(table.columns): return err("YDBv1 DROP TABLE catalog column rows do not match the bound table schema")
+    let index_count: Number = yaza_db_sql_drop_table_stage_matches_v1(storage.file, storage.header, catalog.sys_indexes_root, stored_indexes, indexes_schema, index_key_ordinals, 1, table.table_id, commit_ts, targets)?
+    let constraint_count: Number = yaza_db_sql_drop_table_stage_matches_v1(storage.file, storage.header, catalog.sys_constraints_root, stored_constraints, constraints_schema, constraint_key_ordinals, 1, table.table_id, commit_ts, targets)?
+    var own_constraint_count: Number = 0
+    var own_primary_constraint_count: Number = 0
+    var constraint_row_index: Number = 0
+    while constraint_row_index < list_count(stored_constraints):
+        let constraint_row: YazaDbRowV1 = list_get(stored_constraints, constraint_row_index)
+        if list_count(constraint_row.values) != 6 or list_count(constraint_row.nulls) != 6: return err("YDBv1 DROP TABLE encountered malformed constraint metadata")
+        if not list_get(constraint_row.nulls, 1) and list_get(constraint_row.values, 1).integer_value == table.table_id:
+            if list_get(constraint_row.nulls, 3): return err("YDBv1 DROP TABLE found a constraint without a kind")
+            set own_constraint_count = own_constraint_count + 1
+            if list_get(constraint_row.values, 3).integer_value == 1: set own_primary_constraint_count = own_primary_constraint_count + 1
+        set constraint_row_index = constraint_row_index + 1
+    if index_count < 1 or index_count > 65 or constraint_count < 1 or constraint_count > 129 or own_constraint_count != constraint_count or own_primary_constraint_count != 1: return err("YDBv1 DROP TABLE index or constraint metadata exceeds its supported bound")
+    var index_row_index: Number = 0
+    var matching_primary_count: Number = 0
+    var matching_secondary_count: Number = 0
+    var total_reclaim_reads: Number = reclaim_plan.page_reads
+    var primary_key_columns: Text = ""
+    while index_row_index < list_count(stored_indexes):
+        let index_row: YazaDbRowV1 = list_get(stored_indexes, index_row_index)
+        if list_count(index_row.values) != 7 or list_count(index_row.nulls) != 7: return err("YDBv1 DROP TABLE encountered malformed index metadata")
+        if not list_get(index_row.nulls, 1) and list_get(index_row.values, 1).integer_value == table.table_id:
+            if list_get(index_row.nulls, 3) or list_get(index_row.nulls, 4) or list_get(index_row.nulls, 5) or list_get(index_row.nulls, 6): return err("YDBv1 DROP TABLE primary index metadata is incomplete")
+            let index_kind: Number = list_get(index_row.values, 4).integer_value
+            if index_kind == yaza_db_catalog_index_kind_primary_v1():
+                if list_get(index_row.values, 3).integer_value != table_root_page_id or not list_get(index_row.values, 5).boolean_value:
+                    return err("YDBv1 DROP TABLE found an unsupported or mismatched primary index root")
+                set primary_key_columns = list_get(index_row.values, 6).text_value
+                set matching_primary_count = matching_primary_count + 1
+            elif index_kind == yaza_db_catalog_index_kind_secondary_active_v1():
+                if list_get(index_row.values, 5).boolean_value: return err("YDBv1 DROP TABLE found an unsupported unique secondary index")
+                let secondary_root_page_id: Number = list_get(index_row.values, 3).integer_value
+                let secondary_plan: YazaDbBtreeReclaimPlanV1 = yaza_db_btree_reclaim_plan_v1(storage.file, storage.header, secondary_root_page_id)?
+                if total_reclaim_reads > yaza_db_btree_max_page_reads_v1() - secondary_plan.page_reads: return err("YDBv1 DROP TABLE secondary-index reclamation exceeds its total page-read bound")
+                set total_reclaim_reads = total_reclaim_reads + secondary_plan.page_reads
+                var secondary_page_index: Number = 0
+                while secondary_page_index < list_count(secondary_plan.page_ids):
+                    let secondary_page_id: Number = list_get(secondary_plan.page_ids, secondary_page_index)
+                    var prior_page_index: Number = 0
+                    while prior_page_index < list_count(table_data_pages):
+                        if list_get(table_data_pages, prior_page_index) == secondary_page_id: return err("YDBv1 DROP TABLE found overlapping clustered and secondary index pages")
+                        set prior_page_index = prior_page_index + 1
+                    if list_count(table_data_pages) >= yaza_db_btree_reclaim_max_pages_v1() or not list_try_push(table_data_pages, secondary_page_id):
+                        return err("YDBv1 DROP TABLE could not retain its bounded secondary-index page set")
+                    set secondary_page_index = secondary_page_index + 1
+                set matching_secondary_count = matching_secondary_count + 1
+            else:
+                return err("YDBv1 DROP TABLE cannot reclaim an index outside the primary or ACTIVE secondary profile")
+        set index_row_index = index_row_index + 1
+    if matching_primary_count != 1 or matching_primary_count + matching_secondary_count != index_count:
+        return err("YDBv1 DROP TABLE could not verify all table index roots")
+
+    let primary_key_ordinals: List[Number] = yaza_db_query_parse_key_ordinals_v1(primary_key_columns, list_count(table.columns))?
+    let overflow_reclaim: YazaDbOverflowReclaimPlanV1 = yaza_db_overflow_reclaim_plan_table_v1(storage.root, wal.db_uuid, wal.next_lsn, storage.file, storage.header, reclaim_plan, table.columns, list_get(loaded.table_schema_versions, table_index), primary_key_ordinals)?
+    if total_reclaim_reads > yaza_db_btree_max_page_reads_v1() - overflow_reclaim.page_reads: return err("YDBv1 DROP TABLE combined index and overflow reclamation exceeds its page-read bound")
+    set total_reclaim_reads = total_reclaim_reads + overflow_reclaim.page_reads
+    var overflow_page_index: Number = 0
+    while overflow_page_index < list_count(overflow_reclaim.page_ids):
+        if list_count(table_data_pages) >= yaza_db_btree_reclaim_max_pages_v1() or not list_try_push(table_data_pages, list_get(overflow_reclaim.page_ids, overflow_page_index)):
+            return err("YDBv1 DROP TABLE combined B+Tree and overflow page set exceeds its bound")
+        set overflow_page_index = overflow_page_index + 1
+
+    var table_row_index: Number = 0
+    var table_row_found: Boolean = false
+    while table_row_index < list_count(stored_tables):
+        let row: YazaDbRowV1 = list_get(stored_tables, table_row_index)
+        if list_count(row.values) != list_count(tables_schema) or list_count(row.nulls) != list_count(tables_schema): return err("YDBv1 DROP TABLE encountered a malformed sys_tables row")
+        if not list_get(row.nulls, 0) and list_get(row.values, 0).integer_value == table.table_id:
+            if table_row_found: return err("YDBv1 DROP TABLE found duplicate table catalog rows")
+            let staged: Boolean = yaza_db_sql_drop_table_add_target_v1(storage.file, storage.header, catalog.sys_tables_root, row, tables_schema, table_key_ordinals, commit_ts, targets)?
+            if not staged: return err("YDBv1 DROP TABLE could not stage its table catalog row")
+            set table_row_found = true
+        set table_row_index = table_row_index + 1
+    if not table_row_found: return err("YDBv1 DROP TABLE target is missing its sys_tables row")
+    if list_count(targets) > 7169: return err("YDBv1 DROP TABLE catalog changes exceed the bounded row profile")
+
+    let begun_result: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_begin_prepared_v1(storage, wal)
+    if not result_is_ok(begun_result): return err(result_unwrap_error(begun_result))
+    let begun: YazaDbWriteTransactionV1 = result_unwrap(begun_result)
+    if begun.commit_ts != commit_ts:
+        yaza_db_sql_drop_table_close_v1(begun.storage, begun.wal)
+        return err("YDBv1 DROP TABLE commit timestamp changed after catalog preflight; reopen through recovery")
+    let record_bytes: Number = yaza_db_wal_header_size_v1() + yaza_db_wal_leaf_mutation_payload_size_v1()
+    let catalog_image_bytes: Number = yaza_db_wal_header_size_v1() + yaza_db_wal_page_image_payload_size_v1()
+    if list_count(targets) + 1 > 0 and record_bytes > 0 and (list_count(targets) + 1) > 9223372036854775807 / record_bytes:
+        yaza_db_sql_drop_table_close_v1(begun.storage, begun.wal)
+        return err("YDBv1 DROP TABLE WAL reservation arithmetic overflowed")
+    let free_page_record_bytes: Number = yaza_db_wal_header_size_v1() + yaza_db_page_space_payload_size_v1()
+    let catalog_and_metadata_bytes: Number = (list_count(targets) + 1) * record_bytes + catalog_image_bytes
+    if free_page_record_bytes < 1 or list_count(table_data_pages) > (9223372036854775807 - catalog_and_metadata_bytes) / free_page_record_bytes:
+        yaza_db_sql_drop_table_close_v1(begun.storage, begun.wal)
+        return err("YDBv1 DROP TABLE page reclamation WAL reservation arithmetic overflowed")
+    let required_wal_bytes: Number = catalog_and_metadata_bytes + list_count(table_data_pages) * free_page_record_bytes
+    if not yaza_db_write_transaction_tail_fits_bytes_v1(begun, required_wal_bytes):
+        yaza_db_sql_drop_table_close_v1(begun.storage, begun.wal)
+        return err("YDBv1 DROP TABLE catalog change exceeds the bounded WAL recovery-tail budget")
+
+    let next_catalog: YazaDbCatalogRootV1 = YazaDbCatalogRootV1(catalog.sys_tables_root, catalog.sys_columns_root, catalog.sys_indexes_root, catalog.sys_constraints_root, catalog.next_object_id, catalog.generation + 1, catalog.sys_views_root)
+    let catalog_append_result: Result[YazaDbWalAppendV1, Text] = yaza_db_sql_create_table_append_catalog_root_v1(begun.storage, begun.wal, begun.storage.header.catalog_root, next_catalog)
+    if not result_is_ok(catalog_append_result):
+        yaza_db_sql_drop_table_close_v1(begun.storage, begun.wal)
+        return err("YDBv1 DROP TABLE could not advance its catalog generation; reopen through recovery: " + result_unwrap_error(catalog_append_result))
+    let catalog_append: YazaDbWalAppendV1 = result_unwrap(catalog_append_result)
+    var current: YazaDbWriteTransactionV1 = YazaDbWriteTransactionV1(begun.storage, catalog_append.log, begun.txn_id, begun.commit_ts, begun.last_lsn, begun.pending_pages, begun.pending_keys_hex, begun.pending_rows_hex, begun.active)
+    var target_index: Number = 0
+    while target_index < list_count(targets):
+        let target: YazaDbSqlDropTargetV1 = list_get(targets, target_index)
+        let mutated: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_mutate_leaf_v1(current, yaza_db_wal_type_leaf_update_v1(), target.page_id, target.key, target.tombstone_payload)
+        if not result_is_ok(mutated): return err("YDBv1 DROP TABLE catalog mutation failed; reopen through recovery: " + result_unwrap_error(mutated))
+        set current = result_unwrap(mutated)
+        set target_index = target_index + 1
+    let grouped_free_result: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_free_pages_grouped_v1(current, table_data_pages)
+    if result_is_ok(grouped_free_result):
+        set current = result_unwrap(grouped_free_result)
+    else:
+        let grouped_free_error: Text = result_unwrap_error(grouped_free_result)
+        if not text_starts_with(grouped_free_error, "YDBv1 PAGE_FREE group fallback:"):
+            return err("YDBv1 DROP TABLE page reclamation failed; reopen through recovery: " + grouped_free_error)
+        var freed_page_index: Number = 0
+        while freed_page_index < list_count(table_data_pages):
+            let freed_result: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_free_page_v1(current, list_get(table_data_pages, freed_page_index))
+            if not result_is_ok(freed_result): return err("YDBv1 DROP TABLE fallback page reclamation failed; reopen through recovery: " + result_unwrap_error(freed_result))
+            set current = result_unwrap(freed_result)
+            set freed_page_index = freed_page_index + 1
+    let committed: Result[YazaDbWriteCommitV1, Text] = yaza_db_write_transaction_commit_v1(current)
+    if not result_is_ok(committed):
+        let message: Text = result_unwrap_error(committed)
+        yaza_db_sql_drop_table_close_v1(current.storage, current.wal)
+        return err("YDBv1 DROP TABLE commit failed; reopen through recovery: " + message)
+    return ok(result_unwrap(committed))

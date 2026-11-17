@@ -1,0 +1,271 @@
+use "./page_v1"
+use "./storage_v1"
+use "./wal_v1"
+
+shape YazaDbPageSpaceRecordV1:
+    operation: Number
+    page_id: Number
+    bitmap_page_id: Number
+    bit_index: Number
+
+shape YazaDbPageSpaceChangeV1:
+    storage: YazaDbStorageHandleV1
+    wal: YazaDbWalLogV1
+    record: YazaDbWalRecordV1
+    page_id: Number
+    bitmap_page_id: Number
+    bit_index: Number
+
+shape YazaDbCompensationPayloadV1:
+    operation: Number
+    page_id: Number
+    bitmap_page_id: Number
+    bit_index: Number
+    undo_next_lsn: Number
+    compensated_lsn: Number
+
+fn yaza_db_page_space_payload_size_v1() -> Number:
+    return 24
+
+fn yaza_db_page_space_payload_encode_v1(operation: Number, page_id: Number, bitmap_page_id: Number, bit_index: Number) -> Result[Bytes, Text]:
+    if operation != 1 and operation != 2: return err("YDBv1 page-space operation is unknown")
+    let address: YazaDbBitmapAddressV1 = yaza_db_bitmap_address_v1(page_id)?
+    if address.is_bitmap_page or address.bitmap_page_id != bitmap_page_id or address.bit_index != bit_index: return err("YDBv1 page-space fields do not match the bitmap mapping")
+    let output: Bytes = bytes_try_new_zeroed(yaza_db_page_space_payload_size_v1())?
+    if not yaza_db_write_uint_le_v1(output, 0, 1, 2) or not yaza_db_write_uint_le_v1(output, 2, operation, 2): return err("YDBv1 page-space payload version or operation could not be encoded")
+    if not yaza_db_write_uint_le_v1(output, 4, page_id, 8) or not yaza_db_write_uint_le_v1(output, 12, bitmap_page_id, 8): return err("YDBv1 page-space page IDs could not be encoded")
+    if not yaza_db_write_uint_le_v1(output, 20, bit_index, 4): return err("YDBv1 page-space bit index could not be encoded")
+    return ok(output)
+
+fn yaza_db_page_space_payload_decode_v1(record: YazaDbWalRecordV1) -> Result[YazaDbPageSpaceRecordV1, Text]:
+    if record.rec_type != yaza_db_wal_type_page_alloc_v1() and record.rec_type != yaza_db_wal_type_page_free_v1(): return err("YDBv1 page-space payload requires PAGE_ALLOC or PAGE_FREE")
+    if record.lsn < 1: return err("YDBv1 page-space record LSN must be positive because zero denotes the genesis page state")
+    if bytes_length(record.payload) != yaza_db_page_space_payload_size_v1(): return err("YDBv1 page-space payload has an invalid length")
+    let version: Number = yaza_db_read_uint_le_v1(record.payload, 0, 2)?
+    let operation: Number = yaza_db_read_uint_le_v1(record.payload, 2, 2)?
+    if version != 1: return err("YDBv1 page-space payload version is unknown")
+    if record.rec_type == yaza_db_wal_type_page_alloc_v1() and operation != 1: return err("YDBv1 PAGE_ALLOC payload operation is invalid")
+    if record.rec_type == yaza_db_wal_type_page_free_v1() and operation != 2: return err("YDBv1 PAGE_FREE payload operation is invalid")
+    let page_id: Number = yaza_db_read_uint_le_v1(record.payload, 4, 8)?
+    let bitmap_page_id: Number = yaza_db_read_uint_le_v1(record.payload, 12, 8)?
+    let bit_index: Number = yaza_db_read_uint_le_v1(record.payload, 20, 4)?
+    let address: YazaDbBitmapAddressV1 = yaza_db_bitmap_address_v1(page_id)?
+    if address.is_bitmap_page or address.bitmap_page_id != bitmap_page_id or address.bit_index != bit_index: return err("YDBv1 PAGE_ALLOC payload does not match the bitmap mapping")
+    return ok(YazaDbPageSpaceRecordV1(operation, page_id, bitmap_page_id, bit_index))
+
+fn yaza_db_compensation_payload_size_v1() -> Number:
+    return 40
+
+fn yaza_db_compensation_payload_encode_v1(operation: Number, page_id: Number, bitmap_page_id: Number, bit_index: Number, undo_next_lsn: Number, compensated_lsn: Number) -> Result[Bytes, Text]:
+    if operation != 1 and operation != 2: return err("YDBv1 compensation operation is unknown")
+    if undo_next_lsn < 0 or compensated_lsn < 1 or undo_next_lsn >= compensated_lsn: return err("YDBv1 compensation undo cursor or compensated LSN is invalid")
+    let address: YazaDbBitmapAddressV1 = yaza_db_bitmap_address_v1(page_id)?
+    if address.is_bitmap_page or address.bitmap_page_id != bitmap_page_id or address.bit_index != bit_index: return err("YDBv1 compensation fields do not match the bitmap mapping")
+    let output: Bytes = bytes_try_new_zeroed(yaza_db_compensation_payload_size_v1())?
+    if not yaza_db_write_uint_le_v1(output, 0, 1, 2) or not yaza_db_write_uint_le_v1(output, 2, operation, 2): return err("YDBv1 compensation version or operation could not be encoded")
+    if not yaza_db_write_uint_le_v1(output, 4, page_id, 8) or not yaza_db_write_uint_le_v1(output, 12, bitmap_page_id, 8): return err("YDBv1 compensation page IDs could not be encoded")
+    if not yaza_db_write_uint_le_v1(output, 20, bit_index, 4) or not yaza_db_write_uint_le_v1(output, 24, undo_next_lsn, 8): return err("YDBv1 compensation cursor could not be encoded")
+    if not yaza_db_write_uint_le_v1(output, 32, compensated_lsn, 8): return err("YDBv1 compensated record LSN could not be encoded")
+    return ok(output)
+
+fn yaza_db_compensation_payload_decode_v1(record: YazaDbWalRecordV1) -> Result[YazaDbCompensationPayloadV1, Text]:
+    if record.rec_type != yaza_db_wal_type_compensation_v1(): return err("YDBv1 compensation payload requires a COMPENSATION record")
+    if record.lsn < 1: return err("YDBv1 COMPENSATION record LSN must be positive")
+    if bytes_length(record.payload) != yaza_db_compensation_payload_size_v1(): return err("YDBv1 compensation payload has an invalid length")
+    let version: Number = yaza_db_read_uint_le_v1(record.payload, 0, 2)?
+    let operation: Number = yaza_db_read_uint_le_v1(record.payload, 2, 2)?
+    if version != 1 or (operation != 1 and operation != 2): return err("YDBv1 compensation version or operation is invalid")
+    let page_id: Number = yaza_db_read_uint_le_v1(record.payload, 4, 8)?
+    let bitmap_page_id: Number = yaza_db_read_uint_le_v1(record.payload, 12, 8)?
+    let bit_index: Number = yaza_db_read_uint_le_v1(record.payload, 20, 4)?
+    let undo_next_lsn: Number = yaza_db_read_uint_le_v1(record.payload, 24, 8)?
+    let compensated_lsn: Number = yaza_db_read_uint_le_v1(record.payload, 32, 8)?
+    if compensated_lsn < 1 or compensated_lsn >= record.lsn or compensated_lsn > record.prev_lsn: return err("YDBv1 COMPENSATION compensated_lsn is outside its transaction history")
+    if undo_next_lsn >= compensated_lsn: return err("YDBv1 COMPENSATION undo_next_lsn must precede the compensated record")
+    let address: YazaDbBitmapAddressV1 = yaza_db_bitmap_address_v1(page_id)?
+    if address.is_bitmap_page or address.bitmap_page_id != bitmap_page_id or address.bit_index != bit_index: return err("YDBv1 compensation payload does not match the bitmap mapping")
+    return ok(YazaDbCompensationPayloadV1(operation, page_id, bitmap_page_id, bit_index, undo_next_lsn, compensated_lsn))
+
+fn yaza_db_allocator_validate_page_space_record_v1(storage: YazaDbStorageHandleV1, record: YazaDbWalRecordV1, wal_end_lsn: Number) -> Result[Boolean, Text]:
+    if record.lsn < 0 or record.lsn >= wal_end_lsn: return err("YDBv1 page-space WAL record LSN is outside the recovered log")
+    let decoded: YazaDbPageSpaceRecordV1 = yaza_db_page_space_payload_decode_v1(record)?
+    if decoded.page_id >= storage.header.page_count or decoded.bitmap_page_id >= storage.header.page_count: return err("YDBv1 page-space WAL record references an unallocated bitmap range")
+    let bitmap: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, decoded.bitmap_page_id)?
+    let bitmap_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(bitmap, decoded.bitmap_page_id)?
+    if bitmap_header.page_type != 5: return err("YDBv1 page-space WAL record does not reference a BITMAP page")
+    if bitmap_header.page_lsn > 0 and bitmap_header.page_lsn >= wal_end_lsn: return err("YDBv1 BITMAP page LSN is beyond the recovered WAL end")
+    if bitmap_header.page_lsn < record.lsn: return err("YDBv1 durable page-space WAL is ahead of its BITMAP page; refusing database reuse until recovery is available")
+    if bitmap_header.page_lsn == record.lsn:
+        let allocated: Boolean = yaza_db_bitmap_page_bit_v1(bitmap, decoded.bit_index, decoded.bitmap_page_id)?
+        let expected_allocated: Boolean = decoded.operation == 1
+        if allocated != expected_allocated: return err("YDBv1 BITMAP state disagrees with its latest page-space WAL record")
+    return ok(true)
+
+fn yaza_db_allocator_apply_page_space_v1(storage: YazaDbStorageHandleV1, page_id: Number, bitmap_page_id: Number, bit_index: Number, allocated: Boolean, record_lsn: Number, wal_end_lsn: Number) -> Result[Boolean, Text]:
+    if record_lsn < 1 or record_lsn >= wal_end_lsn: return err("YDBv1 page-space redo LSN is outside the recoverable WAL range")
+    if page_id < 2 or page_id >= storage.header.page_count or bitmap_page_id < 2 or bitmap_page_id >= storage.header.page_count: return err("YDBv1 page-space redo references a page outside the published allocation")
+    let address: YazaDbBitmapAddressV1 = yaza_db_bitmap_address_v1(page_id)?
+    if address.is_bitmap_page or address.bitmap_page_id != bitmap_page_id or address.bit_index != bit_index: return err("YDBv1 page-space redo does not match the bitmap mapping")
+    let bitmap: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, bitmap_page_id)?
+    let bitmap_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(bitmap, bitmap_page_id)?
+    if bitmap_header.page_type != 5: return err("YDBv1 page-space redo target is not a BITMAP page")
+    if bitmap_header.page_lsn > 0 and bitmap_header.page_lsn >= wal_end_lsn: return err("YDBv1 BITMAP page LSN is beyond the recovered WAL end")
+    if bitmap_header.page_lsn > record_lsn: return ok(true)
+    let current_allocated: Boolean = yaza_db_bitmap_page_bit_v1(bitmap, bit_index, bitmap_page_id)?
+    if bitmap_header.page_lsn == record_lsn:
+        if current_allocated != allocated: return err("YDBv1 BITMAP state disagrees with the page-space redo record")
+        return ok(true)
+    let changed: Boolean = yaza_db_bitmap_page_set_allocated_v1(bitmap, bit_index, allocated, record_lsn, bitmap_page_id)?
+    if not changed:
+        if not yaza_db_write_uint_le_v1(bitmap, 0, record_lsn, 8): return err("YDBv1 page-space redo could not advance the BITMAP page LSN")
+        let ignored_checksum: Bytes = yaza_db_page_finalize_v1(bitmap)?
+    let written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, bitmap)?
+    if written != yaza_db_page_size_v1(): return err("YDBv1 page-space redo BITMAP write was incomplete")
+    return ok(true)
+
+fn yaza_db_allocator_redo_page_space_v1(storage: YazaDbStorageHandleV1, record: YazaDbWalRecordV1, wal_end_lsn: Number) -> Result[Boolean, Text]:
+    if record.rec_type != yaza_db_wal_type_page_alloc_v1() and record.rec_type != yaza_db_wal_type_page_free_v1(): return err("YDBv1 page-space redo requires PAGE_ALLOC or PAGE_FREE")
+    if record.lsn < 1 or record.lsn >= wal_end_lsn: return err("YDBv1 page-space redo record LSN is outside the recoverable WAL range")
+    let decoded: YazaDbPageSpaceRecordV1 = yaza_db_page_space_payload_decode_v1(record)?
+    return yaza_db_allocator_apply_page_space_v1(storage, decoded.page_id, decoded.bitmap_page_id, decoded.bit_index, decoded.operation == 1, record.lsn, wal_end_lsn)
+
+fn yaza_db_allocator_redo_compensation_v1(storage: YazaDbStorageHandleV1, record: YazaDbWalRecordV1, wal_end_lsn: Number) -> Result[Boolean, Text]:
+    if record.rec_type != yaza_db_wal_type_compensation_v1(): return err("YDBv1 compensation redo requires a COMPENSATION record")
+    if record.lsn < 1 or record.lsn >= wal_end_lsn: return err("YDBv1 compensation redo record LSN is outside the recoverable WAL range")
+    let decoded: YazaDbCompensationPayloadV1 = yaza_db_compensation_payload_decode_v1(record)?
+    return yaza_db_allocator_apply_page_space_v1(storage, decoded.page_id, decoded.bitmap_page_id, decoded.bit_index, decoded.operation == 1, record.lsn, wal_end_lsn)
+
+fn yaza_db_allocator_count_free_pages_v1(storage: YazaDbStorageHandleV1, stop_after: Number) -> Result[Number, Text]:
+    if stop_after < 0 or stop_after > yaza_db_storage_preallocated_page_count_v1(): return err("YDBv1 free-page count bound is invalid")
+    if stop_after == 0: return ok(0)
+    let capacity: Number = yaza_db_bitmap_page_bit_count_v1()
+    var bitmap_page_id: Number = 2
+    var free_pages: Number = 0
+    while bitmap_page_id < storage.header.page_count and free_pages < stop_after:
+        let bitmap: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, bitmap_page_id)?
+        let bitmap_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(bitmap, bitmap_page_id)?
+        if bitmap_header.page_type != 5: return err("YDBv1 free-page count encountered a non-BITMAP range page")
+        let remaining_pages: Number = storage.header.page_count - bitmap_page_id
+        var end_bit_exclusive: Number = capacity
+        if remaining_pages < end_bit_exclusive: set end_bit_exclusive = remaining_pages
+        var bit_index: Number = 1
+        while bit_index < end_bit_exclusive and free_pages < stop_after:
+            let byte_index: Number = bit_index / 8
+            let first_bit_in_byte: Number = bit_index % 8
+            let byte_value: Number = bytes_get(bitmap, yaza_db_page_header_size_v1() + byte_index)
+            var bits_in_range: Number = 8 - first_bit_in_byte
+            if end_bit_exclusive - bit_index < bits_in_range: set bits_in_range = end_bit_exclusive - bit_index
+            if byte_value == 0:
+                if stop_after - free_pages < bits_in_range: set bits_in_range = stop_after - free_pages
+                set free_pages = free_pages + bits_in_range
+                set bit_index = bit_index + bits_in_range
+            else:
+                if byte_value == 255:
+                    set bit_index = bit_index + bits_in_range
+                else:
+                    var mask: Number = 1
+                    var shift: Number = 0
+                    while shift < first_bit_in_byte:
+                        set mask = mask * 2
+                        set shift = shift + 1
+                    var scanned_in_byte: Number = 0
+                    while scanned_in_byte < bits_in_range and free_pages < stop_after:
+                        if byte_value / mask % 2 == 0: set free_pages = free_pages + 1
+                        set mask = mask * 2
+                        set bit_index = bit_index + 1
+                        set scanned_in_byte = scanned_in_byte + 1
+        set bitmap_page_id = bitmap_page_id + capacity
+    return ok(free_pages)
+
+fn yaza_db_allocator_find_free_existing_v1(storage: YazaDbStorageHandleV1) -> Result[Number, Text]:
+    let capacity: Number = yaza_db_bitmap_page_bit_count_v1()
+    var bitmap_page_id: Number = 2
+    while bitmap_page_id < storage.header.page_count:
+        let bitmap: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, bitmap_page_id)?
+        let remaining_pages: Number = storage.header.page_count - bitmap_page_id
+        var end_bit_exclusive: Number = capacity
+        if remaining_pages < capacity: set end_bit_exclusive = remaining_pages
+        if end_bit_exclusive > 1:
+            let free_bit: Number = yaza_db_bitmap_page_find_free_v1(bitmap, 1, end_bit_exclusive, bitmap_page_id)?
+            if free_bit >= 1: return ok(bitmap_page_id + free_bit)
+        set bitmap_page_id = bitmap_page_id + capacity
+    return err("YDBv1 has no free page in the current allocation ranges; extend capacity before beginning another transaction")
+
+fn yaza_db_allocator_find_free_existing_after_v1(storage: YazaDbStorageHandleV1, after_page_id: Number) -> Result[Number, Text]:
+    if after_page_id < 1 or after_page_id >= storage.header.page_count: return err("YDBv1 free-page search start is outside the existing allocation")
+    let capacity: Number = yaza_db_bitmap_page_bit_count_v1()
+    var bitmap_page_id: Number = 2
+    while bitmap_page_id < storage.header.page_count:
+        let bitmap: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, bitmap_page_id)?
+        let remaining_pages: Number = storage.header.page_count - bitmap_page_id
+        var end_bit_exclusive: Number = capacity
+        if remaining_pages < capacity: set end_bit_exclusive = remaining_pages
+        var first_bit: Number = 1
+        if after_page_id >= bitmap_page_id and after_page_id - bitmap_page_id + 1 > first_bit:
+            set first_bit = after_page_id - bitmap_page_id + 1
+        if first_bit < end_bit_exclusive:
+            let free_bit: Number = yaza_db_bitmap_page_find_free_v1(bitmap, first_bit, end_bit_exclusive, bitmap_page_id)?
+            if free_bit >= first_bit: return ok(bitmap_page_id + free_bit)
+        set bitmap_page_id = bitmap_page_id + capacity
+    return err("YDBv1 has no later free page in the current allocation ranges; extend capacity before beginning another transaction")
+
+fn yaza_db_allocator_allocate_existing_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, txn_id: Number, prev_lsn: Number) -> Result[YazaDbPageSpaceChangeV1, Text]:
+    if txn_id < 1 or prev_lsn < 0: return err("YDBv1 page allocation requires a valid transaction chain")
+    if storage.root != wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid): return err("YDBv1 PAGE_ALLOC WAL does not belong to this database")
+    let capacity: Number = yaza_db_bitmap_page_bit_count_v1()
+    var bitmap_page_id: Number = 2
+    while bitmap_page_id < storage.header.page_count:
+        let bitmap: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, bitmap_page_id)?
+        let remaining_pages: Number = storage.header.page_count - bitmap_page_id
+        var end_bit_exclusive: Number = capacity
+        if remaining_pages < capacity: set end_bit_exclusive = remaining_pages
+        if end_bit_exclusive > 1:
+            let free_bit: Number = yaza_db_bitmap_page_find_free_v1(bitmap, 1, end_bit_exclusive, bitmap_page_id)?
+            if free_bit >= 1:
+                let page_id: Number = bitmap_page_id + free_bit
+                let payload: Bytes = yaza_db_page_space_payload_encode_v1(1, page_id, bitmap_page_id, free_bit)?
+                let input_record: YazaDbWalRecordV1 = YazaDbWalRecordV1(0, prev_lsn, txn_id, yaza_db_wal_type_page_alloc_v1(), 0, payload)
+                let appended: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(wal, input_record)?
+                let allocation_record: YazaDbWalRecordV1 = appended.record
+                let claim_result: Result[Boolean, Text] = yaza_db_bitmap_page_set_allocated_v1(bitmap, free_bit, true, allocation_record.lsn, bitmap_page_id)
+                if not result_is_ok(claim_result):
+                    let ignored_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(appended.log)
+                    return err("YDBv1 PAGE_ALLOC is durable but the bitmap update failed; PAGE_ALLOC redo is required before database reuse")
+                let claimed: Boolean = result_unwrap(claim_result)
+                if not claimed:
+                    let ignored_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(appended.log)
+                    return err("YDBv1 PAGE_ALLOC is durable but its free bit changed; PAGE_ALLOC redo is required before database reuse")
+                let bitmap_write: Result[Number, Text] = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, bitmap)
+                if not result_is_ok(bitmap_write):
+                    let ignored_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(appended.log)
+                    return err("YDBv1 PAGE_ALLOC is durable but its bitmap write or sync failed; PAGE_ALLOC redo is required before database reuse")
+                return ok(YazaDbPageSpaceChangeV1(storage, appended.log, allocation_record, page_id, bitmap_page_id, free_bit))
+        set bitmap_page_id = bitmap_page_id + capacity
+    return err("YDBv1 has no free page in the current allocation ranges; the transaction exhausted its pre-reserved capacity")
+
+fn yaza_db_allocator_free_existing_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, txn_id: Number, prev_lsn: Number, page_id: Number) -> Result[YazaDbPageSpaceChangeV1, Text]:
+    if txn_id < 1 or prev_lsn < 0: return err("YDBv1 page release requires a valid transaction chain")
+    if storage.root != wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid): return err("YDBv1 PAGE_FREE WAL does not belong to this database")
+    if page_id < 2 or page_id >= storage.header.page_count: return err("YDBv1 PAGE_FREE page ID is outside the logical allocation")
+    let address: YazaDbBitmapAddressV1 = yaza_db_bitmap_address_v1(page_id)?
+    if address.is_bitmap_page: return err("YDBv1 PAGE_FREE cannot release a BITMAP metadata page")
+    let validated_page: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, page_id)?
+    let bitmap: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, address.bitmap_page_id)?
+    let currently_allocated: Boolean = yaza_db_bitmap_page_bit_v1(bitmap, address.bit_index, address.bitmap_page_id)?
+    if not currently_allocated: return err("YDBv1 PAGE_FREE page is already marked free")
+    let payload: Bytes = yaza_db_page_space_payload_encode_v1(2, page_id, address.bitmap_page_id, address.bit_index)?
+    let input_record: YazaDbWalRecordV1 = YazaDbWalRecordV1(0, prev_lsn, txn_id, yaza_db_wal_type_page_free_v1(), 0, payload)
+    let appended: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(wal, input_record)?
+    let free_result: Result[Boolean, Text] = yaza_db_bitmap_page_set_allocated_v1(bitmap, address.bit_index, false, appended.record.lsn, address.bitmap_page_id)
+    if not result_is_ok(free_result):
+        let ignored_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(appended.log)
+        return err("YDBv1 PAGE_FREE is durable but the bitmap update failed; PAGE_FREE redo is required before database reuse")
+    let freed: Boolean = result_unwrap(free_result)
+    if not freed:
+        let ignored_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(appended.log)
+        return err("YDBv1 PAGE_FREE is durable but its allocation bit changed; PAGE_FREE redo is required before database reuse")
+    let bitmap_write: Result[Number, Text] = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, bitmap)
+    if not result_is_ok(bitmap_write):
+        let ignored_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(appended.log)
+        return err("YDBv1 PAGE_FREE is durable but its bitmap write or sync failed; PAGE_FREE redo is required before database reuse")
+    return ok(YazaDbPageSpaceChangeV1(storage, appended.log, appended.record, page_id, address.bitmap_page_id, address.bit_index))

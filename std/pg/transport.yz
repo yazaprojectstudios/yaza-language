@@ -1,0 +1,708 @@
+# PostgreSQL SSLRequest negotiation over the native bounded TCP/TLS transport.
+# Remote connections fail closed if the server refuses TLS.
+use "protocol"
+use "errors"
+use "scram"
+
+fn net_peer_is_loopback(handle: Number) -> Boolean:
+    return true
+
+fn net_tls_is_active(handle: Number) -> Boolean:
+    return false
+
+fn net_tls_client_with_ca(handle: Number, host: Text, root_cert: Text, timeout_ms: Number) -> Result[Boolean, Text]:
+    return ok(true)
+
+fn net_write_all(handle: Number, data: Bytes, timeout_ms: Number) -> Result[Boolean, Text]:
+    let written: Result[Number, Text] = net_write(handle, data, timeout_ms)
+    if not result_is_ok(written):
+        return err(result_unwrap_error(written))
+    return ok(true)
+
+fn net_tcp_connect(host: Text, port: Number, timeout_ms: Number) -> Result[Number, Text]:
+    return net_connect(host, port, timeout_ms)
+
+fn net_pg_set_cancel_key_native(handle: Number, pid: Number, secret: Number) -> Boolean:
+    return true
+
+fn net_pg_cancel_native(handle: Number, timeout_ms: Number) -> Result[Boolean, Text]:
+    return ok(true)
+
+fn http_request_cancelled() -> Boolean:
+    return false
+
+fn pg_net_close(handle: Number) -> Number:
+    let r: Result[Boolean, Text] = net_close(handle)
+    if result_is_ok(r):
+        return 0
+    return 1
+
+fn pg_transport_read_exact(handle: Number, expected_bytes: Number, timeout_ms: Number) -> Result[Bytes, Text]:
+    if expected_bytes < 0 or expected_bytes > 67108864:
+        return err("postgres transport: exact read size is outside the 64 MiB limit")
+    if timeout_ms < 1 or timeout_ms > 3600000:
+        return err("postgres transport: timeout must be between 1 and 3600000 milliseconds")
+    if expected_bytes == 0:
+        return ok(bytes_from_text(""))
+    let started: Number = monotonic_ms()
+    if started < 0:
+        return err("postgres transport: monotonic clock is unavailable")
+    let deadline: Number = started + timeout_ms
+    var output: Bytes = bytes_from_text("")
+    while bytes_length(output) < expected_bytes:
+        let now: Number = monotonic_ms()
+        let remaining: Number = deadline - now
+        if now < 0 or remaining <= 0:
+            return err("postgres transport: read timed out")
+        let request_size: Number = expected_bytes - bytes_length(output)
+        let received: Result[Bytes, Text] = net_read(handle, request_size, remaining)
+        if not result_is_ok(received):
+            return err(result_unwrap_error(received))
+        let chunk: Bytes = result_unwrap(received)
+        if bytes_length(chunk) == 0:
+            return err("postgres transport: server closed the connection during a frame")
+        set output = bytes_concat(output, chunk)
+    return ok(output)
+
+fn pg_transport_read_frame(handle: Number, timeout_ms: Number) -> Result[PgBackendFrame, Text]:
+    if timeout_ms < 1 or timeout_ms > 3600000:
+        return err("postgres transport: frame timeout must be between 1 and 3600000 milliseconds")
+    let started: Number = monotonic_ms()
+    if started < 0:
+        return err("postgres transport: monotonic clock is unavailable")
+    let deadline: Number = started + timeout_ms
+    let header: Result[Bytes, Text] = pg_transport_read_exact(handle, 5, timeout_ms)
+    if not result_is_ok(header):
+        return err(result_unwrap_error(header))
+    let length_result: Result[Number, Text] = pg_read_u32_be(result_unwrap(header), 1)
+    if not result_is_ok(length_result):
+        return err(result_unwrap_error(length_result))
+    let message_length: Number = result_unwrap(length_result)
+    if message_length < 4 or message_length > 16777216:
+        return err("postgres transport: backend frame length is outside the 16 MiB limit")
+    let now: Number = monotonic_ms()
+    let remaining: Number = deadline - now
+    if now < 0 or remaining <= 0:
+        return err("postgres transport: backend frame timed out")
+    let payload: Result[Bytes, Text] = pg_transport_read_exact(handle, message_length - 4, remaining)
+    if not result_is_ok(payload):
+        return err(result_unwrap_error(payload))
+    return pg_parse_backend_frame(bytes_concat(result_unwrap(header), result_unwrap(payload)))
+
+fn pg_transport_has_scram_sha256(mechanisms: Bytes) -> Boolean:
+    let expected: Bytes = bytes_from_text("SCRAM-SHA-256")
+    let expected_length: Number = bytes_length(expected)
+    let length: Number = bytes_length(mechanisms)
+    var offset: Number = 0
+    while offset + expected_length < length:
+        var matches: Boolean = offset == 0 or bytes_get(mechanisms, offset - 1) == 0
+        var index: Number = 0
+        while matches and index < expected_length:
+            if bytes_get(mechanisms, offset + index) != bytes_get(expected, index):
+                set matches = false
+            set index = index + 1
+        if matches and bytes_get(mechanisms, offset + expected_length) == 0:
+            return true
+        set offset = offset + 1
+    return false
+
+fn pg_transport_peer_is_loopback(handle: Number) -> Boolean:
+    return net_peer_is_loopback(handle)
+
+fn pg_transport_connection_allowed(handle: Number) -> Boolean:
+    if net_tls_is_active(handle):
+        return true
+    return env_get("PGSSLMODE") == "disable" and pg_transport_peer_is_loopback(handle)
+
+fn pg_transport_register_cancel_key(handle: Number, key: PgBackendKeyData) -> Boolean:
+    return net_pg_set_cancel_key_native(handle, key.process_id, key.secret_key)
+
+fn pg_transport_cancel_active_query(handle: Number) -> Boolean:
+    let cancellation: Result[Boolean, Text] = net_pg_cancel_native(handle, 250)
+    return result_is_ok(cancellation)
+
+fn pg_connect_tls(host: Text, port: Number, timeout_ms: Number) -> Result[Number, Text]:
+    let tcp: Result[Number, Text] = net_tcp_connect(host, port, timeout_ms)
+    if not result_is_ok(tcp):
+        return err(result_unwrap_error(tcp))
+    let handle: Number = result_unwrap(tcp)
+    let ssl_request: Result[Bytes, Text] = pg_ssl_request()
+    if not result_is_ok(ssl_request):
+        let closed: Number = pg_net_close(handle)
+        return err(result_unwrap_error(ssl_request))
+    let sent: Result[Boolean, Text] = net_write_all(handle, result_unwrap(ssl_request), timeout_ms)
+    if not result_is_ok(sent):
+        let closed: Number = pg_net_close(handle)
+        return err(result_unwrap_error(sent))
+    let response: Result[Bytes, Text] = pg_transport_read_exact(handle, 1, timeout_ms)
+    if not result_is_ok(response):
+        let closed: Number = pg_net_close(handle)
+        return err(result_unwrap_error(response))
+    let accepted: Result[Boolean, Text] = pg_parse_ssl_response(result_unwrap(response))
+    if not result_is_ok(accepted):
+        let closed: Number = pg_net_close(handle)
+        return err(result_unwrap_error(accepted))
+    if not result_unwrap(accepted):
+        let closed: Number = pg_net_close(handle)
+        return err("postgres transport: server refused TLS; plaintext fallback is disabled")
+    let tls: Result[Boolean, Text] = net_tls_client_with_ca(handle, host, env_get("PGSSLROOTCERT"), timeout_ms)
+    if not result_is_ok(tls):
+        let closed: Number = pg_net_close(handle)
+        return err(result_unwrap_error(tls))
+    return ok(handle)
+
+fn pg_send_startup(handle: Number, username: Text, database: Text, timeout_ms: Number) -> Result[Boolean, Text]:
+    if not pg_transport_connection_allowed(handle):
+        return err("postgres transport: startup requires verified TLS or explicitly configured loopback plaintext")
+    let startup: Result[Bytes, Text] = pg_startup_packet(username, database)
+    if not result_is_ok(startup):
+        return err(result_unwrap_error(startup))
+    let sent: Result[Boolean, Text] = net_write_all(handle, result_unwrap(startup), timeout_ms)
+    if not result_is_ok(sent):
+        return err(result_unwrap_error(sent))
+    return ok(result_unwrap(sent))
+
+fn pg_authenticate_startup(handle: Number, username: Text, password: Text, timeout_ms: Number) -> Result[Boolean, Text]:
+    if not pg_transport_connection_allowed(handle):
+        return err("postgres transport: authentication requires verified TLS or explicitly configured loopback plaintext")
+    if timeout_ms < 1 or timeout_ms > 3600000:
+        return err("postgres transport: authentication timeout must be between 1 and 3600000 milliseconds")
+    let started: Number = monotonic_ms()
+    if started < 0:
+        return err("postgres transport: monotonic clock is unavailable")
+    let deadline: Number = started + timeout_ms
+    var authenticated: Boolean = false
+    var saw_scram: Boolean = false
+    var scram_verified: Boolean = false
+    var scram_first: Option[PgScramClientFirst] = none
+    var scram_final: Option[PgScramClientFinal] = none
+    var frame_count: Number = 0
+    while frame_count < 256:
+        let now: Number = monotonic_ms()
+        let remaining: Number = deadline - now
+        if now < 0 or remaining <= 0:
+            return err("postgres transport: startup authentication timed out")
+        let frame_result: Result[PgBackendFrame, Text] = pg_transport_read_frame(handle, remaining)
+        if not result_is_ok(frame_result):
+            return err(result_unwrap_error(frame_result))
+        let frame: PgBackendFrame = result_unwrap(frame_result)
+        if frame.tag == 82:
+            let authentication_result: Result[PgAuthentication, Text] = pg_parse_authentication(frame)
+            if not result_is_ok(authentication_result):
+                return err(result_unwrap_error(authentication_result))
+            let authentication: PgAuthentication = result_unwrap(authentication_result)
+            match authentication:
+                Accepted:
+                    if authenticated:
+                        return err("postgres transport: duplicate AuthenticationOk message")
+                    set authenticated = true
+                CleartextPassword:
+                    return err("postgres transport: cleartext password authentication is unsupported")
+                Md5Password(salt):
+                    return err("postgres transport: MD5 password authentication is unsupported")
+                Sasl(mechanisms):
+                    if saw_scram or not pg_transport_has_scram_sha256(mechanisms):
+                        return err("postgres transport: server does not offer supported SCRAM-SHA-256 authentication")
+                    let first_result: Result[PgScramClientFirst, Text] = pg_scram_client_first(username)
+                    if not result_is_ok(first_result):
+                        return err(result_unwrap_error(first_result))
+                    let first: PgScramClientFirst = result_unwrap(first_result)
+                    let initial_result: Result[Bytes, Text] = pg_scram_initial_message(first)
+                    if not result_is_ok(initial_result):
+                        return err(result_unwrap_error(initial_result))
+                    let sent_initial: Result[Boolean, Text] = net_write_all(handle, result_unwrap(initial_result), remaining)
+                    if not result_is_ok(sent_initial):
+                        return err(result_unwrap_error(sent_initial))
+                    set scram_first = some(first)
+                    set saw_scram = true
+                SaslContinue(data):
+                    if not option_is_some(scram_first) or option_is_some(scram_final):
+                        return err("postgres transport: unexpected SCRAM continuation")
+                    let server_first_option: Option[Text] = bytes_to_text_checked(data)
+                    if not option_is_some(server_first_option):
+                        return err("postgres transport: SCRAM server-first message is not valid UTF-8")
+                    let final_result: Result[PgScramClientFinal, Text] = pg_scram_client_final(option_unwrap(scram_first), password, option_unwrap(server_first_option))
+                    if not result_is_ok(final_result):
+                        return err(result_unwrap_error(final_result))
+                    let final_message: PgScramClientFinal = result_unwrap(final_result)
+                    let continue_result: Result[Bytes, Text] = pg_scram_continue_message(final_message)
+                    if not result_is_ok(continue_result):
+                        return err(result_unwrap_error(continue_result))
+                    let sent_continue: Result[Boolean, Text] = net_write_all(handle, result_unwrap(continue_result), remaining)
+                    if not result_is_ok(sent_continue):
+                        return err(result_unwrap_error(sent_continue))
+                    set scram_final = some(final_message)
+                SaslFinal(data):
+                    if not option_is_some(scram_final) or scram_verified:
+                        return err("postgres transport: unexpected SCRAM final message")
+                    let server_final_option: Option[Text] = bytes_to_text_checked(data)
+                    if not option_is_some(server_final_option):
+                        return err("postgres transport: SCRAM server-final message is not valid UTF-8")
+                    let verified: Result[Boolean, Text] = pg_scram_verify_server_final(option_unwrap(scram_final), option_unwrap(server_final_option))
+                    if not result_is_ok(verified):
+                        return err(result_unwrap_error(verified))
+                    set scram_verified = true
+                Unsupported(code):
+                    return err("postgres transport: unsupported authentication method " + number_text(code))
+        else:
+            if frame.tag == 69:
+                let server_error: Result[PgServerError, Text] = pg_parse_error_response(frame)
+                if not result_is_ok(server_error):
+                    return err(result_unwrap_error(server_error))
+                let details: PgServerError = result_unwrap(server_error)
+                return err(pg_server_error_internal_text(details))
+            if frame.tag == 83:
+                let status: Result[PgParameterStatus, Text] = pg_parse_parameter_status(frame)
+                if not result_is_ok(status):
+                    return err(result_unwrap_error(status))
+            else:
+                if frame.tag == 75:
+                    let key: Result[PgBackendKeyData, Text] = pg_parse_backend_key_data(frame)
+                    if not result_is_ok(key):
+                        return err(result_unwrap_error(key))
+                    if not pg_transport_register_cancel_key(handle, result_unwrap(key)):
+                        return err("postgres transport: backend cancellation key could not be registered")
+                else:
+                    if frame.tag == 90:
+                        let ready: Result[PgTransactionStatus, Text] = pg_parse_ready_for_query(frame)
+                        if not result_is_ok(ready):
+                            return err(result_unwrap_error(ready))
+                        if not authenticated or (saw_scram and not scram_verified):
+                            return err("postgres transport: server became ready before authentication completed")
+                        let transaction_status: PgTransactionStatus = result_unwrap(ready)
+                        match transaction_status:
+                            Idle:
+                                return ok(true)
+                            InTransaction:
+                                return err("postgres transport: new connection entered a transaction unexpectedly")
+                            FailedTransaction:
+                                return err("postgres transport: new connection entered a failed transaction unexpectedly")
+                    if frame.tag != 78:
+                        return err("postgres transport: unexpected backend frame during startup")
+        set frame_count = frame_count + 1
+    return err("postgres transport: startup exceeded the 256-frame limit")
+
+fn pg_query_command_count_allowed(command_count: Number, allow_multiple: Boolean) -> Boolean:
+    if command_count < 0 or command_count > 10000:
+        return false
+    if not allow_multiple and command_count > 1:
+        return false
+    return true
+
+fn pg_query_with_message(handle: Number, frontend_message: Bytes, timeout_ms: Number, allow_multiple: Boolean) -> Result[PgQueryResult, Text]:
+    if not pg_transport_connection_allowed(handle):
+        return err("postgres query: verified TLS or explicitly configured loopback plaintext is required")
+    if timeout_ms < 1 or timeout_ms > 3600000:
+        return err("postgres query: timeout must be between 1 and 3600000 milliseconds")
+    let start_time: Number = monotonic_ms()
+    if start_time < 0:
+        return err("postgres query: monotonic clock is unavailable")
+    let deadline: Number = start_time + timeout_ms
+    let before_write: Number = monotonic_ms()
+    let write_remaining: Number = deadline - before_write
+    if before_write < 0 or write_remaining <= 0:
+        return err("postgres query: deadline expired before request write")
+    if http_request_cancelled():
+        return err("postgres query: request was cancelled before query write")
+    let sent: Result[Boolean, Text] = net_write_all(handle, frontend_message, write_remaining)
+    if not result_is_ok(sent):
+        let closed: Number = pg_net_close(handle)
+        return err(result_unwrap_error(sent))
+    let column_metadata: TextList = text_list()
+    let cell_values: TextList = text_list()
+    let cell_is_null: TextList = text_list()
+    var command_tag: Text = ""
+    var command_count: Number = 0
+    var row_count: Number = 0
+    var column_count: Number = 0
+    var total_cells: Number = 0
+    var total_wire_bytes: Number = 0
+    var frame_count: Number = 0
+    var saw_row_description: Boolean = false
+    var complete: Boolean = false
+    var client_error: Text = ""
+    var server_error: Text = ""
+    var transaction_status: PgTransactionStatus = PgTransactionStatus::Idle
+
+    while frame_count < 100000 and not complete:
+        let now: Number = monotonic_ms()
+        let remaining: Number = deadline - now
+        if now < 0 or remaining <= 0:
+            let cancellation_sent: Boolean = pg_transport_cancel_active_query(handle)
+            let closed: Number = pg_net_close(handle)
+            return err("postgres query: deadline expired before ReadyForQuery")
+        if http_request_cancelled():
+            let cancellation_sent: Boolean = pg_transport_cancel_active_query(handle)
+            let closed: Number = pg_net_close(handle)
+            return err("postgres query: request cancelled while awaiting ReadyForQuery")
+        let frame_result: Result[PgBackendFrame, Text] = pg_transport_read_frame(handle, remaining)
+        if not result_is_ok(frame_result):
+            let cancellation_sent: Boolean = pg_transport_cancel_active_query(handle)
+            let closed: Number = pg_net_close(handle)
+            return err(result_unwrap_error(frame_result))
+        let frame: PgBackendFrame = result_unwrap(frame_result)
+        let frame_bytes: Number = bytes_length(frame.payload) + 5
+        set total_wire_bytes = total_wire_bytes + frame_bytes
+        if total_wire_bytes > 16777216 and client_error == "":
+            set client_error = "postgres query: result exceeds the 16 MiB response limit"
+
+        if frame.tag == 84:
+            if saw_row_description:
+                if client_error == "":
+                    set client_error = "postgres query: multiple result sets are not supported"
+            else:
+                let parsed_count: Result[Number, Text] = pg_row_description_field_count(frame.payload)
+                if not result_is_ok(parsed_count):
+                    if client_error == "":
+                        set client_error = result_unwrap_error(parsed_count)
+                else:
+                    set column_count = result_unwrap(parsed_count)
+                    set saw_row_description = true
+                    var column_index: Number = 0
+                    while column_index < column_count:
+                        let column_result: Result[PgColumnDescription, Text] = pg_row_description_field(frame.payload, column_index)
+                        if not result_is_ok(column_result):
+                            if client_error == "":
+                                set client_error = result_unwrap_error(column_result)
+                        else:
+                            let column: PgColumnDescription = result_unwrap(column_result)
+                            if column.format_code != 0 and client_error == "":
+                                set client_error = "postgres query: only text-format result columns are supported"
+                            list_push(column_metadata, column.name)
+                            list_push(column_metadata, number_text(column.table_oid))
+                            list_push(column_metadata, number_text(column.attribute_number))
+                            list_push(column_metadata, number_text(column.type_oid))
+                            list_push(column_metadata, number_text(column.type_size))
+                            list_push(column_metadata, number_text(column.type_modifier))
+                            list_push(column_metadata, number_text(column.format_code))
+                        set column_index = column_index + 1
+        else:
+            if frame.tag == 68:
+                let parsed_row_count: Result[Number, Text] = pg_data_row_field_count(frame.payload)
+                if not saw_row_description:
+                    if client_error == "":
+                        set client_error = "postgres query: DataRow arrived without RowDescription"
+                else:
+                    if not result_is_ok(parsed_row_count):
+                        if client_error == "":
+                            set client_error = result_unwrap_error(parsed_row_count)
+                    else:
+                        if result_unwrap(parsed_row_count) != column_count:
+                            if client_error == "":
+                                set client_error = "postgres query: DataRow column count does not match RowDescription"
+                        else:
+                            if client_error != "":
+                                set row_count = row_count + 1
+                            else:
+                                if row_count >= 10000 or total_cells > 10000 - column_count:
+                                    set client_error = "postgres query: result exceeds the 10000-cell limit"
+                                    set row_count = row_count + 1
+                                else:
+                                    var column_index: Number = 0
+                                    while column_index < column_count:
+                                        let field_result: Result[Option[Bytes], Text] = pg_data_row_field(frame.payload, column_index)
+                                        if not result_is_ok(field_result):
+                                            if client_error == "":
+                                                set client_error = result_unwrap_error(field_result)
+                                        else:
+                                            let field: Option[Bytes] = result_unwrap(field_result)
+                                            if option_is_some(field):
+                                                let decoded: Option[Text] = bytes_to_text_checked(option_unwrap(field))
+                                                if not option_is_some(decoded):
+                                                    if client_error == "":
+                                                        set client_error = "postgres query: text-format field is not valid non-NUL UTF-8"
+                                                    list_push(cell_values, "")
+                                                    list_push(cell_is_null, "1")
+                                                else:
+                                                    list_push(cell_values, option_unwrap(decoded))
+                                                    list_push(cell_is_null, "0")
+                                            else:
+                                                list_push(cell_values, "")
+                                                list_push(cell_is_null, "1")
+                                        set column_index = column_index + 1
+                                    set row_count = row_count + 1
+                                    set total_cells = total_cells + column_count
+            else:
+                if frame.tag == 67:
+                    let parsed_command: Result[Text, Text] = pg_parse_command_complete(frame)
+                    if not result_is_ok(parsed_command):
+                        if client_error == "":
+                            set client_error = result_unwrap_error(parsed_command)
+                    else:
+                        set command_count = command_count + 1
+                        if not pg_query_command_count_allowed(command_count, allow_multiple) and client_error == "":
+                            set client_error = "postgres query: command count exceeds this query mode's allowed limit"
+                        if command_count == 1:
+                            set command_tag = result_unwrap(parsed_command)
+                else:
+                    if frame.tag == 69:
+                        let parsed_error: Result[PgServerError, Text] = pg_parse_error_response(frame)
+                        if result_is_ok(parsed_error):
+                            let details: PgServerError = result_unwrap(parsed_error)
+                            set server_error = details.sqlstate + ": " + details.message
+                        else:
+                            set server_error = result_unwrap_error(parsed_error)
+                    else:
+                        if frame.tag == 90:
+                            let ready: Result[PgTransactionStatus, Text] = pg_parse_ready_for_query(frame)
+                            if not result_is_ok(ready):
+                                let cancellation_sent: Boolean = pg_transport_cancel_active_query(handle)
+                                let closed: Number = pg_net_close(handle)
+                                return err(result_unwrap_error(ready))
+                            set transaction_status = result_unwrap(ready)
+                            set complete = true
+                        else:
+                            if frame.tag == 83:
+                                let parameter: Result[PgParameterStatus, Text] = pg_parse_parameter_status(frame)
+                                if not result_is_ok(parameter) and client_error == "":
+                                    set client_error = result_unwrap_error(parameter)
+                            else:
+                                if frame.tag == 75:
+                                    let key_data: Result[PgBackendKeyData, Text] = pg_parse_backend_key_data(frame)
+                                    if not result_is_ok(key_data):
+                                        if client_error == "":
+                                            set client_error = result_unwrap_error(key_data)
+                                    else:
+                                        if not pg_transport_register_cancel_key(handle, result_unwrap(key_data)) and client_error == "":
+                                            set client_error = "postgres query: backend cancellation key could not be registered"
+                                else:
+                                    if frame.tag == 78:
+                                        let notice: Result[PgServerError, Text] = pg_parse_error_response(PgBackendFrame(69, frame.payload))
+                                        if not result_is_ok(notice) and client_error == "":
+                                            set client_error = result_unwrap_error(notice)
+                                    else:
+                                        if frame.tag == 73:
+                                            if bytes_length(frame.payload) != 0 and client_error == "":
+                                                set client_error = "postgres query: EmptyQueryResponse contains unexpected data"
+                                        else:
+                                            if frame.tag == 49 or frame.tag == 50 or frame.tag == 110:
+                                                if bytes_length(frame.payload) != 0 and client_error == "":
+                                                    set client_error = "postgres query: extended-query completion frame contains unexpected data"
+                                            else:
+                                                let cancellation_sent: Boolean = pg_transport_cancel_active_query(handle)
+                                                let closed: Number = pg_net_close(handle)
+                                                return err("postgres query: unexpected backend frame; connection closed")
+        set frame_count = frame_count + 1
+
+    if not complete:
+        let cancellation_sent: Boolean = pg_transport_cancel_active_query(handle)
+        let closed: Number = pg_net_close(handle)
+        return err("postgres query: backend exceeded the 100000-frame limit")
+    if server_error != "":
+        return err("postgres server error: " + server_error)
+    if client_error != "":
+        return err(client_error)
+    if list_count(cell_values) != list_count(cell_is_null) or list_count(cell_values) != total_cells:
+        let closed: Number = pg_net_close(handle)
+        return err("postgres query: internal result cell count is inconsistent")
+    return ok(PgQueryResult(column_metadata, cell_values, cell_is_null, command_tag, command_count, row_count, transaction_status))
+
+fn pg_query(handle: Number, sql: Text, timeout_ms: Number) -> Result[PgQueryResult, Text]:
+    let query_message: Result[Bytes, Text] = pg_simple_query_message(sql)
+    if not result_is_ok(query_message):
+        return err(result_unwrap_error(query_message))
+    return pg_query_with_message(handle, result_unwrap(query_message), timeout_ms, false)
+
+fn pg_execute_command_script(handle: Number, sql: Text, timeout_ms: Number) -> Result[PgQueryResult, Text]:
+    let query_message: Result[Bytes, Text] = pg_simple_query_message(sql)
+    if not result_is_ok(query_message):
+        return err(result_unwrap_error(query_message))
+    let result: Result[PgQueryResult, Text] = pg_query_with_message(handle, result_unwrap(query_message), timeout_ms, true)
+    if not result_is_ok(result):
+        return err(result_unwrap_error(result))
+    let script_result: PgQueryResult = result_unwrap(result)
+    if script_result.command_count == 0:
+        return err("postgres query: script did not execute any commands")
+    if script_result.row_count != 0 or pg_query_column_count(script_result) != 0:
+        return err("postgres query: command scripts must not return rows")
+    return ok(script_result)
+
+fn pg_query_params(handle: Number, sql: Text, parameters: TextList, null_flags: TextList, timeout_ms: Number) -> Result[PgQueryResult, Text]:
+    return pg_query_params_typed(handle, sql, parameters, null_flags, text_list(), timeout_ms)
+
+fn pg_query_params_typed(handle: Number, sql: Text, parameters: TextList, null_flags: TextList, parameter_type_oids: TextList, timeout_ms: Number) -> Result[PgQueryResult, Text]:
+    let exchange: Result[Bytes, Text] = pg_extended_query_message_with_oids(sql, parameters, null_flags, parameter_type_oids)
+    if not result_is_ok(exchange):
+        return err(result_unwrap_error(exchange))
+    return pg_query_with_message(handle, result_unwrap(exchange), timeout_ms, false)
+
+fn pg_query_with_parameters(handle: Number, sql: Text, parameters: PgParameters, timeout_ms: Number) -> Result[PgQueryResult, Text]:
+    let exchange: Result[Bytes, Text] = pg_parameters_message(sql, parameters)
+    if not result_is_ok(exchange):
+        return err(result_unwrap_error(exchange))
+    return pg_query_with_message(handle, result_unwrap(exchange), timeout_ms, false)
+
+fn pg_transaction_identifier_valid(name: Text) -> Boolean:
+    let byte_length: Number = bytes_length(bytes_from_text(name))
+    if byte_length < 1 or byte_length > 63 or text_length(name) != byte_length:
+        return false
+    var index: Number = 0
+    while index < byte_length:
+        let byte: Number = text_byte(name, index)
+        let is_upper: Boolean = byte >= 65 and byte <= 90
+        let is_lower: Boolean = byte >= 97 and byte <= 122
+        let is_digit: Boolean = byte >= 48 and byte <= 57
+        let is_underscore: Boolean = byte == 95
+        if index == 0:
+            if not is_upper and not is_lower and not is_underscore:
+                return false
+        else:
+            if not is_upper and not is_lower and not is_digit and not is_underscore:
+                return false
+        set index = index + 1
+    return true
+
+fn pg_transaction_status_matches(status: PgTransactionStatus, expected_status: Text) -> Boolean:
+    match status:
+        Idle:
+            return expected_status == "idle"
+        InTransaction:
+            return expected_status == "in_transaction"
+        FailedTransaction:
+            return expected_status == "failed_transaction"
+    return false
+
+fn pg_transaction_result_matches(result: PgQueryResult, command_tag: Text, expected_status: Text) -> Boolean:
+    if result.command_tag != command_tag:
+        return false
+    return pg_transaction_status_matches(result.transaction_status, expected_status)
+
+fn pg_transaction_require_idle(handle: Number, timeout_ms: Number) -> Result[Boolean, Text]:
+    if timeout_ms < 1 or timeout_ms > 3600000:
+        return err("postgres transaction: timeout must be between 1 and 3600000 milliseconds")
+    if not pg_transport_connection_allowed(handle):
+        return err("postgres transaction: verified TLS or explicitly configured loopback plaintext is required")
+    let probe: Result[PgQueryResult, Text] = pg_query(handle, "SELECT 1", timeout_ms)
+    if not result_is_ok(probe):
+        return err("postgres transaction: could not verify an idle connection: " + result_unwrap_error(probe))
+    if not pg_transaction_status_matches(result_unwrap(probe).transaction_status, "idle"):
+        return err("postgres transaction: a transaction is already active; use a savepoint instead")
+    return ok(true)
+
+fn pg_transaction_require_active(handle: Number, timeout_ms: Number) -> Result[Boolean, Text]:
+    if timeout_ms < 1 or timeout_ms > 3600000:
+        return err("postgres transaction: timeout must be between 1 and 3600000 milliseconds")
+    if not pg_transport_connection_allowed(handle):
+        return err("postgres transaction: verified TLS or explicitly configured loopback plaintext is required")
+    let probe: Result[PgQueryResult, Text] = pg_query(handle, "SELECT 1", timeout_ms)
+    if not result_is_ok(probe):
+        return err("postgres transaction: connection is unavailable or transaction is failed; use rollback: " + result_unwrap_error(probe))
+    if not pg_transaction_status_matches(result_unwrap(probe).transaction_status, "in_transaction"):
+        return err("postgres transaction: no active transaction exists")
+    return ok(true)
+
+fn pg_transaction_begin(handle: Number, timeout_ms: Number) -> Result[Boolean, Text]:
+    let idle: Result[Boolean, Text] = pg_transaction_require_idle(handle, timeout_ms)
+    if not result_is_ok(idle):
+        return err(result_unwrap_error(idle))
+    let begun: Result[PgQueryResult, Text] = pg_query(handle, "BEGIN", timeout_ms)
+    if not result_is_ok(begun):
+        return err("postgres transaction: BEGIN failed: " + result_unwrap_error(begun))
+    if not pg_transaction_result_matches(result_unwrap(begun), "BEGIN", "in_transaction"):
+        return err("postgres transaction: server did not enter transaction state after BEGIN")
+    return ok(true)
+
+fn pg_transaction_query(handle: Number, sql: Text, parameters: PgParameters, timeout_ms: Number) -> Result[PgQueryResult, Text]:
+    let active: Result[Boolean, Text] = pg_transaction_require_active(handle, timeout_ms)
+    if not result_is_ok(active):
+        return err(result_unwrap_error(active))
+    let executed: Result[PgQueryResult, Text] = pg_query_with_parameters(handle, sql, parameters, timeout_ms)
+    if not result_is_ok(executed):
+        return err(result_unwrap_error(executed))
+    if not pg_transaction_status_matches(result_unwrap(executed).transaction_status, "in_transaction"):
+        return err("postgres transaction: query ended the transaction unexpectedly")
+    return ok(result_unwrap(executed))
+
+fn pg_transaction_commit(handle: Number, timeout_ms: Number) -> Result[Boolean, Text]:
+    let active: Result[Boolean, Text] = pg_transaction_require_active(handle, timeout_ms)
+    if not result_is_ok(active):
+        return err(result_unwrap_error(active))
+    let committed: Result[PgQueryResult, Text] = pg_query(handle, "COMMIT", timeout_ms)
+    if not result_is_ok(committed):
+        return err("postgres transaction: COMMIT failed: " + result_unwrap_error(committed))
+    if not pg_transaction_result_matches(result_unwrap(committed), "COMMIT", "idle"):
+        return err("postgres transaction: COMMIT did not complete successfully")
+    return ok(true)
+
+fn pg_transaction_rollback(handle: Number, timeout_ms: Number) -> Result[Boolean, Text]:
+    if not pg_transport_connection_allowed(handle):
+        return err("postgres transaction: verified TLS or explicitly configured loopback plaintext is required")
+    let rolled_back: Result[PgQueryResult, Text] = pg_query(handle, "ROLLBACK", timeout_ms)
+    if not result_is_ok(rolled_back):
+        return err("postgres transaction: ROLLBACK failed: " + result_unwrap_error(rolled_back))
+    if not pg_transaction_result_matches(result_unwrap(rolled_back), "ROLLBACK", "idle"):
+        return err("postgres transaction: ROLLBACK did not return the connection to idle state")
+    return ok(true)
+
+fn pg_transaction_savepoint(handle: Number, name: Text, timeout_ms: Number) -> Result[Boolean, Text]:
+    if not pg_transaction_identifier_valid(name):
+        return err("postgres transaction: savepoint name must be an ASCII identifier of 1 to 63 bytes")
+    let active: Result[Boolean, Text] = pg_transaction_require_active(handle, timeout_ms)
+    if not result_is_ok(active):
+        return err(result_unwrap_error(active))
+    let created: Result[PgQueryResult, Text] = pg_query(handle, "SAVEPOINT " + name, timeout_ms)
+    if not result_is_ok(created):
+        return err("postgres transaction: SAVEPOINT failed: " + result_unwrap_error(created))
+    if not pg_transaction_result_matches(result_unwrap(created), "SAVEPOINT", "in_transaction"):
+        return err("postgres transaction: SAVEPOINT did not complete in transaction state")
+    return ok(true)
+
+fn pg_transaction_rollback_to(handle: Number, name: Text, timeout_ms: Number) -> Result[Boolean, Text]:
+    if not pg_transaction_identifier_valid(name):
+        return err("postgres transaction: savepoint name must be an ASCII identifier of 1 to 63 bytes")
+    if not pg_transport_connection_allowed(handle):
+        return err("postgres transaction: verified TLS or explicitly configured loopback plaintext is required")
+    let rolled_back: Result[PgQueryResult, Text] = pg_query(handle, "ROLLBACK TO SAVEPOINT " + name, timeout_ms)
+    if not result_is_ok(rolled_back):
+        return err("postgres transaction: rollback to savepoint failed: " + result_unwrap_error(rolled_back))
+    if not pg_transaction_result_matches(result_unwrap(rolled_back), "ROLLBACK", "in_transaction"):
+        return err("postgres transaction: rollback to savepoint did not restore transaction state")
+    return ok(true)
+
+fn pg_transaction_release_savepoint(handle: Number, name: Text, timeout_ms: Number) -> Result[Boolean, Text]:
+    if not pg_transaction_identifier_valid(name):
+        return err("postgres transaction: savepoint name must be an ASCII identifier of 1 to 63 bytes")
+    let active: Result[Boolean, Text] = pg_transaction_require_active(handle, timeout_ms)
+    if not result_is_ok(active):
+        return err(result_unwrap_error(active))
+    let released: Result[PgQueryResult, Text] = pg_query(handle, "RELEASE SAVEPOINT " + name, timeout_ms)
+    if not result_is_ok(released):
+        return err("postgres transaction: release savepoint failed: " + result_unwrap_error(released))
+    if not pg_transaction_result_matches(result_unwrap(released), "RELEASE", "in_transaction"):
+        return err("postgres transaction: savepoint release did not complete in transaction state")
+    return ok(true)
+
+fn pg_finish_connection_startup(handle: Number, username: Text, database: Text, password: Text, timeout_ms: Number) -> Result[Number, Text]:
+    let startup: Result[Boolean, Text] = pg_send_startup(handle, username, database, timeout_ms)
+    if not result_is_ok(startup):
+        let closed: Number = pg_net_close(handle)
+        return err(result_unwrap_error(startup))
+    let authenticated: Result[Boolean, Text] = pg_authenticate_startup(handle, username, password, timeout_ms)
+    if not result_is_ok(authenticated):
+        let closed: Number = pg_net_close(handle)
+        return err(result_unwrap_error(authenticated))
+    return ok(handle)
+
+fn pg_connect(host: Text, port: Number, username: Text, database: Text, password: Text, timeout_ms: Number) -> Result[Number, Text]:
+    if env_get("PGSSLMODE") == "disable":
+        if host != "127.0.0.1" and host != "localhost" and host != "::1":
+            return err("postgres transport: plaintext mode is restricted to loopback hosts")
+        let local_connection: Result[Number, Text] = net_tcp_connect(host, port, timeout_ms)
+        if not result_is_ok(local_connection):
+            return err(result_unwrap_error(local_connection))
+        let local_handle: Number = result_unwrap(local_connection)
+        if not pg_transport_peer_is_loopback(local_handle):
+            let closed: Number = pg_net_close(local_handle)
+            return err("postgres transport: plaintext peer is not loopback")
+        return pg_finish_connection_startup(local_handle, username, database, password, timeout_ms)
+    let secure_connection: Result[Number, Text] = pg_connect_tls(host, port, timeout_ms)
+    if not result_is_ok(secure_connection):
+        return err(result_unwrap_error(secure_connection))
+    return pg_finish_connection_startup(result_unwrap(secure_connection), username, database, password, timeout_ms)
+
+fn pg_disconnect(handle: Number) -> Number:
+    if pg_transport_connection_allowed(handle):
+        let terminate: Result[Bytes, Text] = pg_frontend_message("X", bytes_from_text(""))
+        if result_is_ok(terminate):
+            let sent: Result[Boolean, Text] = net_write_all(handle, result_unwrap(terminate), 1000)
+    return pg_net_close(handle)

@@ -1,0 +1,73 @@
+use "std/fs"
+use "../yazabase/backup_v1"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/checkpoint_v1"
+use "../yazabase/sql_dispatch_v1"
+use "../yazabase/sql_executor_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/wal_v1"
+
+fn yazabase_backup_v1_smoke(source_path: Text, destination_path: Text) -> Result[Number, Text]:
+    let source_root: Number = root_open(source_path)?
+    let destination_root: Number = root_open(destination_path)?
+    let database_name: Text = "backup-v1-smoke.ydb"
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+
+    let created: YazaDbCatalogBootstrapV1 = yaza_db_catalog_create_v1(source_root, database_name)?
+    let create_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(created.storage, created.wal, "CREATE TABLE backup_probe (id BIGINT PRIMARY KEY, value TEXT NOT NULL, amount DECIMAL(10, 2) DEFAULT 0.10)", no_parameters)?
+    if not option_is_some(create_result.write_commit): return err("YDBv1 backup smoke CREATE TABLE did not commit")
+    let created_commit: YazaDbWriteCommitV1 = option_unwrap(create_result.write_commit)
+    let create_wal_closed: Boolean = yaza_db_wal_log_close_v1(created_commit.wal)?
+    let create_storage_closed: Boolean = yaza_db_storage_close_v1(created_commit.storage)?
+    if not create_wal_closed or not create_storage_closed: return err("YDBv1 backup smoke could not close CREATE TABLE handles")
+
+    let opened: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(source_root, database_name)?
+    let insert_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(opened.storage, opened.wal, "INSERT INTO backup_probe (id, value) VALUES (1, 'snapshot')", no_parameters)?
+    if not option_is_some(insert_result.write_commit): return err("YDBv1 backup smoke INSERT did not commit")
+    let inserted: YazaDbWriteCommitV1 = option_unwrap(insert_result.write_commit)
+    let insert_wal_closed: Boolean = yaza_db_wal_log_close_v1(inserted.wal)?
+    let insert_storage_closed: Boolean = yaza_db_storage_close_v1(inserted.storage)?
+    if not insert_wal_closed or not insert_storage_closed: return err("YDBv1 backup smoke could not close INSERT handles")
+
+    let report: YazaDbBackupReportV1 = yaza_db_backup_v1(source_root, database_name, destination_root)?
+    if report.file_count != report.wal_segment_count + 1 or report.wal_segment_count < 1 or report.bytes_copied <= 0: return err("YDBv1 backup smoke returned an inconsistent copy report")
+    let overwrite_attempt: Result[YazaDbBackupReportV1, Text] = yaza_db_backup_v1(source_root, database_name, destination_root)
+    if result_is_ok(overwrite_attempt): return err("YDBv1 backup smoke allowed overwriting an existing destination database")
+
+    let source_reopened: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(source_root, database_name)?
+    let update_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(source_reopened.storage, source_reopened.wal, "UPDATE backup_probe SET value = 'changed' WHERE id = 1", no_parameters)?
+    if not option_is_some(update_result.write_commit): return err("YDBv1 backup smoke source UPDATE did not commit")
+    let updated: YazaDbWriteCommitV1 = option_unwrap(update_result.write_commit)
+    let decimal_update_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(updated.storage, updated.wal, "UPDATE backup_probe SET amount = 9.99 WHERE id = 1", no_parameters)?
+    if not option_is_some(decimal_update_result.write_commit): return err("YDBv1 backup smoke source DECIMAL UPDATE did not commit")
+    let decimal_updated: YazaDbWriteCommitV1 = option_unwrap(decimal_update_result.write_commit)
+    let update_wal_closed: Boolean = yaza_db_wal_log_close_v1(decimal_updated.wal)?
+    let update_storage_closed: Boolean = yaza_db_storage_close_v1(decimal_updated.storage)?
+    if not update_wal_closed or not update_storage_closed: return err("YDBv1 backup smoke could not close UPDATE handles")
+
+    let backup_reopened: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(destination_root, database_name)?
+    let selected_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(backup_reopened.storage, backup_reopened.wal, "SELECT id, value, amount FROM backup_probe", no_parameters)?
+    if not option_is_some(selected_result.query_result): return err("YDBv1 backup smoke destination SELECT did not return rows")
+    let selected: YazaSqlQueryResultV1 = option_unwrap(selected_result.query_result)
+    if list_count(selected.rows) != 1: return err("YDBv1 backup smoke destination does not contain exactly one row")
+    let row: List[YazaSqlValueV1] = list_get(selected.rows, 0)
+    if list_count(row) != 3 or list_get(row, 0).integer_value != 1 or list_get(row, 1).text_value != "snapshot" or list_get(row, 2).text_value != "0.10": return err("YDBv1 backup smoke did not preserve the source snapshot and exact DECIMAL default")
+    let verify_wal_closed: Boolean = yaza_db_wal_log_close_v1(selected_result.wal)?
+    let verify_storage_closed: Boolean = yaza_db_storage_close_v1(selected_result.storage)?
+    if not verify_wal_closed or not verify_storage_closed: return err("YDBv1 backup smoke could not close verification handles")
+
+    let destination_closed: Boolean = close(destination_root)?
+    let source_closed: Boolean = close(source_root)?
+    if not destination_closed or not source_closed: return err("YDBv1 backup smoke could not close directory handles")
+    return ok(report.file_count)
+
+start:
+    if arg_count() != 2:
+        say "Usage: yazabase-backup-v1-smoke <source-directory> <destination-directory>"
+        exit(2)
+    let outcome: Result[Number, Text] = yazabase_backup_v1_smoke(arg(1), arg(2))
+    if not result_is_ok(outcome):
+        say result_unwrap_error(outcome)
+        exit(1)
+    say "yazabase-backup-v1-ok files=" + number_text(result_unwrap(outcome))
+    exit(0)

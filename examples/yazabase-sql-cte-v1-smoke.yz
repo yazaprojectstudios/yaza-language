@@ -1,0 +1,200 @@
+use "std/fs"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/catalog_snapshot_v1"
+use "../yazabase/sql_binder_v1"
+use "../yazabase/sql_dispatch_v1"
+use "../yazabase/sql_executor_v1"
+use "../yazabase/sql_parser_v3"
+
+fn yazabase_sql_cte_v1(root_path: Text) -> Result[Boolean, Text]:
+    let root: Number = root_open(root_path)?
+    let db_name: Text = "cte-smoke.ydb"
+    let header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_from_text("cte-smoke-uuid01"), 0, 1, 1, 0, 2, 1)
+    let empty_storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, db_name, header)?
+    let empty_closed: Boolean = yaza_db_storage_close_v1(empty_storage)?
+    if not empty_closed: return err("YDBv1 CTE fixture could not close the empty database")
+    let initialized: YazaDbCatalogBootstrapV1 = yaza_db_catalog_initialize_v1(root, db_name)?
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let created: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(initialized.storage, initialized.wal, "CREATE TABLE source_rows (id BIGINT PRIMARY KEY, label TEXT NOT NULL)", no_parameters)?
+    if not option_is_some(created.write_commit): return err("YDBv1 CTE fixture could not create its source table")
+    let inserted: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(created.storage, created.wal, "INSERT INTO source_rows (id, label) VALUES (1, 'one'), (2, 'two'), (3, 'three')", no_parameters)?
+    if not option_is_some(inserted.write_commit): return err("YDBv1 CTE fixture could not insert source rows")
+    let committed: YazaDbWriteCommitV1 = option_unwrap(inserted.write_commit)
+    let one: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 1)?
+    let three: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 3)?
+    let two: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 2)?
+
+    let positional: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(committed.storage, committed.wal, "WITH base_rows AS (SELECT id, label FROM source_rows WHERE id >= $1), renamed (row_id, row_label) AS (SELECT id, label FROM base_rows WHERE id <= $2) SELECT row_label FROM renamed WHERE row_id > $3 ORDER BY row_label", [one, three, one])?
+    if not option_is_some(positional.query_result): return err("YDBv1 CTE dispatcher did not return the final SELECT")
+    let positional_rows: YazaSqlQueryResultV1 = option_unwrap(positional.query_result)
+    if list_count(positional_rows.columns) != 1 or list_get(positional_rows.columns, 0).output_name != "row_label" or list_count(positional_rows.rows) != 2:
+        return err("YDBv1 ordered CTE definitions returned an incorrect output shape")
+    if list_get(list_get(positional_rows.rows, 0), 0).text_value != "three" or list_get(list_get(positional_rows.rows, 1), 0).text_value != "two":
+        return err("YDBv1 CTE definitions did not preserve statement-wide positional binds or ordering")
+    if result_is_ok(yaza_db_query_validate_cte_result_budget_v1(positional_rows, 65535, 0, 0, 0)):
+        return err("YDBv1 CTE result budget did not include rows retained by earlier definitions")
+    if result_is_ok(yaza_db_query_validate_cte_result_budget_v1(positional_rows, 0, 1048575, 0, 0)):
+        return err("YDBv1 CTE result budget did not include cells retained by earlier definitions")
+    if result_is_ok(yaza_db_query_validate_cte_result_budget_v1(positional_rows, 0, 0, 67108863, 0)):
+        return err("YDBv1 CTE result budget did not include text retained by earlier definitions")
+    if result_is_ok(yaza_db_query_validate_cte_result_budget_v1(positional_rows, 0, 0, 0, 99999999)):
+        return err("YDBv1 CTE result budget did not include work from earlier definitions")
+    let auxiliary_rows_probe: YazaSqlQueryResultV1 = YazaSqlQueryResultV1(positional_rows.columns, positional_rows.rows, positional_rows.work_units, 65535, 0, 0)
+    if result_is_ok(yaza_db_query_validate_cte_result_budget_v1(auxiliary_rows_probe, 0, 0, 0, 0)):
+        return err("YDBv1 CTE result budget did not include nested materialized rows")
+    let auxiliary_cells_probe: YazaSqlQueryResultV1 = YazaSqlQueryResultV1(positional_rows.columns, positional_rows.rows, positional_rows.work_units, 0, 1048575, 0)
+    if result_is_ok(yaza_db_query_validate_cte_result_budget_v1(auxiliary_cells_probe, 0, 0, 0, 0)):
+        return err("YDBv1 CTE result budget did not include nested materialized cells")
+    let auxiliary_text_probe: YazaSqlQueryResultV1 = YazaSqlQueryResultV1(positional_rows.columns, positional_rows.rows, positional_rows.work_units, 0, 0, 67108863)
+    if result_is_ok(yaza_db_query_validate_cte_result_budget_v1(auxiliary_text_probe, 0, 0, 0, 0)):
+        return err("YDBv1 CTE result budget did not include nested materialized Text")
+
+    let anonymous: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(committed.storage, committed.wal, "WITH lower_bound AS (SELECT id, label FROM source_rows WHERE id >= ?), upper_bound AS (SELECT id, label FROM lower_bound WHERE id <= ?) SELECT label FROM upper_bound WHERE id = ?", [one, three, two])?
+    if not option_is_some(anonymous.query_result) or list_count(option_unwrap(anonymous.query_result).rows) != 1:
+        return err("YDBv1 CTE definitions did not bind anonymous parameters in statement order")
+    if list_get(list_get(option_unwrap(anonymous.query_result).rows, 0), 0).text_value != "two":
+        return err("YDBv1 CTE anonymous parameter mapping returned the wrong row")
+
+    let named: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(committed.storage, committed.wal, "WITH chosen AS (SELECT id, label FROM source_rows WHERE id = :target) SELECT label FROM chosen WHERE id = :target", [two])?
+    if not option_is_some(named.query_result) or list_count(option_unwrap(named.query_result).rows) != 1 or list_get(list_get(option_unwrap(named.query_result).rows, 0), 0).text_value != "two":
+        return err("YDBv1 CTE definitions did not reuse statement-wide named parameters")
+
+    let quoted: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(committed.storage, committed.wal, "WITH \"chosen rows\" (\"row id\", \"row label\") AS (SELECT id, label FROM source_rows) SELECT \"row label\" FROM \"chosen rows\" WHERE \"row id\" = $1", [two])?
+    if not option_is_some(quoted.query_result) or list_count(option_unwrap(quoted.query_result).rows) != 1 or list_get(list_get(option_unwrap(quoted.query_result).rows, 0), 0).text_value != "two":
+        return err("YDBv1 CTE execution did not preserve quoted relation and column identifiers")
+
+    let mixed_case_alias: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(committed.storage, committed.wal, "WITH aliases AS (SELECT id AS MixedId, label AS MixedLabel FROM source_rows) SELECT mixedlabel FROM aliases WHERE mixedid = $1", [two])?
+    if not option_is_some(mixed_case_alias.query_result) or list_count(option_unwrap(mixed_case_alias.query_result).rows) != 1 or list_get(list_get(option_unwrap(mixed_case_alias.query_result).rows, 0), 0).text_value != "two":
+        return err("YDBv1 CTE did not normalize unquoted output aliases using SQL identifier rules")
+
+    let cte_physical_join: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(committed.storage, committed.wal, "WITH selected_rows AS (SELECT id, label FROM source_rows WHERE id <= 2) SELECT chosen.label, source_rows.label FROM selected_rows AS chosen INNER JOIN source_rows ON chosen.id = source_rows.id", no_parameters)?
+    if not option_is_some(cte_physical_join.query_result) or list_count(option_unwrap(cte_physical_join.query_result).rows) != 2:
+        return err("YDBv1 JOIN could not consume a scoped CTE and a persisted relation")
+
+    let cte_cte_join: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(committed.storage, committed.wal, "WITH left_rows AS (SELECT id, label FROM source_rows WHERE id <= 2), right_rows AS (SELECT id, label FROM source_rows WHERE id >= 2) SELECT left_side.label, right_side.label FROM left_rows AS left_side INNER JOIN right_rows AS right_side ON left_side.id = right_side.id", no_parameters)?
+    if not option_is_some(cte_cte_join.query_result) or list_count(option_unwrap(cte_cte_join.query_result).rows) != 1:
+        return err("YDBv1 JOIN could not consume two scoped CTE relations")
+    let cte_cte_join_row: List[YazaSqlValueV1] = list_get(option_unwrap(cte_cte_join.query_result).rows, 0)
+    if list_get(cte_cte_join_row, 0).text_value != "two" or list_get(cte_cte_join_row, 1).text_value != "two":
+        return err("YDBv1 CTE-to-CTE JOIN returned incorrect values")
+
+    let cte_body_union: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(committed.storage, committed.wal, "WITH union_rows AS (SELECT id, label FROM source_rows WHERE id = 1 UNION ALL SELECT id, label FROM source_rows WHERE id = 2) SELECT label FROM union_rows", no_parameters)?
+    if not option_is_some(cte_body_union.query_result) or list_count(option_unwrap(cte_body_union.query_result).rows) != 2:
+        return err("YDBv1 CTE body did not execute supported set-operation branches")
+
+    let cte_outer_union: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(committed.storage, committed.wal, "WITH selected_rows AS (SELECT id, label FROM source_rows WHERE id = 2) SELECT label FROM selected_rows UNION ALL SELECT label FROM selected_rows", no_parameters)?
+    if not option_is_some(cte_outer_union.query_result) or list_count(option_unwrap(cte_outer_union.query_result).rows) != 2:
+        return err("YDBv1 outer SELECT set operation could not resolve its scoped CTE")
+
+    let cte_in_subquery: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(committed.storage, committed.wal, "WITH selected_rows AS (SELECT id FROM source_rows WHERE id >= $1) SELECT label FROM source_rows WHERE id IN (SELECT id FROM selected_rows)", [two])?
+    if not option_is_some(cte_in_subquery.query_result) or list_count(option_unwrap(cte_in_subquery.query_result).rows) != 2:
+        return err("YDBv1 IN subquery could not read a statement-scoped CTE")
+    let cte_in_result: YazaSqlQueryResultV1 = option_unwrap(cte_in_subquery.query_result)
+    if cte_in_result.work_units <= 0 or cte_in_result.auxiliary_rows <= 0 or cte_in_result.auxiliary_cells <= 0:
+        return err("YDBv1 CTE subquery did not propagate query-work/materialization accounting")
+    if list_get(list_get(option_unwrap(cte_in_subquery.query_result).rows, 0), 0).text_value != "two" or list_get(list_get(option_unwrap(cte_in_subquery.query_result).rows, 1), 0).text_value != "three":
+        return err("YDBv1 IN subquery reading a CTE returned incorrect values")
+
+    let preflight_source: Text = "SELECT id FROM source_rows WHERE id IN (SELECT id FROM source_rows)"
+    let preflight_ast: YazaSqlSelectAstV3 = yaza_sql_parse_select_v3(preflight_source)?
+    let preflight_catalog: YazaSqlCatalogSnapshotV1 = yaza_db_catalog_snapshot_load_v1(committed.storage.file, committed.storage.header)?
+    let preflight_plan: YazaSqlBoundPlanV1 = yaza_sql_bind_select_v1(preflight_source, preflight_ast, preflight_catalog)?
+    if list_count(preflight_plan.subqueries) != 1: return err("YDBv1 work-budget fixture did not bind one IN subquery")
+    let preflight_id: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 1)?
+    let preflight_text: YazaSqlValueV1 = yaza_sql_value_text_v1("one")
+    let preflight_table: YazaSqlMemoryTableV1 = YazaSqlMemoryTableV1(preflight_plan.table_id, preflight_catalog.version, [4, 9], [[preflight_id, preflight_text]], 0)
+    let preflight_values: List[YazaSqlValueV1] = [preflight_id]
+    let expensive_subquery: YazaSqlSubqueryValuesV1 = YazaSqlSubqueryValuesV1(preflight_values, List[List[YazaSqlValueV1]](), true, 99999999, 0, 0, 0)
+    let preflight_subqueries: List[YazaSqlSubqueryValuesV1] = [expensive_subquery]
+    let cumulative_work_probe: Result[YazaSqlQueryResultV1, Text] = yaza_sql_execute_memory_with_subqueries_and_prior_v1(preflight_plan, preflight_table, no_parameters, preflight_subqueries, 0)
+    if result_is_ok(cumulative_work_probe): return err("YDBv1 executor did not include nested subquery work in its preflight estimate")
+    if not text_starts_with(result_unwrap_error(cumulative_work_probe), "SQL executor exceeds the bounded per-query work budget"):
+        return err("YDBv1 executor rejected cumulative subquery work after, rather than during, query-work preflight")
+
+    let cte_exists_subquery: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(committed.storage, committed.wal, "WITH selected_rows AS (SELECT id FROM source_rows WHERE id = 2) SELECT label FROM source_rows WHERE EXISTS (SELECT id FROM selected_rows)", no_parameters)?
+    if not option_is_some(cte_exists_subquery.query_result) or list_count(option_unwrap(cte_exists_subquery.query_result).rows) != 3:
+        return err("YDBv1 EXISTS subquery could not read a statement-scoped CTE")
+
+    let cte_additional_join: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(committed.storage, committed.wal, "WITH first_rows AS (SELECT id, label FROM source_rows), second_rows AS (SELECT id, label FROM source_rows) SELECT base.label, first.label, second.label FROM source_rows AS base INNER JOIN first_rows AS first ON base.id = first.id INNER JOIN second_rows AS second ON first.id = second.id", no_parameters)?
+    if not option_is_some(cte_additional_join.query_result) or list_count(option_unwrap(cte_additional_join.query_result).rows) != 3:
+        return err("YDBv1 additional JOIN stage could not consume scoped CTE relations")
+
+    let cte_explain: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(committed.storage, committed.wal, "EXPLAIN WITH picked AS (SELECT id, label FROM source_rows WHERE id > 1), merged AS (SELECT id, label FROM picked UNION ALL SELECT id, label FROM source_rows WHERE id = 1) SELECT label FROM merged ORDER BY label", no_parameters)?
+    if not option_is_some(cte_explain.explain_text): return err("YDBv1 EXPLAIN did not return the CTE plan")
+    let cte_explain_text: Text = option_unwrap(cte_explain.explain_text)
+    if text_find(cte_explain_text, "CTE[1] picked Materialize") < 0 or text_find(cte_explain_text, "Set combine: UNION ALL") < 0 or text_find(cte_explain_text, "Scan(table_id=1000000)") < 0 or text_find(cte_explain_text, "Final query") < 0:
+        return err("YDBv1 EXPLAIN omitted ordered CTE materialization, set operations, virtual scans, or the final query")
+    let plain_explain: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(committed.storage, committed.wal, "EXPLAIN SELECT id FROM source_rows WHERE id = 2", no_parameters)?
+    if not option_is_some(plain_explain.explain_text) or text_find(option_unwrap(plain_explain.explain_text), "YazaBase logical plan v1") < 0 or text_find(option_unwrap(plain_explain.explain_text), "Physical: ClusteredBTreeScan") < 0:
+        return err("YDBv1 EXPLAIN SELECT regressed while adding EXPLAIN WITH")
+
+    let cte_diagnostic_source: Text = "WITH broken AS (SELECT missing FROM source_rows) SELECT id FROM broken"
+    let cte_diagnostic: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(committed.storage, committed.wal, cte_diagnostic_source, no_parameters)
+    if result_is_ok(cte_diagnostic): return err("YDBv1 CTE binder accepted a missing column")
+    let cte_diagnostic_text: Text = result_unwrap_error(cte_diagnostic)
+    if text_find(cte_diagnostic_text, "SQL CTE definition query failed at byte 23 (line 1, column 24)") < 0 or text_find(cte_diagnostic_text, "SQL binder could not resolve multi-table column") < 0:
+        return err("YDBv1 CTE binder diagnostic did not map its byte and column to the full SQL statement: " + cte_diagnostic_text)
+
+    let final_cte_diagnostic_source: Text = "WITH valid AS (SELECT id FROM source_rows)\nSELECT missing FROM valid"
+    let final_cte_diagnostic: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(committed.storage, committed.wal, final_cte_diagnostic_source, no_parameters)
+    if result_is_ok(final_cte_diagnostic): return err("YDBv1 final CTE SELECT accepted a missing column")
+    if text_find(result_unwrap_error(final_cte_diagnostic), "(line 2, column 8)") < 0:
+        return err("YDBv1 final CTE diagnostic did not preserve the original multiline SQL location: " + result_unwrap_error(final_cte_diagnostic))
+
+    let plain_set_branch_source: Text = "SELECT id FROM source_rows UNION ALL SELECT missing FROM source_rows"
+    let plain_set_branch_error: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(committed.storage, committed.wal, plain_set_branch_source, no_parameters)
+    if result_is_ok(plain_set_branch_error): return err("YDBv1 set-query accepted a missing column in its second branch")
+    if text_find(result_unwrap_error(plain_set_branch_error), "byte 44 (line 1, column 45)") < 0:
+        return err("YDBv1 set-query diagnostic did not identify the original failing branch: " + result_unwrap_error(plain_set_branch_error))
+
+    let cte_set_branch_source: Text = "WITH first AS (SELECT id FROM source_rows UNION ALL SELECT missing FROM source_rows) SELECT id FROM first"
+    let cte_set_branch_error: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(committed.storage, committed.wal, cte_set_branch_source, no_parameters)
+    if result_is_ok(cte_set_branch_error): return err("YDBv1 CTE definition set branch accepted a missing column")
+    if text_find(result_unwrap_error(cte_set_branch_error), "byte 59 (line 1, column 60)") < 0 or text_find(result_unwrap_error(cte_set_branch_error), "SQL binder could not resolve multi-table column") < 0:
+        return err("YDBv1 CTE definition set-branch diagnostic did not identify the original failing branch: " + result_unwrap_error(cte_set_branch_error))
+    let historical_set_branch_error: Result[YazaSqlQueryResultV1, Text] = yaza_db_execute_select_at_snapshot_v1(committed.storage, committed.wal, cte_set_branch_source, no_parameters, option_unwrap(inserted.write_commit).commit_ts, 0, List[YazaDbTxnStatusV1]())
+    if result_is_ok(historical_set_branch_error) or text_find(result_unwrap_error(historical_set_branch_error), "byte 59 (line 1, column 60)") < 0:
+        return err("YDBv1 historical CTE set-branch diagnostic lost its original source location")
+
+    let final_set_branch_source: Text = "WITH valid AS (SELECT id FROM source_rows) SELECT id FROM valid UNION ALL SELECT missing FROM source_rows"
+    let final_set_branch_error: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(committed.storage, committed.wal, final_set_branch_source, no_parameters)
+    if result_is_ok(final_set_branch_error): return err("YDBv1 final CTE set branch accepted a missing column")
+    if text_find(result_unwrap_error(final_set_branch_error), "byte 81 (line 1, column 82)") < 0 or text_find(result_unwrap_error(final_set_branch_error), "SQL binder could not resolve multi-table column") < 0:
+        return err("YDBv1 final CTE set-branch diagnostic did not identify the original failing branch: " + result_unwrap_error(final_set_branch_error))
+
+    let rewritten_bind_diagnostic_source: Text = "WITH first AS (SELECT id FROM source_rows WHERE id >= :longparameter UNION ALL SELECT missing FROM source_rows) SELECT id FROM first"
+    let rewritten_bind_diagnostic: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(committed.storage, committed.wal, rewritten_bind_diagnostic_source, [one])
+    if result_is_ok(rewritten_bind_diagnostic): return err("YDBv1 CTE branch with a rewritten positional bind accepted a missing column")
+    if text_find(result_unwrap_error(rewritten_bind_diagnostic), "byte 86 (line 1, column 87)") < 0:
+        return err("YDBv1 CTE diagnostic did not compensate for named-bind rewrite offsets: " + result_unwrap_error(rewritten_bind_diagnostic))
+
+    let committed_ts: Number = option_unwrap(inserted.write_commit).commit_ts
+    let historical_cte: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(committed.storage, committed.wal, "WITH visible_rows AS (SELECT id, label FROM source_rows WHERE id >= $1) SELECT label FROM visible_rows WHERE id <= $2", [one, three], committed_ts, 0, List[YazaDbTxnStatusV1]())?
+    if list_count(historical_cte.rows) != 3 or list_get(list_get(historical_cte.rows, 2), 0).text_value != "three":
+        return err("YDBv1 historical CTE definitions did not share their requested snapshot")
+
+    if result_is_ok(yaza_db_execute_statement_v1(committed.storage, committed.wal, "WITH RECURSIVE tree AS (SELECT id FROM source_rows) SELECT id FROM tree", no_parameters)):
+        return err("YDBv1 CTE execution silently accepted unsupported recursive semantics")
+    if result_is_ok(yaza_db_execute_statement_v1(committed.storage, committed.wal, "WITH later AS (SELECT id FROM earlier), earlier AS (SELECT id FROM source_rows) SELECT id FROM later", no_parameters)):
+        return err("YDBv1 CTE execution accepted a forward reference")
+    let shadowed_catalog_name: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(committed.storage, committed.wal, "WITH source_rows AS (SELECT id FROM source_rows), later_rows AS (SELECT id FROM source_rows WHERE id > 1) SELECT id FROM later_rows", no_parameters)?
+    if not option_is_some(shadowed_catalog_name.query_result) or list_count(option_unwrap(shadowed_catalog_name.query_result).rows) != 2:
+        return err("YDBv1 CTE scope did not shadow the physical table after its own definition")
+    let scoped: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(committed.storage, committed.wal, "WITH leaked AS (SELECT id FROM source_rows) SELECT id FROM leaked", no_parameters)?
+    if not option_is_some(scoped.query_result) or list_count(option_unwrap(scoped.query_result).rows) != 3:
+        return err("YDBv1 CTE execution failed to materialize a statement-scoped relation")
+    if result_is_ok(yaza_db_execute_statement_v1(committed.storage, committed.wal, "SELECT id FROM leaked", no_parameters)):
+        return err("YDBv1 CTE relation escaped its statement scope")
+
+    let wal_closed: Boolean = yaza_db_wal_log_close_v1(committed.wal)?
+    let storage_closed: Boolean = yaza_db_storage_close_v1(committed.storage)?
+    if not wal_closed or not storage_closed: return err("YDBv1 CTE fixture could not close the database")
+    return ok(true)
+
+start:
+    let root_path: Text = arg(1)
+    let result: Result[Boolean, Text] = yazabase_sql_cte_v1(root_path)
+    if not result_is_ok(result):
+        say result_unwrap_error(result)
+        exit(1)
+    say "yazabase-sql-cte-v1-ok"

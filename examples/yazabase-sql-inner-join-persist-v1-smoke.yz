@@ -1,0 +1,466 @@
+use "std/fs"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/checkpoint_v1"
+use "../yazabase/sql_dispatch_v1"
+
+fn yazabase_sql_inner_join_persist_v1(root_path: Text) -> Result[Boolean, Text]:
+    let root: Number = root_open(root_path)?
+    let db_name: Text = "inner-join-persist-smoke.ydb"
+    let header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_from_text("inner-join-uuid1"), 0, 1, 1, 0, 2, 1)
+    let empty_storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, db_name, header)?
+    let empty_closed: Boolean = yaza_db_storage_close_v1(empty_storage)?
+    if not empty_closed: return err("YDBv1 JOIN fixture could not close its empty database")
+    let initialized: YazaDbCatalogBootstrapV1 = yaza_db_catalog_initialize_v1(root, db_name)?
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+
+    let create_items: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(initialized.storage, initialized.wal, "CREATE TABLE items (id BIGINT PRIMARY KEY, label TEXT NOT NULL)", no_parameters)?
+    if create_items.statement_kind != yaza_db_sql_statement_kind_create_table_v1() or not option_is_some(create_items.write_commit): return err("YDBv1 JOIN fixture could not create its left table")
+    let create_profiles: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(create_items.storage, create_items.wal, "CREATE TABLE profiles (id BIGINT PRIMARY KEY, user_id BIGINT, note TEXT NOT NULL)", no_parameters)?
+    if create_profiles.statement_kind != yaza_db_sql_statement_kind_create_table_v1() or not option_is_some(create_profiles.write_commit): return err("YDBv1 JOIN fixture could not create its right table")
+    let create_probe: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(create_profiles.storage, create_profiles.wal, "CREATE TABLE membership_probe (id BIGINT PRIMARY KEY, bucket BIGINT, tested BIGINT NOT NULL)", no_parameters)?
+    if create_probe.statement_kind != yaza_db_sql_statement_kind_create_table_v1() or not option_is_some(create_probe.write_commit): return err("YDBv1 correlated IN fixture could not create its probe table")
+    let create_candidates: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(create_probe.storage, create_probe.wal, "CREATE TABLE membership_candidate (id BIGINT PRIMARY KEY, bucket BIGINT NOT NULL, candidate BIGINT)", no_parameters)?
+    if create_candidates.statement_kind != yaza_db_sql_statement_kind_create_table_v1() or not option_is_some(create_candidates.write_commit): return err("YDBv1 correlated IN fixture could not create its candidate table")
+
+    let insert_probe: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(create_candidates.storage, create_candidates.wal, "INSERT INTO membership_probe (id, bucket, tested) VALUES (1, 1, 1), (2, 1, 99), (3, 2, 2), (4, 3, 99), (5, NULL, 99)", no_parameters)?
+    if insert_probe.statement_kind != yaza_db_sql_statement_kind_insert_v1() or not option_is_some(insert_probe.write_commit): return err("YDBv1 correlated IN fixture could not insert probe rows")
+    let insert_candidates: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(insert_probe.storage, insert_probe.wal, "INSERT INTO membership_candidate (id, bucket, candidate) VALUES (1, 1, 1), (2, 1, NULL), (3, 2, 2)", no_parameters)?
+    if insert_candidates.statement_kind != yaza_db_sql_statement_kind_insert_v1() or not option_is_some(insert_candidates.write_commit): return err("YDBv1 correlated IN fixture could not insert candidate rows")
+    let insert_items: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(insert_candidates.storage, insert_candidates.wal, "INSERT INTO items (id, label) VALUES (1, 'one'), (2, 'two'), (3, 'three')", no_parameters)?
+    if insert_items.statement_kind != yaza_db_sql_statement_kind_insert_v1() or not option_is_some(insert_items.write_commit): return err("YDBv1 JOIN fixture could not insert left rows")
+    let left_commit: YazaDbWriteCommitV1 = option_unwrap(insert_items.write_commit)
+    let insert_profiles: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(insert_items.storage, insert_items.wal, "INSERT INTO profiles (id, user_id, note) VALUES (10, 1, 'alpha'), (11, 1, 'omega'), (12, 2, 'beta'), (13, NULL, 'null-key'), (14, 9, 'unmatched')", no_parameters)?
+    if insert_profiles.statement_kind != yaza_db_sql_statement_kind_insert_v1() or not option_is_some(insert_profiles.write_commit): return err("YDBv1 JOIN fixture could not insert right rows")
+    let right_commit: YazaDbWriteCommitV1 = option_unwrap(insert_profiles.write_commit)
+
+    let source: Text = "SELECT i.id, p.note FROM items AS i INNER JOIN profiles AS p ON i.id = p.user_id ORDER BY p.note"
+    let selected: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, source, no_parameters)?
+    if selected.statement_kind != yaza_db_sql_statement_kind_select_v1() or not option_is_some(selected.query_result): return err("YDBv1 SQL dispatcher did not return the joined SELECT result")
+    let rows: YazaSqlQueryResultV1 = option_unwrap(selected.query_result)
+    if list_count(rows.columns) != 2 or list_count(rows.rows) != 3: return err("YDBv1 INNER JOIN returned an incorrect result shape")
+    if list_get(rows.columns, 0).output_name != "id" or list_get(rows.columns, 1).output_name != "note": return err("YDBv1 INNER JOIN returned incorrect output column names")
+    let first: List[YazaSqlValueV1] = list_get(rows.rows, 0)
+    let second: List[YazaSqlValueV1] = list_get(rows.rows, 1)
+    let third: List[YazaSqlValueV1] = list_get(rows.rows, 2)
+    if list_get(first, 0).integer_value != 1 or list_get(first, 1).text_value != "alpha": return err("YDBv1 INNER JOIN did not sort its first joined row correctly")
+    if list_get(second, 0).integer_value != 2 or list_get(second, 1).text_value != "beta": return err("YDBv1 INNER JOIN did not sort its second joined row correctly")
+    if list_get(third, 0).integer_value != 1 or list_get(third, 1).text_value != "omega": return err("YDBv1 INNER JOIN did not retain duplicate-key matches")
+
+    let left_source: Text = "SELECT i.id, p.note FROM items AS i LEFT JOIN profiles AS p ON i.id = p.user_id ORDER BY i.id"
+    let left_selected: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, left_source, no_parameters)?
+    if not option_is_some(left_selected.query_result): return err("YDBv1 LEFT JOIN did not return a query result")
+    let left_rows: YazaSqlQueryResultV1 = option_unwrap(left_selected.query_result)
+    if list_count(left_rows.rows) != 4 or not list_get(left_rows.columns, 1).nullable: return err("YDBv1 LEFT JOIN returned an incorrect row count or nullability")
+    var found_unmatched: Boolean = false
+    var left_row_index: Number = 0
+    while left_row_index < list_count(left_rows.rows):
+        let left_row: List[YazaSqlValueV1] = list_get(left_rows.rows, left_row_index)
+        if list_get(left_row, 0).integer_value == 3 and list_get(left_row, 1).is_null: set found_unmatched = true
+        set left_row_index = left_row_index + 1
+    if not found_unmatched: return err("YDBv1 LEFT JOIN did not null-extend the unmatched left row")
+
+    let right_source: Text = "SELECT i.id, p.note FROM items AS i RIGHT OUTER JOIN profiles AS p ON i.id = p.user_id"
+    let right_selected: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, right_source, no_parameters)?
+    if not option_is_some(right_selected.query_result): return err("YDBv1 RIGHT JOIN did not return a query result")
+    let right_rows: YazaSqlQueryResultV1 = option_unwrap(right_selected.query_result)
+    if list_count(right_rows.rows) != 5 or not list_get(right_rows.columns, 0).nullable or list_get(right_rows.columns, 1).nullable:
+        return err("YDBv1 RIGHT JOIN returned incorrect row count or nullability")
+    var right_duplicate_key_count: Number = 0
+    var right_null_extended_count: Number = 0
+    var right_row_index: Number = 0
+    while right_row_index < list_count(right_rows.rows):
+        let right_row: List[YazaSqlValueV1] = list_get(right_rows.rows, right_row_index)
+        if (list_get(right_row, 1).text_value == "alpha" or list_get(right_row, 1).text_value == "omega") and not list_get(right_row, 0).is_null:
+            if list_get(right_row, 0).integer_value != 1: return err("YDBv1 RIGHT JOIN matched a duplicate key to the wrong left row")
+            set right_duplicate_key_count = right_duplicate_key_count + 1
+        if list_get(right_row, 1).text_value == "null-key" or list_get(right_row, 1).text_value == "unmatched":
+            if not list_get(right_row, 0).is_null: return err("YDBv1 RIGHT JOIN failed to preserve an unmatched right row")
+            set right_null_extended_count = right_null_extended_count + 1
+        set right_row_index = right_row_index + 1
+    if right_duplicate_key_count != 2 or right_null_extended_count != 2:
+        return err("YDBv1 RIGHT JOIN lost duplicate matches or unmatched right rows")
+
+    let right_empty_snapshot: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(right_commit.storage, right_commit.wal, right_source, no_parameters, left_commit.commit_ts, 0, List[YazaDbTxnStatusV1]())?
+    if list_count(right_empty_snapshot.rows) != 0: return err("YDBv1 historical RIGHT JOIN exposed rows committed after its snapshot")
+    let right_visible_snapshot: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(right_commit.storage, right_commit.wal, right_source, no_parameters, right_commit.commit_ts, 0, List[YazaDbTxnStatusV1]())?
+    if list_count(right_visible_snapshot.rows) != 5: return err("YDBv1 historical RIGHT JOIN omitted rows visible at its snapshot")
+
+    let full_source: Text = "SELECT i.id, p.user_id, p.note FROM items AS i FULL OUTER JOIN profiles AS p ON i.id = p.user_id"
+    let full_selected: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, full_source, no_parameters)?
+    if not option_is_some(full_selected.query_result): return err("YDBv1 FULL JOIN did not return a query result")
+    let full_rows: YazaSqlQueryResultV1 = option_unwrap(full_selected.query_result)
+    if list_count(full_rows.rows) != 6 or not list_get(full_rows.columns, 0).nullable or not list_get(full_rows.columns, 2).nullable:
+        return err("YDBv1 FULL JOIN returned an incorrect row count or nullability")
+    var full_duplicate_count: Number = 0
+    var full_left_unmatched_count: Number = 0
+    var full_right_unmatched_count: Number = 0
+    var full_row_index: Number = 0
+    while full_row_index < list_count(full_rows.rows):
+        let full_row: List[YazaSqlValueV1] = list_get(full_rows.rows, full_row_index)
+        let full_left_id: YazaSqlValueV1 = list_get(full_row, 0)
+        let full_right_id: YazaSqlValueV1 = list_get(full_row, 1)
+        let full_note: YazaSqlValueV1 = list_get(full_row, 2)
+        if full_left_id.is_null:
+            if full_note.is_null or (full_note.text_value != "null-key" and full_note.text_value != "unmatched"): return err("YDBv1 FULL JOIN returned an unexpected unmatched right row")
+            set full_right_unmatched_count = full_right_unmatched_count + 1
+        elif full_left_id.integer_value == 1:
+            if full_right_id.is_null or full_right_id.integer_value != 1 or full_note.is_null or (full_note.text_value != "alpha" and full_note.text_value != "omega"): return err("YDBv1 FULL JOIN changed duplicate key matches")
+            set full_duplicate_count = full_duplicate_count + 1
+        elif full_left_id.integer_value == 2:
+            if full_right_id.is_null or full_right_id.integer_value != 2 or full_note.is_null or full_note.text_value != "beta": return err("YDBv1 FULL JOIN returned the wrong matched right row")
+        elif full_left_id.integer_value == 3:
+            if not full_right_id.is_null or not full_note.is_null: return err("YDBv1 FULL JOIN did not null-extend the unmatched left row")
+            set full_left_unmatched_count = full_left_unmatched_count + 1
+        else:
+            return err("YDBv1 FULL JOIN returned an unexpected left key")
+        set full_row_index = full_row_index + 1
+    if full_duplicate_count != 2 or full_left_unmatched_count != 1 or full_right_unmatched_count != 2:
+        return err("YDBv1 FULL JOIN lost a duplicate, NULL-key, or unmatched row")
+    let full_empty_snapshot: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(right_commit.storage, right_commit.wal, full_source, no_parameters, left_commit.commit_ts, 0, List[YazaDbTxnStatusV1]())?
+    if list_count(full_empty_snapshot.rows) != 3: return err("YDBv1 historical FULL JOIN did not retain left rows when the right side was empty")
+
+    let right_star_source: Text = "SELECT * FROM items AS i RIGHT JOIN profiles AS p ON i.id = p.user_id"
+    let right_star_statement: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, right_star_source, no_parameters)?
+    if not option_is_some(right_star_statement.query_result): return err("YDBv1 RIGHT JOIN wildcard did not return a query result")
+    let right_star: YazaSqlQueryResultV1 = option_unwrap(right_star_statement.query_result)
+    if list_count(right_star.columns) != 5 or not list_get(right_star.columns, 0).nullable or not list_get(right_star.columns, 1).nullable:
+        return err("YDBv1 RIGHT JOIN wildcard did not preserve original projection order or nullability")
+    var right_star_unmatched_seen: Boolean = false
+    var right_star_index: Number = 0
+    while right_star_index < list_count(right_star.rows):
+        let right_star_row: List[YazaSqlValueV1] = list_get(right_star.rows, right_star_index)
+        if list_get(right_star_row, 4).text_value == "unmatched":
+            if not list_get(right_star_row, 0).is_null or not list_get(right_star_row, 1).is_null or list_get(right_star_row, 2).integer_value != 14 or list_get(right_star_row, 3).integer_value != 9:
+                return err("YDBv1 RIGHT JOIN wildcard changed original left/right column order")
+            set right_star_unmatched_seen = true
+        set right_star_index = right_star_index + 1
+    if not right_star_unmatched_seen: return err("YDBv1 RIGHT JOIN wildcard omitted an unmatched right row")
+
+    let right_where_source: Text = "SELECT i.id, p.note FROM items AS i RIGHT JOIN profiles AS p ON i.id = p.user_id WHERE i.id = 1"
+    let right_where_statement: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, right_where_source, no_parameters)?
+    if not option_is_some(right_where_statement.query_result) or list_count(option_unwrap(right_where_statement.query_result).rows) != 2:
+        return err("YDBv1 RIGHT JOIN WHERE did not filter null-extended rows after the join")
+
+    let in_list: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE id IN (1, 3, NULL)", no_parameters)?
+    if not option_is_some(in_list.query_result) or list_count(option_unwrap(in_list.query_result).rows) != 2:
+        return err("YDBv1 IN list did not preserve SQL NULL truth semantics")
+    let in_parameters_created: Result[List[YazaSqlValueV1], Text] = list_try_new()
+    if not result_is_ok(in_parameters_created): return err("YDBv1 IN parameter fixture could not allocate its binds")
+    let in_parameters: List[YazaSqlValueV1] = result_unwrap(in_parameters_created)
+    let first_in_parameter: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 1)?
+    let second_in_parameter: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 3)?
+    if not list_try_push(in_parameters, first_in_parameter) or not list_try_push(in_parameters, second_in_parameter):
+        return err("YDBv1 IN parameter fixture could not append its binds")
+    let in_bound: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE id IN ($1, $2)", in_parameters)?
+    if not option_is_some(in_bound.query_result) or list_count(option_unwrap(in_bound.query_result).rows) != 2:
+        return err("YDBv1 IN list did not bind positional parameters")
+    let large_in_list: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE id IN (1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70)", no_parameters)?
+    if not option_is_some(large_in_list.query_result) or list_count(option_unwrap(large_in_list.query_result).rows) != 3:
+        return err("YDBv1 large IN list exceeded the verified balanced-expression depth")
+    let not_in_list: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE id NOT IN (1, 3)", no_parameters)?
+    if not option_is_some(not_in_list.query_result) or list_count(option_unwrap(not_in_list.query_result).rows) != 1 or list_get(list_get(option_unwrap(not_in_list.query_result).rows, 0), 0).integer_value != 2:
+        return err("YDBv1 NOT IN list returned an incorrect complement")
+    let null_not_in: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE id NOT IN (1, 3, NULL)", no_parameters)?
+    if not option_is_some(null_not_in.query_result) or list_count(option_unwrap(null_not_in.query_result).rows) != 0:
+        return err("YDBv1 NOT IN with NULL did not yield UNKNOWN for non-matches")
+    if result_is_ok(yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE id IN ()", no_parameters)):
+        return err("YDBv1 SQL parser accepted an empty IN list")
+    let in_subquery: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE id IN (SELECT user_id FROM profiles)", no_parameters)?
+    if not option_is_some(in_subquery.query_result) or list_count(option_unwrap(in_subquery.query_result).rows) != 2:
+        return err("YDBv1 IN subquery did not materialize the one-column profile set")
+    let subquery_named_bind_created: Result[List[YazaSqlValueV1], Text] = list_try_new()
+    if not result_is_ok(subquery_named_bind_created): return err("YDBv1 subquery named-bind fixture could not allocate its binds")
+    let subquery_named_bind: List[YazaSqlValueV1] = result_unwrap(subquery_named_bind_created)
+    let subquery_named_value: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 1)?
+    if not list_try_push(subquery_named_bind, subquery_named_value): return err("YDBv1 subquery named-bind fixture could not append its bind")
+    let bound_in_subquery: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE id IN (SELECT user_id FROM profiles WHERE user_id = :wanted)", subquery_named_bind)?
+    if not option_is_some(bound_in_subquery.query_result) or list_count(option_unwrap(bound_in_subquery.query_result).rows) != 1 or list_get(list_get(option_unwrap(bound_in_subquery.query_result).rows, 0), 0).integer_value != 1:
+        return err("YDBv1 named bind inside an IN subquery returned incorrect membership")
+    let bound_not_in_subquery: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE id NOT IN (SELECT user_id FROM profiles WHERE user_id = :wanted)", subquery_named_bind)?
+    if not option_is_some(bound_not_in_subquery.query_result) or list_count(option_unwrap(bound_not_in_subquery.query_result).rows) != 2:
+        return err("YDBv1 named bind inside a NOT IN subquery returned incorrect membership")
+    let bound_exists_subquery: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE EXISTS (SELECT user_id FROM profiles WHERE user_id = :wanted)", subquery_named_bind)?
+    if not option_is_some(bound_exists_subquery.query_result) or list_count(option_unwrap(bound_exists_subquery.query_result).rows) != 3:
+        return err("YDBv1 named bind inside an EXISTS subquery returned an incorrect result")
+    let historical_bound_in_subquery: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE id IN (SELECT user_id FROM profiles WHERE user_id = :wanted)", subquery_named_bind, right_commit.commit_ts, 0, List[YazaDbTxnStatusV1]())?
+    if list_count(historical_bound_in_subquery.rows) != 1 or list_get(list_get(historical_bound_in_subquery.rows, 0), 0).integer_value != 1:
+        return err("YDBv1 historical named bind inside an IN subquery returned incorrect membership")
+    let shared_named_bind: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE id = :wanted AND id IN (SELECT user_id FROM profiles WHERE user_id = :wanted)", subquery_named_bind)?
+    if not option_is_some(shared_named_bind.query_result) or list_count(option_unwrap(shared_named_bind.query_result).rows) != 1 or list_get(list_get(option_unwrap(shared_named_bind.query_result).rows, 0), 0).integer_value != 1:
+        return err("YDBv1 shared named bind was not reused across the outer SELECT and subquery")
+    let shared_positional_bind: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE id = $1 AND id IN (SELECT user_id FROM profiles WHERE user_id = $1)", subquery_named_bind)?
+    if not option_is_some(shared_positional_bind.query_result) or list_count(option_unwrap(shared_positional_bind.query_result).rows) != 1 or list_get(list_get(option_unwrap(shared_positional_bind.query_result).rows, 0), 0).integer_value != 1:
+        return err("YDBv1 shared positional bind was not reused across the outer SELECT and subquery")
+    let subquery_ordered_binds_created: Result[List[YazaSqlValueV1], Text] = list_try_new()
+    if not result_is_ok(subquery_ordered_binds_created): return err("YDBv1 nested bind-order fixture could not allocate its binds")
+    let subquery_ordered_binds: List[YazaSqlValueV1] = result_unwrap(subquery_ordered_binds_created)
+    let subquery_first_value: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 1)?
+    let subquery_second_value: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 1)?
+    if not list_try_push(subquery_ordered_binds, subquery_first_value) or not list_try_push(subquery_ordered_binds, subquery_second_value):
+        return err("YDBv1 nested bind-order fixture could not append its binds")
+    let ordered_bound_in_subquery: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE id = ? AND id IN (SELECT user_id FROM profiles WHERE user_id = ?)", subquery_ordered_binds)?
+    if not option_is_some(ordered_bound_in_subquery.query_result) or list_count(option_unwrap(ordered_bound_in_subquery.query_result).rows) != 1 or list_get(list_get(option_unwrap(ordered_bound_in_subquery.query_result).rows, 0), 0).integer_value != 1:
+        return err("YDBv1 outer and subquery anonymous binds were not mapped in statement order")
+    if result_is_ok(yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE id = :same AND id IN (SELECT user_id FROM profiles WHERE note = :same)", subquery_named_bind)):
+        return err("YDBv1 binder accepted one named bind with incompatible outer and subquery types")
+    if result_is_ok(yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE id IN (SELECT user_id FROM profiles WHERE user_id = $2)", subquery_named_bind)):
+        return err("YDBv1 binder accepted a positional subquery bind with an unbound positional gap")
+    let nested_positional_offset_bind: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE id = $1 AND id IN (SELECT user_id FROM profiles WHERE user_id = $2)", subquery_ordered_binds)?
+    if not option_is_some(nested_positional_offset_bind.query_result) or list_count(option_unwrap(nested_positional_offset_bind.query_result).rows) != 1 or list_get(list_get(option_unwrap(nested_positional_offset_bind.query_result).rows, 0), 0).integer_value != 1:
+        return err("YDBv1 nested positional $n offset did not map the subquery bind to the statement's second value")
+    let not_in_subquery_with_null: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE id NOT IN (SELECT user_id FROM profiles)", no_parameters)?
+    if not option_is_some(not_in_subquery_with_null.query_result) or list_count(option_unwrap(not_in_subquery_with_null.query_result).rows) != 0:
+        return err("YDBv1 NOT IN subquery did not preserve NULL-to-UNKNOWN semantics")
+    let empty_in_subquery: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE id IN (SELECT user_id FROM profiles WHERE user_id = 500)", no_parameters)?
+    let empty_not_in_subquery: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT user_id FROM profiles WHERE user_id NOT IN (SELECT user_id FROM profiles WHERE user_id = 500)", no_parameters)?
+    if not option_is_some(empty_in_subquery.query_result) or list_count(option_unwrap(empty_in_subquery.query_result).rows) != 0:
+        return err("YDBv1 IN with an empty subquery did not produce FALSE")
+    if not option_is_some(empty_not_in_subquery.query_result) or list_count(option_unwrap(empty_not_in_subquery.query_result).rows) != 5:
+        return err("YDBv1 NOT IN with an empty subquery did not produce TRUE, including for a NULL left value")
+    let text_in_subquery: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT label FROM items WHERE label IN (SELECT label FROM items WHERE id = 2)", no_parameters)?
+    if not option_is_some(text_in_subquery.query_result) or list_count(option_unwrap(text_in_subquery.query_result).rows) != 1 or list_get(list_get(option_unwrap(text_in_subquery.query_result).rows, 0), 0).text_value != "two":
+        return err("YDBv1 text IN subquery returned an incorrect match")
+    let nested_in_subquery: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE id IN (SELECT user_id FROM profiles WHERE user_id IN (SELECT id FROM items WHERE id = 1))", no_parameters)?
+    if not option_is_some(nested_in_subquery.query_result) or list_count(option_unwrap(nested_in_subquery.query_result).rows) != 1 or list_get(list_get(option_unwrap(nested_in_subquery.query_result).rows, 0), 0).integer_value != 1:
+        return err("YDBv1 nested IN subquery returned incorrect membership rows")
+    let nested_bound_in_subquery: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE id IN (SELECT user_id FROM profiles WHERE user_id IN (SELECT id FROM items WHERE id = :wanted))", subquery_named_bind)?
+    if not option_is_some(nested_bound_in_subquery.query_result) or list_count(option_unwrap(nested_bound_in_subquery.query_result).rows) != 1 or list_get(list_get(option_unwrap(nested_bound_in_subquery.query_result).rows, 0), 0).integer_value != 1:
+        return err("YDBv1 recursive subquery bind mapping returned incorrect membership rows")
+    let nested_not_in_empty: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE id NOT IN (SELECT user_id FROM profiles WHERE user_id IN (SELECT id FROM items WHERE id = 500)) ORDER BY id", no_parameters)?
+    if not option_is_some(nested_not_in_empty.query_result) or list_count(option_unwrap(nested_not_in_empty.query_result).rows) != 3:
+        return err("YDBv1 nested NOT IN did not preserve empty-set semantics")
+    let nested_not_in_null: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE id NOT IN (SELECT user_id FROM profiles WHERE user_id IS NULL AND EXISTS (SELECT id FROM items WHERE id = 1))", no_parameters)?
+    if not option_is_some(nested_not_in_null.query_result) or list_count(option_unwrap(nested_not_in_null.query_result).rows) != 0:
+        return err("YDBv1 nested NOT IN did not preserve NULL-to-UNKNOWN semantics")
+    let joined_in_subquery: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE id IN (SELECT p.user_id FROM profiles AS p INNER JOIN items AS i ON p.user_id = i.id INNER JOIN profiles AS q ON q.user_id = i.id) ORDER BY id", no_parameters)?
+    if not option_is_some(joined_in_subquery.query_result) or list_count(option_unwrap(joined_in_subquery.query_result).rows) != 2 or list_get(list_get(option_unwrap(joined_in_subquery.query_result).rows, 0), 0).integer_value != 1 or list_get(list_get(option_unwrap(joined_in_subquery.query_result).rows, 1), 0).integer_value != 2:
+        return err("YDBv1 IN subquery with a JOIN returned incorrect membership rows")
+    let joined_not_in_subquery: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE id NOT IN (SELECT i.id FROM profiles AS p INNER JOIN items AS i ON p.user_id = i.id INNER JOIN profiles AS q ON q.user_id = i.id)", no_parameters)?
+    if not option_is_some(joined_not_in_subquery.query_result) or list_count(option_unwrap(joined_not_in_subquery.query_result).rows) != 1 or list_get(list_get(option_unwrap(joined_not_in_subquery.query_result).rows, 0), 0).integer_value != 3:
+        return err("YDBv1 NOT IN subquery with a JOIN returned an incorrect complement")
+    let joined_not_in_null: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE id NOT IN (SELECT i.id FROM items AS i RIGHT JOIN profiles AS p ON i.id = p.user_id WHERE i.id IS NULL)", no_parameters)?
+    if not option_is_some(joined_not_in_null.query_result) or list_count(option_unwrap(joined_not_in_null.query_result).rows) != 0:
+        return err("YDBv1 NOT IN subquery with a RIGHT JOIN lost NULL-to-UNKNOWN semantics")
+    let exists_rows: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE EXISTS (SELECT user_id FROM profiles WHERE user_id = 1)", no_parameters)?
+    if not option_is_some(exists_rows.query_result) or list_count(option_unwrap(exists_rows.query_result).rows) != 3:
+        return err("YDBv1 EXISTS did not retain outer rows when its subquery returned rows")
+    let joined_exists_rows: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE EXISTS (SELECT p.user_id FROM profiles AS p INNER JOIN items AS i ON p.user_id = i.id INNER JOIN profiles AS q ON q.user_id = i.id)", no_parameters)?
+    if not option_is_some(joined_exists_rows.query_result) or list_count(option_unwrap(joined_exists_rows.query_result).rows) != 3:
+        return err("YDBv1 EXISTS subquery with a JOIN did not retain outer rows")
+    let joined_exists_empty: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE EXISTS (SELECT p.user_id FROM profiles AS p INNER JOIN items AS i ON p.user_id = i.id INNER JOIN profiles AS q ON q.user_id = i.id WHERE i.id = 500)", no_parameters)?
+    if not option_is_some(joined_exists_empty.query_result) or list_count(option_unwrap(joined_exists_empty.query_result).rows) != 0:
+        return err("YDBv1 EXISTS subquery with a JOIN retained rows for an empty joined result")
+    let right_join_exists_rows: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE EXISTS (SELECT i.id FROM items AS i RIGHT JOIN profiles AS p ON i.id = p.user_id WHERE p.user_id = 9)", no_parameters)?
+    if not option_is_some(right_join_exists_rows.query_result) or list_count(option_unwrap(right_join_exists_rows.query_result).rows) != 3:
+        return err("YDBv1 EXISTS subquery with a RIGHT JOIN did not retain outer rows")
+    let exists_empty: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE EXISTS (SELECT user_id FROM profiles WHERE user_id = 500)", no_parameters)?
+    if not option_is_some(exists_empty.query_result) or list_count(option_unwrap(exists_empty.query_result).rows) != 0:
+        return err("YDBv1 EXISTS retained outer rows for an empty subquery")
+    let nested_exists_rows: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE EXISTS (SELECT user_id FROM profiles WHERE EXISTS (SELECT id FROM items WHERE id = 1))", no_parameters)?
+    if not option_is_some(nested_exists_rows.query_result) or list_count(option_unwrap(nested_exists_rows.query_result).rows) != 3:
+        return err("YDBv1 nested EXISTS did not retain rows from a non-empty nested result")
+    let nested_exists_empty: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE EXISTS (SELECT user_id FROM profiles WHERE EXISTS (SELECT id FROM items WHERE id = 500))", no_parameters)?
+    if not option_is_some(nested_exists_empty.query_result) or list_count(option_unwrap(nested_exists_empty.query_result).rows) != 0:
+        return err("YDBv1 nested EXISTS retained rows from an empty nested result")
+    let not_exists_rows: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE NOT EXISTS (SELECT user_id FROM profiles WHERE user_id = 500)", no_parameters)?
+    if not option_is_some(not_exists_rows.query_result) or list_count(option_unwrap(not_exists_rows.query_result).rows) != 3:
+        return err("YDBv1 NOT EXISTS did not invert the empty-subquery result")
+    let not_exists_empty: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE NOT EXISTS (SELECT user_id FROM profiles WHERE user_id = 1)", no_parameters)?
+    if not option_is_some(not_exists_empty.query_result) or list_count(option_unwrap(not_exists_empty.query_result).rows) != 0:
+        return err("YDBv1 NOT EXISTS retained rows for a non-empty subquery")
+    let exists_many_columns: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE EXISTS (SELECT user_id, note FROM profiles)", no_parameters)?
+    if not option_is_some(exists_many_columns.query_result) or list_count(option_unwrap(exists_many_columns.query_result).rows) != 3:
+        return err("YDBv1 EXISTS incorrectly required a single projected subquery column")
+    let exists_boolean_tree: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE EXISTS (SELECT user_id FROM profiles WHERE user_id = 500) OR id = 3", no_parameters)?
+    if not option_is_some(exists_boolean_tree.query_result) or list_count(option_unwrap(exists_boolean_tree.query_result).rows) != 1 or list_get(list_get(option_unwrap(exists_boolean_tree.query_result).rows, 0), 0).integer_value != 3:
+        return err("YDBv1 EXISTS did not compose correctly in an OR expression")
+    let exists_and_in: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE EXISTS (SELECT user_id FROM profiles WHERE user_id = 1) AND id IN (SELECT user_id FROM profiles)", no_parameters)?
+    if not option_is_some(exists_and_in.query_result) or list_count(option_unwrap(exists_and_in.query_result).rows) != 2:
+        return err("YDBv1 mixed EXISTS and IN subqueries used the wrong descriptor")
+    let exists_limit_zero: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE EXISTS (SELECT user_id FROM profiles LIMIT 0)", no_parameters)?
+    if not option_is_some(exists_limit_zero.query_result) or list_count(option_unwrap(exists_limit_zero.query_result).rows) != 0:
+        return err("YDBv1 EXISTS did not honor a subquery LIMIT 0")
+    if result_is_ok(yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE id IN (SELECT note FROM profiles)", no_parameters)):
+        return err("YDBv1 binder accepted an IN subquery with an incompatible output type")
+    if result_is_ok(yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE id IN (SELECT id, user_id FROM profiles)", no_parameters)):
+        return err("YDBv1 binder accepted a multi-column IN subquery")
+    let correlated_in: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT p.id FROM membership_probe AS p WHERE p.tested IN (SELECT c.candidate FROM membership_candidate AS c WHERE c.bucket = p.bucket) ORDER BY p.id", no_parameters)?
+    if not option_is_some(correlated_in.query_result): return err("YDBv1 correlated IN did not return a query result")
+    let correlated_in_rows: YazaSqlQueryResultV1 = option_unwrap(correlated_in.query_result)
+    if list_count(correlated_in_rows.rows) != 2 or list_get(list_get(correlated_in_rows.rows, 0), 0).integer_value != 1 or list_get(list_get(correlated_in_rows.rows, 1), 0).integer_value != 3:
+        return err("YDBv1 correlated IN returned incorrect matches or mishandled an inner NULL")
+    let correlated_not_in: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT p.id FROM membership_probe AS p WHERE p.tested NOT IN (SELECT c.candidate FROM membership_candidate AS c WHERE c.bucket = p.bucket) ORDER BY p.id", no_parameters)?
+    if not option_is_some(correlated_not_in.query_result): return err("YDBv1 correlated NOT IN did not return a query result")
+    let correlated_not_in_rows: YazaSqlQueryResultV1 = option_unwrap(correlated_not_in.query_result)
+    if list_count(correlated_not_in_rows.rows) != 2 or list_get(list_get(correlated_not_in_rows.rows, 0), 0).integer_value != 4 or list_get(list_get(correlated_not_in_rows.rows, 1), 0).integer_value != 5:
+        return err("YDBv1 correlated NOT IN did not preserve empty-set and NULL truth semantics")
+    let correlated_not_in_local: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT p.id FROM membership_probe AS p WHERE p.tested NOT IN (SELECT c.candidate FROM membership_candidate AS c WHERE c.bucket = p.bucket AND c.candidate >= 0) ORDER BY p.id", no_parameters)?
+    if not option_is_some(correlated_not_in_local.query_result): return err("YDBv1 correlated NOT IN with an inner-local predicate did not return a query result")
+    let correlated_not_in_local_rows: YazaSqlQueryResultV1 = option_unwrap(correlated_not_in_local.query_result)
+    if list_count(correlated_not_in_local_rows.rows) != 3 or list_get(list_get(correlated_not_in_local_rows.rows, 0), 0).integer_value != 2 or list_get(list_get(correlated_not_in_local_rows.rows, 1), 0).integer_value != 4 or list_get(list_get(correlated_not_in_local_rows.rows, 2), 0).integer_value != 5:
+        return err("YDBv1 correlated NOT IN did not apply its inner-local predicate")
+    let correlated_in_snapshot: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(right_commit.storage, right_commit.wal, "SELECT p.id FROM membership_probe AS p WHERE p.tested IN (SELECT c.candidate FROM membership_candidate AS c WHERE c.bucket = p.bucket) ORDER BY p.id", no_parameters, right_commit.commit_ts, 0, List[YazaDbTxnStatusV1]())?
+    if list_count(correlated_in_snapshot.rows) != 2 or list_get(list_get(correlated_in_snapshot.rows, 1), 0).integer_value != 3:
+        return err("YDBv1 correlated IN returned incorrect rows at a historical snapshot")
+    if result_is_ok(yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT i.id FROM items AS i WHERE i.id IN (SELECT p.user_id FROM profiles AS p INNER JOIN items AS j ON p.user_id = j.id INNER JOIN profiles AS q ON q.user_id = j.id WHERE j.id = i.id)", no_parameters)):
+        return err("YDBv1 binder accepted a correlated IN subquery containing a JOIN as uncorrelated")
+    let correlated_exists: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT i.id FROM items AS i WHERE EXISTS (SELECT p.user_id FROM profiles AS p WHERE p.user_id = i.id) ORDER BY i.id", no_parameters)?
+    if not option_is_some(correlated_exists.query_result) or list_count(option_unwrap(correlated_exists.query_result).rows) != 2:
+        return err("YDBv1 correlated EXISTS did not match the two outer keys with inner rows")
+    let correlated_exists_rows: YazaSqlQueryResultV1 = option_unwrap(correlated_exists.query_result)
+    if list_get(list_get(correlated_exists_rows.rows, 0), 0).integer_value != 1 or list_get(list_get(correlated_exists_rows.rows, 1), 0).integer_value != 2:
+        return err("YDBv1 correlated EXISTS returned the wrong outer rows")
+    let reversed_correlated_exists: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT i.id FROM items AS i WHERE EXISTS (SELECT p.user_id FROM profiles AS p WHERE i.id = p.user_id) ORDER BY i.id", no_parameters)?
+    if not option_is_some(reversed_correlated_exists.query_result) or list_count(option_unwrap(reversed_correlated_exists.query_result).rows) != 2:
+        return err("YDBv1 correlated EXISTS did not accept reversed equality operands")
+    let correlated_with_local_filter: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT i.id FROM items AS i WHERE EXISTS (SELECT p.user_id FROM profiles AS p WHERE p.user_id = i.id AND p.note = 'alpha') ORDER BY i.id", no_parameters)?
+    if not option_is_some(correlated_with_local_filter.query_result) or list_count(option_unwrap(correlated_with_local_filter.query_result).rows) != 1 or list_get(list_get(option_unwrap(correlated_with_local_filter.query_result).rows, 0), 0).integer_value != 1:
+        return err("YDBv1 correlated EXISTS did not apply its inner-local AND predicate")
+    let correlated_named_parameters_created: Result[List[YazaSqlValueV1], Text] = list_try_new()
+    if not result_is_ok(correlated_named_parameters_created): return err("YDBv1 correlated named-bind fixture could not allocate its values")
+    let correlated_named_parameters: List[YazaSqlValueV1] = result_unwrap(correlated_named_parameters_created)
+    let correlated_named_key: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 1)?
+    let correlated_named_note: YazaSqlValueV1 = yaza_sql_value_text_v1("alpha")
+    if not list_try_push(correlated_named_parameters, correlated_named_key) or not list_try_push(correlated_named_parameters, correlated_named_note):
+        return err("YDBv1 correlated named-bind fixture could not append its values")
+    let correlated_exists_named_bind: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT i.id FROM items AS i WHERE i.id = :wanted AND EXISTS (SELECT p.user_id FROM profiles AS p WHERE p.user_id = i.id AND p.note = :note)", correlated_named_parameters)?
+    if not option_is_some(correlated_exists_named_bind.query_result) or list_count(option_unwrap(correlated_exists_named_bind.query_result).rows) != 1 or list_get(list_get(option_unwrap(correlated_exists_named_bind.query_result).rows, 0), 0).integer_value != 1:
+        return err("YDBv1 correlated EXISTS did not map outer and inner named parameters")
+    let correlated_question_parameters_created: Result[List[YazaSqlValueV1], Text] = list_try_new()
+    if not result_is_ok(correlated_question_parameters_created): return err("YDBv1 correlated anonymous-bind fixture could not allocate its values")
+    let correlated_question_parameters: List[YazaSqlValueV1] = result_unwrap(correlated_question_parameters_created)
+    if not list_try_push(correlated_question_parameters, correlated_named_note): return err("YDBv1 correlated anonymous-bind fixture could not append its value")
+    let correlated_exists_question_bind: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT i.id FROM items AS i WHERE EXISTS (SELECT p.user_id FROM profiles AS p WHERE p.user_id = i.id AND p.note = ?)", correlated_question_parameters)?
+    if not option_is_some(correlated_exists_question_bind.query_result) or list_count(option_unwrap(correlated_exists_question_bind.query_result).rows) != 1 or list_get(list_get(option_unwrap(correlated_exists_question_bind.query_result).rows, 0), 0).integer_value != 1:
+        return err("YDBv1 correlated EXISTS did not map an inner anonymous bind")
+    let correlated_exists_historical_bind: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(right_commit.storage, right_commit.wal, "SELECT i.id FROM items AS i WHERE i.id = :wanted AND EXISTS (SELECT p.user_id FROM profiles AS p WHERE p.user_id = i.id AND p.note = :note)", correlated_named_parameters, right_commit.commit_ts, 0, List[YazaDbTxnStatusV1]())?
+    if list_count(correlated_exists_historical_bind.rows) != 1 or list_get(list_get(correlated_exists_historical_bind.rows, 0), 0).integer_value != 1:
+        return err("YDBv1 historical correlated EXISTS did not map its inner named bind")
+    let correlated_integer_parameters_created: Result[List[YazaSqlValueV1], Text] = list_try_new()
+    if not result_is_ok(correlated_integer_parameters_created): return err("YDBv1 correlated positional-bind fixture could not allocate its values")
+    let correlated_integer_parameters: List[YazaSqlValueV1] = result_unwrap(correlated_integer_parameters_created)
+    let correlated_integer_parameter: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 1)?
+    if not list_try_push(correlated_integer_parameters, correlated_integer_parameter):
+        return err("YDBv1 correlated positional-bind fixture could not append its value")
+    let correlated_in_shared_positional_bind: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT p.id FROM membership_probe AS p WHERE p.id = $1 AND p.tested IN (SELECT c.candidate FROM membership_candidate AS c WHERE c.bucket = p.bucket AND c.candidate >= $1)", correlated_integer_parameters)?
+    if not option_is_some(correlated_in_shared_positional_bind.query_result) or list_count(option_unwrap(correlated_in_shared_positional_bind.query_result).rows) != 1 or list_get(list_get(option_unwrap(correlated_in_shared_positional_bind.query_result).rows, 0), 0).integer_value != 1:
+        return err("YDBv1 correlated IN did not reuse a shared positional parameter in the outer and local predicates")
+    let correlated_in_positional_offset_bind: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT p.id FROM membership_probe AS p WHERE p.id = $1 AND p.tested IN (SELECT c.candidate FROM membership_candidate AS c WHERE c.bucket = p.bucket AND c.candidate >= $2)", subquery_ordered_binds)?
+    if not option_is_some(correlated_in_positional_offset_bind.query_result) or list_count(option_unwrap(correlated_in_positional_offset_bind.query_result).rows) != 1 or list_get(list_get(option_unwrap(correlated_in_positional_offset_bind.query_result).rows, 0), 0).integer_value != 1:
+        return err("YDBv1 correlated IN did not map an inner $2 bind to the statement's second value")
+    let correlated_not_in_named_bind: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT p.id FROM membership_probe AS p WHERE p.tested NOT IN (SELECT c.candidate FROM membership_candidate AS c WHERE c.bucket = p.bucket AND c.candidate >= :minimum) ORDER BY p.id", correlated_integer_parameters)?
+    if not option_is_some(correlated_not_in_named_bind.query_result) or list_count(option_unwrap(correlated_not_in_named_bind.query_result).rows) != 3 or list_get(list_get(option_unwrap(correlated_not_in_named_bind.query_result).rows, 0), 0).integer_value != 2 or list_get(list_get(option_unwrap(correlated_not_in_named_bind.query_result).rows, 1), 0).integer_value != 4 or list_get(list_get(option_unwrap(correlated_not_in_named_bind.query_result).rows, 2), 0).integer_value != 5:
+        return err("YDBv1 correlated NOT IN did not bind its local filter while preserving empty-set semantics")
+    if result_is_ok(yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT i.id FROM items AS i WHERE i.id = :same AND EXISTS (SELECT p.user_id FROM profiles AS p WHERE p.user_id = i.id AND p.note = :same)", no_parameters)):
+        return err("YDBv1 binder accepted one named parameter with conflicting outer and correlated-local types")
+    let correlated_not_exists: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT i.id FROM items AS i WHERE NOT EXISTS (SELECT p.user_id FROM profiles AS p WHERE p.user_id = i.id) ORDER BY i.id", no_parameters)?
+    if not option_is_some(correlated_not_exists.query_result) or list_count(option_unwrap(correlated_not_exists.query_result).rows) != 1 or list_get(list_get(option_unwrap(correlated_not_exists.query_result).rows, 0), 0).integer_value != 3:
+        return err("YDBv1 correlated NOT EXISTS did not retain the unmatched outer row")
+    let correlated_snapshot: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(right_commit.storage, right_commit.wal, "SELECT i.id FROM items AS i WHERE EXISTS (SELECT p.user_id FROM profiles AS p WHERE p.user_id = i.id) ORDER BY i.id", no_parameters, right_commit.commit_ts, 0, List[YazaDbTxnStatusV1]())?
+    if list_count(correlated_snapshot.rows) != 2 or list_get(list_get(correlated_snapshot.rows, 1), 0).integer_value != 2:
+        return err("YDBv1 correlated EXISTS returned incorrect rows at a historical snapshot")
+    if result_is_ok(yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT i.id FROM items AS i WHERE EXISTS (SELECT p.user_id FROM profiles AS p INNER JOIN items AS j ON p.user_id = j.id INNER JOIN profiles AS q ON q.user_id = j.id WHERE j.id = i.id)", no_parameters)):
+        return err("YDBv1 binder accepted a correlated EXISTS subquery containing a JOIN as uncorrelated")
+    if result_is_ok(yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE EXISTS (SELECT user_id FROM profiles WHERE user_id = $1)", no_parameters)):
+        return err("YDBv1 binder accepted a bind parameter inside an EXISTS subquery")
+    var depth_eight_query: Text = "SELECT id FROM items"
+    var nested_level: Number = 0
+    while nested_level < 8:
+        set depth_eight_query = "SELECT id FROM items WHERE EXISTS (" + depth_eight_query + ")"
+        set nested_level = nested_level + 1
+    let depth_eight_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, depth_eight_query, no_parameters)?
+    if not option_is_some(depth_eight_result.query_result) or list_count(option_unwrap(depth_eight_result.query_result).rows) != 3:
+        return err("YDBv1 binder or executor rejected the supported eight-level subquery depth")
+    set depth_eight_query = "SELECT id FROM items WHERE EXISTS (" + depth_eight_query + ")"
+    if result_is_ok(yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, depth_eight_query, no_parameters)):
+        return err("YDBv1 binder accepted a subquery deeper than its eight-level bound")
+    let historical_in_subquery: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE id IN (SELECT user_id FROM profiles)", no_parameters, left_commit.commit_ts, 0, List[YazaDbTxnStatusV1]())?
+    if list_count(historical_in_subquery.rows) != 0:
+        return err("YDBv1 historical IN subquery observed rows newer than its snapshot")
+    let historical_nested_exists: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE EXISTS (SELECT user_id FROM profiles WHERE EXISTS (SELECT id FROM items WHERE id = 1))", no_parameters, left_commit.commit_ts, 0, List[YazaDbTxnStatusV1]())?
+    if list_count(historical_nested_exists.rows) != 0:
+        return err("YDBv1 historical nested EXISTS observed rows newer than its snapshot")
+    let historical_joined_in_subquery: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE id IN (SELECT p.user_id FROM profiles AS p INNER JOIN items AS i ON p.user_id = i.id INNER JOIN profiles AS q ON q.user_id = i.id)", no_parameters, right_commit.commit_ts, 0, List[YazaDbTxnStatusV1]())?
+    if list_count(historical_joined_in_subquery.rows) != 2:
+        return err("YDBv1 historical IN subquery with a JOIN returned incorrect snapshot rows")
+    let historical_exists: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE EXISTS (SELECT user_id FROM profiles)", no_parameters, left_commit.commit_ts, 0, List[YazaDbTxnStatusV1]())?
+    if list_count(historical_exists.rows) != 0:
+        return err("YDBv1 historical EXISTS observed rows newer than its snapshot")
+    let historical_exists_visible: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE EXISTS (SELECT user_id FROM profiles)", no_parameters, right_commit.commit_ts, 0, List[YazaDbTxnStatusV1]())?
+    if list_count(historical_exists_visible.rows) != 3:
+        return err("YDBv1 historical EXISTS omitted rows visible at its snapshot")
+    let historical_joined_exists: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(right_commit.storage, right_commit.wal, "SELECT id FROM items WHERE EXISTS (SELECT p.user_id FROM profiles AS p INNER JOIN items AS i ON p.user_id = i.id INNER JOIN profiles AS q ON q.user_id = i.id)", no_parameters, right_commit.commit_ts, 0, List[YazaDbTxnStatusV1]())?
+    if list_count(historical_joined_exists.rows) != 3:
+        return err("YDBv1 historical EXISTS subquery with a JOIN omitted rows visible at its snapshot")
+
+    let left_where_source: Text = "SELECT i.id, p.note FROM items AS i LEFT JOIN profiles AS p ON i.id = p.user_id WHERE p.note = 'alpha'"
+    let left_where_statement: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(right_commit.storage, right_commit.wal, left_where_source, no_parameters)?
+    if not option_is_some(left_where_statement.query_result): return err("YDBv1 LEFT JOIN WHERE query did not return a result")
+    let left_where: YazaSqlQueryResultV1 = option_unwrap(left_where_statement.query_result)
+    if list_count(left_where.rows) != 1: return err("YDBv1 LEFT JOIN WHERE predicate did not filter null-extended rows using SQL NULL semantics")
+
+    let empty_right_snapshot: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(left_commit.storage, left_commit.wal, left_source, no_parameters, left_commit.commit_ts, 0, List[YazaDbTxnStatusV1]())?
+    if list_count(empty_right_snapshot.rows) != 3: return err("YDBv1 historical LEFT JOIN did not preserve left rows when the right table was empty")
+    var empty_right_nulls: Number = 0
+    var empty_row_index: Number = 0
+    while empty_row_index < list_count(empty_right_snapshot.rows):
+        if list_get(list_get(empty_right_snapshot.rows, empty_row_index), 1).is_null: set empty_right_nulls = empty_right_nulls + 1
+        set empty_row_index = empty_row_index + 1
+    if empty_right_nulls != 3: return err("YDBv1 historical LEFT JOIN did not null-extend every row for an empty right input")
+
+    let empty_at_snapshot: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(right_commit.storage, right_commit.wal, source, no_parameters, left_commit.commit_ts, 0, List[YazaDbTxnStatusV1]())?
+    if list_count(empty_at_snapshot.rows) != 0: return err("YDBv1 historical INNER JOIN exposed rows from after its snapshot")
+    let visible_at_snapshot: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(right_commit.storage, right_commit.wal, source, no_parameters, right_commit.commit_ts, 0, List[YazaDbTxnStatusV1]())?
+    if list_count(visible_at_snapshot.rows) != 3: return err("YDBv1 historical INNER JOIN did not see rows committed by its snapshot")
+
+    let query_closed: Boolean = yaza_db_wal_log_close_v1(selected.wal)?
+    let storage_closed: Boolean = yaza_db_storage_close_v1(selected.storage)?
+    if not query_closed or not storage_closed: return err("YDBv1 JOIN fixture could not close its database handles")
+    let recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, db_name)?
+    let reopened: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(recovered.storage, recovered.wal, source, no_parameters)?
+    if not option_is_some(reopened.query_result) or list_count(option_unwrap(reopened.query_result).rows) != 3:
+        return err("YDBv1 INNER JOIN did not survive close and reopen")
+    let reopened_left: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(reopened.storage, reopened.wal, left_source, no_parameters)?
+    if not option_is_some(reopened_left.query_result) or list_count(option_unwrap(reopened_left.query_result).rows) != 4:
+        return err("YDBv1 LEFT JOIN did not survive close and reopen")
+    let reopened_right: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(reopened.storage, reopened.wal, right_source, no_parameters)?
+    if not option_is_some(reopened_right.query_result) or list_count(option_unwrap(reopened_right.query_result).rows) != 5:
+        return err("YDBv1 RIGHT JOIN did not survive close and reopen")
+    let cross_source: Text = "SELECT i.id, p.note FROM items AS i CROSS JOIN profiles AS p"
+    let reopened_cross: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(reopened.storage, reopened.wal, cross_source, no_parameters)?
+    if not option_is_some(reopened_cross.query_result) or list_count(option_unwrap(reopened_cross.query_result).rows) != 15:
+        return err("YDBv1 CROSS JOIN did not return the persisted Cartesian product")
+    let cross_explain: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(reopened.storage, reopened.wal, "EXPLAIN SELECT i.id, p.note FROM items AS i CROSS JOIN profiles AS p", no_parameters)?
+    if not option_is_some(cross_explain.explain_text) or text_find(option_unwrap(cross_explain.explain_text), "CrossJoin(table_id=") < 0:
+        return err("YDBv1 EXPLAIN did not report CROSS JOIN")
+    let theta_source: Text = "SELECT i.id, p.user_id FROM items AS i JOIN profiles AS p ON i.id < p.user_id"
+    let reopened_theta: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(reopened.storage, reopened.wal, theta_source, no_parameters)?
+    if not option_is_some(reopened_theta.query_result) or list_count(option_unwrap(reopened_theta.query_result).rows) != 4:
+        return err("YDBv1 theta JOIN returned an incorrect persistent result")
+    var theta_row_index: Number = 0
+    while theta_row_index < list_count(option_unwrap(reopened_theta.query_result).rows):
+        let theta_row: List[YazaSqlValueV1] = list_get(option_unwrap(reopened_theta.query_result).rows, theta_row_index)
+        if list_get(theta_row, 0).integer_value >= list_get(theta_row, 1).integer_value or list_get(theta_row, 1).is_null:
+            return err("YDBv1 theta JOIN returned a false match or matched a NULL key")
+        set theta_row_index = theta_row_index + 1
+    let theta_explain: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(reopened.storage, reopened.wal, "EXPLAIN SELECT i.id, p.user_id FROM items AS i JOIN profiles AS p ON i.id < p.user_id", no_parameters)?
+    if not option_is_some(theta_explain.explain_text) or text_find(option_unwrap(theta_explain.explain_text), "ThetaJoin(table_id=") < 0 or text_find(option_unwrap(theta_explain.explain_text), "predicate=<") < 0:
+        return err("YDBv1 EXPLAIN did not report the theta JOIN predicate")
+    let right_explain: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(reopened.storage, reopened.wal, "EXPLAIN SELECT i.id, p.note FROM items AS i RIGHT JOIN profiles AS p ON i.id = p.user_id", no_parameters)?
+    if not option_is_some(right_explain.explain_text) or text_find(option_unwrap(right_explain.explain_text), "RightJoin(normalized_to_left") < 0:
+        return err("YDBv1 EXPLAIN did not report RIGHT JOIN normalization")
+    let full_explain: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(reopened.storage, reopened.wal, "EXPLAIN SELECT i.id, p.note FROM items AS i FULL JOIN profiles AS p ON i.id = p.user_id", no_parameters)?
+    if not option_is_some(full_explain.explain_text) or text_find(option_unwrap(full_explain.explain_text), "FullJoin(table_id=") < 0:
+        return err("YDBv1 EXPLAIN did not report FULL JOIN")
+    let reopened_wal_closed: Boolean = yaza_db_wal_log_close_v1(reopened.wal)?
+    let reopened_storage_closed: Boolean = yaza_db_storage_close_v1(reopened.storage)?
+    if not reopened_wal_closed or not reopened_storage_closed: return err("YDBv1 reopened JOIN fixture handles did not close")
+    let root_closed: Boolean = close(root)?
+    if not root_closed: return err("YDBv1 JOIN fixture root did not close")
+    return ok(true)
+
+start:
+    let outcome: Result[Boolean, Text] = yazabase_sql_inner_join_persist_v1(arg(1))
+    if not result_is_ok(outcome): say result_unwrap_error(outcome)
+    elif result_unwrap(outcome): say "yazabase-sql-inner-join-persist-v1-ok"
+    else: say "YDBv1 JOIN fixture returned false"

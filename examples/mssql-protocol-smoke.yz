@@ -1,0 +1,97 @@
+use "std/mssql/protocol"
+
+start:
+    # 1. Endian helpers
+    let u16_be_res: Result[Bytes, Text] = tds_u16_be(1433)
+    assert result_is_ok(u16_be_res)
+    let u16_be: Bytes = result_unwrap(u16_be_res)
+    assert bytes_get(u16_be, 0) == 5
+    assert bytes_get(u16_be, 1) == 153
+    let u16_be_dec: Result[Number, Text] = tds_read_u16_be(u16_be, 0)
+    assert result_is_ok(u16_be_dec)
+    assert result_unwrap(u16_be_dec) == 1433
+
+    let u16_le_res: Result[Bytes, Text] = tds_u16_le(1433)
+    assert result_is_ok(u16_le_res)
+    let u16_le: Bytes = result_unwrap(u16_le_res)
+    assert bytes_get(u16_le, 0) == 153
+    assert bytes_get(u16_le, 1) == 5
+    let u16_le_dec: Result[Number, Text] = tds_read_u16_le(u16_le, 0)
+    assert result_is_ok(u16_le_dec)
+    assert result_unwrap(u16_le_dec) == 1433
+
+    # 2. UTF-16LE encoding and decoding
+    let text_sample: Text = "SELECT @@VERSION"
+    let utf16: Bytes = tds_encode_utf16le(text_sample)
+    assert bytes_length(utf16) == text_length(text_sample) * 2
+    let decoded_text_res: Result[Text, Text] = tds_decode_utf16le(utf16, 0, text_length(text_sample))
+    assert result_is_ok(decoded_text_res)
+    assert result_unwrap(decoded_text_res) == text_sample
+
+    # 3. TDS Password scrambling (nibble swap XOR 0xA5)
+    let scrambled_pass: Bytes = tds_scramble_password("Password1")
+    assert bytes_length(scrambled_pass) == text_length("Password1") * 2
+    # Verify scrambled is not cleartext
+    assert not bytes_equal(scrambled_pass, tds_encode_utf16le("Password1"))
+
+    # 4. TDS Packet framing (8-byte header)
+    let pkt_res: Result[Bytes, Text] = tds_packet(1, 1, bytes_from_text("SQL"), 42, 1)
+    assert result_is_ok(pkt_res)
+    let pkt: Bytes = result_unwrap(pkt_res)
+    assert bytes_length(pkt) == 11
+    let hdr_res: Result[TdsPacketHeader, Text] = tds_parse_packet_header(pkt, 0)
+    assert result_is_ok(hdr_res)
+    let hdr: TdsPacketHeader = result_unwrap(hdr_res)
+    assert hdr.packet_type == 1
+    assert hdr.status == 1
+    assert hdr.length == 11
+    assert hdr.spid == 42
+    assert hdr.packet_id == 1
+
+    # 5. PRELOGIN packet
+    let prelogin_res: Result[Bytes, Text] = tds_prelogin_packet(0)
+    assert result_is_ok(prelogin_res)
+    let prelogin: Bytes = result_unwrap(prelogin_res)
+    let pl_hdr: Result[TdsPacketHeader, Text] = tds_parse_packet_header(prelogin, 0)
+    assert result_is_ok(pl_hdr)
+    assert result_unwrap(pl_hdr).packet_type == 18
+    assert result_unwrap(pl_hdr).status == 1
+
+    # 6. SQL Batch packet
+    let batch_res: Result[Bytes, Text] = tds_sql_batch_packet("SELECT 1", 10)
+    assert result_is_ok(batch_res)
+    let batch: Bytes = result_unwrap(batch_res)
+    let batch_hdr: Result[TdsPacketHeader, Text] = tds_parse_packet_header(batch, 0)
+    assert result_is_ok(batch_hdr)
+    assert result_unwrap(batch_hdr).packet_type == 1
+    assert result_unwrap(batch_hdr).spid == 10
+
+    # 7. Token parsing: DONE token (0xFD)
+    # Payload: status 16 (count valid), curcmd 193, rowcount 5
+    var done_bytes: Bytes = bytes_concat(result_unwrap(tds_u16_le(16)), result_unwrap(tds_u16_le(193)))
+    set done_bytes = bytes_concat(done_bytes, result_unwrap(tds_u32_le(5)))
+    set done_bytes = bytes_concat(done_bytes, result_unwrap(tds_u32_le(0)))
+    let done_res: Result[TdsDoneToken, Text] = tds_parse_done_token(done_bytes, 0)
+    assert result_is_ok(done_res)
+    assert result_unwrap(done_res).status == 16
+    assert result_unwrap(done_res).cur_cmd == 193
+    assert result_unwrap(done_res).row_count == 5
+
+    # 8. Token parsing: ERROR token (0xAA)
+    # len (u16 LE), num (u32 LE), state (u8), class (u8), msg_len (u16 LE), msg (UTF-16LE)
+    let err_msg: Text = "Invalid object"
+    let err_utf16: Bytes = tds_encode_utf16le(err_msg)
+    let total_err_len: Number = 8 + bytes_length(err_utf16)
+    var err_payload: Bytes = result_unwrap(tds_u16_le(total_err_len))
+    set err_payload = bytes_concat(err_payload, result_unwrap(tds_u32_le(208))) # error 208
+    set err_payload = bytes_concat(err_payload, bytes_concat(bytes_from_number(1), bytes_from_number(16))) # state 1, severity 16
+    set err_payload = bytes_concat(err_payload, result_unwrap(tds_u16_le(text_length(err_msg))))
+    set err_payload = bytes_concat(err_payload, err_utf16)
+
+    let err_res: Result[TdsErrorToken, Text] = tds_parse_error_token(err_payload, 0)
+    assert result_is_ok(err_res)
+    let err_token: TdsErrorToken = result_unwrap(err_res)
+    assert err_token.error_number == 208
+    assert err_token.state == 1
+    assert err_token.severity == 16
+    assert err_token.message == "Invalid object"

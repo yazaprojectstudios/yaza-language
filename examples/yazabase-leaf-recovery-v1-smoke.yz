@@ -1,0 +1,190 @@
+use "std/fs"
+use "../yazabase/allocator_v1"
+use "../yazabase/checkpoint_v1"
+use "../yazabase/page_v1"
+use "../yazabase/page_wal_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/wal_v1"
+
+shape YazaBaseLeafRecoverySeedV1:
+    storage: YazaDbStorageHandleV1
+    wal: YazaDbWalLogV1
+    txn_id: Number
+    page_id: Number
+    begin_lsn: Number
+    allocation_lsn: Number
+    before_image: Bytes
+
+fn yazabase_leaf_recovery_seed_v1(root: Number, file_name: Text, db_uuid: Bytes) -> Result[YazaBaseLeafRecoverySeedV1, Text]:
+    let initial: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(db_uuid, 0, 1, 1, 0, 2, 1)
+    let storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, file_name, initial)?
+    let wal: YazaDbWalLogV1 = yaza_db_wal_log_open_for_v1(root, db_uuid)?
+    let begin: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(wal, YazaDbWalRecordV1(0, 0, 1, yaza_db_wal_type_mtr_end_v1(), 0, bytes_from_text("")))?
+    let allocation: YazaDbPageSpaceChangeV1 = yaza_db_allocator_allocate_existing_v1(storage, begin.log, 1, begin.record.lsn)?
+    let empty_leaf: Bytes = yaza_db_page_new_v1(allocation.page_id, allocation.record.lsn, 1, 0)?
+    let written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, empty_leaf)?
+    if written != yaza_db_page_size_v1(): return err("YDBv1 leaf-recovery fixture could not initialize its allocated leaf")
+    return ok(YazaBaseLeafRecoverySeedV1(storage, allocation.wal, 1, allocation.page_id, begin.record.lsn, allocation.record.lsn, empty_leaf))
+
+fn yazabase_leaf_page_has_key_v1(page: Bytes, page_id: Number, expected_key: Bytes) -> Result[Boolean, Text]:
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, page_id)?
+    var index: Number = 0
+    while index < header.count:
+        let key: Bytes = yaza_db_page_slot_key_v1(page, index, page_id)?
+        if bytes_equal(key, expected_key): return ok(true)
+        set index = index + 1
+    return ok(false)
+
+fn yazabase_leaf_page_value_equals_v1(page: Bytes, page_id: Number, expected_key: Bytes, expected_value: Bytes) -> Result[Boolean, Text]:
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, page_id)?
+    var index: Number = 0
+    while index < header.count:
+        let key: Bytes = yaza_db_page_slot_key_v1(page, index, page_id)?
+        if bytes_equal(key, expected_key):
+            let slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(page, index, page_id)?
+            return ok(bytes_equal(slot.payload, expected_value))
+        set index = index + 1
+    return ok(false)
+
+fn yazabase_leaf_recovery_check_v1(root_path: Text) -> Result[Number, Text]:
+    let root: Number = root_open(root_path)?
+
+    # Committed WAL record with an intentionally unflushed after-image: startup must redo it.
+    let committed_seed: YazaBaseLeafRecoverySeedV1 = yazabase_leaf_recovery_seed_v1(root, "leaf-committed-smoke.ydb", bytes_from_text("leafcommit-uuid1"))?
+    let committed_key: Bytes = bytes_from_text("committed-key")
+    let committed_value: Bytes = bytes_from_text("committed-row")
+    let committed_payload_size: Number = yaza_db_wal_leaf_mutation_payload_size_v1()
+    let committed_record_length: Number = yaza_db_wal_header_size_v1() + committed_payload_size
+    let committed_lsn: Number = yaza_db_wal_record_lsn_for_append_v1(committed_seed.wal, committed_record_length)?
+    let committed_after: Bytes = yaza_db_page_insert_slot_v1(committed_seed.before_image, committed_key, committed_value)?
+    if not yaza_db_write_uint_le_v1(committed_after, 0, committed_lsn, 8): return err("YDBv1 committed leaf fixture could not stamp its after-image")
+    let committed_final: Bytes = yaza_db_page_finalize_v1(committed_after)?
+    let committed_payload: Bytes = yaza_db_wal_leaf_mutation_payload_encode_v1(yaza_db_wal_type_leaf_insert_v1(), committed_seed.page_id, committed_lsn, committed_seed.before_image, committed_final)?
+    let committed_mutation: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(committed_seed.wal, YazaDbWalRecordV1(0, committed_seed.allocation_lsn, committed_seed.txn_id, yaza_db_wal_type_leaf_insert_v1(), 0, committed_payload))?
+    if committed_mutation.record.lsn != committed_lsn: return err("YDBv1 committed leaf fixture LSN prediction changed")
+    let committed_insert_written: Number = yaza_db_storage_write_page_sync_v1(committed_seed.storage.file, committed_seed.storage.header, committed_final)?
+    if committed_insert_written != yaza_db_page_size_v1(): return err("YDBv1 committed leaf fixture could not persist its first insert image")
+    let committed_value_v2: Bytes = bytes_from_text("committed-row-v2")
+    let committed_update: YazaDbWalLeafMutationAppendV1 = yaza_db_storage_append_leaf_mutation_v1(committed_seed.storage, committed_mutation.log, committed_seed.txn_id, committed_mutation.record.lsn, yaza_db_wal_type_leaf_update_v1(), committed_seed.page_id, committed_key, committed_value_v2)?
+    let commit_payload: Bytes = yaza_db_wal_commit_payload_encode_v1(1)?
+    let committed_log: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(committed_update.append.log, YazaDbWalRecordV1(0, committed_update.append.record.lsn, committed_seed.txn_id, yaza_db_wal_type_commit_v1(), 0, commit_payload))?
+    let committed_stale_write: Number = yaza_db_storage_write_page_sync_v1(committed_seed.storage.file, committed_seed.storage.header, committed_final)?
+    if committed_stale_write != yaza_db_page_size_v1(): return err("YDBv1 committed leaf fixture could not restore its older synced page for redo")
+    let committed_wal_closed: Boolean = yaza_db_wal_log_close_v1(committed_log.log)?
+    let committed_storage_closed: Boolean = yaza_db_storage_close_v1(committed_seed.storage)?
+    if not committed_wal_closed or not committed_storage_closed: return err("YDBv1 committed leaf fixture could not close before simulated crash")
+    let committed_recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "leaf-committed-smoke.ydb")?
+    let committed_page: Bytes = yaza_db_storage_read_page_v1(committed_recovered.storage.file, committed_recovered.storage.header, committed_seed.page_id)?
+    let committed_value_ok: Boolean = yazabase_leaf_page_value_equals_v1(committed_page, committed_seed.page_id, committed_key, committed_value_v2)?
+    if not committed_value_ok or committed_recovered.storage.header.next_commit_ts != 2 or committed_recovered.storage.header.next_txn_id != 2: return err("YDBv1 startup recovery did not redo and publish the committed leaf update")
+    let committed_checkpoint_lsn: Number = committed_recovered.storage.header.checkpoint_lsn
+    let committed_wal_end: Number = committed_recovered.wal.next_lsn
+    let committed_recovered_wal_closed: Boolean = yaza_db_wal_log_close_v1(committed_recovered.wal)?
+    let committed_recovered_storage_closed: Boolean = yaza_db_storage_close_v1(committed_recovered.storage)?
+    if not committed_recovered_wal_closed or not committed_recovered_storage_closed: return err("YDBv1 committed leaf recovery handles could not close")
+    let committed_again: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "leaf-committed-smoke.ydb")?
+    let committed_again_page: Bytes = yaza_db_storage_read_page_v1(committed_again.storage.file, committed_again.storage.header, committed_seed.page_id)?
+    let committed_again_value_ok: Boolean = yazabase_leaf_page_value_equals_v1(committed_again_page, committed_seed.page_id, committed_key, committed_value_v2)?
+    if not committed_again_value_ok or committed_again.applied_checkpoint_count != 0 or committed_again.storage.header.checkpoint_lsn != committed_checkpoint_lsn or committed_again.wal.next_lsn != committed_wal_end: return err("YDBv1 committed leaf redo/checkpoint was not idempotent")
+    let committed_again_wal_closed: Boolean = yaza_db_wal_log_close_v1(committed_again.wal)?
+    let committed_again_storage_closed: Boolean = yaza_db_storage_close_v1(committed_again.storage)?
+    if not committed_again_wal_closed or not committed_again_storage_closed: return err("YDBv1 committed leaf idempotence handles could not close")
+
+    # A loser update is redone first, then undone with a durable leaf CLR and page-allocation CLR.
+    let loser_seed: YazaBaseLeafRecoverySeedV1 = yazabase_leaf_recovery_seed_v1(root, "leaf-loser-smoke.ydb", bytes_from_text("leafloser-uuid01"))?
+    let loser_key: Bytes = bytes_from_text("loser-key")
+    let loser_mutation: YazaDbWalLeafMutationAppendV1 = yaza_db_storage_append_leaf_mutation_v1(loser_seed.storage, loser_seed.wal, loser_seed.txn_id, loser_seed.allocation_lsn, yaza_db_wal_type_leaf_insert_v1(), loser_seed.page_id, loser_key, bytes_from_text("loser-row"))?
+    let loser_wal_closed: Boolean = yaza_db_wal_log_close_v1(loser_mutation.append.log)?
+    let loser_storage_closed: Boolean = yaza_db_storage_close_v1(loser_seed.storage)?
+    if not loser_wal_closed or not loser_storage_closed: return err("YDBv1 loser leaf fixture could not close before recovery")
+    let loser_recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "leaf-loser-smoke.ydb")?
+    let loser_page_offset: Number = yaza_db_storage_page_offset_v1(loser_seed.page_id)?
+    let loser_page: Bytes = read_exact(loser_recovered.storage.file, loser_page_offset, yaza_db_page_size_v1())?
+    let loser_found: Boolean = yazabase_leaf_page_has_key_v1(loser_page, loser_seed.page_id, loser_key)?
+    let loser_bitmap: Bytes = yaza_db_storage_read_page_v1(loser_recovered.storage.file, loser_recovered.storage.header, 2)?
+    let loser_allocated: Boolean = yaza_db_bitmap_page_bit_for_page_v1(loser_bitmap, loser_seed.page_id, 2)?
+    if loser_found or loser_allocated or loser_recovered.applied_checkpoint_count != 1: return err("YDBv1 recovery did not undo the loser leaf insert and its page allocation")
+    let loser_checkpoint_lsn: Number = loser_recovered.storage.header.checkpoint_lsn
+    let loser_wal_end: Number = loser_recovered.wal.next_lsn
+    let loser_recovered_wal_closed: Boolean = yaza_db_wal_log_close_v1(loser_recovered.wal)?
+    let loser_recovered_storage_closed: Boolean = yaza_db_storage_close_v1(loser_recovered.storage)?
+    if not loser_recovered_wal_closed or not loser_recovered_storage_closed: return err("YDBv1 loser recovery handles could not close")
+    let loser_again: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "leaf-loser-smoke.ydb")?
+    if loser_again.applied_checkpoint_count != 0 or loser_again.storage.header.checkpoint_lsn != loser_checkpoint_lsn or loser_again.wal.next_lsn != loser_wal_end: return err("YDBv1 loser undo and compensation replay were not idempotent")
+    let loser_again_wal_closed: Boolean = yaza_db_wal_log_close_v1(loser_again.wal)?
+    let loser_again_storage_closed: Boolean = yaza_db_storage_close_v1(loser_again.storage)?
+    if not loser_again_wal_closed or not loser_again_storage_closed: return err("YDBv1 loser idempotence handles could not close")
+
+    # A committed row survives a loser's UPDATE and DELETE in reverse-LSN order.
+    let edit_seed: YazaBaseLeafRecoverySeedV1 = yazabase_leaf_recovery_seed_v1(root, "leaf-loser-edit-smoke.ydb", bytes_from_text("leafedit-uuid001"))?
+    let edit_key: Bytes = bytes_from_text("edit-key")
+    let edit_base: Bytes = bytes_from_text("edit-base-row")
+    let edit_insert: YazaDbWalLeafMutationAppendV1 = yaza_db_storage_append_leaf_mutation_v1(edit_seed.storage, edit_seed.wal, edit_seed.txn_id, edit_seed.allocation_lsn, yaza_db_wal_type_leaf_insert_v1(), edit_seed.page_id, edit_key, edit_base)?
+    let edit_commit_payload: Bytes = yaza_db_wal_commit_payload_encode_v1(1)?
+    let edit_commit: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(edit_insert.append.log, YazaDbWalRecordV1(0, edit_insert.append.record.lsn, edit_seed.txn_id, yaza_db_wal_type_commit_v1(), 0, edit_commit_payload))?
+    let edit_begin: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(edit_commit.log, YazaDbWalRecordV1(0, 0, 2, yaza_db_wal_type_mtr_end_v1(), 0, bytes_from_text("")))?
+    let edit_update: YazaDbWalLeafMutationAppendV1 = yaza_db_storage_append_leaf_mutation_v1(edit_seed.storage, edit_begin.log, 2, edit_begin.record.lsn, yaza_db_wal_type_leaf_update_v1(), edit_seed.page_id, edit_key, bytes_from_text("edit-loser-update"))?
+    let edit_delete: YazaDbWalLeafMutationAppendV1 = yaza_db_storage_append_leaf_mutation_v1(edit_seed.storage, edit_update.append.log, 2, edit_update.append.record.lsn, yaza_db_wal_type_leaf_delete_v1(), edit_seed.page_id, edit_key, bytes_from_text(""))?
+    let edit_wal_closed: Boolean = yaza_db_wal_log_close_v1(edit_delete.append.log)?
+    let edit_storage_closed: Boolean = yaza_db_storage_close_v1(edit_seed.storage)?
+    if not edit_wal_closed or not edit_storage_closed: return err("YDBv1 loser edit fixture could not close before recovery")
+    let edit_recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "leaf-loser-edit-smoke.ydb")?
+    let edit_page: Bytes = yaza_db_storage_read_page_v1(edit_recovered.storage.file, edit_recovered.storage.header, edit_seed.page_id)?
+    let edit_value_ok: Boolean = yazabase_leaf_page_value_equals_v1(edit_page, edit_seed.page_id, edit_key, edit_base)?
+    if not edit_value_ok or edit_recovered.storage.header.next_commit_ts != 2 or edit_recovered.storage.header.next_txn_id != 3 or edit_recovered.applied_checkpoint_count != 1: return err("YDBv1 loser UPDATE/DELETE recovery did not restore the committed row")
+    let edit_checkpoint_lsn: Number = edit_recovered.storage.header.checkpoint_lsn
+    let edit_wal_end: Number = edit_recovered.wal.next_lsn
+    let edit_recovered_wal_closed: Boolean = yaza_db_wal_log_close_v1(edit_recovered.wal)?
+    let edit_recovered_storage_closed: Boolean = yaza_db_storage_close_v1(edit_recovered.storage)?
+    if not edit_recovered_wal_closed or not edit_recovered_storage_closed: return err("YDBv1 loser edit recovery handles could not close")
+    let edit_again: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "leaf-loser-edit-smoke.ydb")?
+    let edit_again_page: Bytes = yaza_db_storage_read_page_v1(edit_again.storage.file, edit_again.storage.header, edit_seed.page_id)?
+    let edit_again_value_ok: Boolean = yazabase_leaf_page_value_equals_v1(edit_again_page, edit_seed.page_id, edit_key, edit_base)?
+    if not edit_again_value_ok or edit_again.applied_checkpoint_count != 0 or edit_again.storage.header.checkpoint_lsn != edit_checkpoint_lsn or edit_again.wal.next_lsn != edit_wal_end: return err("YDBv1 loser UPDATE/DELETE recovery was not idempotent")
+    let edit_again_wal_closed: Boolean = yaza_db_wal_log_close_v1(edit_again.wal)?
+    let edit_again_storage_closed: Boolean = yaza_db_storage_close_v1(edit_again.storage)?
+    if not edit_again_wal_closed or not edit_again_storage_closed: return err("YDBv1 loser edit idempotence handles could not close")
+
+    # Simulate a crash after the CLR is durable but before its restored page image reaches disk.
+    let resume_seed: YazaBaseLeafRecoverySeedV1 = yazabase_leaf_recovery_seed_v1(root, "leaf-clr-resume-smoke.ydb", bytes_from_text("leafresume-uuid1"))?
+    let resume_key: Bytes = bytes_from_text("resume-key")
+    let resume_mutation: YazaDbWalLeafMutationAppendV1 = yaza_db_storage_append_leaf_mutation_v1(resume_seed.storage, resume_seed.wal, resume_seed.txn_id, resume_seed.allocation_lsn, yaza_db_wal_type_leaf_insert_v1(), resume_seed.page_id, resume_key, bytes_from_text("resume-row"))?
+    let resume_clr_length: Number = yaza_db_wal_header_size_v1() + yaza_db_wal_leaf_compensation_payload_size_v1()
+    let resume_clr_lsn: Number = yaza_db_wal_record_lsn_for_append_v1(resume_mutation.append.log, resume_clr_length)?
+    let resume_before: Bytes = bytes_try_slice(resume_seed.before_image, 0, yaza_db_page_size_v1())?
+    if not yaza_db_write_uint_le_v1(resume_before, 0, resume_clr_lsn, 8): return err("YDBv1 CLR-resume fixture could not stamp its compensation image")
+    let resume_clr_image: Bytes = yaza_db_page_finalize_v1(resume_before)?
+    let resume_clr_payload: Bytes = yaza_db_wal_leaf_compensation_payload_encode_v1(yaza_db_wal_type_leaf_insert_v1(), resume_seed.page_id, resume_seed.allocation_lsn, resume_mutation.append.record.lsn, resume_clr_lsn, resume_mutation.append.record.lsn, resume_clr_image)?
+    let resume_clr: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(resume_mutation.append.log, YazaDbWalRecordV1(0, resume_mutation.append.record.lsn, resume_seed.txn_id, yaza_db_wal_type_compensation_v1(), 0, resume_clr_payload))?
+    if resume_clr.record.lsn != resume_clr_lsn: return err("YDBv1 CLR-resume fixture LSN prediction changed")
+    let resume_wal_closed: Boolean = yaza_db_wal_log_close_v1(resume_clr.log)?
+    let resume_storage_closed: Boolean = yaza_db_storage_close_v1(resume_seed.storage)?
+    if not resume_wal_closed or not resume_storage_closed: return err("YDBv1 CLR-resume fixture could not close before simulated crash")
+    let resume_recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "leaf-clr-resume-smoke.ydb")?
+    let resume_page_offset: Number = yaza_db_storage_page_offset_v1(resume_seed.page_id)?
+    let resume_page: Bytes = read_exact(resume_recovered.storage.file, resume_page_offset, yaza_db_page_size_v1())?
+    let resume_found: Boolean = yazabase_leaf_page_has_key_v1(resume_page, resume_seed.page_id, resume_key)?
+    let resume_bitmap: Bytes = yaza_db_storage_read_page_v1(resume_recovered.storage.file, resume_recovered.storage.header, 2)?
+    let resume_allocated: Boolean = yaza_db_bitmap_page_bit_for_page_v1(resume_bitmap, resume_seed.page_id, 2)?
+    if resume_found or resume_allocated or resume_recovered.applied_checkpoint_count != 1: return err("YDBv1 startup recovery did not replay the durable CLR and finish loser undo")
+    let resume_wal_end: Number = resume_recovered.wal.next_lsn
+    let resume_checkpoint_lsn: Number = resume_recovered.storage.header.checkpoint_lsn
+    let resume_recovered_wal_closed: Boolean = yaza_db_wal_log_close_v1(resume_recovered.wal)?
+    let resume_recovered_storage_closed: Boolean = yaza_db_storage_close_v1(resume_recovered.storage)?
+    if not resume_recovered_wal_closed or not resume_recovered_storage_closed: return err("YDBv1 CLR-resume recovery handles could not close")
+    let resume_again: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "leaf-clr-resume-smoke.ydb")?
+    if resume_again.applied_checkpoint_count != 0 or resume_again.storage.header.checkpoint_lsn != resume_checkpoint_lsn or resume_again.wal.next_lsn != resume_wal_end: return err("YDBv1 CLR restart recovery was not idempotent")
+    let resume_again_wal_closed: Boolean = yaza_db_wal_log_close_v1(resume_again.wal)?
+    let resume_again_storage_closed: Boolean = yaza_db_storage_close_v1(resume_again.storage)?
+    if not resume_again_wal_closed or not resume_again_storage_closed: return err("YDBv1 CLR idempotence handles could not close")
+
+    let ignored_root_close: Boolean = close(root)?
+    if not ignored_root_close: return err("YDBv1 leaf-recovery fixture root close failed")
+    return ok(4)
+
+start:
+    let outcome: Result[Number, Text] = yazabase_leaf_recovery_check_v1(arg(1))
+    if result_is_ok(outcome):
+        say "yazabase-leaf-recovery-v1-ok cases=" + number_text(result_unwrap(outcome))
+    else:
+        say result_unwrap_error(outcome)

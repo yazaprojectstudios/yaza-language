@@ -1,0 +1,79 @@
+# HTTP Middleware Activation Helper (CORS, Fail-Closed Auth Secret, YWT/JWT HS256, and RBAC).
+# Production hardening:
+#   - Set YAZA_ENV=production + YAZA_AUTH_SECRET (min 32 chars) -> fail-closed startup if missing/weak.
+#   - Set YAZA_AUTH_ENABLED=false in local dev only to bypass Bearer verification.
+
+use "std/middleware"
+use "std/http"
+use "std/ywt"
+use "std/jwt"
+use "std/time"
+
+fn api_dev_fallback_secret() -> Text:
+    return "yaza-dev-secret-change-in-prod-and-rotate"
+
+fn api_auth_secret() -> Text:
+    let env_secret: Text = env_get("YAZA_AUTH_SECRET")
+    if env_secret != "":
+        return env_secret
+    return api_dev_fallback_secret()
+
+fn api_auth_enabled() -> Boolean:
+    if env_get("YAZA_ENV") == "production":
+        return true
+    return env_get("YAZA_AUTH_ENABLED") != "false"
+
+fn api_auth_validate_config() -> Result[Boolean, Text]:
+    if env_get("YAZA_ENV") == "production":
+        let s: Text = env_get("YAZA_AUTH_SECRET")
+        if text_length(s) < 32 or s == api_dev_fallback_secret():
+            return err("YAZA_ENV=production requires YAZA_AUTH_SECRET with at least 32 non-default characters")
+    return ok(true)
+
+fn api_auth_issuer() -> Text:
+    return "yaza-api"
+
+fn api_auth_audience() -> Text:
+    return "yaza-clients"
+
+fn api_middleware_pipeline_auth(request: HttpRequest, allowed_roles_csv: Text) -> MiddlewareContext:
+    var ctx: MiddlewareContext = middleware_begin(request)
+    set ctx = middleware_cors_preflight(ctx)
+    if not api_auth_enabled():
+        return ctx
+    let bearer: Text = middleware_bearer_token(request)
+    if text_starts_with(bearer, "ywt1."):
+        set ctx = middleware_auth_ywt(ctx, api_auth_issuer(), api_auth_secret())
+    else:
+        set ctx = middleware_auth_jwt(ctx, api_auth_issuer(), api_auth_audience(), api_auth_secret())
+    if allowed_roles_csv != "":
+        set ctx = middleware_require_any_role(ctx, allowed_roles_csv)
+    return ctx
+
+fn api_middleware_pipeline_jwt(request: HttpRequest, allowed_roles_csv: Text) -> MiddlewareContext:
+    var ctx: MiddlewareContext = middleware_begin(request)
+    set ctx = middleware_cors_preflight(ctx)
+    if not api_auth_enabled():
+        return ctx
+    set ctx = middleware_auth_jwt(ctx, api_auth_issuer(), api_auth_audience(), api_auth_secret())
+    if allowed_roles_csv != "":
+        set ctx = middleware_require_any_role(ctx, allowed_roles_csv)
+    return ctx
+
+fn api_middleware_pipeline_ywt(request: HttpRequest, required_role: Text) -> MiddlewareContext:
+    var ctx: MiddlewareContext = middleware_begin(request)
+    set ctx = middleware_cors_preflight(ctx)
+    if not api_auth_enabled():
+        return ctx
+    set ctx = middleware_auth_ywt(ctx, api_auth_issuer(), api_auth_secret())
+    if required_role != "":
+        set ctx = middleware_require_role(ctx, required_role)
+    return ctx
+
+fn api_issue_token_jwt(subject: Text, role: Text, ttl_seconds: Number) -> Text:
+    let exp: Number = (time_now_unix_ms() / 1000) + ttl_seconds
+    return jwt_create_hs256(subject, api_auth_issuer(), api_auth_audience(), role, exp, api_auth_secret())
+
+fn api_issue_token_ywt(subject: Text, role: Text, ttl_seconds: Number) -> Text:
+    let exp: Number = (time_now_unix_ms() / 1000) + ttl_seconds
+    return ywt_create_with_role(subject, api_auth_issuer(), role, exp, api_auth_secret())

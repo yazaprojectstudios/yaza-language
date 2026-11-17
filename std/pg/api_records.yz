@@ -1,0 +1,275 @@
+# Parameterized CRUD operations for the YAZA API record table.
+# The wire protocol, transport, and SQL value binding remain in YAZA modules.
+use "transport"
+use "errors"
+use "std/db/query"
+
+fn pg_api_records_resource_valid(resource: Text) -> Boolean:
+    let length: Number = text_length(resource)
+    if length < 2 or length > 255 or text_byte(resource, 0) != 47:
+        return false
+    var index: Number = 1
+    var previous_slash: Boolean = true
+    while index < length:
+        let byte: Number = text_byte(resource, index)
+        if byte == 47:
+            if previous_slash or index + 1 == length:
+                return false
+            set previous_slash = true
+        else:
+            let alpha: Boolean = (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122)
+            let digit: Boolean = byte >= 48 and byte <= 57
+            if not alpha and not digit and byte != 45 and byte != 95:
+                return false
+            set previous_slash = false
+        set index = index + 1
+    return not previous_slash
+
+fn pg_api_records_id_valid(id: Text) -> Boolean:
+    let length: Number = text_length(id)
+    if length < 1 or length > 128:
+        return false
+    var index: Number = 0
+    while index < length:
+        let byte: Number = text_byte(id, index)
+        let alpha: Boolean = (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122)
+        let digit: Boolean = byte >= 48 and byte <= 57
+        if not alpha and not digit and byte != 45 and byte != 95:
+            return false
+        set index = index + 1
+    return true
+
+fn pg_api_records_payload_valid(payload: Text) -> Boolean:
+    let byte_length: Number = bytes_length(bytes_from_text(payload))
+    if byte_length < 2 or byte_length > 49152:
+        return false
+    var first: Number = 0
+    while first < byte_length and (text_byte(payload, first) == 32 or text_byte(payload, first) == 9 or text_byte(payload, first) == 10 or text_byte(payload, first) == 13):
+        set first = first + 1
+    var last: Number = byte_length - 1
+    while last >= first and (text_byte(payload, last) == 32 or text_byte(payload, last) == 9 or text_byte(payload, last) == 10 or text_byte(payload, last) == 13):
+        set last = last - 1
+    return first < last and text_byte(payload, first) == 123 and text_byte(payload, last) == 125
+
+fn pg_api_records_result_shape_valid(result: PgQueryResult, expected_columns: Number) -> Boolean:
+    let columns: Number = pg_query_column_count(result)
+    if columns != expected_columns or result.row_count < 0 or result.row_count > 100:
+        return false
+    if list_count(result.cell_values) != result.row_count * columns or list_count(result.cell_is_null) != result.row_count * columns:
+        return false
+    return true
+
+fn pg_api_records_payload_at(result: PgQueryResult, row: Number) -> Result[Text, Text]:
+    if not pg_api_records_result_shape_valid(result, 1):
+        return err("postgres API records: server returned an unexpected result shape")
+    if row < 0 or row >= result.row_count:
+        return err("postgres API records: row index is outside the result")
+    if list_get(result.column_metadata, 0) != "payload":
+        return err("postgres API records: server returned an unexpected payload column")
+    let value: Result[Option[Text], Text] = pg_query_text(result, row, 0)
+    if not result_is_ok(value):
+        return err(result_unwrap_error(value))
+    if not option_is_some(result_unwrap(value)):
+        return err("postgres API records: stored payload is unexpectedly NULL")
+    let payload: Text = option_unwrap(result_unwrap(value))
+    if not pg_api_records_payload_valid(payload):
+        return err("postgres API records: stored payload exceeds the object profile")
+    return ok(payload)
+
+fn pg_api_records_transaction_idle(status: PgTransactionStatus) -> Boolean:
+    match status:
+        Idle:
+            return true
+        InTransaction:
+            return false
+        FailedTransaction:
+            return false
+    return false
+
+fn pg_api_records_list_json(result: PgQueryResult) -> Result[Text, Text]:
+    if not pg_api_records_result_shape_valid(result, 1):
+        return err("postgres API records: server returned an unexpected result shape")
+    let items: TextList = text_list()
+    var row: Number = 0
+    while row < result.row_count:
+        let payload: Result[Text, Text] = pg_api_records_payload_at(result, row)
+        if not result_is_ok(payload):
+            return err(result_unwrap_error(payload))
+        list_push(items, result_unwrap(payload))
+        set row = row + 1
+    return ok("[" + text_join(items, ",") + "]")
+
+fn pg_api_records_get_json(result: PgQueryResult) -> Result[Option[Text], Text]:
+    if not pg_api_records_result_shape_valid(result, 1):
+        return err("postgres API records: server returned an unexpected result shape")
+    if result.row_count == 0:
+        return ok(none)
+    if result.row_count != 1:
+        return err("postgres API records: primary key lookup returned duplicate rows")
+    let payload: Result[Text, Text] = pg_api_records_payload_at(result, 0)
+    if not result_is_ok(payload):
+        return err(result_unwrap_error(payload))
+    return ok(some(result_unwrap(payload)))
+
+fn pg_api_records_add_identity(parameters: PgParameters, resource: Text, id: Text) -> Result[Boolean, Text]:
+    let resource_added: Result[Boolean, Text] = pg_parameters_add_text(parameters, resource)
+    if not result_is_ok(resource_added):
+        return err(result_unwrap_error(resource_added))
+    let id_added: Result[Boolean, Text] = pg_parameters_add_text(parameters, id)
+    if not result_is_ok(id_added):
+        return err(result_unwrap_error(id_added))
+    return ok(true)
+
+fn pg_api_records_probe(handle: Number, timeout_ms: Number) -> Result[Boolean, Text]:
+    let columns: TextList = text_list()
+    list_push(columns, "id")
+    let descriptor: Result[DbSelect, DbError] = db_select_new("yaza_api_records", columns)
+    if not result_is_ok(descriptor):
+        return err("postgres API records: readiness query descriptor is invalid")
+    let page: Result[DbSelect, DbError] = db_select_page(result_unwrap(descriptor), 1, 0)
+    if not result_is_ok(page):
+        return err("postgres API records: readiness query page is invalid")
+    let statement: Result[Text, DbError] = db_select_postgres_sql(result_unwrap(page))
+    if not result_is_ok(statement):
+        return err("postgres API records: readiness query could not be compiled")
+    let parameters: PgParameters = pg_parameters_new()
+    let query: Result[PgQueryResult, Text] = pg_query_with_parameters(handle, result_unwrap(statement), parameters, timeout_ms)
+    if not result_is_ok(query):
+        return err("postgres API records: readiness query failed")
+    let result: PgQueryResult = result_unwrap(query)
+    if result.command_count != 1 or result.row_count < 0 or result.row_count > 1 or pg_query_column_count(result) != 1:
+        return err("postgres API records: readiness query returned an unexpected result")
+    if list_get(result.column_metadata, 0) != "id" or not pg_api_records_transaction_idle(result.transaction_status):
+        return err("postgres API records: readiness query returned unexpected metadata")
+    return ok(true)
+
+fn pg_api_records_list(handle: Number, resource: Text, limit: Number, offset: Number, timeout_ms: Number) -> Result[Text, Text]:
+    if not pg_api_records_resource_valid(resource):
+        return err("postgres API records: resource path is invalid")
+    if limit < 1 or limit > 100:
+        return err("postgres API records: limit must be between 1 and 100")
+    if offset < 0 or offset > 2147483647:
+        return err("postgres API records: offset must be between 0 and 2147483647")
+    let parameters: PgParameters = pg_parameters_new()
+    let resource_added: Result[Boolean, Text] = pg_parameters_add_text(parameters, resource)
+    if not result_is_ok(resource_added):
+        return err(result_unwrap_error(resource_added))
+    let limit_value: Int32 = int32_from_number(limit)
+    let limit_added: Result[Boolean, Text] = pg_parameters_add_int32(parameters, limit_value)
+    if not result_is_ok(limit_added):
+        return err(result_unwrap_error(limit_added))
+    let offset_value: Int32 = int32_from_number(offset)
+    let offset_added: Result[Boolean, Text] = pg_parameters_add_int32(parameters, offset_value)
+    if not result_is_ok(offset_added):
+        return err(result_unwrap_error(offset_added))
+    let query: Result[PgQueryResult, Text] = pg_query_with_parameters(handle, "SELECT payload::text AS payload FROM yaza_api_records WHERE resource = $1 ORDER BY id LIMIT $2 OFFSET $3", parameters, timeout_ms)
+    if not result_is_ok(query):
+        return err(result_unwrap_error(query))
+    return pg_api_records_list_json(result_unwrap(query))
+
+fn pg_api_records_get(handle: Number, resource: Text, id: Text, timeout_ms: Number) -> Result[Option[Text], Text]:
+    if not pg_api_records_resource_valid(resource) or not pg_api_records_id_valid(id):
+        return err("postgres API records: resource path or id is invalid")
+    let parameters: PgParameters = pg_parameters_new()
+    let identity_added: Result[Boolean, Text] = pg_api_records_add_identity(parameters, resource, id)
+    if not result_is_ok(identity_added):
+        return err(result_unwrap_error(identity_added))
+    let query: Result[PgQueryResult, Text] = pg_query_with_parameters(handle, "SELECT payload::text AS payload FROM yaza_api_records WHERE resource = $1 AND id = $2", parameters, timeout_ms)
+    if not result_is_ok(query):
+        return err(result_unwrap_error(query))
+    let result: PgQueryResult = result_unwrap(query)
+    if not pg_api_records_result_shape_valid(result, 1):
+        return err("postgres API records: server returned an unexpected result shape")
+    if result.row_count == 0:
+        return ok(none)
+    if result.row_count != 1:
+        return err("postgres API records: primary key lookup returned duplicate rows")
+    let payload: Result[Text, Text] = pg_api_records_payload_at(result, 0)
+    if not result_is_ok(payload):
+        return err(result_unwrap_error(payload))
+    return ok(some(result_unwrap(payload)))
+
+fn pg_api_records_insert(handle: Number, resource: Text, id: Text, payload: Text, timeout_ms: Number) -> Result[Boolean, Text]:
+    if not pg_api_records_resource_valid(resource) or not pg_api_records_id_valid(id):
+        return err("postgres API records: resource path or id is invalid")
+    if not pg_api_records_payload_valid(payload):
+        return err("postgres API records: payload must be a bounded JSON object")
+    let parameters: PgParameters = pg_parameters_new()
+    let identity_added: Result[Boolean, Text] = pg_api_records_add_identity(parameters, resource, id)
+    if not result_is_ok(identity_added):
+        return err(result_unwrap_error(identity_added))
+    let payload_added: Result[Boolean, Text] = pg_parameters_add_text_as(parameters, payload, 3802)
+    if not result_is_ok(payload_added):
+        return err(result_unwrap_error(payload_added))
+    let query: Result[PgQueryResult, Text] = pg_query_with_parameters(handle, "INSERT INTO yaza_api_records(resource, id, payload) VALUES ($1, $2, jsonb_set($3, '{id}', to_jsonb($2::text), true)) ON CONFLICT (resource, id) DO NOTHING RETURNING id", parameters, timeout_ms)
+    if not result_is_ok(query):
+        return err(result_unwrap_error(query))
+    let result: PgQueryResult = result_unwrap(query)
+    if not pg_api_records_result_shape_valid(result, 1) or list_get(result.column_metadata, 0) != "id" or result.row_count > 1:
+        return err("postgres API records: insert returned an unexpected result shape")
+    return ok(result.row_count == 1)
+
+fn pg_api_records_replace(handle: Number, resource: Text, id: Text, payload: Text, timeout_ms: Number) -> Result[Option[Text], Text]:
+    if not pg_api_records_resource_valid(resource) or not pg_api_records_id_valid(id):
+        return err("postgres API records: resource path or id is invalid")
+    if not pg_api_records_payload_valid(payload):
+        return err("postgres API records: payload must be a bounded JSON object")
+    let parameters: PgParameters = pg_parameters_new()
+    let identity_added: Result[Boolean, Text] = pg_api_records_add_identity(parameters, resource, id)
+    if not result_is_ok(identity_added):
+        return err(result_unwrap_error(identity_added))
+    let payload_added: Result[Boolean, Text] = pg_parameters_add_text_as(parameters, payload, 3802)
+    if not result_is_ok(payload_added):
+        return err(result_unwrap_error(payload_added))
+    let query: Result[PgQueryResult, Text] = pg_query_with_parameters(handle, "UPDATE yaza_api_records SET payload = jsonb_set($3, '{id}', to_jsonb($2::text), true), updated_at = clock_timestamp() WHERE resource = $1 AND id = $2 RETURNING payload::text AS payload", parameters, timeout_ms)
+    if not result_is_ok(query):
+        return err(result_unwrap_error(query))
+    let result: PgQueryResult = result_unwrap(query)
+    if not pg_api_records_result_shape_valid(result, 1) or result.row_count > 1:
+        return err("postgres API records: replacement returned an unexpected result shape")
+    if result.row_count == 0:
+        return ok(none)
+    let updated: Result[Text, Text] = pg_api_records_payload_at(result, 0)
+    if not result_is_ok(updated):
+        return err(result_unwrap_error(updated))
+    return ok(some(result_unwrap(updated)))
+
+fn pg_api_records_patch(handle: Number, resource: Text, id: Text, patch: Text, timeout_ms: Number) -> Result[Option[Text], Text]:
+    if not pg_api_records_resource_valid(resource) or not pg_api_records_id_valid(id):
+        return err("postgres API records: resource path or id is invalid")
+    if not pg_api_records_payload_valid(patch):
+        return err("postgres API records: patch must be a bounded JSON object")
+    let parameters: PgParameters = pg_parameters_new()
+    let identity_added: Result[Boolean, Text] = pg_api_records_add_identity(parameters, resource, id)
+    if not result_is_ok(identity_added):
+        return err(result_unwrap_error(identity_added))
+    let patch_added: Result[Boolean, Text] = pg_parameters_add_text_as(parameters, patch, 3802)
+    if not result_is_ok(patch_added):
+        return err(result_unwrap_error(patch_added))
+    let query: Result[PgQueryResult, Text] = pg_query_with_parameters(handle, "UPDATE yaza_api_records SET payload = jsonb_set(payload || $3, '{id}', to_jsonb($2::text), true), updated_at = clock_timestamp() WHERE resource = $1 AND id = $2 RETURNING payload::text AS payload", parameters, timeout_ms)
+    if not result_is_ok(query):
+        return err(result_unwrap_error(query))
+    let result: PgQueryResult = result_unwrap(query)
+    if not pg_api_records_result_shape_valid(result, 1) or result.row_count > 1:
+        return err("postgres API records: patch returned an unexpected result shape")
+    if result.row_count == 0:
+        return ok(none)
+    let updated: Result[Text, Text] = pg_api_records_payload_at(result, 0)
+    if not result_is_ok(updated):
+        return err(result_unwrap_error(updated))
+    return ok(some(result_unwrap(updated)))
+
+fn pg_api_records_delete(handle: Number, resource: Text, id: Text, timeout_ms: Number) -> Result[Boolean, Text]:
+    if not pg_api_records_resource_valid(resource) or not pg_api_records_id_valid(id):
+        return err("postgres API records: resource path or id is invalid")
+    let parameters: PgParameters = pg_parameters_new()
+    let identity_added: Result[Boolean, Text] = pg_api_records_add_identity(parameters, resource, id)
+    if not result_is_ok(identity_added):
+        return err(result_unwrap_error(identity_added))
+    let query: Result[PgQueryResult, Text] = pg_query_with_parameters(handle, "DELETE FROM yaza_api_records WHERE resource = $1 AND id = $2 RETURNING id", parameters, timeout_ms)
+    if not result_is_ok(query):
+        return err(result_unwrap_error(query))
+    let result: PgQueryResult = result_unwrap(query)
+    if not pg_api_records_result_shape_valid(result, 1) or list_get(result.column_metadata, 0) != "id" or result.row_count > 1:
+        return err("postgres API records: delete returned an unexpected result shape")
+    return ok(result.row_count == 1)

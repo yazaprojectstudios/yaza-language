@@ -1,0 +1,719 @@
+# Phase 0 SELECT operand parser: qualified names, AS aliases, bounded WHERE expressions,
+# one-column IN and bounded EXISTS subqueries, optional ORDER BY, and a bounded literal LIMIT.
+use "sql_parser_v2"
+
+shape YazaSqlExpressionNodeV3:
+    kind: Number
+    operator: Number
+    left_index: Number
+    right_index: Number
+    start_byte: Number
+    end_byte: Number
+    operator_start_byte: Number
+    operator_end_byte: Number
+    column: YazaSqlNameV2
+    right_column: YazaSqlNameV2
+    value: YazaSqlTokenV1
+    aggregate_kind: Number
+
+shape YazaSqlExpressionStateV3:
+    cursor: Number
+    root_index: Number
+
+shape YazaSqlAdditionalJoinV3:
+    join_type: Number
+    join_comparison_operator: Number
+    table_name: YazaSqlNameV2
+    has_table_alias: Boolean
+    table_alias: YazaSqlTokenV1
+    left_column: YazaSqlNameV2
+    right_column: YazaSqlNameV2
+
+shape YazaSqlSelectAstV3:
+    version: Number
+    start_byte: Number
+    end_byte: Number
+    distinct: Boolean
+    projections: List[YazaSqlProjectionV2]
+    table_name: YazaSqlNameV2
+    has_table_alias: Boolean
+    table_alias: YazaSqlTokenV1
+    join_type: Number
+    join_comparison_operator: Number
+    join_table_name: YazaSqlNameV2
+    has_join_table_alias: Boolean
+    join_table_alias: YazaSqlTokenV1
+    join_left_column: YazaSqlNameV2
+    join_right_column: YazaSqlNameV2
+    additional_joins: List[YazaSqlAdditionalJoinV3]
+    has_where: Boolean
+    where_nodes: List[YazaSqlExpressionNodeV3]
+    where_root: Number
+    group_by: List[YazaSqlNameV2]
+    has_having: Boolean
+    having_nodes: List[YazaSqlExpressionNodeV3]
+    having_root: Number
+    order_by: List[YazaSqlOrderTermV2]
+    has_limit: Boolean
+    limit: Number
+
+fn yaza_sql_v3_build_in_or_tree(nodes: List[YazaSqlExpressionNodeV3], comparisons: List[Number], start: Number, count: Number, in_token: YazaSqlTokenV1) -> Result[Number, Text]:
+    if count <= 0 or start < 0 or start + count > list_count(comparisons): return err("SQL parser received an invalid IN-list comparison range")
+    if count == 1: return ok(list_get(comparisons, start))
+    let left_count: Number = count / 2
+    let left_result: Result[Number, Text] = yaza_sql_v3_build_in_or_tree(nodes, comparisons, start, left_count, in_token)
+    if not result_is_ok(left_result): return err(result_unwrap_error(left_result))
+    let right_result: Result[Number, Text] = yaza_sql_v3_build_in_or_tree(nodes, comparisons, start + left_count, count - left_count, in_token)
+    if not result_is_ok(right_result): return err(result_unwrap_error(right_result))
+    let left_index: Number = result_unwrap(left_result)
+    let right_index: Number = result_unwrap(right_result)
+    let left_node: YazaSqlExpressionNodeV3 = list_get(nodes, left_index)
+    let right_node: YazaSqlExpressionNodeV3 = list_get(nodes, right_index)
+    let empty_name: YazaSqlNameV2 = YazaSqlNameV2(YazaSqlTokenV1(0, 0, 0), YazaSqlTokenV1(0, 0, 0), YazaSqlTokenV1(0, 0, 0), 0, false, 0, 0, 0)
+    let empty_token: YazaSqlTokenV1 = YazaSqlTokenV1(0, 0, 0)
+    if not list_try_push(nodes, YazaSqlExpressionNodeV3(3, 0, left_index, right_index, left_node.start_byte, right_node.end_byte, in_token.start_byte, in_token.end_byte, empty_name, empty_name, empty_token, 0)):
+        return err("SQL parser could not allocate a balanced IN-list expression tree")
+    return ok(list_count(nodes) - 1)
+
+fn yaza_sql_v3_parse_primary(source: Text, tokens: List[YazaSqlTokenV1], nodes: List[YazaSqlExpressionNodeV3], cursor: Number, depth: Number) -> Result[YazaSqlExpressionStateV3, Text]:
+    if depth > 64:
+        return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expression nesting exceeds 64 at byte "))
+    if cursor >= list_count(tokens): return err("SQL parser expected a WHERE expression at end of input")
+
+    let empty_name: YazaSqlNameV2 = YazaSqlNameV2(YazaSqlTokenV1(0, 0, 0), YazaSqlTokenV1(0, 0, 0), YazaSqlTokenV1(0, 0, 0), 0, false, 0, 0, 0)
+    let empty_token: YazaSqlTokenV1 = YazaSqlTokenV1(0, 0, 0)
+    if yaza_sql_v2_is_keyword(source, tokens, cursor, "NOT"):
+        let not_token: YazaSqlTokenV1 = list_get(tokens, cursor)
+        let child_result: Result[YazaSqlExpressionStateV3, Text] = yaza_sql_v3_parse_primary(source, tokens, nodes, cursor + 1, depth + 1)
+        if not result_is_ok(child_result): return err(result_unwrap_error(child_result))
+        let child: YazaSqlExpressionStateV3 = result_unwrap(child_result)
+        let child_node: YazaSqlExpressionNodeV3 = list_get(nodes, child.root_index)
+        if not list_try_push(nodes, YazaSqlExpressionNodeV3(4, 0, child.root_index, -1, not_token.start_byte, child_node.end_byte, not_token.start_byte, not_token.end_byte, empty_name, empty_name, empty_token, 0)):
+            return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expression node limit or allocation failure at byte "))
+        return ok(YazaSqlExpressionStateV3(child.cursor, list_count(nodes) - 1))
+
+    if yaza_sql_v2_is_symbol(source, tokens, cursor, 40):
+        let nested_result: Result[YazaSqlExpressionStateV3, Text] = yaza_sql_v3_parse_or(source, tokens, nodes, cursor + 1, depth + 1)
+        if not result_is_ok(nested_result): return err(result_unwrap_error(nested_result))
+        let nested: YazaSqlExpressionStateV3 = result_unwrap(nested_result)
+        if not yaza_sql_v2_is_symbol(source, tokens, nested.cursor, 41):
+            return err(yaza_sql_v2_parse_error(source, tokens, nested.cursor, "SQL parser expected ')' after WHERE expression at byte "))
+        return ok(YazaSqlExpressionStateV3(nested.cursor + 1, nested.root_index))
+
+    if yaza_sql_v2_is_keyword(source, tokens, cursor, "EXISTS"):
+        let exists_token: YazaSqlTokenV1 = list_get(tokens, cursor)
+        if not yaza_sql_v2_is_symbol(source, tokens, cursor + 1, 40):
+            return err(yaza_sql_v2_parse_error(source, tokens, cursor + 1, "SQL parser expected '(' after EXISTS at byte "))
+        let select_index: Number = cursor + 2
+        if not yaza_sql_v2_is_keyword(source, tokens, select_index, "SELECT"):
+            return err(yaza_sql_v2_parse_error(source, tokens, select_index, "SQL parser EXISTS requires a SELECT subquery at byte "))
+        if depth > 40: return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser subquery nesting exceeds its verified expression-depth budget at byte "))
+        let select_token: YazaSqlTokenV1 = list_get(tokens, select_index)
+        var scan_index: Number = select_index
+        var nested_parentheses: Number = 0
+        var found_close: Boolean = false
+        var close_token: YazaSqlTokenV1 = empty_token
+        var query_end_byte: Number = select_token.end_byte
+        while scan_index < list_count(tokens) and not found_close:
+            if yaza_sql_v2_is_symbol(source, tokens, scan_index, 40):
+                set nested_parentheses = nested_parentheses + 1
+            elif yaza_sql_v2_is_symbol(source, tokens, scan_index, 41):
+                if nested_parentheses == 0:
+                    set close_token = list_get(tokens, scan_index)
+                    set found_close = true
+                else:
+                    set nested_parentheses = nested_parentheses - 1
+            if not found_close:
+                set query_end_byte = list_get(tokens, scan_index).end_byte
+                set scan_index = scan_index + 1
+        if not found_close: return err(yaza_sql_v2_parse_error(source, tokens, select_index, "SQL parser expected ')' after EXISTS subquery at byte "))
+        if query_end_byte <= select_token.start_byte: return err(yaza_sql_v2_parse_error(source, tokens, select_index, "SQL parser received an empty EXISTS subquery at byte "))
+        if not list_try_push(nodes, YazaSqlExpressionNodeV3(7, 1, select_token.start_byte, query_end_byte, exists_token.start_byte, close_token.end_byte, exists_token.start_byte, exists_token.end_byte, empty_name, empty_name, empty_token, 0)):
+            return err(yaza_sql_v2_parse_error(source, tokens, select_index, "SQL parser EXISTS node limit or allocation failure at byte "))
+        return ok(YazaSqlExpressionStateV3(scan_index + 1, list_count(nodes) - 1))
+
+    var aggregate_kind: Number = 0
+    var column: YazaSqlNameV2 = empty_name
+    var subject_start_byte: Number = 0
+    var operator_index: Number = cursor
+    if yaza_sql_v2_is_keyword(source, tokens, cursor, "COUNT") and yaza_sql_v2_is_symbol(source, tokens, cursor + 1, 40) and yaza_sql_v2_is_symbol(source, tokens, cursor + 2, 42) and yaza_sql_v2_is_symbol(source, tokens, cursor + 3, 41):
+        let function_token: YazaSqlTokenV1 = list_get(tokens, cursor)
+        let close_token: YazaSqlTokenV1 = list_get(tokens, cursor + 3)
+        set aggregate_kind = 1
+        set subject_start_byte = function_token.start_byte
+        set operator_index = cursor + 4
+        set column = YazaSqlNameV2(function_token, YazaSqlTokenV1(0, 0, 0), YazaSqlTokenV1(0, 0, 0), 1, false, function_token.start_byte, close_token.end_byte, 4)
+    elif (yaza_sql_v2_is_keyword(source, tokens, cursor, "SUM") or yaza_sql_v2_is_keyword(source, tokens, cursor, "MIN") or yaza_sql_v2_is_keyword(source, tokens, cursor, "MAX") or yaza_sql_v2_is_keyword(source, tokens, cursor, "AVG")) and yaza_sql_v2_is_symbol(source, tokens, cursor + 1, 40):
+        let function_token: YazaSqlTokenV1 = list_get(tokens, cursor)
+        let argument_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, cursor + 2, false)
+        if not result_is_ok(argument_result): return err(yaza_sql_v2_parse_error(source, tokens, cursor + 2, "SQL parser expected a column inside HAVING aggregate at byte "))
+        set column = result_unwrap(argument_result)
+        let close_index: Number = cursor + 2 + column.consumed_tokens
+        if not yaza_sql_v2_is_symbol(source, tokens, close_index, 41):
+            return err(yaza_sql_v2_parse_error(source, tokens, close_index, "SQL parser expected ')' after HAVING aggregate column at byte "))
+        let close_token: YazaSqlTokenV1 = list_get(tokens, close_index)
+        if yaza_sql_v2_is_keyword(source, tokens, cursor, "SUM"): set aggregate_kind = 2
+        elif yaza_sql_v2_is_keyword(source, tokens, cursor, "MIN"): set aggregate_kind = 3
+        elif yaza_sql_v2_is_keyword(source, tokens, cursor, "MAX"): set aggregate_kind = 4
+        else: set aggregate_kind = 5
+        set subject_start_byte = function_token.start_byte
+        set column.start_byte = function_token.start_byte
+        set column.end_byte = close_token.end_byte
+        set operator_index = close_index + 1
+    else:
+        let column_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, cursor, false)
+        if not result_is_ok(column_result): return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected a comparison in WHERE at byte "))
+        set column = result_unwrap(column_result)
+        set subject_start_byte = column.start_byte
+        set operator_index = cursor + column.consumed_tokens
+    if yaza_sql_v2_is_keyword(source, tokens, operator_index, "IS"):
+        let is_token: YazaSqlTokenV1 = list_get(tokens, operator_index)
+        var null_index: Number = operator_index + 1
+        var is_not_null: Boolean = false
+        if yaza_sql_v2_is_keyword(source, tokens, null_index, "NOT"):
+            set is_not_null = true
+            set null_index = null_index + 1
+        if not yaza_sql_v2_is_keyword(source, tokens, null_index, "NULL"):
+            return err(yaza_sql_v2_parse_error(source, tokens, null_index, "SQL parser expected NULL after IS at byte "))
+        let null_token: YazaSqlTokenV1 = list_get(tokens, null_index)
+        var is_operator: Number = 1
+        if is_not_null: set is_operator = 2
+        if not list_try_push(nodes, YazaSqlExpressionNodeV3(5, is_operator, -1, -1, subject_start_byte, null_token.end_byte, is_token.start_byte, null_token.end_byte, column, empty_name, empty_token, aggregate_kind)):
+            return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expression node limit or allocation failure at byte "))
+        return ok(YazaSqlExpressionStateV3(null_index + 1, list_count(nodes) - 1))
+
+    var in_operator_index: Number = operator_index
+    var is_not_in: Boolean = false
+    var not_in_token: YazaSqlTokenV1 = empty_token
+    if yaza_sql_v2_is_keyword(source, tokens, operator_index, "NOT") and yaza_sql_v2_is_keyword(source, tokens, operator_index + 1, "IN"):
+        set is_not_in = true
+        set not_in_token = list_get(tokens, operator_index)
+        set in_operator_index = operator_index + 1
+    if yaza_sql_v2_is_keyword(source, tokens, in_operator_index, "IN"):
+        let in_token: YazaSqlTokenV1 = list_get(tokens, in_operator_index)
+        var operator_start_byte: Number = in_token.start_byte
+        if is_not_in: set operator_start_byte = not_in_token.start_byte
+        if not yaza_sql_v2_is_symbol(source, tokens, in_operator_index + 1, 40):
+            return err(yaza_sql_v2_parse_error(source, tokens, in_operator_index + 1, "SQL parser expected '(' after IN at byte "))
+        var value_index: Number = in_operator_index + 2
+        if yaza_sql_v2_is_keyword(source, tokens, value_index, "SELECT"):
+            if depth > 40: return err(yaza_sql_v2_parse_error(source, tokens, in_operator_index, "SQL parser subquery nesting exceeds its verified expression-depth budget at byte "))
+            let select_token: YazaSqlTokenV1 = list_get(tokens, value_index)
+            var scan_index: Number = value_index
+            var nested_parentheses: Number = 0
+            var found_close: Boolean = false
+            var close_token: YazaSqlTokenV1 = empty_token
+            var query_end_byte: Number = select_token.end_byte
+            while scan_index < list_count(tokens) and not found_close:
+                if yaza_sql_v2_is_symbol(source, tokens, scan_index, 40):
+                    set nested_parentheses = nested_parentheses + 1
+                elif yaza_sql_v2_is_symbol(source, tokens, scan_index, 41):
+                    if nested_parentheses == 0:
+                        set close_token = list_get(tokens, scan_index)
+                        set found_close = true
+                    else:
+                        set nested_parentheses = nested_parentheses - 1
+                if not found_close:
+                    set query_end_byte = list_get(tokens, scan_index).end_byte
+                    set scan_index = scan_index + 1
+            if not found_close: return err(yaza_sql_v2_parse_error(source, tokens, value_index, "SQL parser expected ')' after IN subquery at byte "))
+            if query_end_byte <= select_token.start_byte: return err(yaza_sql_v2_parse_error(source, tokens, value_index, "SQL parser received an empty IN subquery at byte "))
+            var in_kind: Number = 1
+            if is_not_in: set in_kind = 2
+            if not list_try_push(nodes, YazaSqlExpressionNodeV3(6, in_kind, select_token.start_byte, query_end_byte, subject_start_byte, close_token.end_byte, operator_start_byte, in_token.end_byte, column, empty_name, empty_token, aggregate_kind)):
+                return err(yaza_sql_v2_parse_error(source, tokens, value_index, "SQL parser IN subquery node limit or allocation failure at byte "))
+            return ok(YazaSqlExpressionStateV3(scan_index + 1, list_count(nodes) - 1))
+        var item_count: Number = 0
+        let comparisons_result: Result[List[Number], Text] = list_try_new()
+        if not result_is_ok(comparisons_result): return err("SQL parser could not allocate its bounded IN-list index")
+        let comparison_indices: List[Number] = result_unwrap(comparisons_result)
+        var close_token: YazaSqlTokenV1 = empty_token
+        var parsing_in_values: Boolean = true
+        while parsing_in_values:
+            if value_index >= list_count(tokens): return err("SQL parser expected a value or ')' in the IN list at end of input")
+            if item_count == 0 and yaza_sql_v2_is_symbol(source, tokens, value_index, 41):
+                return err(yaza_sql_v2_parse_error(source, tokens, value_index, "SQL parser IN list cannot be empty at byte "))
+            var required_nodes: Number = item_count + 1
+            if is_not_in: set required_nodes = required_nodes + 1
+            if item_count >= 1024 or list_count(nodes) + required_nodes > 4095:
+                return err(yaza_sql_v2_parse_error(source, tokens, value_index, "SQL parser IN list exceeds its bounded item or expression-node limit at byte "))
+            let value: YazaSqlTokenV1 = list_get(tokens, value_index)
+            if value.kind != 3 and value.kind != 4 and value.kind != 5 and value.kind != 8:
+                if not yaza_sql_v2_is_keyword(source, tokens, value_index, "NULL") and not yaza_sql_v2_is_keyword(source, tokens, value_index, "TRUE") and not yaza_sql_v2_is_keyword(source, tokens, value_index, "FALSE"):
+                    return err(yaza_sql_v2_parse_error(source, tokens, value_index, "SQL parser expected a literal or bind parameter in the IN list at byte "))
+            if not list_try_push(nodes, YazaSqlExpressionNodeV3(1, 1, -1, -1, subject_start_byte, value.end_byte, operator_start_byte, in_token.end_byte, column, empty_name, value, aggregate_kind)):
+                return err(yaza_sql_v2_parse_error(source, tokens, value_index, "SQL parser expression node limit or allocation failure at byte "))
+            let comparison_index: Number = list_count(nodes) - 1
+            if not list_try_push(comparison_indices, comparison_index): return err("SQL parser could not append an IN-list comparison index")
+            set item_count = item_count + 1
+            set value_index = value_index + 1
+            if yaza_sql_v2_is_symbol(source, tokens, value_index, 44):
+                set value_index = value_index + 1
+                continue
+            if not yaza_sql_v2_is_symbol(source, tokens, value_index, 41):
+                return err(yaza_sql_v2_parse_error(source, tokens, value_index, "SQL parser expected ',' or ')' after an IN list value at byte "))
+            set close_token = list_get(tokens, value_index)
+            set parsing_in_values = false
+        if item_count == 0: return err(yaza_sql_v2_parse_error(source, tokens, in_operator_index + 2, "SQL parser IN list cannot be empty at byte "))
+        if depth > 40: return err(yaza_sql_v2_parse_error(source, tokens, in_operator_index, "SQL parser IN-list nesting exceeds its verified expression-depth budget at byte "))
+        let root_result: Result[Number, Text] = yaza_sql_v3_build_in_or_tree(nodes, comparison_indices, 0, item_count, in_token)
+        if not result_is_ok(root_result): return err(result_unwrap_error(root_result))
+        var root_index: Number = result_unwrap(root_result)
+        if is_not_in:
+            if not list_try_push(nodes, YazaSqlExpressionNodeV3(4, 0, root_index, -1, subject_start_byte, close_token.end_byte, not_in_token.start_byte, in_token.end_byte, empty_name, empty_name, empty_token, 0)):
+                return err(yaza_sql_v2_parse_error(source, tokens, in_operator_index, "SQL parser NOT IN expression-node allocation failure at byte "))
+            set root_index = list_count(nodes) - 1
+        else:
+            let root: YazaSqlExpressionNodeV3 = list_get(nodes, root_index)
+            list_set(nodes, root_index, YazaSqlExpressionNodeV3(root.kind, root.operator, root.left_index, root.right_index, root.start_byte, close_token.end_byte, root.operator_start_byte, root.operator_end_byte, root.column, root.right_column, root.value, root.aggregate_kind))
+        return ok(YazaSqlExpressionStateV3(value_index + 1, root_index))
+
+    var like_op_index: Number = operator_index
+    var is_not_like: Boolean = false
+    var not_like_token: YazaSqlTokenV1 = empty_token
+    if operator_index + 1 < list_count(tokens) and yaza_sql_v2_is_keyword(source, tokens, operator_index, "NOT") and (yaza_sql_v2_is_keyword(source, tokens, operator_index + 1, "LIKE") or yaza_sql_v2_is_keyword(source, tokens, operator_index + 1, "ILIKE")):
+        set is_not_like = true
+        set not_like_token = list_get(tokens, operator_index)
+        set like_op_index = operator_index + 1
+
+    if like_op_index < list_count(tokens) and (yaza_sql_v2_is_keyword(source, tokens, like_op_index, "LIKE") or yaza_sql_v2_is_keyword(source, tokens, like_op_index, "ILIKE")):
+        let is_ilike: Boolean = yaza_sql_v2_is_keyword(source, tokens, like_op_index, "ILIKE")
+        let like_token: YazaSqlTokenV1 = list_get(tokens, like_op_index)
+        var op_start_byte: Number = like_token.start_byte
+        if is_not_like: set op_start_byte = not_like_token.start_byte
+        let pattern_val_index: Number = like_op_index + 1
+        if pattern_val_index >= list_count(tokens): return err("SQL parser expected a pattern after LIKE at end of input")
+        let pattern_val: YazaSqlTokenV1 = list_get(tokens, pattern_val_index)
+        if pattern_val.kind != 4 and pattern_val.kind != 5:
+            return err(yaza_sql_v2_parse_error(source, tokens, pattern_val_index, "SQL parser expected a text literal or bind parameter for LIKE at byte "))
+        var like_op: Number = 7
+        if is_not_like and not is_ilike: set like_op = 8
+        if not is_not_like and is_ilike: set like_op = 9
+        if is_not_like and is_ilike: set like_op = 10
+        if not list_try_push(nodes, YazaSqlExpressionNodeV3(1, like_op, -1, -1, subject_start_byte, pattern_val.end_byte, op_start_byte, like_token.end_byte, column, empty_name, pattern_val, aggregate_kind)):
+            return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expression node limit or allocation failure at byte "))
+        return ok(YazaSqlExpressionStateV3(pattern_val_index + 1, list_count(nodes) - 1))
+
+    let operator: Number = yaza_sql_v2_comparison_code(source, tokens, operator_index)
+    if operator == 0:
+        return err(yaza_sql_v2_parse_error(source, tokens, operator_index, "SQL parser expected a comparison operator at byte "))
+    let value_index: Number = operator_index + 1
+    if value_index >= list_count(tokens): return err("SQL parser expected a comparison value at end of input")
+    let value: YazaSqlTokenV1 = list_get(tokens, value_index)
+    let comparison_token: YazaSqlTokenV1 = list_get(tokens, operator_index)
+    if (value.kind == 1 or value.kind == 2) and not yaza_sql_v2_is_keyword(source, tokens, value_index, "NULL") and not yaza_sql_v2_is_keyword(source, tokens, value_index, "TRUE") and not yaza_sql_v2_is_keyword(source, tokens, value_index, "FALSE"):
+        let right_column_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, value_index, false)
+        if result_is_ok(right_column_result):
+            let right_column: YazaSqlNameV2 = result_unwrap(right_column_result)
+            if not list_try_push(nodes, YazaSqlExpressionNodeV3(8, operator, -1, -1, subject_start_byte, right_column.end_byte, comparison_token.start_byte, comparison_token.end_byte, column, right_column, empty_token, aggregate_kind)):
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser column-comparison expression-node allocation failure at byte "))
+            return ok(YazaSqlExpressionStateV3(value_index + right_column.consumed_tokens, list_count(nodes) - 1))
+    if value.kind != 3 and value.kind != 4 and value.kind != 5 and value.kind != 8:
+        if not yaza_sql_v2_is_keyword(source, tokens, value_index, "NULL") and not yaza_sql_v2_is_keyword(source, tokens, value_index, "TRUE") and not yaza_sql_v2_is_keyword(source, tokens, value_index, "FALSE"):
+            return err(yaza_sql_v2_parse_error(source, tokens, value_index, "SQL parser expected a literal or bind parameter at byte "))
+    if not list_try_push(nodes, YazaSqlExpressionNodeV3(1, operator, -1, -1, subject_start_byte, value.end_byte, comparison_token.start_byte, comparison_token.end_byte, column, empty_name, value, aggregate_kind)):
+        return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expression node limit or allocation failure at byte "))
+    return ok(YazaSqlExpressionStateV3(value_index + 1, list_count(nodes) - 1))
+
+fn yaza_sql_v3_parse_and(source: Text, tokens: List[YazaSqlTokenV1], nodes: List[YazaSqlExpressionNodeV3], cursor: Number, depth: Number) -> Result[YazaSqlExpressionStateV3, Text]:
+    let first_result: Result[YazaSqlExpressionStateV3, Text] = yaza_sql_v3_parse_primary(source, tokens, nodes, cursor, depth)
+    if not result_is_ok(first_result): return err(result_unwrap_error(first_result))
+    var state: YazaSqlExpressionStateV3 = result_unwrap(first_result)
+    var parsing: Boolean = true
+    while parsing:
+        if not yaza_sql_v2_is_keyword(source, tokens, state.cursor, "AND"):
+            set parsing = false
+        else:
+            let and_token: YazaSqlTokenV1 = list_get(tokens, state.cursor)
+            let left_node: YazaSqlExpressionNodeV3 = list_get(nodes, state.root_index)
+            let right_result: Result[YazaSqlExpressionStateV3, Text] = yaza_sql_v3_parse_primary(source, tokens, nodes, state.cursor + 1, depth)
+            if not result_is_ok(right_result): return err(result_unwrap_error(right_result))
+            let right: YazaSqlExpressionStateV3 = result_unwrap(right_result)
+            let right_node: YazaSqlExpressionNodeV3 = list_get(nodes, right.root_index)
+            if not list_try_push(nodes, YazaSqlExpressionNodeV3(2, 0, state.root_index, right.root_index, left_node.start_byte, right_node.end_byte, and_token.start_byte, and_token.end_byte, YazaSqlNameV2(YazaSqlTokenV1(0, 0, 0), YazaSqlTokenV1(0, 0, 0), YazaSqlTokenV1(0, 0, 0), 0, false, 0, 0, 0), YazaSqlNameV2(YazaSqlTokenV1(0, 0, 0), YazaSqlTokenV1(0, 0, 0), YazaSqlTokenV1(0, 0, 0), 0, false, 0, 0, 0), YazaSqlTokenV1(0, 0, 0), 0)):
+                return err(yaza_sql_v2_parse_error(source, tokens, state.cursor, "SQL parser expression node limit or allocation failure at byte "))
+            set state = YazaSqlExpressionStateV3(right.cursor, list_count(nodes) - 1)
+    return ok(state)
+
+fn yaza_sql_v3_parse_or(source: Text, tokens: List[YazaSqlTokenV1], nodes: List[YazaSqlExpressionNodeV3], cursor: Number, depth: Number) -> Result[YazaSqlExpressionStateV3, Text]:
+    let first_result: Result[YazaSqlExpressionStateV3, Text] = yaza_sql_v3_parse_and(source, tokens, nodes, cursor, depth)
+    if not result_is_ok(first_result): return err(result_unwrap_error(first_result))
+    var state: YazaSqlExpressionStateV3 = result_unwrap(first_result)
+    var parsing: Boolean = true
+    while parsing:
+        if not yaza_sql_v2_is_keyword(source, tokens, state.cursor, "OR"):
+            set parsing = false
+        else:
+            let or_token: YazaSqlTokenV1 = list_get(tokens, state.cursor)
+            let left_node: YazaSqlExpressionNodeV3 = list_get(nodes, state.root_index)
+            let right_result: Result[YazaSqlExpressionStateV3, Text] = yaza_sql_v3_parse_and(source, tokens, nodes, state.cursor + 1, depth)
+            if not result_is_ok(right_result): return err(result_unwrap_error(right_result))
+            let right: YazaSqlExpressionStateV3 = result_unwrap(right_result)
+            let right_node: YazaSqlExpressionNodeV3 = list_get(nodes, right.root_index)
+            if not list_try_push(nodes, YazaSqlExpressionNodeV3(3, 0, state.root_index, right.root_index, left_node.start_byte, right_node.end_byte, or_token.start_byte, or_token.end_byte, YazaSqlNameV2(YazaSqlTokenV1(0, 0, 0), YazaSqlTokenV1(0, 0, 0), YazaSqlTokenV1(0, 0, 0), 0, false, 0, 0, 0), YazaSqlNameV2(YazaSqlTokenV1(0, 0, 0), YazaSqlTokenV1(0, 0, 0), YazaSqlTokenV1(0, 0, 0), 0, false, 0, 0, 0), YazaSqlTokenV1(0, 0, 0), 0)):
+                return err(yaza_sql_v2_parse_error(source, tokens, state.cursor, "SQL parser expression node limit or allocation failure at byte "))
+            set state = YazaSqlExpressionStateV3(right.cursor, list_count(nodes) - 1)
+    return ok(state)
+
+fn yaza_sql_parse_select_v3(source: Text) -> Result[YazaSqlSelectAstV3, Text]:
+    let lexed: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(source)
+    if not result_is_ok(lexed): return err(result_unwrap_error(lexed))
+    return yaza_sql_parse_select_tokens_v3(source, result_unwrap(lexed))
+
+fn yaza_sql_parse_select_tokens_v3(source: Text, tokens: List[YazaSqlTokenV1]) -> Result[YazaSqlSelectAstV3, Text]:
+    let token_count: Number = list_count(tokens)
+    if token_count < 2: return err("SQL parser received an invalid token stream")
+
+    var cursor: Number = 0
+    if not yaza_sql_v2_is_keyword(source, tokens, cursor, "SELECT"):
+        return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected SELECT at byte "))
+    let first_token: YazaSqlTokenV1 = list_get(tokens, cursor)
+    set cursor = cursor + 1
+    var distinct: Boolean = false
+    if yaza_sql_v2_is_keyword(source, tokens, cursor, "DISTINCT"):
+        set distinct = true
+        set cursor = cursor + 1
+
+    let projections_result: Result[List[YazaSqlProjectionV2], Text] = list_try_new()
+    if not result_is_ok(projections_result): return err("SQL parser could not allocate the projection list")
+    var projections: List[YazaSqlProjectionV2] = result_unwrap(projections_result)
+    var projection_done: Boolean = false
+    while not projection_done:
+        if cursor >= token_count: return err("SQL parser expected a projection at end of input")
+        var aggregate_kind: Number = 0
+        var name: YazaSqlNameV2 = YazaSqlNameV2(YazaSqlTokenV1(0, 0, 0), YazaSqlTokenV1(0, 0, 0), YazaSqlTokenV1(0, 0, 0), 0, false, 0, 0, 0)
+        if yaza_sql_v2_is_keyword(source, tokens, cursor, "COUNT") and yaza_sql_v2_is_symbol(source, tokens, cursor + 1, 40) and yaza_sql_v2_is_symbol(source, tokens, cursor + 2, 42) and yaza_sql_v2_is_symbol(source, tokens, cursor + 3, 41):
+            let function_token: YazaSqlTokenV1 = list_get(tokens, cursor)
+            let close_token: YazaSqlTokenV1 = list_get(tokens, cursor + 3)
+            set aggregate_kind = 1
+            set name = YazaSqlNameV2(function_token, YazaSqlTokenV1(0, 0, 0), YazaSqlTokenV1(0, 0, 0), 1, false, function_token.start_byte, close_token.end_byte, 4)
+            set cursor = cursor + 4
+        elif (yaza_sql_v2_is_keyword(source, tokens, cursor, "SUM") or yaza_sql_v2_is_keyword(source, tokens, cursor, "MIN") or yaza_sql_v2_is_keyword(source, tokens, cursor, "MAX") or yaza_sql_v2_is_keyword(source, tokens, cursor, "AVG")) and yaza_sql_v2_is_symbol(source, tokens, cursor + 1, 40):
+            let function_token: YazaSqlTokenV1 = list_get(tokens, cursor)
+            let argument_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, cursor + 2, false)
+            if not result_is_ok(argument_result): return err(yaza_sql_v2_parse_error(source, tokens, cursor + 2, "SQL parser expected a column inside aggregate at byte "))
+            let argument: YazaSqlNameV2 = result_unwrap(argument_result)
+            let close_index: Number = cursor + 2 + argument.consumed_tokens
+            if not yaza_sql_v2_is_symbol(source, tokens, close_index, 41):
+                return err(yaza_sql_v2_parse_error(source, tokens, close_index, "SQL parser expected ')' after aggregate column at byte "))
+            let close_token: YazaSqlTokenV1 = list_get(tokens, close_index)
+            if yaza_sql_v2_is_keyword(source, tokens, cursor, "SUM"): set aggregate_kind = 2
+            elif yaza_sql_v2_is_keyword(source, tokens, cursor, "MIN"): set aggregate_kind = 3
+            elif yaza_sql_v2_is_keyword(source, tokens, cursor, "MAX"): set aggregate_kind = 4
+            else: set aggregate_kind = 5
+            set name = argument
+            set name.start_byte = function_token.start_byte
+            set name.end_byte = close_token.end_byte
+            set cursor = close_index + 1
+        else:
+            let name_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, cursor, true)
+            if not result_is_ok(name_result): return err(result_unwrap_error(name_result))
+            set name = result_unwrap(name_result)
+            set cursor = cursor + name.consumed_tokens
+
+        var has_alias: Boolean = false
+        var alias: YazaSqlTokenV1 = YazaSqlTokenV1(0, 0, 0)
+        if yaza_sql_v2_is_keyword(source, tokens, cursor, "AS"):
+            set cursor = cursor + 1
+            if cursor >= token_count: return err("SQL parser expected a projection alias at end of input")
+            set alias = list_get(tokens, cursor)
+            if alias.kind != 1 and alias.kind != 2:
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected an identifier alias at byte "))
+            set has_alias = true
+            set cursor = cursor + 1
+        if not list_try_push(projections, YazaSqlProjectionV2(name, aggregate_kind, has_alias, alias)):
+            return err(yaza_sql_v2_parse_error(source, tokens, cursor - 1, "SQL parser projection limit or allocation failure at byte "))
+        if yaza_sql_v2_is_symbol(source, tokens, cursor, 44):
+            set cursor = cursor + 1
+        else:
+            set projection_done = true
+
+    if not yaza_sql_v2_is_keyword(source, tokens, cursor, "FROM"):
+        return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected FROM at byte "))
+    set cursor = cursor + 1
+    if cursor >= token_count: return err("SQL parser expected a table name at end of input")
+    let table_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, cursor, false)
+    if not result_is_ok(table_result): return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected a table name at byte "))
+    let table_name: YazaSqlNameV2 = result_unwrap(table_result)
+    set cursor = cursor + table_name.consumed_tokens
+
+    var has_table_alias: Boolean = false
+    var table_alias: YazaSqlTokenV1 = YazaSqlTokenV1(0, 0, 0)
+    if yaza_sql_v2_is_keyword(source, tokens, cursor, "AS"):
+        set cursor = cursor + 1
+        if cursor >= token_count: return err("SQL parser expected a table alias at end of input")
+        set table_alias = list_get(tokens, cursor)
+        if table_alias.kind != 1 and table_alias.kind != 2:
+            return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected an identifier alias at byte "))
+        set has_table_alias = true
+        set cursor = cursor + 1
+
+    let empty_name: YazaSqlNameV2 = YazaSqlNameV2(YazaSqlTokenV1(0, 0, 0), YazaSqlTokenV1(0, 0, 0), YazaSqlTokenV1(0, 0, 0), 0, false, 0, 0, 0)
+    var join_type: Number = 0
+    var join_comparison_operator: Number = 0
+    var join_table_name: YazaSqlNameV2 = empty_name
+    var has_join_table_alias: Boolean = false
+    var join_table_alias: YazaSqlTokenV1 = YazaSqlTokenV1(0, 0, 0)
+    var join_left_column: YazaSqlNameV2 = empty_name
+    var join_right_column: YazaSqlNameV2 = empty_name
+    if yaza_sql_v2_is_keyword(source, tokens, cursor, "INNER") or yaza_sql_v2_is_keyword(source, tokens, cursor, "JOIN") or yaza_sql_v2_is_keyword(source, tokens, cursor, "LEFT") or yaza_sql_v2_is_keyword(source, tokens, cursor, "RIGHT") or yaza_sql_v2_is_keyword(source, tokens, cursor, "FULL") or yaza_sql_v2_is_keyword(source, tokens, cursor, "CROSS"):
+        if yaza_sql_v2_is_keyword(source, tokens, cursor, "INNER"):
+            set cursor = cursor + 1
+            if not yaza_sql_v2_is_keyword(source, tokens, cursor, "JOIN"):
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected JOIN after INNER at byte "))
+            set join_type = 1
+        elif yaza_sql_v2_is_keyword(source, tokens, cursor, "LEFT"):
+            set join_type = 2
+            set cursor = cursor + 1
+            if yaza_sql_v2_is_keyword(source, tokens, cursor, "OUTER"): set cursor = cursor + 1
+            if not yaza_sql_v2_is_keyword(source, tokens, cursor, "JOIN"):
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected JOIN after LEFT [OUTER] at byte "))
+        elif yaza_sql_v2_is_keyword(source, tokens, cursor, "RIGHT"):
+            set join_type = 3
+            set cursor = cursor + 1
+            if yaza_sql_v2_is_keyword(source, tokens, cursor, "OUTER"): set cursor = cursor + 1
+            if not yaza_sql_v2_is_keyword(source, tokens, cursor, "JOIN"):
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected JOIN after RIGHT [OUTER] at byte "))
+        elif yaza_sql_v2_is_keyword(source, tokens, cursor, "FULL"):
+            set join_type = 4
+            set cursor = cursor + 1
+            if yaza_sql_v2_is_keyword(source, tokens, cursor, "OUTER"): set cursor = cursor + 1
+            if not yaza_sql_v2_is_keyword(source, tokens, cursor, "JOIN"):
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected JOIN after FULL [OUTER] at byte "))
+        elif yaza_sql_v2_is_keyword(source, tokens, cursor, "CROSS"):
+            set join_type = 5
+            set cursor = cursor + 1
+            if not yaza_sql_v2_is_keyword(source, tokens, cursor, "JOIN"):
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected JOIN after CROSS at byte "))
+        else:
+            set join_type = 1
+        set cursor = cursor + 1
+        let join_table_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, cursor, false)
+        if not result_is_ok(join_table_result):
+            return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected a joined table name at byte "))
+        set join_table_name = result_unwrap(join_table_result)
+        set cursor = cursor + join_table_name.consumed_tokens
+        if yaza_sql_v2_is_keyword(source, tokens, cursor, "AS"):
+            set cursor = cursor + 1
+            if cursor >= token_count: return err("SQL parser expected a joined table alias at end of input")
+            set join_table_alias = list_get(tokens, cursor)
+            if join_table_alias.kind != 1 and join_table_alias.kind != 2:
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected an identifier for the joined table alias at byte "))
+            set has_join_table_alias = true
+            set cursor = cursor + 1
+        if join_type != 5:
+            if not yaza_sql_v2_is_keyword(source, tokens, cursor, "ON"):
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected ON after the joined table at byte "))
+            set cursor = cursor + 1
+            let join_left_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, cursor, false)
+            if not result_is_ok(join_left_result):
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected a left join column at byte "))
+            set join_left_column = result_unwrap(join_left_result)
+            set cursor = cursor + join_left_column.consumed_tokens
+            set join_comparison_operator = yaza_sql_v2_comparison_code(source, tokens, cursor)
+            if join_comparison_operator == 0:
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected a comparison operator in JOIN ON at byte "))
+            set cursor = cursor + 1
+            let join_right_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, cursor, false)
+            if not result_is_ok(join_right_result):
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected a right join column at byte "))
+            set join_right_column = result_unwrap(join_right_result)
+            set cursor = cursor + join_right_column.consumed_tokens
+
+    let additional_joins_result: Result[List[YazaSqlAdditionalJoinV3], Text] = list_try_new()
+    if not result_is_ok(additional_joins_result): return err("SQL parser could not allocate the additional JOIN list")
+    var additional_joins: List[YazaSqlAdditionalJoinV3] = result_unwrap(additional_joins_result)
+    var parsing_additional_joins: Boolean = true
+    while parsing_additional_joins:
+        let starts_join: Boolean = yaza_sql_v2_is_keyword(source, tokens, cursor, "INNER") or yaza_sql_v2_is_keyword(source, tokens, cursor, "JOIN") or yaza_sql_v2_is_keyword(source, tokens, cursor, "LEFT") or yaza_sql_v2_is_keyword(source, tokens, cursor, "RIGHT") or yaza_sql_v2_is_keyword(source, tokens, cursor, "FULL") or yaza_sql_v2_is_keyword(source, tokens, cursor, "CROSS")
+        if not starts_join:
+            set parsing_additional_joins = false
+        else:
+            if list_count(additional_joins) >= 6:
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser JOIN chain exceeds the eight-table limit at byte "))
+            var additional_join_type: Number = 1
+            if yaza_sql_v2_is_keyword(source, tokens, cursor, "INNER"):
+                set cursor = cursor + 1
+                if not yaza_sql_v2_is_keyword(source, tokens, cursor, "JOIN"):
+                    return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected JOIN after INNER at byte "))
+            elif yaza_sql_v2_is_keyword(source, tokens, cursor, "LEFT") or yaza_sql_v2_is_keyword(source, tokens, cursor, "RIGHT") or yaza_sql_v2_is_keyword(source, tokens, cursor, "FULL"):
+                if yaza_sql_v2_is_keyword(source, tokens, cursor, "LEFT"): set additional_join_type = 2
+                elif yaza_sql_v2_is_keyword(source, tokens, cursor, "RIGHT"): set additional_join_type = 3
+                else: set additional_join_type = 4
+                set cursor = cursor + 1
+                if yaza_sql_v2_is_keyword(source, tokens, cursor, "OUTER"): set cursor = cursor + 1
+                if not yaza_sql_v2_is_keyword(source, tokens, cursor, "JOIN"):
+                    return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected JOIN after an outer JOIN kind at byte "))
+            elif yaza_sql_v2_is_keyword(source, tokens, cursor, "CROSS"):
+                set additional_join_type = 5
+                set cursor = cursor + 1
+                if not yaza_sql_v2_is_keyword(source, tokens, cursor, "JOIN"):
+                    return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected JOIN after CROSS at byte "))
+            elif not yaza_sql_v2_is_keyword(source, tokens, cursor, "JOIN"):
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser additional stages support CROSS and INNER/LEFT/RIGHT/FULL JOINs only at byte "))
+            set cursor = cursor + 1
+            let extra_table_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, cursor, false)
+            if not result_is_ok(extra_table_result):
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected an additional joined table name at byte "))
+            let extra_table_name: YazaSqlNameV2 = result_unwrap(extra_table_result)
+            set cursor = cursor + extra_table_name.consumed_tokens
+            var extra_has_alias: Boolean = false
+            var extra_alias: YazaSqlTokenV1 = YazaSqlTokenV1(0, 0, 0)
+            if yaza_sql_v2_is_keyword(source, tokens, cursor, "AS"):
+                set cursor = cursor + 1
+                if cursor >= token_count: return err("SQL parser expected an additional joined table alias at end of input")
+                set extra_alias = list_get(tokens, cursor)
+                if extra_alias.kind != 1 and extra_alias.kind != 2:
+                    return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected an identifier for the additional joined table alias at byte "))
+                set extra_has_alias = true
+                set cursor = cursor + 1
+            if additional_join_type == 5:
+                if not list_try_push(additional_joins, YazaSqlAdditionalJoinV3(additional_join_type, 0, extra_table_name, extra_has_alias, extra_alias, empty_name, empty_name)):
+                    return err(yaza_sql_v2_parse_error(source, tokens, cursor - 1, "SQL parser additional JOIN list limit or allocation failure at byte "))
+            else:
+                if not yaza_sql_v2_is_keyword(source, tokens, cursor, "ON"):
+                    return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected ON after the additional joined table at byte "))
+                set cursor = cursor + 1
+                let extra_left_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, cursor, false)
+                if not result_is_ok(extra_left_result):
+                    return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected a left column in the additional JOIN at byte "))
+                let extra_left_column: YazaSqlNameV2 = result_unwrap(extra_left_result)
+                set cursor = cursor + extra_left_column.consumed_tokens
+                let extra_comparison: Number = yaza_sql_v2_comparison_code(source, tokens, cursor)
+                if extra_comparison < 1 or extra_comparison > 6 or (additional_join_type != 1 and extra_comparison != 1):
+                    return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser outer JOIN stages require equality and INNER JOIN operators must be supported comparisons at byte "))
+                set cursor = cursor + 1
+                let extra_right_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, cursor, false)
+                if not result_is_ok(extra_right_result):
+                    return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected a right column in the additional JOIN at byte "))
+                let extra_right_column: YazaSqlNameV2 = result_unwrap(extra_right_result)
+                set cursor = cursor + extra_right_column.consumed_tokens
+                if not list_try_push(additional_joins, YazaSqlAdditionalJoinV3(additional_join_type, extra_comparison, extra_table_name, extra_has_alias, extra_alias, extra_left_column, extra_right_column)):
+                    return err(yaza_sql_v2_parse_error(source, tokens, cursor - 1, "SQL parser additional JOIN list limit or allocation failure at byte "))
+
+    let expression_result: Result[List[YazaSqlExpressionNodeV3], Text] = list_try_new()
+    if not result_is_ok(expression_result): return err("SQL parser could not allocate the WHERE expression list")
+    var where_nodes: List[YazaSqlExpressionNodeV3] = result_unwrap(expression_result)
+    var has_where: Boolean = false
+    var where_root: Number = -1
+    if yaza_sql_v2_is_keyword(source, tokens, cursor, "WHERE"):
+        set has_where = true
+        let parsed_expression: Result[YazaSqlExpressionStateV3, Text] = yaza_sql_v3_parse_or(source, tokens, where_nodes, cursor + 1, 0)
+        if not result_is_ok(parsed_expression): return err(result_unwrap_error(parsed_expression))
+        let expression: YazaSqlExpressionStateV3 = result_unwrap(parsed_expression)
+        set where_root = expression.root_index
+        set cursor = expression.cursor
+
+    let group_result: Result[List[YazaSqlNameV2], Text] = list_try_new()
+    if not result_is_ok(group_result): return err("SQL parser could not allocate the GROUP BY list")
+    var group_by: List[YazaSqlNameV2] = result_unwrap(group_result)
+    if yaza_sql_v2_is_keyword(source, tokens, cursor, "GROUP"):
+        set cursor = cursor + 1
+        if not yaza_sql_v2_is_keyword(source, tokens, cursor, "BY"):
+            return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected BY after GROUP at byte "))
+        set cursor = cursor + 1
+        var group_done: Boolean = false
+        while not group_done:
+            if cursor >= token_count: return err("SQL parser expected a GROUP BY column at end of input")
+            let group_name_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, cursor, false)
+            if not result_is_ok(group_name_result): return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected a GROUP BY column at byte "))
+            let group_name: YazaSqlNameV2 = result_unwrap(group_name_result)
+            if list_count(group_by) >= 64: return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser GROUP BY list exceeds 64 columns at byte "))
+            if not list_try_push(group_by, group_name): return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser GROUP BY list limit or allocation failure at byte "))
+            set cursor = cursor + group_name.consumed_tokens
+            if yaza_sql_v2_is_symbol(source, tokens, cursor, 44):
+                set cursor = cursor + 1
+            else:
+                set group_done = true
+
+    let having_result: Result[List[YazaSqlExpressionNodeV3], Text] = list_try_new()
+    if not result_is_ok(having_result): return err("SQL parser could not allocate the HAVING expression list")
+    var having_nodes: List[YazaSqlExpressionNodeV3] = result_unwrap(having_result)
+    var has_having: Boolean = false
+    var having_root: Number = -1
+    if yaza_sql_v2_is_keyword(source, tokens, cursor, "HAVING"):
+        set has_having = true
+        let parsed_having: Result[YazaSqlExpressionStateV3, Text] = yaza_sql_v3_parse_or(source, tokens, having_nodes, cursor + 1, 0)
+        if not result_is_ok(parsed_having): return err(result_unwrap_error(parsed_having))
+        let having_expression: YazaSqlExpressionStateV3 = result_unwrap(parsed_having)
+        set having_root = having_expression.root_index
+        set cursor = having_expression.cursor
+
+    let order_result: Result[List[YazaSqlOrderTermV2], Text] = list_try_new()
+    if not result_is_ok(order_result): return err("SQL parser could not allocate the ORDER BY list")
+    var order_by: List[YazaSqlOrderTermV2] = result_unwrap(order_result)
+    if yaza_sql_v2_is_keyword(source, tokens, cursor, "ORDER"):
+        set cursor = cursor + 1
+        if not yaza_sql_v2_is_keyword(source, tokens, cursor, "BY"):
+            return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected BY after ORDER at byte "))
+        set cursor = cursor + 1
+        var order_done: Boolean = false
+        while not order_done:
+            if cursor >= token_count: return err("SQL parser expected an ORDER BY column at end of input")
+            let name_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, cursor, false)
+            if not result_is_ok(name_result): return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected an ORDER BY column at byte "))
+            let order_name: YazaSqlNameV2 = result_unwrap(name_result)
+            set cursor = cursor + order_name.consumed_tokens
+            var descending: Boolean = false
+            if yaza_sql_v2_is_keyword(source, tokens, cursor, "DESC"):
+                set descending = true
+                set cursor = cursor + 1
+            elif yaza_sql_v2_is_keyword(source, tokens, cursor, "ASC"):
+                set cursor = cursor + 1
+            if not list_try_push(order_by, YazaSqlOrderTermV2(order_name, descending)):
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor - 1, "SQL parser order-list limit or allocation failure at byte "))
+            if yaza_sql_v2_is_symbol(source, tokens, cursor, 44):
+                set cursor = cursor + 1
+            else:
+                set order_done = true
+
+    var has_limit: Boolean = false
+    var limit_value: Number = 0
+    if yaza_sql_v2_is_keyword(source, tokens, cursor, "LIMIT"):
+        set has_limit = true
+        set cursor = cursor + 1
+        if cursor >= token_count: return err("SQL parser expected an integer LIMIT at end of input")
+        let limit_token: YazaSqlTokenV1 = list_get(tokens, cursor)
+        if limit_token.kind != 3:
+            return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser expected an integer LIMIT at byte "))
+        var digit_offset: Number = limit_token.start_byte
+        while digit_offset < limit_token.end_byte:
+            let digit_byte: Number = text_byte(source, digit_offset)
+            if digit_byte < 48 or digit_byte > 57:
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser LIMIT must be an unsigned integer at byte "))
+            let digit: Number = digit_byte - 48
+            if limit_value > 100000 or (limit_value == 100000 and digit > 0):
+                return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser LIMIT exceeds 1000000 at byte "))
+            set limit_value = limit_value * 10 + digit
+            set digit_offset = digit_offset + 1
+        if limit_value > 1000000:
+            return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser LIMIT exceeds 1000000 at byte "))
+        set cursor = cursor + 1
+
+    var statement_end: Number = list_get(tokens, cursor - 1).end_byte
+    if yaza_sql_v2_is_symbol(source, tokens, cursor, 59):
+        set statement_end = list_get(tokens, cursor).end_byte
+        set cursor = cursor + 1
+    if cursor >= token_count or list_get(tokens, cursor).kind != 0:
+        return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser supports one statement; unexpected token at byte "))
+
+    return ok(YazaSqlSelectAstV3(3, first_token.start_byte, statement_end, distinct, projections, table_name, has_table_alias, table_alias, join_type, join_comparison_operator, join_table_name, has_join_table_alias, join_table_alias, join_left_column, join_right_column, additional_joins, has_where, where_nodes, where_root, group_by, has_having, having_nodes, having_root, order_by, has_limit, limit_value))
+
+fn yaza_sql_v3_diagnostic_code(message: Text) -> Number:
+    if text_starts_with(message, "SQL parser expression nesting exceeds"): return 2002
+    if text_starts_with(message, "SQL parser could not allocate"): return 2003
+    if text_starts_with(message, "SQL parser projection limit"): return 2003
+    if text_starts_with(message, "SQL parser order-list limit"): return 2003
+    if text_starts_with(message, "SQL parser GROUP BY list limit"): return 2003
+    if text_starts_with(message, "SQL parser expression node limit"): return 2003
+    if text_starts_with(message, "SQL parser supports one statement"): return 2004
+    if text_starts_with(message, "SQL parser LIMIT exceeds"): return 2005
+    return 2001
+
+fn yaza_sql_parse_select_structured_v1(source: Text) -> Result[YazaSqlSelectAstV3, YazaSqlDiagnosticV1]:
+    let parsed: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(source)
+    if result_is_ok(parsed): return ok(result_unwrap(parsed))
+    let message: Text = result_unwrap_error(parsed)
+    if text_starts_with(message, "SQL lexer "):
+        return err(yaza_sql_v1_diagnostic(source, message, 1, yaza_sql_v1_diagnostic_code(message)))
+    return err(yaza_sql_v1_diagnostic(source, message, 2, yaza_sql_v3_diagnostic_code(message)))

@@ -1,0 +1,1183 @@
+use "std/fs"
+use "./disk_quota_v1"
+use "./page_v1"
+
+shape YazaDbWalRecordV1:
+    lsn: Number
+    prev_lsn: Number
+    txn_id: Number
+    rec_type: Number
+    flags: Number
+    payload: Bytes
+
+shape YazaDbWalLogV1:
+    root: Number
+    db_uuid: Bytes
+    file: Number
+    segment_index: Number
+    segment_base_lsn: Number
+    next_lsn: Number
+
+shape YazaDbWalAppendV1:
+    log: YazaDbWalLogV1
+    record: YazaDbWalRecordV1
+
+shape YazaDbWalPageImageV1:
+    page_id: Number
+    image: Bytes
+
+shape YazaDbWalLeafCompensationV1:
+    operation: Number
+    page_id: Number
+    undo_next_lsn: Number
+    compensated_lsn: Number
+    image: Bytes
+
+shape YazaDbWalNodeSplitPageV1:
+    page_id: Number
+    has_before_image: Boolean
+    before_image: Bytes
+    after_image: Bytes
+
+shape YazaDbWalNodeSplitV1:
+    pages: List[YazaDbWalNodeSplitPageV1]
+
+shape YazaDbWalPageSetImageV1:
+    page_id: Number
+    image: Bytes
+
+shape YazaDbWalNodeSplitCompensationV1:
+    undo_next_lsn: Number
+    compensated_lsn: Number
+    pages: List[YazaDbWalPageSetImageV1]
+
+shape YazaDbWalCatalogRootCommitV1:
+    commit_ts: Number
+    previous_catalog_root: Number
+    new_catalog_root: Number
+
+fn yaza_db_wal_segment_size_v1() -> Number:
+    return 67108864
+
+fn yaza_db_wal_header_size_v1() -> Number:
+    return 40
+
+fn yaza_db_wal_max_record_size_v1() -> Number:
+    return 16777216
+
+fn yaza_db_wal_type_leaf_insert_v1() -> Number:
+    return 1
+
+fn yaza_db_wal_type_leaf_update_v1() -> Number:
+    return 2
+
+fn yaza_db_wal_type_leaf_delete_v1() -> Number:
+    return 3
+
+fn yaza_db_wal_type_node_split_v1() -> Number:
+    return 4
+
+fn yaza_db_wal_type_node_merge_v1() -> Number:
+    return 5
+
+fn yaza_db_wal_type_page_alloc_v1() -> Number:
+    return 6
+
+fn yaza_db_wal_type_page_free_v1() -> Number:
+    return 7
+
+fn yaza_db_wal_type_full_page_image_v1() -> Number:
+    return 8
+
+fn yaza_db_wal_type_commit_v1() -> Number:
+    return 9
+
+fn yaza_db_wal_type_abort_v1() -> Number:
+    return 10
+
+fn yaza_db_wal_type_compensation_v1() -> Number:
+    return 11
+
+fn yaza_db_wal_type_checkpoint_begin_v1() -> Number:
+    return 12
+
+fn yaza_db_wal_type_checkpoint_end_v1() -> Number:
+    return 13
+
+fn yaza_db_wal_type_mtr_end_v1() -> Number:
+    return 14
+
+fn yaza_db_wal_type_skip_v1() -> Number:
+    return 15
+
+fn yaza_db_wal_type_catalog_root_commit_v1() -> Number:
+    return 16
+
+fn yaza_db_wal_type_valid_v1(rec_type: Number) -> Boolean:
+    return rec_type >= yaza_db_wal_type_leaf_insert_v1() and rec_type <= yaza_db_wal_type_catalog_root_commit_v1()
+
+fn yaza_db_wal_commit_payload_size_v1() -> Number:
+    return 8
+
+fn yaza_db_wal_catalog_root_commit_payload_size_v1() -> Number:
+    return 32
+
+fn yaza_db_wal_page_image_header_size_v1() -> Number:
+    return 20
+
+fn yaza_db_wal_page_image_payload_size_v1() -> Number:
+    return yaza_db_wal_page_image_header_size_v1() + yaza_db_page_size_v1()
+
+fn yaza_db_wal_leaf_compensation_payload_size_v1() -> Number:
+    return 40 + yaza_db_page_size_v1()
+
+fn yaza_db_wal_node_split_header_size_v1() -> Number:
+    return 16
+
+fn yaza_db_wal_node_split_entry_size_v1() -> Number:
+    return 16 + 2 * yaza_db_page_size_v1()
+
+fn yaza_db_wal_node_split_compensation_header_size_v1() -> Number:
+    return 40
+
+fn yaza_db_wal_node_split_compensation_entry_size_v1() -> Number:
+    return 16 + yaza_db_page_size_v1()
+
+fn yaza_db_wal_node_split_max_pages_v1() -> Number:
+    return 16
+
+fn yaza_db_wal_node_split_compensation_max_pages_v1() -> Number:
+    return yaza_db_wal_node_split_max_pages_v1()
+
+fn yaza_db_wal_bytes_all_zero_v1(input: Bytes) -> Boolean:
+    var index: Number = 0
+    while index < bytes_length(input):
+        if bytes_get(input, index) != 0: return false
+        set index = index + 1
+    return true
+
+fn yaza_db_wal_node_split_validate_page_v1(page_id: Number, record_lsn: Number, before_image: Bytes, has_before_image: Boolean, after_image: Bytes) -> Result[Boolean, Text]:
+    if page_id < 2 or record_lsn < 1: return err("YDBv1 NODE_SPLIT page ID or record LSN is invalid")
+    if bytes_length(after_image) != yaza_db_page_size_v1(): return err("YDBv1 NODE_SPLIT after-image must contain one full database page")
+    let after_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(after_image, page_id)?
+    if after_header.page_lsn != record_lsn: return err("YDBv1 NODE_SPLIT after-image LSN must equal its WAL record LSN")
+    if after_header.page_type != 1 and after_header.page_type != 2 and after_header.page_type != 4: return err("YDBv1 NODE_SPLIT only carries LEAF, INNER, and META pages")
+    if has_before_image:
+        if bytes_length(before_image) != yaza_db_page_size_v1(): return err("YDBv1 NODE_SPLIT before-image must contain one full database page")
+        let before_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(before_image, page_id)?
+        if before_header.page_lsn >= record_lsn: return err("YDBv1 NODE_SPLIT before-image LSN must precede the split record")
+        if before_header.page_type != after_header.page_type:
+            if before_header.page_type != 1 or before_header.level != 0 or after_header.page_type != 2 or after_header.level != 1 or after_header.count != 1: return err("YDBv1 NODE_SPLIT page-type changes are allowed only for a one-separator LEAF-root promotion")
+        elif before_header.level != after_header.level:
+            if before_header.page_type != 2 or after_header.level != before_header.level + 1 or after_header.count != 1: return err("YDBv1 NODE_SPLIT level changes are allowed only for a one-separator INNER root promotion")
+    else:
+        if bytes_length(before_image) != 0 and not yaza_db_wal_bytes_all_zero_v1(before_image): return err("YDBv1 NODE_SPLIT absent before-image must be empty or zero-filled")
+        if after_header.page_type != 1 and after_header.page_type != 2: return err("YDBv1 NODE_SPLIT newly allocated page must be LEAF or INNER")
+    return ok(true)
+
+fn yaza_db_wal_node_split_fence_v1(page: Bytes, header: YazaDbPageHeaderV1, low: Boolean) -> Result[Bytes, Text]:
+    var offset: Number = header.high_fence_offset
+    var length: Number = header.high_fence_len
+    if low:
+        set offset = header.low_fence_offset
+        set length = header.low_fence_len
+    return bytes_try_slice(page, offset, length)
+
+fn yaza_db_wal_node_split_validate_leaf_root_growth_v1(pages: List[YazaDbWalNodeSplitPageV1], root_index: Number) -> Result[Boolean, Text]:
+    if list_count(pages) != 3: return err("YDBv1 LEAF-root growth must contain one root and exactly two allocated children")
+    let root_page: YazaDbWalNodeSplitPageV1 = list_get(pages, root_index)
+    if not root_page.has_before_image: return err("YDBv1 LEAF-root growth root must carry its before-image")
+    let before_root: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(root_page.before_image, root_page.page_id)?
+    let after_root: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(root_page.after_image, root_page.page_id)?
+    if before_root.page_type != 1 or before_root.level != 0 or before_root.count < 2 or before_root.low_fence_len != 0 or before_root.high_fence_len != 0: return err("YDBv1 LEAF-root growth source must be an unfenced, splittable LEAF root")
+    if after_root.page_type != 2 or after_root.level != 1 or after_root.count != 1 or after_root.low_fence_len != 0 or after_root.high_fence_len != 0: return err("YDBv1 LEAF-root growth must replace the root with one unfenced INNER level")
+    let root_slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(root_page.after_image, 0, root_page.page_id)?
+    let separator: Bytes = yaza_db_page_slot_key_v1(root_page.after_image, 0, root_page.page_id)?
+    let left_page_id: Number = yaza_db_page_inner_child_page_id_v1(root_slot.payload)?
+    let right_page_id: Number = after_root.upper / 2
+    if left_page_id < 2 or right_page_id < 2 or left_page_id == right_page_id or left_page_id == root_page.page_id or right_page_id == root_page.page_id: return err("YDBv1 LEAF-root growth child pointers are invalid")
+    var left_page: Bytes = bytes_from_text("")
+    var right_page: Bytes = bytes_from_text("")
+    var found_left: Boolean = false
+    var found_right: Boolean = false
+    var index: Number = 0
+    while index < list_count(pages):
+        let page: YazaDbWalNodeSplitPageV1 = list_get(pages, index)
+        if index != root_index:
+            if page.has_before_image: return err("YDBv1 LEAF-root growth child must be newly allocated")
+            if page.page_id == left_page_id:
+                set left_page = page.after_image
+                set found_left = true
+            elif page.page_id == right_page_id:
+                set right_page = page.after_image
+                set found_right = true
+            else:
+                return err("YDBv1 LEAF-root growth page set contains an unreferenced child")
+        set index = index + 1
+    if not found_left or not found_right: return err("YDBv1 LEAF-root growth root does not reference both new pages")
+    let left_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(left_page, left_page_id)?
+    let right_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(right_page, right_page_id)?
+    if left_header.page_type != 1 or right_header.page_type != 1 or left_header.level != 0 or right_header.level != 0 or left_header.count < 1 or right_header.count < 1: return err("YDBv1 LEAF-root growth children must be non-empty LEAF pages")
+    if left_header.low_fence_len != 0 or left_header.high_fence_len != bytes_length(separator) or right_header.low_fence_len != bytes_length(separator) or right_header.high_fence_len != 0: return err("YDBv1 LEAF-root growth children have invalid fence widths")
+    let left_high: Bytes = yaza_db_wal_node_split_fence_v1(left_page, left_header, false)?
+    let right_low: Bytes = yaza_db_wal_node_split_fence_v1(right_page, right_header, true)?
+    if not bytes_equal(left_high, separator) or not bytes_equal(right_low, separator): return err("YDBv1 LEAF-root growth children do not meet at the root separator")
+    if left_header.prefix_len != before_root.prefix_len or right_header.prefix_len != before_root.prefix_len: return err("YDBv1 LEAF-root growth did not preserve the leaf key prefix")
+    if after_root.count != 1 or left_header.count + right_header.count != before_root.count: return err("YDBv1 LEAF-root growth changed the source slot count")
+    let split_index: Number = yaza_db_page_lower_bound_v1(root_page.before_image, separator, root_page.page_id)?
+    if split_index <= 0 or split_index >= before_root.count: return err("YDBv1 LEAF-root separator must divide the source keys into non-empty ranges")
+    let source_separator: Bytes = yaza_db_page_slot_key_v1(root_page.before_image, split_index, root_page.page_id)?
+    let right_first_key: Bytes = yaza_db_page_slot_key_v1(right_page, 0, right_page_id)?
+    if not bytes_equal(source_separator, separator) or not bytes_equal(right_first_key, separator) or left_header.count != split_index: return err("YDBv1 LEAF-root separator is not the first key on the right child")
+    var slot_index: Number = 0
+    while slot_index < before_root.count:
+        var child_page: Bytes = left_page
+        var child_page_id: Number = left_page_id
+        var child_slot_index: Number = slot_index
+        if slot_index >= split_index:
+            set child_page = right_page
+            set child_page_id = right_page_id
+            set child_slot_index = slot_index - split_index
+        let source_key: Bytes = yaza_db_page_slot_key_v1(root_page.before_image, slot_index, root_page.page_id)?
+        let child_key: Bytes = yaza_db_page_slot_key_v1(child_page, child_slot_index, child_page_id)?
+        let source_slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(root_page.before_image, slot_index, root_page.page_id)?
+        let child_slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(child_page, child_slot_index, child_page_id)?
+        if not bytes_equal(source_key, child_key) or not bytes_equal(source_slot.payload, child_slot.payload): return err("YDBv1 LEAF-root growth changed or reordered a source key/value")
+        set slot_index = slot_index + 1
+    return ok(true)
+
+fn yaza_db_wal_node_split_validate_root_promotion_v1(pages: List[YazaDbWalNodeSplitPageV1]) -> Result[Boolean, Text]:
+    var root_index: Number = -1
+    var promotion_count: Number = 0
+    var index: Number = 0
+    while index < list_count(pages):
+        let page: YazaDbWalNodeSplitPageV1 = list_get(pages, index)
+        if page.has_before_image:
+            let before_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page.before_image, page.page_id)?
+            let after_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page.after_image, page.page_id)?
+            if before_header.level != after_header.level or before_header.page_type != after_header.page_type:
+                set root_index = index
+                set promotion_count = promotion_count + 1
+        set index = index + 1
+    if promotion_count == 0: return ok(true)
+    if promotion_count != 1 or list_count(pages) != 3: return err("YDBv1 root promotion must atomically contain one old root and exactly two new child pages")
+
+    let root_page: YazaDbWalNodeSplitPageV1 = list_get(pages, root_index)
+    if not root_page.has_before_image: return err("YDBv1 promoted root must have a before-image")
+    let before_root: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(root_page.before_image, root_page.page_id)?
+    let after_root: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(root_page.after_image, root_page.page_id)?
+    if before_root.page_type == 1: return yaza_db_wal_node_split_validate_leaf_root_growth_v1(pages, root_index)
+    if before_root.page_type != 2 or before_root.level < 1 or before_root.level >= 254 or before_root.count < 3: return err("YDBv1 root promotion source must be a splittable INNER root")
+    if after_root.page_type != 2 or after_root.level != before_root.level + 1 or after_root.count != 1: return err("YDBv1 promoted root must add one level and contain one separator")
+
+    var left_page_id: Number = -1
+    var right_page_id: Number = -1
+    var left_page: Bytes = bytes_from_text("")
+    var right_page: Bytes = bytes_from_text("")
+    set index = 0
+    while index < list_count(pages):
+        let page: YazaDbWalNodeSplitPageV1 = list_get(pages, index)
+        if not page.has_before_image:
+            let child_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page.after_image, page.page_id)?
+            if child_header.page_type != 2 or child_header.level != before_root.level: return err("YDBv1 root promotion children must be INNER pages one level below the new root")
+            if left_page_id < 0:
+                set left_page_id = page.page_id
+                set left_page = page.after_image
+            else:
+                set right_page_id = page.page_id
+                set right_page = page.after_image
+        set index = index + 1
+    if left_page_id < 2 or right_page_id < 2 or left_page_id == right_page_id: return err("YDBv1 root promotion must contain distinct allocated left and right child pages")
+
+    let root_slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(root_page.after_image, 0, root_page.page_id)?
+    let separator: Bytes = yaza_db_page_slot_key_v1(root_page.after_image, 0, root_page.page_id)?
+    let left_pointer_page_id: Number = yaza_db_page_inner_child_page_id_v1(root_slot.payload)?
+    let right_pointer_page_id: Number = after_root.upper / 2
+    if left_pointer_page_id != left_page_id or right_pointer_page_id != right_page_id: return err("YDBv1 promoted root child pointers do not reference its two new children")
+
+    let left_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(left_page, left_page_id)?
+    let right_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(right_page, right_page_id)?
+    let old_upper_child_id: Number = before_root.upper / 2
+    if old_upper_child_id == root_page.page_id or old_upper_child_id == left_page_id or old_upper_child_id == right_page_id: return err("YDBv1 root promotion source upper child aliases a root or newly allocated child page")
+    set index = 0
+    while index < before_root.count:
+        let old_child_slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(root_page.before_image, index, root_page.page_id)?
+        let old_child: Number = yaza_db_page_inner_child_page_id_v1(old_child_slot.payload)?
+        if old_child == root_page.page_id or old_child == left_page_id or old_child == right_page_id: return err("YDBv1 root promotion source contains a root or newly allocated child alias")
+        set index = index + 1
+    let left_low: Bytes = yaza_db_wal_node_split_fence_v1(left_page, left_header, true)?
+    let left_high: Bytes = yaza_db_wal_node_split_fence_v1(left_page, left_header, false)?
+    let right_low: Bytes = yaza_db_wal_node_split_fence_v1(right_page, right_header, true)?
+    let right_high: Bytes = yaza_db_wal_node_split_fence_v1(right_page, right_header, false)?
+    let old_low: Bytes = yaza_db_wal_node_split_fence_v1(root_page.before_image, before_root, true)?
+    let old_high: Bytes = yaza_db_wal_node_split_fence_v1(root_page.before_image, before_root, false)?
+    let new_root_low: Bytes = yaza_db_wal_node_split_fence_v1(root_page.after_image, after_root, true)?
+    let new_root_high: Bytes = yaza_db_wal_node_split_fence_v1(root_page.after_image, after_root, false)?
+    if before_root.low_fence_len != after_root.low_fence_len or before_root.high_fence_len != after_root.high_fence_len or not bytes_equal(old_low, new_root_low) or not bytes_equal(old_high, new_root_high): return err("YDBv1 root promotion must preserve the old root's outer key fences")
+    if left_header.low_fence_len != before_root.low_fence_len or left_header.high_fence_len != bytes_length(separator) or right_header.low_fence_len != bytes_length(separator) or right_header.high_fence_len != before_root.high_fence_len: return err("YDBv1 promoted child fences do not cover the old root range")
+    if not bytes_equal(left_low, old_low) or not bytes_equal(left_high, separator) or not bytes_equal(right_low, separator) or not bytes_equal(right_high, old_high): return err("YDBv1 promoted child fences do not meet at the root separator")
+
+    let split_index: Number = yaza_db_page_lower_bound_v1(root_page.before_image, separator, root_page.page_id)?
+    if split_index <= 0 or split_index + 1 >= before_root.count: return err("YDBv1 root promotion separator must leave at least two child ranges on each side")
+    let old_promoted_key: Bytes = yaza_db_page_slot_key_v1(root_page.before_image, split_index, root_page.page_id)?
+    if not bytes_equal(old_promoted_key, separator): return err("YDBv1 root promotion separator must come from the old root")
+    let promoted_slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(root_page.before_image, split_index, root_page.page_id)?
+    let expected_left_upper: Number = yaza_db_page_inner_child_page_id_v1(promoted_slot.payload)?
+    if left_header.upper / 2 != expected_left_upper or right_header.upper != before_root.upper: return err("YDBv1 root promotion did not preserve the boundary and rightmost child pointers")
+    if left_header.count != split_index or right_header.count != before_root.count - split_index - 1: return err("YDBv1 root promotion did not preserve all separator slots")
+
+    var old_slot_index: Number = 0
+    while old_slot_index < before_root.count:
+        if old_slot_index < split_index:
+            let old_slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(root_page.before_image, old_slot_index, root_page.page_id)?
+            let new_slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(left_page, old_slot_index, left_page_id)?
+            let old_key: Bytes = yaza_db_page_slot_key_v1(root_page.before_image, old_slot_index, root_page.page_id)?
+            let new_key: Bytes = yaza_db_page_slot_key_v1(left_page, old_slot_index, left_page_id)?
+            if not bytes_equal(old_key, new_key) or not bytes_equal(old_slot.payload, new_slot.payload): return err("YDBv1 root promotion changed a left-side separator or child pointer")
+        elif old_slot_index > split_index:
+            let right_index: Number = old_slot_index - split_index - 1
+            let old_slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(root_page.before_image, old_slot_index, root_page.page_id)?
+            let new_slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(right_page, right_index, right_page_id)?
+            let old_key: Bytes = yaza_db_page_slot_key_v1(root_page.before_image, old_slot_index, root_page.page_id)?
+            let new_key: Bytes = yaza_db_page_slot_key_v1(right_page, right_index, right_page_id)?
+            if not bytes_equal(old_key, new_key) or not bytes_equal(old_slot.payload, new_slot.payload): return err("YDBv1 root promotion changed a right-side separator or child pointer")
+        set old_slot_index = old_slot_index + 1
+    return ok(true)
+
+fn yaza_db_wal_node_split_payload_size_v1(page_count: Number) -> Number:
+    return yaza_db_wal_node_split_header_size_v1() + page_count * yaza_db_wal_node_split_entry_size_v1()
+
+fn yaza_db_wal_node_split_payload_encode_v1(record_lsn: Number, pages: List[YazaDbWalNodeSplitPageV1]) -> Result[Bytes, Text]:
+    let page_count: Number = list_count(pages)
+    if record_lsn < 1 or page_count < 2 or page_count > yaza_db_wal_node_split_max_pages_v1(): return err("YDBv1 NODE_SPLIT LSN or page count is outside the supported bound")
+    var previous_page_id: Number = 1
+    var index: Number = 0
+    while index < page_count:
+        let page: YazaDbWalNodeSplitPageV1 = list_get(pages, index)
+        if page.page_id <= previous_page_id: return err("YDBv1 NODE_SPLIT pages must be strictly ordered by page ID")
+        let ignored_page: Boolean = yaza_db_wal_node_split_validate_page_v1(page.page_id, record_lsn, page.before_image, page.has_before_image, page.after_image)?
+        set previous_page_id = page.page_id
+        set index = index + 1
+    let ignored_root_promotion: Boolean = yaza_db_wal_node_split_validate_root_promotion_v1(pages)?
+    let output: Bytes = bytes_try_new_zeroed(yaza_db_wal_node_split_payload_size_v1(page_count))?
+    if not yaza_db_write_uint_le_v1(output, 0, 1, 2) or not yaza_db_write_uint_le_v1(output, 2, 0, 2): return err("YDBv1 NODE_SPLIT payload version or flags could not be encoded")
+    if not yaza_db_write_uint_le_v1(output, 4, page_count, 4) or not yaza_db_write_uint_le_v1(output, 8, yaza_db_page_size_v1(), 4) or not yaza_db_write_uint_le_v1(output, 12, 0, 4): return err("YDBv1 NODE_SPLIT payload metadata could not be encoded")
+    set index = 0
+    while index < page_count:
+        let page: YazaDbWalNodeSplitPageV1 = list_get(pages, index)
+        let entry_offset: Number = yaza_db_wal_node_split_header_size_v1() + index * yaza_db_wal_node_split_entry_size_v1()
+        let image_offset: Number = entry_offset + 16
+        var before_flag: Number = 0
+        if page.has_before_image: set before_flag = 1
+        if not yaza_db_write_uint_le_v1(output, entry_offset, page.page_id, 8) or not yaza_db_write_uint_le_v1(output, entry_offset + 8, before_flag, 4) or not yaza_db_write_uint_le_v1(output, entry_offset + 12, 0, 4): return err("YDBv1 NODE_SPLIT entry header could not be encoded")
+        if page.has_before_image and not yaza_db_write_bytes_v1(output, image_offset, page.before_image): return err("YDBv1 NODE_SPLIT before-image could not be copied")
+        if not yaza_db_write_bytes_v1(output, image_offset + yaza_db_page_size_v1(), page.after_image): return err("YDBv1 NODE_SPLIT after-image could not be copied")
+        set index = index + 1
+    return ok(output)
+
+fn yaza_db_wal_node_split_payload_decode_v1(record: YazaDbWalRecordV1) -> Result[YazaDbWalNodeSplitV1, Text]:
+    if record.rec_type != yaza_db_wal_type_node_split_v1() or record.txn_id < 1 or record.lsn < 1: return err("YDBv1 NODE_SPLIT requires a transactional WAL record with positive LSN")
+    let payload_length: Number = bytes_length(record.payload)
+    if payload_length < yaza_db_wal_node_split_payload_size_v1(2): return err("YDBv1 NODE_SPLIT payload is truncated")
+    let version: Number = yaza_db_read_uint_le_v1(record.payload, 0, 2)?
+    let flags: Number = yaza_db_read_uint_le_v1(record.payload, 2, 2)?
+    let page_count: Number = yaza_db_read_uint_le_v1(record.payload, 4, 4)?
+    let image_size: Number = yaza_db_read_uint_le_v1(record.payload, 8, 4)?
+    let reserved: Number = yaza_db_read_uint_le_v1(record.payload, 12, 4)?
+    if version != 1 or flags != 0 or reserved != 0 or image_size != yaza_db_page_size_v1(): return err("YDBv1 NODE_SPLIT payload version, flags, reserved field, or page size is invalid")
+    if page_count < 2 or page_count > yaza_db_wal_node_split_max_pages_v1() or payload_length != yaza_db_wal_node_split_payload_size_v1(page_count): return err("YDBv1 NODE_SPLIT page count or payload length is invalid")
+    var pages: List[YazaDbWalNodeSplitPageV1] = List[YazaDbWalNodeSplitPageV1]()
+    var previous_page_id: Number = 1
+    var index: Number = 0
+    while index < page_count:
+        let entry_offset: Number = yaza_db_wal_node_split_header_size_v1() + index * yaza_db_wal_node_split_entry_size_v1()
+        let page_id: Number = yaza_db_read_uint_le_v1(record.payload, entry_offset, 8)?
+        let before_flag: Number = yaza_db_read_uint_le_v1(record.payload, entry_offset + 8, 4)?
+        let entry_reserved: Number = yaza_db_read_uint_le_v1(record.payload, entry_offset + 12, 4)?
+        if page_id <= previous_page_id or (before_flag != 0 and before_flag != 1) or entry_reserved != 0: return err("YDBv1 NODE_SPLIT page IDs, image flags, or reserved field are invalid")
+        let image_offset: Number = entry_offset + 16
+        let before_image: Bytes = bytes_try_slice(record.payload, image_offset, yaza_db_page_size_v1())?
+        let after_image: Bytes = bytes_try_slice(record.payload, image_offset + yaza_db_page_size_v1(), yaza_db_page_size_v1())?
+        let has_before_image: Boolean = before_flag == 1
+        if not has_before_image and not yaza_db_wal_bytes_all_zero_v1(before_image): return err("YDBv1 NODE_SPLIT absent before-image is not canonical zero-filled data")
+        let ignored_page: Boolean = yaza_db_wal_node_split_validate_page_v1(page_id, record.lsn, before_image, has_before_image, after_image)?
+        let page: YazaDbWalNodeSplitPageV1 = YazaDbWalNodeSplitPageV1(page_id, has_before_image, before_image, after_image)
+        if not list_try_push(pages, page): return err("YDBv1 NODE_SPLIT decoded page list allocation failed")
+        set previous_page_id = page_id
+        set index = index + 1
+    let ignored_root_promotion: Boolean = yaza_db_wal_node_split_validate_root_promotion_v1(pages)?
+    return ok(YazaDbWalNodeSplitV1(pages))
+
+fn yaza_db_wal_node_split_compensation_payload_size_v1(page_count: Number) -> Number:
+    return yaza_db_wal_node_split_compensation_header_size_v1() + page_count * yaza_db_wal_node_split_compensation_entry_size_v1()
+
+fn yaza_db_wal_node_split_compensation_payload_encode_v1(undo_next_lsn: Number, compensated_lsn: Number, record_lsn: Number, record_prev_lsn: Number, pages: List[YazaDbWalPageSetImageV1]) -> Result[Bytes, Text]:
+    let page_count: Number = list_count(pages)
+    if undo_next_lsn < 0 or compensated_lsn <= undo_next_lsn or compensated_lsn >= record_lsn or compensated_lsn > record_prev_lsn: return err("YDBv1 NODE_SPLIT CLR transaction LSN chain is invalid")
+    if record_lsn < 1 or page_count < 1 or page_count > yaza_db_wal_node_split_compensation_max_pages_v1(): return err("YDBv1 NODE_SPLIT CLR record LSN or page count is outside the supported bound")
+    var previous_page_id: Number = 1
+    var index: Number = 0
+    while index < page_count:
+        let page: YazaDbWalPageSetImageV1 = list_get(pages, index)
+        if page.page_id <= previous_page_id or bytes_length(page.image) != yaza_db_page_size_v1(): return err("YDBv1 NODE_SPLIT CLR page IDs or image length are invalid")
+        let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page.image, page.page_id)?
+        if header.page_lsn != record_lsn or (header.page_type != 1 and header.page_type != 2 and header.page_type != 4): return err("YDBv1 NODE_SPLIT CLR image type or LSN is invalid")
+        set previous_page_id = page.page_id
+        set index = index + 1
+    let output: Bytes = bytes_try_new_zeroed(yaza_db_wal_node_split_compensation_payload_size_v1(page_count))?
+    if not yaza_db_write_uint_le_v1(output, 0, 3, 2) or not yaza_db_write_uint_le_v1(output, 2, yaza_db_wal_type_node_split_v1(), 2) or not yaza_db_write_uint_le_v1(output, 4, 0, 4): return err("YDBv1 NODE_SPLIT CLR version, operation, or flags could not be encoded")
+    if not yaza_db_write_uint_le_v1(output, 8, undo_next_lsn, 8) or not yaza_db_write_uint_le_v1(output, 16, compensated_lsn, 8): return err("YDBv1 NODE_SPLIT CLR transaction LSNs could not be encoded")
+    if not yaza_db_write_uint_le_v1(output, 24, page_count, 4) or not yaza_db_write_uint_le_v1(output, 28, yaza_db_page_size_v1(), 4) or not yaza_db_write_uint_le_v1(output, 32, 0, 8): return err("YDBv1 NODE_SPLIT CLR page count, image size, or reserved field could not be encoded")
+    set index = 0
+    while index < page_count:
+        let page: YazaDbWalPageSetImageV1 = list_get(pages, index)
+        let entry_offset: Number = yaza_db_wal_node_split_compensation_header_size_v1() + index * yaza_db_wal_node_split_compensation_entry_size_v1()
+        if not yaza_db_write_uint_le_v1(output, entry_offset, page.page_id, 8) or not yaza_db_write_uint_le_v1(output, entry_offset + 8, 0, 8): return err("YDBv1 NODE_SPLIT CLR page entry could not be encoded")
+        if not yaza_db_write_bytes_v1(output, entry_offset + 16, page.image): return err("YDBv1 NODE_SPLIT CLR image could not be copied")
+        set index = index + 1
+    return ok(output)
+
+fn yaza_db_wal_node_split_compensation_payload_decode_v1(record: YazaDbWalRecordV1) -> Result[YazaDbWalNodeSplitCompensationV1, Text]:
+    if record.rec_type != yaza_db_wal_type_compensation_v1() or record.txn_id < 1 or record.lsn < 1: return err("YDBv1 NODE_SPLIT CLR requires a transactional COMPENSATION record with positive LSN")
+    let payload_length: Number = bytes_length(record.payload)
+    if payload_length < yaza_db_wal_node_split_compensation_payload_size_v1(1): return err("YDBv1 NODE_SPLIT CLR payload is truncated")
+    let version: Number = yaza_db_read_uint_le_v1(record.payload, 0, 2)?
+    let operation: Number = yaza_db_read_uint_le_v1(record.payload, 2, 2)?
+    let flags: Number = yaza_db_read_uint_le_v1(record.payload, 4, 4)?
+    let undo_next_lsn: Number = yaza_db_read_uint_le_v1(record.payload, 8, 8)?
+    let compensated_lsn: Number = yaza_db_read_uint_le_v1(record.payload, 16, 8)?
+    let page_count: Number = yaza_db_read_uint_le_v1(record.payload, 24, 4)?
+    let image_size: Number = yaza_db_read_uint_le_v1(record.payload, 28, 4)?
+    let reserved: Number = yaza_db_read_uint_le_v1(record.payload, 32, 8)?
+    if version != 3 or operation != yaza_db_wal_type_node_split_v1() or flags != 0 or reserved != 0 or image_size != yaza_db_page_size_v1(): return err("YDBv1 NODE_SPLIT CLR version, operation, flags, image size, or reserved field is invalid")
+    if compensated_lsn <= undo_next_lsn or compensated_lsn >= record.lsn or compensated_lsn > record.prev_lsn: return err("YDBv1 NODE_SPLIT CLR compensated LSN or undo cursor is invalid")
+    if page_count < 1 or page_count > yaza_db_wal_node_split_compensation_max_pages_v1() or payload_length != yaza_db_wal_node_split_compensation_payload_size_v1(page_count): return err("YDBv1 NODE_SPLIT CLR page count or payload length is invalid")
+    var pages: List[YazaDbWalPageSetImageV1] = List[YazaDbWalPageSetImageV1]()
+    var previous_page_id: Number = 1
+    var index: Number = 0
+    while index < page_count:
+        let entry_offset: Number = yaza_db_wal_node_split_compensation_header_size_v1() + index * yaza_db_wal_node_split_compensation_entry_size_v1()
+        let page_id: Number = yaza_db_read_uint_le_v1(record.payload, entry_offset, 8)?
+        let entry_reserved: Number = yaza_db_read_uint_le_v1(record.payload, entry_offset + 8, 8)?
+        if page_id <= previous_page_id or entry_reserved != 0: return err("YDBv1 NODE_SPLIT CLR page ID order or reserved field is invalid")
+        let image: Bytes = bytes_try_slice(record.payload, entry_offset + 16, image_size)?
+        let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(image, page_id)?
+        if header.page_lsn != record.lsn or (header.page_type != 1 and header.page_type != 2 and header.page_type != 4): return err("YDBv1 NODE_SPLIT CLR page image type or LSN is invalid")
+        if not list_try_push(pages, YazaDbWalPageSetImageV1(page_id, image)): return err("YDBv1 NODE_SPLIT CLR decoded page list allocation failed")
+        set previous_page_id = page_id
+        set index = index + 1
+    return ok(YazaDbWalNodeSplitCompensationV1(undo_next_lsn, compensated_lsn, pages))
+
+fn yaza_db_wal_page_image_payload_encode_v1(page_id: Number, record_lsn: Number, image: Bytes) -> Result[Bytes, Text]:
+    if page_id < 2 or record_lsn < 1: return err("YDBv1 FULL_PAGE_IMAGE page ID and LSN must be positive")
+    if bytes_length(image) != yaza_db_page_size_v1(): return err("YDBv1 FULL_PAGE_IMAGE must contain one complete database page")
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(image, page_id)?
+    if header.page_lsn != record_lsn: return err("YDBv1 FULL_PAGE_IMAGE page LSN must equal its WAL record LSN")
+    if header.page_type < 1 or header.page_type > 4: return err("YDBv1 FULL_PAGE_IMAGE supports LEAF, INNER, OVERFLOW, or META pages")
+    let payload: Bytes = bytes_try_new_zeroed(yaza_db_wal_page_image_payload_size_v1())?
+    if not yaza_db_write_uint_le_v1(payload, 0, 1, 2) or not yaza_db_write_uint_le_v1(payload, 2, 0, 2): return err("YDBv1 FULL_PAGE_IMAGE version or flags could not be encoded")
+    if not yaza_db_write_uint_le_v1(payload, 4, page_id, 8) or not yaza_db_write_uint_le_v1(payload, 12, yaza_db_page_size_v1(), 4) or not yaza_db_write_uint_le_v1(payload, 16, 0, 4): return err("YDBv1 FULL_PAGE_IMAGE page metadata could not be encoded")
+    if not yaza_db_write_bytes_v1(payload, yaza_db_wal_page_image_header_size_v1(), image): return err("YDBv1 FULL_PAGE_IMAGE page bytes could not be copied")
+    return ok(payload)
+
+fn yaza_db_wal_page_image_payload_decode_v1(record: YazaDbWalRecordV1) -> Result[YazaDbWalPageImageV1, Text]:
+    if record.rec_type != yaza_db_wal_type_full_page_image_v1() or record.txn_id != 0 or record.prev_lsn != 0: return err("YDBv1 FULL_PAGE_IMAGE requires a system WAL record")
+    if record.lsn < 1 or bytes_length(record.payload) != yaza_db_wal_page_image_payload_size_v1(): return err("YDBv1 FULL_PAGE_IMAGE record LSN or payload length is invalid")
+    let version: Number = yaza_db_read_uint_le_v1(record.payload, 0, 2)?
+    let flags: Number = yaza_db_read_uint_le_v1(record.payload, 2, 2)?
+    let page_id: Number = yaza_db_read_uint_le_v1(record.payload, 4, 8)?
+    let image_length: Number = yaza_db_read_uint_le_v1(record.payload, 12, 4)?
+    let reserved: Number = yaza_db_read_uint_le_v1(record.payload, 16, 4)?
+    if version != 1 or flags != 0 or reserved != 0: return err("YDBv1 FULL_PAGE_IMAGE version, flags, or reserved field is invalid")
+    if page_id < 2 or image_length != yaza_db_page_size_v1(): return err("YDBv1 FULL_PAGE_IMAGE page ID or image length is invalid")
+    let image: Bytes = bytes_try_slice(record.payload, yaza_db_wal_page_image_header_size_v1(), image_length)?
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(image, page_id)?
+    if header.page_lsn != record.lsn: return err("YDBv1 FULL_PAGE_IMAGE page LSN does not match the WAL record")
+    if header.page_type < 1 or header.page_type > 4: return err("YDBv1 FULL_PAGE_IMAGE supports LEAF, INNER, OVERFLOW, or META pages")
+    return ok(YazaDbWalPageImageV1(page_id, image))
+
+fn yaza_db_wal_commit_payload_encode_v1(commit_ts: Number) -> Result[Bytes, Text]:
+    if commit_ts < 1: return err("YDBv1 COMMIT timestamp must be positive")
+    let payload: Bytes = bytes_try_new_zeroed(yaza_db_wal_commit_payload_size_v1())?
+    if not yaza_db_write_uint_le_v1(payload, 0, commit_ts, 8): return err("YDBv1 COMMIT timestamp could not be encoded")
+    return ok(payload)
+
+fn yaza_db_wal_commit_payload_decode_v1(record: YazaDbWalRecordV1) -> Result[Number, Text]:
+    if record.rec_type != yaza_db_wal_type_commit_v1(): return err("YDBv1 COMMIT timestamp requires a COMMIT record")
+    if bytes_length(record.payload) != yaza_db_wal_commit_payload_size_v1(): return err("YDBv1 COMMIT payload must contain exactly one 64-bit commit timestamp")
+    let commit_ts: Number = yaza_db_read_uint_le_v1(record.payload, 0, 8)?
+    if commit_ts < 1: return err("YDBv1 COMMIT timestamp must be positive")
+    return ok(commit_ts)
+
+fn yaza_db_wal_commit_timestamp_v1(record: YazaDbWalRecordV1) -> Result[Number, Text]:
+    if record.rec_type == yaza_db_wal_type_commit_v1(): return yaza_db_wal_commit_payload_decode_v1(record)
+    if record.rec_type == yaza_db_wal_type_catalog_root_commit_v1():
+        let commit: YazaDbWalCatalogRootCommitV1 = yaza_db_wal_catalog_root_commit_payload_decode_v1(record)?
+        return ok(commit.commit_ts)
+    return err("YDBv1 WAL record is not a supported commit record")
+
+fn yaza_db_wal_catalog_root_commit_payload_encode_v1(commit_ts: Number, previous_catalog_root: Number, new_catalog_root: Number) -> Result[Bytes, Text]:
+    if commit_ts < 1 or previous_catalog_root < 2 or new_catalog_root < 2 or new_catalog_root == previous_catalog_root:
+        return err("YDBv1 COMMIT_CATALOG_ROOT timestamp or root pages are invalid")
+    let payload: Bytes = bytes_try_new_zeroed(yaza_db_wal_catalog_root_commit_payload_size_v1())?
+    if not yaza_db_write_uint_le_v1(payload, 0, 1, 2) or not yaza_db_write_uint_le_v1(payload, 2, 0, 2): return err("YDBv1 COMMIT_CATALOG_ROOT version or flags could not be encoded")
+    if not yaza_db_write_uint_le_v1(payload, 4, commit_ts, 8) or not yaza_db_write_uint_le_v1(payload, 12, previous_catalog_root, 8) or not yaza_db_write_uint_le_v1(payload, 20, new_catalog_root, 8): return err("YDBv1 COMMIT_CATALOG_ROOT state could not be encoded")
+    if not yaza_db_write_uint_le_v1(payload, 28, 0, 4): return err("YDBv1 COMMIT_CATALOG_ROOT reserved field could not be encoded")
+    return ok(payload)
+
+fn yaza_db_wal_catalog_root_commit_payload_decode_v1(record: YazaDbWalRecordV1) -> Result[YazaDbWalCatalogRootCommitV1, Text]:
+    if record.rec_type != yaza_db_wal_type_catalog_root_commit_v1() or record.txn_id < 1 or record.lsn < 1:
+        return err("YDBv1 COMMIT_CATALOG_ROOT requires a transactional record with a positive LSN")
+    if bytes_length(record.payload) != yaza_db_wal_catalog_root_commit_payload_size_v1():
+        return err("YDBv1 COMMIT_CATALOG_ROOT payload length is invalid")
+    let version: Number = yaza_db_read_uint_le_v1(record.payload, 0, 2)?
+    let flags: Number = yaza_db_read_uint_le_v1(record.payload, 2, 2)?
+    let commit_ts: Number = yaza_db_read_uint_le_v1(record.payload, 4, 8)?
+    let previous_catalog_root: Number = yaza_db_read_uint_le_v1(record.payload, 12, 8)?
+    let new_catalog_root: Number = yaza_db_read_uint_le_v1(record.payload, 20, 8)?
+    let reserved: Number = yaza_db_read_uint_le_v1(record.payload, 28, 4)?
+    if version != 1 or flags != 0 or reserved != 0: return err("YDBv1 COMMIT_CATALOG_ROOT version, flags, or reserved field is invalid")
+    if commit_ts < 1 or previous_catalog_root < 2 or new_catalog_root < 2 or previous_catalog_root == new_catalog_root:
+        return err("YDBv1 COMMIT_CATALOG_ROOT timestamp or root pages are invalid")
+    return ok(YazaDbWalCatalogRootCommitV1(commit_ts, previous_catalog_root, new_catalog_root))
+
+fn yaza_db_wal_validate_page_space_payload_v1(record: YazaDbWalRecordV1) -> Result[Boolean, Text]:
+    if record.rec_type != yaza_db_wal_type_page_alloc_v1() and record.rec_type != yaza_db_wal_type_page_free_v1(): return err("YDBv1 page-space payload requires PAGE_ALLOC or PAGE_FREE")
+    if record.lsn < 1: return err("YDBv1 PAGE_ALLOC/PAGE_FREE LSN must be positive because zero denotes the genesis page state")
+    if bytes_length(record.payload) != 24: return err("YDBv1 page-space WAL payload must be exactly 24 bytes")
+    let version: Number = yaza_db_read_uint_le_v1(record.payload, 0, 2)?
+    let operation: Number = yaza_db_read_uint_le_v1(record.payload, 2, 2)?
+    if version != 1: return err("YDBv1 page-space WAL payload version is unknown")
+    if record.rec_type == yaza_db_wal_type_page_alloc_v1() and operation != 1: return err("YDBv1 PAGE_ALLOC WAL operation is invalid")
+    if record.rec_type == yaza_db_wal_type_page_free_v1() and operation != 2: return err("YDBv1 PAGE_FREE WAL operation is invalid")
+    let page_id: Number = yaza_db_read_uint_le_v1(record.payload, 4, 8)?
+    let bitmap_page_id: Number = yaza_db_read_uint_le_v1(record.payload, 12, 8)?
+    let bit_index: Number = yaza_db_read_uint_le_v1(record.payload, 20, 4)?
+    let address: YazaDbBitmapAddressV1 = yaza_db_bitmap_address_v1(page_id)?
+    if address.is_bitmap_page or address.bitmap_page_id != bitmap_page_id or address.bit_index != bit_index: return err("YDBv1 page-space WAL payload does not match the bitmap mapping")
+    return ok(true)
+
+fn yaza_db_wal_leaf_compensation_payload_encode_v1(operation: Number, page_id: Number, undo_next_lsn: Number, compensated_lsn: Number, record_lsn: Number, record_prev_lsn: Number, image: Bytes) -> Result[Bytes, Text]:
+    if operation != yaza_db_wal_type_leaf_insert_v1() and operation != yaza_db_wal_type_leaf_update_v1() and operation != yaza_db_wal_type_leaf_delete_v1(): return err("YDBv1 leaf CLR operation is invalid")
+    if page_id < 2 or undo_next_lsn < 0 or compensated_lsn <= undo_next_lsn or compensated_lsn >= record_lsn or compensated_lsn > record_prev_lsn: return err("YDBv1 leaf CLR page ID or transaction LSN chain is invalid")
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(image, page_id)?
+    if header.page_type != 1 or header.level != 0 or header.page_lsn != record_lsn: return err("YDBv1 leaf CLR image must be a level-zero LEAF at the CLR LSN")
+    let payload: Bytes = bytes_try_new_zeroed(yaza_db_wal_leaf_compensation_payload_size_v1())?
+    if not yaza_db_write_uint_le_v1(payload, 0, 2, 2) or not yaza_db_write_uint_le_v1(payload, 2, operation, 2): return err("YDBv1 leaf CLR version or operation could not be encoded")
+    if not yaza_db_write_uint_le_v1(payload, 4, page_id, 8) or not yaza_db_write_uint_le_v1(payload, 12, undo_next_lsn, 8) or not yaza_db_write_uint_le_v1(payload, 20, compensated_lsn, 8): return err("YDBv1 leaf CLR transaction metadata could not be encoded")
+    if not yaza_db_write_uint_le_v1(payload, 28, yaza_db_page_size_v1(), 4) or not yaza_db_write_uint_le_v1(payload, 32, 0, 8): return err("YDBv1 leaf CLR image size or reserved field could not be encoded")
+    if not yaza_db_write_bytes_v1(payload, 40, image): return err("YDBv1 leaf CLR image could not be copied")
+    return ok(payload)
+
+fn yaza_db_wal_leaf_compensation_payload_decode_v1(record: YazaDbWalRecordV1) -> Result[YazaDbWalLeafCompensationV1, Text]:
+    if record.rec_type != yaza_db_wal_type_compensation_v1() or record.txn_id < 1 or record.lsn < 1: return err("YDBv1 leaf CLR requires a transactional COMPENSATION record with positive LSN")
+    if bytes_length(record.payload) != yaza_db_wal_leaf_compensation_payload_size_v1(): return err("YDBv1 leaf CLR payload length is invalid")
+    let version: Number = yaza_db_read_uint_le_v1(record.payload, 0, 2)?
+    let operation: Number = yaza_db_read_uint_le_v1(record.payload, 2, 2)?
+    let page_id: Number = yaza_db_read_uint_le_v1(record.payload, 4, 8)?
+    let undo_next_lsn: Number = yaza_db_read_uint_le_v1(record.payload, 12, 8)?
+    let compensated_lsn: Number = yaza_db_read_uint_le_v1(record.payload, 20, 8)?
+    let image_size: Number = yaza_db_read_uint_le_v1(record.payload, 28, 4)?
+    let reserved: Number = yaza_db_read_uint_le_v1(record.payload, 32, 8)?
+    if version != 2 or (operation != yaza_db_wal_type_leaf_insert_v1() and operation != yaza_db_wal_type_leaf_update_v1() and operation != yaza_db_wal_type_leaf_delete_v1()) or reserved != 0: return err("YDBv1 leaf CLR version, operation, or reserved field is invalid")
+    if page_id < 2 or image_size != yaza_db_page_size_v1(): return err("YDBv1 leaf CLR page ID or image length is invalid")
+    if compensated_lsn <= undo_next_lsn or compensated_lsn >= record.lsn or compensated_lsn > record.prev_lsn: return err("YDBv1 leaf CLR compensated or undo-next LSN is outside its transaction history")
+    let image: Bytes = bytes_try_slice(record.payload, 40, image_size)?
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(image, page_id)?
+    if header.page_type != 1 or header.level != 0 or header.page_lsn != record.lsn: return err("YDBv1 leaf CLR image must be a level-zero LEAF at the CLR LSN")
+    return ok(YazaDbWalLeafCompensationV1(operation, page_id, undo_next_lsn, compensated_lsn, image))
+
+fn yaza_db_wal_validate_compensation_payload_v1(record: YazaDbWalRecordV1) -> Result[Boolean, Text]:
+    if record.rec_type != yaza_db_wal_type_compensation_v1(): return err("YDBv1 compensation validation requires a COMPENSATION record")
+    if record.lsn < 1 or bytes_length(record.payload) < 2: return err("YDBv1 COMPENSATION record has an invalid LSN or payload length")
+    let version: Number = yaza_db_read_uint_le_v1(record.payload, 0, 2)?
+    if version == 2:
+        let ignored_leaf_clr: YazaDbWalLeafCompensationV1 = yaza_db_wal_leaf_compensation_payload_decode_v1(record)?
+        return ok(true)
+    if version == 3:
+        let ignored_node_split_clr: YazaDbWalNodeSplitCompensationV1 = yaza_db_wal_node_split_compensation_payload_decode_v1(record)?
+        return ok(true)
+    if bytes_length(record.payload) != 40: return err("YDBv1 bitmap COMPENSATION payload must be exactly 40 bytes")
+    let operation: Number = yaza_db_read_uint_le_v1(record.payload, 2, 2)?
+    if version != 1 or (operation != 1 and operation != 2): return err("YDBv1 COMPENSATION version or operation is invalid")
+    let page_id: Number = yaza_db_read_uint_le_v1(record.payload, 4, 8)?
+    let bitmap_page_id: Number = yaza_db_read_uint_le_v1(record.payload, 12, 8)?
+    let bit_index: Number = yaza_db_read_uint_le_v1(record.payload, 20, 4)?
+    let undo_next_lsn: Number = yaza_db_read_uint_le_v1(record.payload, 24, 8)?
+    let compensated_lsn: Number = yaza_db_read_uint_le_v1(record.payload, 32, 8)?
+    if compensated_lsn < 1 or compensated_lsn >= record.lsn or compensated_lsn > record.prev_lsn: return err("YDBv1 COMPENSATION compensated_lsn is outside its transaction history")
+    if undo_next_lsn >= compensated_lsn: return err("YDBv1 COMPENSATION undo_next_lsn must precede the compensated record")
+    let address: YazaDbBitmapAddressV1 = yaza_db_bitmap_address_v1(page_id)?
+    if address.is_bitmap_page or address.bitmap_page_id != bitmap_page_id or address.bit_index != bit_index: return err("YDBv1 COMPENSATION payload does not match the bitmap mapping")
+    return ok(true)
+
+fn yaza_db_wal_validate_record_fields_v1(record: YazaDbWalRecordV1) -> Result[Number, Text]:
+    if record.lsn < 0 or record.prev_lsn < 0 or record.txn_id < 0: return err("YDBv1 WAL offsets and transaction IDs must be non-negative")
+    if record.prev_lsn != 0 and record.prev_lsn >= record.lsn: return err("YDBv1 WAL prev_lsn must point to an earlier record")
+    if not yaza_db_wal_type_valid_v1(record.rec_type): return err("YDBv1 WAL record type is unknown")
+    if record.flags != 0: return err("YDBv1 WAL flags are reserved in this profile")
+    if record.rec_type == yaza_db_wal_type_checkpoint_begin_v1() or record.rec_type == yaza_db_wal_type_checkpoint_end_v1() or record.rec_type == yaza_db_wal_type_skip_v1() or record.rec_type == yaza_db_wal_type_full_page_image_v1():
+        if record.txn_id != 0 or record.prev_lsn != 0: return err("YDBv1 system WAL records cannot belong to a transaction")
+    else:
+        if record.txn_id < 1: return err("YDBv1 WAL transaction record requires a positive transaction ID")
+    if record.rec_type == yaza_db_wal_type_skip_v1() and bytes_length(record.payload) != 0: return err("YDBv1 WAL SKIP record cannot carry a payload")
+    if record.rec_type == yaza_db_wal_type_commit_v1():
+        let ignored_commit_ts: Number = yaza_db_wal_commit_payload_decode_v1(record)?
+    if record.rec_type == yaza_db_wal_type_catalog_root_commit_v1():
+        let ignored_catalog_root_commit: YazaDbWalCatalogRootCommitV1 = yaza_db_wal_catalog_root_commit_payload_decode_v1(record)?
+    if record.rec_type == yaza_db_wal_type_full_page_image_v1():
+        let ignored_page_image: YazaDbWalPageImageV1 = yaza_db_wal_page_image_payload_decode_v1(record)?
+    if record.rec_type == yaza_db_wal_type_node_split_v1():
+        let ignored_node_split: YazaDbWalNodeSplitV1 = yaza_db_wal_node_split_payload_decode_v1(record)?
+    if record.rec_type == yaza_db_wal_type_page_alloc_v1() or record.rec_type == yaza_db_wal_type_page_free_v1():
+        let ignored_page_space_validation: Boolean = yaza_db_wal_validate_page_space_payload_v1(record)?
+    if record.rec_type == yaza_db_wal_type_compensation_v1():
+        let ignored_compensation_validation: Boolean = yaza_db_wal_validate_compensation_payload_v1(record)?
+    if record.rec_type == yaza_db_wal_type_abort_v1() and bytes_length(record.payload) != 0: return err("YDBv1 ABORT record cannot carry a payload in this profile")
+    if record.rec_type == yaza_db_wal_type_mtr_end_v1() and bytes_length(record.payload) != 0: return err("YDBv1 MTR_END record cannot carry a payload in this profile")
+    let payload_length: Number = bytes_length(record.payload)
+    if payload_length > yaza_db_wal_max_record_size_v1() - yaza_db_wal_header_size_v1(): return err("YDBv1 WAL record exceeds the 16 MiB record limit")
+    return ok(yaza_db_wal_header_size_v1() + payload_length)
+
+fn yaza_db_wal_validate_record_v1(record: YazaDbWalRecordV1) -> Result[Number, Text]:
+    let total_length: Number = yaza_db_wal_validate_record_fields_v1(record)?
+    let segment_offset: Number = record.lsn % yaza_db_wal_segment_size_v1()
+    if total_length > yaza_db_wal_segment_size_v1() - segment_offset: return err("YDBv1 WAL record crosses a 64 MiB segment boundary")
+    return ok(total_length)
+
+fn yaza_db_wal_encode_v1(record: YazaDbWalRecordV1) -> Result[Bytes, Text]:
+    let total_length: Number = yaza_db_wal_validate_record_v1(record)?
+    let made: Result[Bytes, Text] = bytes_try_new_zeroed(total_length)
+    if not result_is_ok(made): return err(result_unwrap_error(made))
+    let output: Bytes = result_unwrap(made)
+    if not yaza_db_write_uint_le_v1(output, 0, total_length, 4): return err("YDBv1 WAL total length could not be encoded")
+    if not yaza_db_write_uint_le_v1(output, 4, 0, 4): return err("YDBv1 WAL CRC field could not be initialized")
+    if not yaza_db_write_uint_le_v1(output, 8, record.lsn, 8): return err("YDBv1 WAL LSN could not be encoded")
+    if not yaza_db_write_uint_le_v1(output, 16, record.prev_lsn, 8): return err("YDBv1 WAL prev_lsn could not be encoded")
+    if not yaza_db_write_uint_le_v1(output, 24, record.txn_id, 8): return err("YDBv1 WAL transaction ID could not be encoded")
+    if not yaza_db_write_uint_le_v1(output, 32, record.rec_type, 1): return err("YDBv1 WAL record type could not be encoded")
+    if not yaza_db_write_uint_le_v1(output, 33, record.flags, 1): return err("YDBv1 WAL flags could not be encoded")
+    if not yaza_db_write_uint_le_v1(output, 34, 0, 6): return err("YDBv1 WAL reserved field could not be initialized")
+    if not yaza_db_write_bytes_v1(output, yaza_db_wal_header_size_v1(), record.payload): return err("YDBv1 WAL payload could not be copied")
+    let checksum: Number = bytes_ydbv1_checksum_zeroed_range(output, 4, 4)
+    if not yaza_db_write_uint_le_v1(output, 4, checksum, 4): return err("YDBv1 WAL checksum could not be written")
+    return ok(output)
+
+fn yaza_db_wal_decode_v1(input: Bytes, expected_lsn: Number) -> Result[YazaDbWalRecordV1, Text]:
+    let input_length: Number = bytes_length(input)
+    if input_length < yaza_db_wal_header_size_v1() or input_length > yaza_db_wal_max_record_size_v1(): return err("YDBv1 WAL record length is outside its supported bound")
+    let total_length: Number = yaza_db_read_uint_le_v1(input, 0, 4)?
+    if total_length != input_length: return err("YDBv1 WAL total_len does not match the supplied record bytes")
+    let stored_crc: Number = yaza_db_read_uint_le_v1(input, 4, 4)?
+    if bytes_ydbv1_checksum_zeroed_range(input, 4, 4) != stored_crc: return err("YDBv1 WAL checksum mismatch")
+    let lsn: Number = yaza_db_read_uint_le_v1(input, 8, 8)?
+    let prev_lsn: Number = yaza_db_read_uint_le_v1(input, 16, 8)?
+    let txn_id: Number = yaza_db_read_uint_le_v1(input, 24, 8)?
+    let rec_type: Number = yaza_db_read_uint_le_v1(input, 32, 1)?
+    let flags: Number = yaza_db_read_uint_le_v1(input, 33, 1)?
+    let reserved: Number = yaza_db_read_uint_le_v1(input, 34, 6)?
+    if reserved != 0: return err("YDBv1 WAL reserved field is non-zero")
+    if expected_lsn >= 0 and lsn != expected_lsn: return err("YDBv1 WAL record LSN does not match its physical offset")
+    let payload: Bytes = bytes_try_slice(input, yaza_db_wal_header_size_v1(), input_length - yaza_db_wal_header_size_v1())?
+    let record: YazaDbWalRecordV1 = YazaDbWalRecordV1(lsn, prev_lsn, txn_id, rec_type, flags, payload)
+    let ignored_total_length: Number = yaza_db_wal_validate_record_v1(record)?
+    return ok(record)
+
+fn yaza_db_wal_validate_segment_file_v1(file: Number) -> Result[Number, Text]:
+    let actual_size: Number = file_size(file)?
+    if actual_size < 0 or actual_size > yaza_db_wal_segment_size_v1(): return err("YDBv1 WAL segment file exceeds its 64 MiB logical capacity")
+    return ok(actual_size)
+
+fn yaza_db_wal_write_encoded_segment_record_v1(file: Number, record: YazaDbWalRecordV1, encoded: Bytes) -> Result[Number, Text]:
+    let expected_length: Number = yaza_db_wal_validate_record_v1(record)?
+    if bytes_length(encoded) != expected_length: return err("YDBv1 encoded WAL record length does not match its fields")
+    let encoded_length: Number = yaza_db_read_uint_le_v1(encoded, 0, 4)?
+    let encoded_lsn: Number = yaza_db_read_uint_le_v1(encoded, 8, 8)?
+    let encoded_prev_lsn: Number = yaza_db_read_uint_le_v1(encoded, 16, 8)?
+    let encoded_txn_id: Number = yaza_db_read_uint_le_v1(encoded, 24, 8)?
+    let encoded_type: Number = yaza_db_read_uint_le_v1(encoded, 32, 1)?
+    let encoded_flags: Number = yaza_db_read_uint_le_v1(encoded, 33, 1)?
+    let stored_crc: Number = yaza_db_read_uint_le_v1(encoded, 4, 4)?
+    if encoded_length != expected_length: return err("YDBv1 encoded WAL total_len does not match its payload")
+    if encoded_lsn != record.lsn or encoded_prev_lsn != record.prev_lsn: return err("YDBv1 encoded WAL LSN fields do not match the record")
+    if encoded_txn_id != record.txn_id or encoded_type != record.rec_type or encoded_flags != record.flags: return err("YDBv1 encoded WAL metadata does not match the record")
+    if bytes_ydbv1_checksum_zeroed_range(encoded, 4, 4) != stored_crc: return err("YDBv1 encoded WAL record checksum is invalid")
+    let ignored_size: Number = yaza_db_wal_validate_segment_file_v1(file)?
+    let segment_offset: Number = record.lsn % yaza_db_wal_segment_size_v1()
+    let written: Number = write_exact(file, segment_offset, encoded)?
+    if written != bytes_length(encoded): return err("YDBv1 WAL segment record write was incomplete")
+    return ok(written)
+
+fn yaza_db_wal_write_segment_record_v1(file: Number, record: YazaDbWalRecordV1) -> Result[Number, Text]:
+    let encoded: Bytes = yaza_db_wal_encode_v1(record)?
+    return yaza_db_wal_write_encoded_segment_record_v1(file, record, encoded)
+
+fn yaza_db_wal_read_segment_record_v1(file: Number, segment_offset: Number, expected_lsn: Number) -> Result[YazaDbWalRecordV1, Text]:
+    let actual_size: Number = yaza_db_wal_validate_segment_file_v1(file)?
+    if segment_offset < 0 or segment_offset > yaza_db_wal_segment_size_v1() - yaza_db_wal_header_size_v1(): return err("YDBv1 WAL segment offset cannot contain a full record header")
+    if expected_lsn >= 0 and expected_lsn % yaza_db_wal_segment_size_v1() != segment_offset: return err("YDBv1 expected LSN does not match the segment-local offset")
+    let length_bytes: Bytes = read_exact(file, segment_offset, 4)?
+    let total_length: Number = yaza_db_read_uint_le_v1(length_bytes, 0, 4)?
+    if total_length < yaza_db_wal_header_size_v1() or total_length > yaza_db_wal_max_record_size_v1(): return err("YDBv1 WAL segment record length is invalid")
+    if total_length > yaza_db_wal_segment_size_v1() - segment_offset: return err("YDBv1 WAL segment record crosses its segment boundary")
+    if segment_offset > actual_size or total_length > actual_size - segment_offset: return err("YDBv1 WAL segment record extends past the physical end of the segment")
+    let encoded: Bytes = read_exact(file, segment_offset, total_length)?
+    let record: YazaDbWalRecordV1 = yaza_db_wal_decode_v1(encoded, expected_lsn)?
+    if record.lsn % yaza_db_wal_segment_size_v1() != segment_offset: return err("YDBv1 WAL record LSN does not match its segment-local offset")
+    return ok(record)
+
+fn yaza_db_wal_read_record_at_v1(root: Number, db_uuid: Bytes, record_lsn: Number, log_end_lsn: Number) -> Result[YazaDbWalRecordV1, Text]:
+    let segment_size: Number = yaza_db_wal_segment_size_v1()
+    let max_log_bytes: Number = yaza_db_wal_max_segment_count_v1() * segment_size
+    if bytes_length(db_uuid) != 16 or record_lsn < 0 or log_end_lsn < 0 or log_end_lsn > max_log_bytes or record_lsn >= log_end_lsn: return err("YDBv1 WAL absolute read cursor is outside its namespaced log")
+    let segment_index: Number = record_lsn / segment_size
+    if segment_index >= yaza_db_wal_max_segment_count_v1(): return err("YDBv1 WAL absolute read exceeds the segment-count limit")
+    let segment_offset: Number = record_lsn - segment_index * segment_size
+    let name: Text = yaza_db_wal_segment_name_for_v1(segment_index, db_uuid)?
+    let opened: Result[Number, Text] = open_read(root, name)
+    if not result_is_ok(opened): return err(result_unwrap_error(opened))
+    let file: Number = result_unwrap(opened)
+    let decoded: Result[YazaDbWalRecordV1, Text] = yaza_db_wal_read_segment_record_v1(file, segment_offset, record_lsn)
+    let closed: Result[Boolean, Text] = close(file)
+    if not result_is_ok(decoded): return err(result_unwrap_error(decoded))
+    if not result_is_ok(closed) or not result_unwrap(closed): return err("YDBv1 WAL absolute reader could not close its segment")
+    let record: YazaDbWalRecordV1 = result_unwrap(decoded)
+    let record_length: Number = yaza_db_wal_header_size_v1() + bytes_length(record.payload)
+    if record.lsn > 9223372036854775807 - record_length: return err("YDBv1 WAL absolute record end overflows the signed LSN range")
+    if record.lsn + record_length > log_end_lsn: return err("YDBv1 WAL absolute record extends beyond the recovered log end")
+    return ok(record)
+
+fn yaza_db_wal_validate_zero_tail_v1(file: Number, segment_offset: Number) -> Result[Boolean, Text]:
+    let actual_size: Number = yaza_db_wal_validate_segment_file_v1(file)?
+    if segment_offset < 0 or segment_offset > actual_size: return err("YDBv1 WAL zero-tail offset is outside its physical segment")
+    var offset: Number = segment_offset
+    while offset < actual_size:
+        var chunk_length: Number = 1048576
+        if chunk_length > actual_size - offset: set chunk_length = actual_size - offset
+        var chunk_status: Number = 0
+        arena_scope 2097152:
+            let chunk_result: Result[Bytes, Text] = read_exact(file, offset, chunk_length)
+            if not result_is_ok(chunk_result): set chunk_status = 1
+            else:
+                let chunk: Bytes = result_unwrap(chunk_result)
+                var index: Number = 0
+                while index < chunk_length:
+                    if bytes_get(chunk, index) != 0: set chunk_status = 2
+                    set index = index + 1
+        if chunk_status == 1: return err("YDBv1 WAL segment zero-tail read failed")
+        if chunk_status == 2: return err("YDBv1 WAL segment has non-zero bytes after its valid record prefix")
+        set offset = offset + chunk_length
+    return ok(true)
+
+fn yaza_db_wal_has_torn_suffix_v1(encoded: Bytes) -> Boolean:
+    var index: Number = bytes_length(encoded) - 1
+    var zero_count: Number = 0
+    while index >= 0 and bytes_get(encoded, index) == 0:
+        set zero_count = zero_count + 1
+        set index = index - 1
+    return zero_count >= 7
+
+fn yaza_db_wal_repair_torn_tail_v1(file: Number, segment_offset: Number, repair_length: Number) -> Result[Boolean, Text]:
+    if segment_offset < 0 or repair_length < 1 or repair_length > yaza_db_wal_segment_size_v1() - segment_offset: return err("YDBv1 torn WAL tail repair range is outside its segment")
+    let actual_size: Number = yaza_db_wal_validate_segment_file_v1(file)?
+    if actual_size < yaza_db_wal_segment_size_v1():
+        let shortened: Boolean = truncate(file, segment_offset)?
+        if not shortened: return err("YDBv1 WAL torn-tail truncation failed")
+        let truncate_sync: Boolean = sync(file)?
+        if not truncate_sync: return err("YDBv1 WAL torn-tail truncation sync failed")
+        return ok(true)
+    var offset: Number = segment_offset
+    let repair_end: Number = segment_offset + repair_length
+    while offset < repair_end:
+        var chunk_length: Number = 1048576
+        if chunk_length > repair_end - offset: set chunk_length = repair_end - offset
+        var write_status: Number = 0
+        arena_scope 2097152:
+            let zero_result: Result[Bytes, Text] = bytes_try_new_zeroed(chunk_length)
+            if not result_is_ok(zero_result): set write_status = 1
+            else:
+                let zeros: Bytes = result_unwrap(zero_result)
+                let written_result: Result[Number, Text] = write_exact(file, offset, zeros)
+                if not result_is_ok(written_result): set write_status = 2
+                elif result_unwrap(written_result) != chunk_length: set write_status = 3
+        if write_status == 1: return err("YDBv1 WAL torn-tail repair could not allocate a bounded zero chunk")
+        if write_status == 2: return err("YDBv1 WAL torn-tail repair write failed")
+        if write_status == 3: return err("YDBv1 WAL torn-tail repair write was incomplete")
+        set offset = offset + chunk_length
+    let synced: Boolean = sync(file)?
+    if not synced: return err("YDBv1 WAL torn-tail repair sync failed")
+    return ok(true)
+
+fn yaza_db_wal_recover_segment_end_from_offset_for_log_v1(file: Number, segment_base_lsn: Number, start_offset: Number, allow_torn_tail: Boolean) -> Result[Number, Text]:
+    if segment_base_lsn < 0 or segment_base_lsn % yaza_db_wal_segment_size_v1() != 0: return err("YDBv1 WAL segment base LSN must be non-negative and segment-aligned")
+    if segment_base_lsn > 9223372036854775807 - yaza_db_wal_segment_size_v1(): return err("YDBv1 WAL segment base LSN exceeds the signed offset range")
+    let physical_size: Number = yaza_db_wal_validate_segment_file_v1(file)?
+    if start_offset < 0 or start_offset > physical_size: return err("YDBv1 WAL recovery start offset is outside the physical segment")
+    var segment_offset: Number = start_offset
+    while segment_offset + yaza_db_wal_header_size_v1() <= physical_size:
+        let length_bytes: Bytes = read_exact(file, segment_offset, 4)?
+        let total_length: Number = yaza_db_read_uint_le_v1(length_bytes, 0, 4)?
+        if total_length == 0:
+            let ignored_zero_tail: Boolean = yaza_db_wal_validate_zero_tail_v1(file, segment_offset)?
+            return ok(segment_base_lsn + segment_offset)
+        if total_length < yaza_db_wal_header_size_v1() or total_length > yaza_db_wal_max_record_size_v1() or total_length > yaza_db_wal_segment_size_v1() - segment_offset:
+            if allow_torn_tail and segment_offset <= yaza_db_wal_segment_size_v1() - 4:
+                let remaining_tail: Result[Boolean, Text] = yaza_db_wal_validate_zero_tail_v1(file, segment_offset + 4)
+                if result_is_ok(remaining_tail):
+                    let ignored_repair: Boolean = yaza_db_wal_repair_torn_tail_v1(file, segment_offset, 4)?
+                    return ok(segment_base_lsn + segment_offset)
+            return err("YDBv1 WAL record length is invalid at the recovered tail")
+        if total_length > physical_size - segment_offset:
+            if allow_torn_tail:
+                let ignored_partial_header: Bytes = read_exact(file, segment_offset, yaza_db_wal_header_size_v1())?
+                let partial_lsn: Number = yaza_db_read_uint_le_v1(ignored_partial_header, 8, 8)?
+                if partial_lsn == segment_base_lsn + segment_offset:
+                    let ignored_partial_repair: Boolean = yaza_db_wal_repair_torn_tail_v1(file, segment_offset, physical_size - segment_offset)?
+                    return ok(segment_base_lsn + segment_offset)
+            return err("YDBv1 WAL final record is physically truncated")
+        let encoded: Bytes = read_exact(file, segment_offset, total_length)?
+        let stored_crc: Number = yaza_db_read_uint_le_v1(encoded, 4, 4)?
+        let actual_crc: Number = bytes_ydbv1_checksum_zeroed_range(encoded, 4, 4)
+        if stored_crc != actual_crc:
+            if allow_torn_tail and yaza_db_wal_has_torn_suffix_v1(encoded):
+                let tail_status: Result[Boolean, Text] = yaza_db_wal_validate_zero_tail_v1(file, segment_offset + total_length)
+                if result_is_ok(tail_status):
+                    let ignored_repair: Boolean = yaza_db_wal_repair_torn_tail_v1(file, segment_offset, total_length)?
+                    return ok(segment_base_lsn + segment_offset)
+            return err("YDBv1 WAL checksum mismatch")
+        let record: YazaDbWalRecordV1 = yaza_db_wal_decode_v1(encoded, segment_base_lsn + segment_offset)?
+        set segment_offset = segment_offset + yaza_db_wal_header_size_v1() + bytes_length(record.payload)
+    if segment_offset == physical_size:
+        return ok(segment_base_lsn + physical_size)
+    let ignored_zero_tail: Boolean = yaza_db_wal_validate_zero_tail_v1(file, segment_offset)?
+    if physical_size == yaza_db_wal_segment_size_v1(): return ok(segment_base_lsn + yaza_db_wal_segment_size_v1())
+    return ok(segment_base_lsn + segment_offset)
+
+fn yaza_db_wal_recover_segment_end_for_log_v1(file: Number, segment_base_lsn: Number, allow_torn_tail: Boolean) -> Result[Number, Text]:
+    return yaza_db_wal_recover_segment_end_from_offset_for_log_v1(file, segment_base_lsn, 0, allow_torn_tail)
+
+fn yaza_db_wal_recover_segment_end_v1(file: Number, segment_base_lsn: Number) -> Result[Number, Text]:
+    return yaza_db_wal_recover_segment_end_for_log_v1(file, segment_base_lsn, false)
+
+fn yaza_db_wal_append_segment_record_durable_v1(file: Number, expected_next_lsn: Number, record: YazaDbWalRecordV1) -> Result[Number, Text]:
+    if expected_next_lsn < 0 or record.lsn != expected_next_lsn: return err("YDBv1 WAL append LSN does not match the caller's recovered end position")
+    let encoded: Bytes = yaza_db_wal_encode_v1(record)?
+    if record.lsn > 9223372036854775807 - bytes_length(encoded): return err("YDBv1 WAL append would overflow the signed LSN range")
+    let written: Number = yaza_db_wal_write_encoded_segment_record_v1(file, record, encoded)?
+    if written != bytes_length(encoded): return err("YDBv1 WAL append write was incomplete")
+    let synced: Boolean = sync(file)?
+    if not synced: return err("YDBv1 WAL append sync failed; close and recover the segment before reuse")
+    return ok(record.lsn + written)
+
+fn yaza_db_wal_max_segment_count_v1() -> Number:
+    return 16384
+
+fn yaza_db_wal_default_namespace_v1() -> Bytes:
+    return bytes_from_text("default-wal-uuid")
+
+fn yaza_db_wal_namespace_prefix_v1(db_uuid: Bytes) -> Result[Text, Text]:
+    if bytes_length(db_uuid) != 16: return err("YDBv1 WAL namespace requires a 16-byte database UUID")
+    let digits: Text = "0123456789abcdef"
+    var prefix: Text = "ydb-wal-"
+    var index: Number = 0
+    while index < 16:
+        let value: Number = bytes_get(db_uuid, index)
+        set prefix = prefix + text_slice(digits, value / 16, 1) + text_slice(digits, value % 16, 1)
+        set index = index + 1
+    return ok(prefix + "-seg-")
+
+fn yaza_db_wal_segment_name_for_v1(segment_index: Number, db_uuid: Bytes) -> Result[Text, Text]:
+    if segment_index < 0 or segment_index >= yaza_db_wal_max_segment_count_v1(): return err("YDBv1 WAL segment index exceeds the 1 TiB profile limit")
+    let prefix: Text = yaza_db_wal_namespace_prefix_v1(db_uuid)?
+    return ok(prefix + number_text(segment_index) + ".yzw")
+
+fn yaza_db_wal_segment_name_v1(segment_index: Number) -> Result[Text, Text]:
+    return yaza_db_wal_segment_name_for_v1(segment_index, yaza_db_wal_default_namespace_v1())
+
+fn yaza_db_wal_name_bytes_match_text_v1(input: Bytes, offset: Number, text: Text) -> Boolean:
+    if offset < 0 or offset > bytes_length(input) - text_length(text): return false
+    var index: Number = 0
+    while index < text_length(text):
+        if bytes_get(input, offset + index) != text_byte(text, index): return false
+        set index = index + 1
+    return true
+
+fn yaza_db_wal_parse_segment_name_for_v1(input: Bytes, offset: Number, name_length: Number, db_uuid: Bytes) -> Result[Number, Text]:
+    let family: Text = "ydb-wal-"
+    let suffix: Text = ".yzw"
+    let family_length: Number = text_length(family)
+    let suffix_length: Number = text_length(suffix)
+    if offset < 0 or name_length < 0 or offset > bytes_length(input) - name_length: return err("YDBv1 WAL segment filename span is invalid")
+    if name_length < family_length or not yaza_db_wal_name_bytes_match_text_v1(input, offset, family): return ok(-1)
+    if bytes_length(db_uuid) != 16: return err("YDBv1 WAL namespace requires a 16-byte database UUID")
+    let prefix: Text = yaza_db_wal_namespace_prefix_v1(db_uuid)?
+    let prefix_length: Number = text_length(prefix)
+    if name_length < prefix_length + 1 + suffix_length: return err("YDBv1 WAL segment filename is malformed")
+    if not yaza_db_wal_name_bytes_match_text_v1(input, offset + prefix_length - 5, "-seg-"):
+        return err("YDBv1 WAL segment filename has an invalid namespace separator")
+    var uuid_index: Number = 0
+    while uuid_index < 32:
+        let value: Number = bytes_get(input, offset + family_length + uuid_index)
+        if not ((value >= 48 and value <= 57) or (value >= 97 and value <= 102)): return err("YDBv1 WAL segment namespace must use lowercase hexadecimal")
+        set uuid_index = uuid_index + 1
+    if not yaza_db_wal_name_bytes_match_text_v1(input, offset + name_length - suffix_length, suffix): return err("YDBv1 WAL segment filename has an invalid suffix")
+    let digits_length: Number = name_length - prefix_length - suffix_length
+    if digits_length > 1 and bytes_get(input, offset + prefix_length) == 48: return err("YDBv1 WAL segment index is not canonical decimal")
+    var segment_index: Number = 0
+    var digit_index: Number = 0
+    while digit_index < digits_length:
+        let digit: Number = bytes_get(input, offset + prefix_length + digit_index)
+        if digit < 48 or digit > 57: return err("YDBv1 WAL segment index is not decimal")
+        let numeric_digit: Number = digit - 48
+        let maximum_index: Number = yaza_db_wal_max_segment_count_v1() - 1
+        if segment_index > (maximum_index - numeric_digit) / 10: return err("YDBv1 WAL segment index exceeds the 1 TiB profile limit")
+        set segment_index = segment_index * 10 + numeric_digit
+        set digit_index = digit_index + 1
+    if not yaza_db_wal_name_bytes_match_text_v1(input, offset, prefix): return ok(-1)
+    return ok(segment_index)
+
+fn yaza_db_wal_parse_segment_name_v1(input: Bytes, offset: Number, name_length: Number) -> Result[Number, Text]:
+    return yaza_db_wal_parse_segment_name_for_v1(input, offset, name_length, yaza_db_wal_default_namespace_v1())
+
+fn yaza_db_wal_segment_count_for_v1(root: Number, db_uuid: Bytes) -> Result[Number, Text]:
+    let names: Bytes = list_names(root)?
+    let names_length: Number = bytes_length(names)
+    var offset: Number = 0
+    var count: Number = 0
+    var highest_index: Number = -1
+    while offset < names_length:
+        var end: Number = offset
+        while end < names_length and bytes_get(names, end) != 0:
+            set end = end + 1
+        if end >= names_length: return err("YDB VFS directory listing is missing a name terminator")
+        let segment_index: Number = yaza_db_wal_parse_segment_name_for_v1(names, offset, end - offset, db_uuid)?
+        if segment_index >= 0:
+            set count = count + 1
+            if segment_index > highest_index: set highest_index = segment_index
+        set offset = end + 1
+    if count == 0: return ok(0)
+    if highest_index + 1 != count: return err("YDBv1 WAL segment sequence has a missing or duplicate index")
+    return ok(count)
+
+fn yaza_db_wal_segment_count_v1(root: Number) -> Result[Number, Text]:
+    return yaza_db_wal_segment_count_for_v1(root, yaza_db_wal_default_namespace_v1())
+
+fn yaza_db_wal_recover_log_end_for_v1(root: Number, segment_count: Number, db_uuid: Bytes) -> Result[Number, Text]:
+    if segment_count < 0 or segment_count > yaza_db_wal_max_segment_count_v1(): return err("YDBv1 WAL segment count is outside its profile limit")
+    if segment_count == 0: return ok(0)
+    var segment_index: Number = 0
+    var log_end: Number = 0
+    while segment_index < segment_count:
+        let name: Text = yaza_db_wal_segment_name_for_v1(segment_index, db_uuid)?
+        var file: Number = open_read(root, name)?
+        let is_last_segment: Boolean = segment_index + 1 == segment_count
+        if is_last_segment:
+            let closed_reader: Boolean = close(file)?
+            if not closed_reader: return err("YDBv1 WAL recovery could not close the final segment reader")
+            set file = open_rw(root, name)?
+        let segment_base_lsn: Number = segment_index * yaza_db_wal_segment_size_v1()
+        let recovered: Result[Number, Text] = yaza_db_wal_recover_segment_end_for_log_v1(file, segment_base_lsn, is_last_segment)
+        let closed: Result[Boolean, Text] = close(file)
+        if not result_is_ok(recovered): return err(result_unwrap_error(recovered))
+        if not result_is_ok(closed): return err(result_unwrap_error(closed))
+        if not result_unwrap(closed): return err("YDBv1 WAL recovery could not close a segment handle")
+        let segment_end_lsn: Number = result_unwrap(recovered)
+        if segment_index + 1 < segment_count and segment_end_lsn < segment_base_lsn + yaza_db_wal_segment_size_v1():
+            let padding: Number = segment_base_lsn + yaza_db_wal_segment_size_v1() - segment_end_lsn
+            if padding >= yaza_db_wal_max_record_size_v1(): return err("YDBv1 WAL has a later segment after an unjustified gap")
+            set log_end = segment_base_lsn + yaza_db_wal_segment_size_v1()
+        else:
+            set log_end = segment_end_lsn
+        set segment_index = segment_index + 1
+    return ok(log_end)
+
+fn yaza_db_wal_recover_log_end_v1(root: Number, segment_count: Number) -> Result[Number, Text]:
+    return yaza_db_wal_recover_log_end_for_v1(root, segment_count, yaza_db_wal_default_namespace_v1())
+
+fn yaza_db_wal_recover_log_end_after_checkpoint_for_v1(root: Number, segment_count: Number, db_uuid: Bytes, checkpoint_lsn: Number) -> Result[Number, Text]:
+    if segment_count < 0 or segment_count > yaza_db_wal_max_segment_count_v1(): return err("YDBv1 WAL segment count is outside its profile limit")
+    if checkpoint_lsn < 0: return err("YDBv1 published checkpoint LSN cannot be negative")
+    if checkpoint_lsn == 0: return yaza_db_wal_recover_log_end_for_v1(root, segment_count, db_uuid)
+    if segment_count == 0: return err("YDBv1 published checkpoint has no WAL segment")
+    let segment_size: Number = yaza_db_wal_segment_size_v1()
+    let first_segment_index: Number = checkpoint_lsn / segment_size
+    if first_segment_index >= segment_count: return err("YDBv1 published checkpoint LSN is outside the WAL segment sequence")
+    let checkpoint_segment_offset: Number = checkpoint_lsn % segment_size
+    let checkpoint_name: Text = yaza_db_wal_segment_name_for_v1(first_segment_index, db_uuid)?
+    let checkpoint_file: Number = open_read(root, checkpoint_name)?
+    let checkpoint_record_result: Result[YazaDbWalRecordV1, Text] = yaza_db_wal_read_segment_record_v1(checkpoint_file, checkpoint_segment_offset, checkpoint_lsn)
+    let checkpoint_close_result: Result[Boolean, Text] = close(checkpoint_file)
+    if not result_is_ok(checkpoint_record_result): return err(result_unwrap_error(checkpoint_record_result))
+    if not result_is_ok(checkpoint_close_result) or not result_unwrap(checkpoint_close_result): return err("YDBv1 recovery could not close the published checkpoint segment")
+    let checkpoint_record: YazaDbWalRecordV1 = result_unwrap(checkpoint_record_result)
+    if checkpoint_record.rec_type != yaza_db_wal_type_checkpoint_end_v1() or checkpoint_record.txn_id != 0 or checkpoint_record.prev_lsn != 0: return err("YDBv1 published checkpoint LSN does not reference a CHECKPOINT_END record")
+    let checkpoint_length: Number = yaza_db_wal_header_size_v1() + bytes_length(checkpoint_record.payload)
+    if checkpoint_lsn > 9223372036854775807 - checkpoint_length: return err("YDBv1 published checkpoint record end overflows the signed LSN range")
+    let tail_start_lsn: Number = checkpoint_lsn + checkpoint_length
+    let maximum_log_lsn: Number = segment_count * segment_size
+    if tail_start_lsn > maximum_log_lsn: return err("YDBv1 published checkpoint record extends beyond the WAL segment sequence")
+    if tail_start_lsn == maximum_log_lsn: return ok(tail_start_lsn)
+    let first_tail_segment_index: Number = tail_start_lsn / segment_size
+    let first_tail_segment_offset: Number = tail_start_lsn % segment_size
+    var segment_index: Number = first_tail_segment_index
+    var log_end: Number = tail_start_lsn
+    while segment_index < segment_count:
+        let name: Text = yaza_db_wal_segment_name_for_v1(segment_index, db_uuid)?
+        var file: Number = open_read(root, name)?
+        let is_last_segment: Boolean = segment_index + 1 == segment_count
+        if is_last_segment:
+            let closed_reader: Boolean = close(file)?
+            if not closed_reader: return err("YDBv1 WAL recovery could not close the final segment reader")
+            set file = open_rw(root, name)?
+        let segment_base_lsn: Number = segment_index * segment_size
+        var start_offset: Number = 0
+        if segment_index == first_tail_segment_index: set start_offset = first_tail_segment_offset
+        let recovered: Result[Number, Text] = yaza_db_wal_recover_segment_end_from_offset_for_log_v1(file, segment_base_lsn, start_offset, is_last_segment)
+        let closed: Result[Boolean, Text] = close(file)
+        if not result_is_ok(recovered): return err(result_unwrap_error(recovered))
+        if not result_is_ok(closed): return err(result_unwrap_error(closed))
+        if not result_unwrap(closed): return err("YDBv1 WAL recovery could not close a segment handle")
+        let segment_end_lsn: Number = result_unwrap(recovered)
+        if segment_index + 1 < segment_count and segment_end_lsn < segment_base_lsn + segment_size:
+            let padding: Number = segment_base_lsn + segment_size - segment_end_lsn
+            if padding >= yaza_db_wal_max_record_size_v1(): return err("YDBv1 WAL has a later segment after an unjustified gap")
+            set log_end = segment_base_lsn + segment_size
+        else:
+            set log_end = segment_end_lsn
+        set segment_index = segment_index + 1
+    return ok(log_end)
+
+fn yaza_db_wal_cleanup_new_segment_v1(root: Number, name: Text, file: Number) -> Number:
+    let ignored_close: Result[Boolean, Text] = close(file)
+    let ignored_remove: Result[Boolean, Text] = remove(root, name)
+    let ignored_sync: Result[Boolean, Text] = sync_directory(root)
+    return 0
+
+fn yaza_db_wal_create_segment_v1(root: Number, segment_index: Number, db_uuid: Bytes) -> Result[Number, Text]:
+    let name: Text = yaza_db_wal_segment_name_for_v1(segment_index, db_uuid)?
+    let quota_checked: Boolean = yaza_db_disk_quota_check_wal_segment_create_v1(root, db_uuid)?
+    if not quota_checked: return err("YDBv1 WAL segment creation was denied by the database disk quota")
+    let created: Result[Number, Text] = create_exclusive(root, name)
+    if not result_is_ok(created): return err(result_unwrap_error(created))
+    let file: Number = result_unwrap(created)
+    let file_sync: Result[Boolean, Text] = sync(file)
+    if not result_is_ok(file_sync) or not result_unwrap(file_sync):
+        var error: Text = "YDBv1 WAL new segment sync failed"
+        if not result_is_ok(file_sync): set error = result_unwrap_error(file_sync)
+        let ignored_cleanup: Number = yaza_db_wal_cleanup_new_segment_v1(root, name, file)
+        return err(error)
+    let directory_sync: Result[Boolean, Text] = sync_directory(root)
+    if not result_is_ok(directory_sync) or not result_unwrap(directory_sync):
+        var error: Text = "YDBv1 WAL segment directory sync failed"
+        if not result_is_ok(directory_sync): set error = result_unwrap_error(directory_sync)
+        let ignored_cleanup: Number = yaza_db_wal_cleanup_new_segment_v1(root, name, file)
+        return err(error)
+    return ok(file)
+
+fn yaza_db_wal_log_open_after_checkpoint_for_v1(root: Number, db_uuid: Bytes, checkpoint_lsn: Number) -> Result[YazaDbWalLogV1, Text]:
+    if bytes_length(db_uuid) != 16: return err("YDBv1 WAL open requires a 16-byte database UUID namespace")
+    let segment_count: Number = yaza_db_wal_segment_count_for_v1(root, db_uuid)?
+    if segment_count == 0:
+        if checkpoint_lsn != 0: return err("YDBv1 published checkpoint has no WAL segment")
+        let first_file: Number = yaza_db_wal_create_segment_v1(root, 0, db_uuid)?
+        return ok(YazaDbWalLogV1(root, db_uuid, first_file, 0, 0, 0))
+    let recovered_end: Number = yaza_db_wal_recover_log_end_after_checkpoint_for_v1(root, segment_count, db_uuid, checkpoint_lsn)?
+    let last_index: Number = segment_count - 1
+    let last_base: Number = last_index * yaza_db_wal_segment_size_v1()
+    if recovered_end == last_base + yaza_db_wal_segment_size_v1():
+        if segment_count >= yaza_db_wal_max_segment_count_v1(): return err("YDBv1 WAL reached its 1 TiB profile limit")
+        let next_file: Number = yaza_db_wal_create_segment_v1(root, segment_count, db_uuid)?
+        let next_base: Number = segment_count * yaza_db_wal_segment_size_v1()
+        return ok(YazaDbWalLogV1(root, db_uuid, next_file, segment_count, next_base, next_base))
+    let name: Text = yaza_db_wal_segment_name_for_v1(last_index, db_uuid)?
+    let active_file: Number = open_rw(root, name)?
+    return ok(YazaDbWalLogV1(root, db_uuid, active_file, last_index, last_base, recovered_end))
+
+fn yaza_db_wal_log_open_for_v1(root: Number, db_uuid: Bytes) -> Result[YazaDbWalLogV1, Text]:
+    return yaza_db_wal_log_open_after_checkpoint_for_v1(root, db_uuid, 0)
+
+fn yaza_db_wal_log_open_v1(root: Number) -> Result[YazaDbWalLogV1, Text]:
+    return yaza_db_wal_log_open_for_v1(root, yaza_db_wal_default_namespace_v1())
+
+fn yaza_db_wal_log_close_v1(log: YazaDbWalLogV1) -> Result[Boolean, Text]:
+    return close(log.file)
+
+fn yaza_db_wal_record_lsn_for_append_v1(log: YazaDbWalLogV1, record_length: Number) -> Result[Number, Text]:
+    if bytes_length(log.db_uuid) != 16: return err("YDBv1 WAL writer state has an invalid database namespace")
+    if log.segment_index < 0 or log.segment_index >= yaza_db_wal_max_segment_count_v1() or log.segment_base_lsn != log.segment_index * yaza_db_wal_segment_size_v1(): return err("YDBv1 WAL writer state has an invalid segment identity")
+    if log.next_lsn < log.segment_base_lsn or log.next_lsn > log.segment_base_lsn + yaza_db_wal_segment_size_v1(): return err("YDBv1 WAL writer state has an invalid next LSN")
+    if record_length < yaza_db_wal_header_size_v1() or record_length > yaza_db_wal_max_record_size_v1(): return err("YDBv1 WAL target record length is outside the supported bound")
+    if record_length > yaza_db_wal_segment_size_v1(): return err("YDBv1 WAL target record cannot fit in an empty segment")
+    let remaining: Number = yaza_db_wal_segment_size_v1() - (log.next_lsn - log.segment_base_lsn)
+    if record_length > remaining:
+        if log.segment_index + 1 >= yaza_db_wal_max_segment_count_v1(): return err("YDBv1 WAL reached its 1 TiB profile limit")
+        return ok((log.segment_index + 1) * yaza_db_wal_segment_size_v1())
+    return ok(log.next_lsn)
+
+fn yaza_db_wal_log_append_internal_v1(log: YazaDbWalLogV1, input_record: YazaDbWalRecordV1, sync_after_append: Boolean) -> Result[YazaDbWalAppendV1, Text]:
+    if bytes_length(log.db_uuid) != 16: return err("YDBv1 WAL writer state has an invalid database namespace")
+    if log.segment_index < 0 or log.segment_index >= yaza_db_wal_max_segment_count_v1() or log.segment_base_lsn != log.segment_index * yaza_db_wal_segment_size_v1(): return err("YDBv1 WAL writer state has an invalid segment identity")
+    if log.next_lsn < log.segment_base_lsn or log.next_lsn > log.segment_base_lsn + yaza_db_wal_segment_size_v1(): return err("YDBv1 WAL writer state has an invalid next LSN")
+    let candidate: YazaDbWalRecordV1 = YazaDbWalRecordV1(log.next_lsn, input_record.prev_lsn, input_record.txn_id, input_record.rec_type, input_record.flags, input_record.payload)
+    let record_length: Number = yaza_db_wal_validate_record_fields_v1(candidate)?
+    let segment_offset: Number = log.next_lsn - log.segment_base_lsn
+    let remaining: Number = yaza_db_wal_segment_size_v1() - segment_offset
+    var target_file: Number = log.file
+    var target_index: Number = log.segment_index
+    var target_base: Number = log.segment_base_lsn
+    var target_lsn: Number = log.next_lsn
+    var target_record: YazaDbWalRecordV1 = candidate
+    var target_encoded: Bytes = bytes_from_text("")
+    if record_length > remaining:
+        if log.segment_index + 1 >= yaza_db_wal_max_segment_count_v1(): return err("YDBv1 WAL reached its 1 TiB profile limit")
+        if not sync_after_append:
+            let previous_sync: Result[Boolean, Text] = sync(log.file)
+            if not result_is_ok(previous_sync) or not result_unwrap(previous_sync):
+                let ignored_close: Result[Boolean, Text] = close(log.file)
+                if not result_is_ok(previous_sync): return err("YDBv1 buffered WAL segment rotation could not flush the previous segment: " + result_unwrap_error(previous_sync))
+                return err("YDBv1 buffered WAL segment rotation could not flush the previous segment")
+        set target_index = log.segment_index + 1
+        set target_base = target_index * yaza_db_wal_segment_size_v1()
+        set target_lsn = target_base
+        set target_record = YazaDbWalRecordV1(target_lsn, input_record.prev_lsn, input_record.txn_id, input_record.rec_type, input_record.flags, input_record.payload)
+        let rotated_bytes: Bytes = yaza_db_wal_encode_v1(target_record)?
+        if bytes_length(rotated_bytes) > yaza_db_wal_segment_size_v1(): return err("YDBv1 WAL record cannot fit in an empty segment")
+        set target_encoded = rotated_bytes
+        set target_file = yaza_db_wal_create_segment_v1(log.root, target_index, log.db_uuid)?
+        let closed_previous: Result[Boolean, Text] = close(log.file)
+        if not result_is_ok(closed_previous) or not result_unwrap(closed_previous):
+            let ignored_close: Result[Boolean, Text] = close(target_file)
+            if not result_is_ok(closed_previous): return err(result_unwrap_error(closed_previous))
+            return err("YDBv1 WAL previous segment close failed during rotation")
+    else:
+        set target_encoded = yaza_db_wal_encode_v1(candidate)?
+        let active_segment_size: Number = file_size(log.file)?
+        if segment_offset > active_segment_size: return err("YDBv1 WAL writer position is beyond the physical active-segment end")
+        if segment_offset < active_segment_size:
+            if active_segment_size - segment_offset < 4: return err("YDBv1 WAL writer found a truncated physical tail")
+            let existing_length_bytes: Bytes = read_exact(log.file, segment_offset, 4)?
+            let existing_total_length: Number = yaza_db_read_uint_le_v1(existing_length_bytes, 0, 4)?
+            if existing_total_length != 0: return err("YDBv1 WAL writer state is stale or the segment tail is not empty")
+    if target_lsn < 0 or target_record.lsn != target_lsn: return err("YDBv1 WAL manager assigned an invalid record LSN")
+    if target_lsn > 9223372036854775807 - bytes_length(target_encoded):
+        let ignored_close: Result[Boolean, Text] = close(target_file)
+        return err("YDBv1 WAL append would overflow the signed LSN range")
+    let encoded_write: Result[Number, Text] = yaza_db_wal_write_encoded_segment_record_v1(target_file, target_record, target_encoded)
+    if not result_is_ok(encoded_write):
+        let ignored_close: Result[Boolean, Text] = close(target_file)
+        return err(result_unwrap_error(encoded_write))
+    if sync_after_append:
+        let synced: Result[Boolean, Text] = sync(target_file)
+        if not result_is_ok(synced) or not result_unwrap(synced):
+            let ignored_close: Result[Boolean, Text] = close(target_file)
+            if not result_is_ok(synced): return err(result_unwrap_error(synced))
+            return err("YDBv1 WAL append sync failed; reopen and recover the segment before reuse")
+    let next_lsn: Number = target_lsn + bytes_length(target_encoded)
+    let next_log: YazaDbWalLogV1 = YazaDbWalLogV1(log.root, log.db_uuid, target_file, target_index, target_base, next_lsn)
+    return ok(YazaDbWalAppendV1(next_log, target_record))
+
+fn yaza_db_wal_log_append_v1(log: YazaDbWalLogV1, input_record: YazaDbWalRecordV1) -> Result[YazaDbWalAppendV1, Text]:
+    return yaza_db_wal_log_append_internal_v1(log, input_record, true)
+
+fn yaza_db_wal_log_append_unflushed_v1(log: YazaDbWalLogV1, input_record: YazaDbWalRecordV1) -> Result[YazaDbWalAppendV1, Text]:
+    return yaza_db_wal_log_append_internal_v1(log, input_record, false)

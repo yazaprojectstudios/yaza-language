@@ -1,0 +1,659 @@
+# YazaBase HTTP & API Parity (Item 5)
+# Full HTTP/1.1 REST & SQL API engine supporting YazaBase SQL execution,
+# RESTful table & record CRUD, JSON and YBIF content negotiation,
+# YWT authentication, security headers, metrics, and health probes.
+
+use "std/fs"
+use "std/net"
+use "std/http"
+use "std/json"
+use "std/ybif"
+use "std/ywt"
+use "std/time"
+use "std/db/yazabase"
+use "std/config/api_config"
+use "./checkpoint_v1"
+use "./session_v1"
+use "./sql_binder_v1"
+use "./sql_dispatch_v1"
+use "./sql_executor_v1"
+use "./transaction_v1"
+
+shape YazaApiServerStateV1:
+    config: ApiServiceConfig
+    start_time_ms: Number
+    req_count: Number
+    in_flight_requests: Number
+    overload_rejections: Number
+
+shape YazaApiConnectionResultV1:
+    session: YazaDbSessionV1
+    state: YazaApiServerStateV1
+
+fn yaza_api_default_service_config(db_name: Text) -> ApiServiceConfig:
+    let def_res: Result[ApiResourcesConfig, Text] = api_resources_default_for_profile("balanced")
+    let res: ApiResourcesConfig = result_unwrap(def_res)
+    let formats: TextList = text_list()
+    list_push(formats, "json")
+    list_push(formats, "yaza")
+    list_push(formats, "ybif")
+    return ApiServiceConfig("yazabase-api", "127.0.0.1", 8080, "json", formats, 65536, "yazabase", "./db/" + db_name, "", "", res)
+
+fn yaza_api_server_state_default(db_name: Text) -> YazaApiServerStateV1:
+    return YazaApiServerStateV1(yaza_api_default_service_config(db_name), monotonic_ms(), 0, 0, 0)
+
+fn yaza_api_server_state_with_config(config: ApiServiceConfig) -> YazaApiServerStateV1:
+    return YazaApiServerStateV1(config, monotonic_ms(), 0, 0, 0)
+
+shape YazaApiSessionResponseV1:
+    session: YazaDbSessionV1
+    response: HttpResponse
+
+shape YazaApiSqlOutcomeV1:
+    session: YazaDbSessionV1
+    statement: Option[YazaDbSqlStatementResultV1]
+    error_message: Text
+
+fn yaza_api_value_json(value: YazaSqlValueV1) -> Text:
+    if value.is_null: return "null"
+    if value.type_id == 1:
+        if value.boolean_value: return "true"
+        return "false"
+    if value.type_id == 2 or value.type_id == 3 or value.type_id == 4:
+        return number_text(value.integer_value)
+    if value.type_id == 6:
+        return float64_text(value.float_value)
+    if value.type_id == 16:
+        let checked_text: Result[Text, Text] = bytes_try_to_text(value.bytes_value)
+        if result_is_ok(checked_text):
+            return "\"" + json_escape_text(result_unwrap(checked_text)) + "\""
+        return "\"[blob]\""
+    return "\"" + json_escape_text(value.text_value) + "\""
+
+fn yaza_api_row_json(row: List[YazaSqlValueV1]) -> Text:
+    let items: List[Text] = List[Text]()
+    var c: Number = 0
+    let count: Number = list_count(row)
+    while c < count:
+        list_push(items, yaza_api_value_json(list_get(row, c)))
+        set c = c + 1
+    return json_array(items)
+
+fn yaza_api_select_json(query_result: YazaSqlQueryResultV1) -> Text:
+    let col_names: List[Text] = List[Text]()
+    var c: Number = 0
+    let col_count: Number = list_count(query_result.columns)
+    while c < col_count:
+        let proj: YazaSqlBoundProjectionV1 = list_get(query_result.columns, c)
+        list_push(col_names, json_string(proj.output_name))
+        set c = c + 1
+    let row_strings: List[Text] = List[Text]()
+    var r: Number = 0
+    let row_count: Number = list_count(query_result.rows)
+    while r < row_count:
+        list_push(row_strings, yaza_api_row_json(list_get(query_result.rows, r)))
+        set r = r + 1
+    return "{\"columns\":" + json_array(col_names) + ",\"rows\":" + json_array(row_strings) + ",\"row_count\":" + number_text(row_count) + "}"
+
+fn yaza_api_select_ybif(query_result: YazaSqlQueryResultV1) -> Bytes:
+    let col_names: List[Text] = List[Text]()
+    var c: Number = 0
+    let col_count: Number = list_count(query_result.columns)
+    while c < col_count:
+        let proj: YazaSqlBoundProjectionV1 = list_get(query_result.columns, c)
+        list_push(col_names, proj.output_name)
+        set c = c + 1
+    let row_strings: List[Text] = List[Text]()
+    var r: Number = 0
+    let row_count: Number = list_count(query_result.rows)
+    while r < row_count:
+        list_push(row_strings, yaza_api_row_json(list_get(query_result.rows, r)))
+        set r = r + 1
+    return ybif_encode_sql_result(col_names, row_strings, row_count)
+
+fn yaza_api_commit_json(commit: YazaDbWriteCommitV1) -> Text:
+    return "{\"status\":\"ok\",\"affected_rows\":" + number_text(commit.affected_rows) + ",\"commit_ts\":" + number_text(commit.commit_ts) + "}"
+
+# Verifies Authorization: Bearer <ywt> header against auth_secret (fail-closed, real unix time).
+fn yaza_api_verify_auth(request: HttpRequest, auth_secret: Text) -> Option[HttpResponse]:
+    if text_length(auth_secret) < 32:
+        return some(http_response_unauthorized("API authentication secret is not configured (minimum 32 characters)", true))
+    if not text_starts_with(request.authorization, "Bearer "):
+        return some(http_response_unauthorized("missing or invalid Bearer authorization header", true))
+    let token: Text = text_slice(request.authorization, 7, text_length(request.authorization) - 7)
+    let now_s: Number = time_now_unix_ms() / 1000
+    let verified: Result[Text, Text] = ywt_verify(token, "yazabase", now_s, auth_secret)
+    if not result_is_ok(verified):
+        return some(http_response_unauthorized(result_unwrap_error(verified), true))
+    return none
+
+# Executes SQL statement with crash-safe session recovery on error.
+fn yaza_api_execute_sql(session: YazaDbSessionV1, root_path: Text, db_name: Text, sql: Text) -> YazaApiSqlOutcomeV1:
+    let exec_result: Result[YazaDbSessionStatementV1, Text] = yaza_db_session_execute_v1(session, sql, List[YazaSqlValueV1]())
+    if result_is_ok(exec_result):
+        let session_stmt: YazaDbSessionStatementV1 = result_unwrap(exec_result)
+        return YazaApiSqlOutcomeV1(session_stmt.session, some(session_stmt.statement), "")
+
+    let err_msg: Text = result_unwrap_error(exec_result)
+    var recovered: YazaDbSessionV1 = YazaDbSessionV1(-1, session.storage, session.wal, none, none, false)
+    if root_path != "":
+        let rec_root_result: Result[Number, Text] = root_open(root_path)
+        if result_is_ok(rec_root_result):
+            let rec_root: Number = result_unwrap(rec_root_result)
+            let rec_sess_result: Result[YazaDbSessionV1, Text] = yaza_db_session_open_v1(rec_root, db_name)
+            if result_is_ok(rec_sess_result):
+                set recovered = result_unwrap(rec_sess_result)
+    return YazaApiSqlOutcomeV1(recovered, none, err_msg)
+
+# Asynchronous SQL execution helper (Core 2 Best Practice)
+async fn yaza_api_execute_sql_async(session: YazaDbSessionV1, root_path: Text, db_name: Text, sql: Text) -> YazaApiSqlOutcomeV1:
+    return yaza_api_execute_sql(session, root_path, db_name, sql)
+
+fn yaza_api_route_request_state(session: YazaDbSessionV1, root_path: Text, db_name: Text, request: HttpRequest, auth_secret: Text, state: YazaApiServerStateV1) -> Result[YazaApiSessionResponseV1, Text]:
+    # CORS preflight
+    if request.method == "OPTIONS":
+        return ok(YazaApiSessionResponseV1(session, http_response_no_content()))
+
+    # Health / Readiness probes
+    if request.path == "/readyz" or request.path == "/healthz":
+        if session.is_open:
+            return ok(YazaApiSessionResponseV1(session, http_response_ok_json("{\"status\":\"ready\",\"database\":\"" + json_escape_text(db_name) + "\"}")))
+        return ok(YazaApiSessionResponseV1(session, http_response_internal_error("database session is closed", true)))
+
+    if request.path == "/livez":
+        return ok(YazaApiSessionResponseV1(session, http_response_ok_json("{\"status\":\"alive\"}")))
+
+    # Diagnostic Config Inspection endpoint
+    if request.path == "/config" or request.path == "/api/v1/config":
+        let auth_err: Option[HttpResponse] = yaza_api_verify_auth(request, auth_secret)
+        if option_is_some(auth_err):
+            return ok(YazaApiSessionResponseV1(session, option_unwrap(auth_err)))
+        return ok(YazaApiSessionResponseV1(session, http_response_ok_json(api_config_to_json(state.config))))
+
+    # Metrics endpoints
+    if request.path == "/metrics" or request.path == "/api/v1/metrics":
+        let auth_err: Option[HttpResponse] = yaza_api_verify_auth(request, auth_secret)
+        if option_is_some(auth_err):
+            return ok(YazaApiSessionResponseV1(session, option_unwrap(auth_err)))
+        let uptime_s: Number = (monotonic_ms() - state.start_time_ms) / 1000
+        let a_used: Number = arena_used()
+        let a_store: Number = arena_storage_used()
+        var is_open_val: Number = 0
+        if session.is_open: set is_open_val = 1
+        let r: ApiResourcesConfig = state.config.resources
+
+        if text_find(request.accept, "application/json") >= 0 or request.path == "/api/v1/metrics":
+            var m_json: Text = "{"
+            set m_json = m_json + "\"database\":\"" + json_escape_text(db_name) + "\","
+            set m_json = m_json + "\"uptime_seconds\":" + number_text(uptime_s) + ","
+            set m_json = m_json + "\"requests_total\":" + number_text(state.req_count) + ","
+            set m_json = m_json + "\"arena_used_bytes\":" + number_text(a_used) + ","
+            set m_json = m_json + "\"arena_storage_used_bytes\":" + number_text(a_store) + ","
+            set m_json = m_json + "\"session_is_open\":" + json_bool(session.is_open) + ","
+            set m_json = m_json + "\"profile\":\"" + json_escape_text(r.profile) + "\","
+            set m_json = m_json + "\"arena_mode\":\"" + json_escape_text(r.arena_mode) + "\","
+            set m_json = m_json + "\"max_in_flight\":" + number_text(r.max_in_flight) + ","
+            set m_json = m_json + "\"in_flight_requests\":" + number_text(state.in_flight_requests) + ","
+            set m_json = m_json + "\"overloads_total\":" + number_text(state.overload_rejections) + ","
+            set m_json = m_json + "\"process_arena_limit_bytes\":" + number_text(r.process_arena_limit) + ","
+            set m_json = m_json + "\"request_arena_ceiling_bytes\":" + number_text(r.request_arena_ceiling) + ","
+            set m_json = m_json + "\"max_request_body_bytes\":" + number_text(state.config.max_request_body_bytes)
+            set m_json = m_json + "}"
+            return ok(YazaApiSessionResponseV1(session, http_response_ok_json(m_json)))
+
+        var m_txt: Text = "# HELP yazabase_uptime_seconds Total server uptime in seconds\n# TYPE yazabase_uptime_seconds gauge\nyazabase_uptime_seconds " + number_text(uptime_s) + "\n"
+        set m_txt = m_txt + "# HELP yazabase_requests_total Total number of HTTP requests processed\n# TYPE yazabase_requests_total counter\nyazabase_requests_total " + number_text(state.req_count) + "\n"
+        set m_txt = m_txt + "# HELP yazabase_arena_used_bytes Primary arena memory used in bytes\n# TYPE yazabase_arena_used_bytes gauge\nyazabase_arena_used_bytes " + number_text(a_used) + "\n"
+        set m_txt = m_txt + "# HELP yazabase_arena_storage_used_bytes Storage arena memory used in bytes\n# TYPE yazabase_arena_storage_used_bytes gauge\nyazabase_arena_storage_used_bytes " + number_text(a_store) + "\n"
+        set m_txt = m_txt + "# HELP yazabase_session_is_open Database session open status\n# TYPE yazabase_session_is_open gauge\nyazabase_session_is_open " + number_text(is_open_val) + "\n"
+        set m_txt = m_txt + "# HELP yazabase_profile_info Resource profile information\n# TYPE yazabase_profile_info gauge\nyazabase_profile_info{profile=\"" + r.profile + "\",arena_mode=\"" + r.arena_mode + "\"} 1\n"
+        set m_txt = m_txt + "# HELP yazabase_max_in_flight Maximum concurrent requests admitted\n# TYPE yazabase_max_in_flight gauge\nyazabase_max_in_flight " + number_text(r.max_in_flight) + "\n"
+        set m_txt = m_txt + "# HELP yazabase_in_flight_requests Current active requests\n# TYPE yazabase_in_flight_requests gauge\nyazabase_in_flight_requests " + number_text(state.in_flight_requests) + "\n"
+        set m_txt = m_txt + "# HELP yazabase_overloads_total Total requests rejected due to concurrency overload\n# TYPE yazabase_overloads_total counter\nyazabase_overloads_total " + number_text(state.overload_rejections) + "\n"
+        set m_txt = m_txt + "# HELP yazabase_process_arena_limit_bytes Process arena hard limit\n# TYPE yazabase_process_arena_limit_bytes gauge\nyazabase_process_arena_limit_bytes " + number_text(r.process_arena_limit) + "\n"
+        set m_txt = m_txt + "# HELP yazabase_request_arena_ceiling_bytes Per-request arena ceiling\n# TYPE yazabase_request_arena_ceiling_bytes gauge\nyazabase_request_arena_ceiling_bytes " + number_text(r.request_arena_ceiling) + "\n"
+        set m_txt = m_txt + "# HELP yazabase_request_body_limit_bytes Maximum allowed request body size\n# TYPE yazabase_request_body_limit_bytes gauge\nyazabase_request_body_limit_bytes " + number_text(state.config.max_request_body_bytes) + "\n"
+        return ok(YazaApiSessionResponseV1(session, HttpResponse(200, "OK", "text/plain; version=0.0.4; charset=utf-8", bytes_from_text(m_txt))))
+
+    # Authentication token endpoint (fail-closed, verifies database credentials & issues 1h YWT)
+    if request.path == "/api/v1/auth/token":
+        if request.method != "POST":
+            return ok(YazaApiSessionResponseV1(session, http_response_method_not_allowed("use POST for /api/v1/auth/token", true)))
+        if text_length(auth_secret) < 32:
+            return ok(YazaApiSessionResponseV1(session, http_response_unauthorized("API authentication secret is not configured", true)))
+        if not text_starts_with(request.body_text, "{"):
+            return ok(YazaApiSessionResponseV1(session, http_response_unauthorized("missing JSON credentials payload {username, password}", true)))
+        let user_opt: Option[Text] = json_extract_string(request.body_text, "username")
+        let pass_opt: Option[Text] = json_extract_string(request.body_text, "password")
+        if not option_is_some(user_opt) or not option_is_some(pass_opt):
+            return ok(YazaApiSessionResponseV1(session, http_response_unauthorized("username and password are required", true)))
+        let sub: Text = option_unwrap(user_opt)
+        let pass: Text = option_unwrap(pass_opt)
+        var cred_dir: Text = root_path
+        if cred_dir == "":
+            set cred_dir = "./data"
+        # Token issuance requires an explicitly configured, non-development credential.
+        # The legacy local-development fallback is deliberately not an API identity.
+        if text_length(pass) < 16 or pass == "yaza_dev_password" or not file_exists(cred_dir + "/.yaza_credentials") or not yazabase_verify_credentials(cred_dir, sub, pass):
+            return ok(YazaApiSessionResponseV1(session, http_response_unauthorized("invalid database username or password", true)))
+        let now_s: Number = time_now_unix_ms() / 1000
+        let exp_s: Number = now_s + 3600
+        let token: Text = ywt_create_with_role(sub, "yazabase", "admin", exp_s, auth_secret)
+        return ok(YazaApiSessionResponseV1(session, http_response_ok_json("{\"token\":\"" + token + "\",\"sub\":\"" + json_escape_text(sub) + "\",\"expires_in\":3600}")))
+
+    # Protected sample endpoint
+    if request.path == "/api/v1/protected":
+        let auth_err: Option[HttpResponse] = yaza_api_verify_auth(request, auth_secret)
+        if option_is_some(auth_err):
+            return ok(YazaApiSessionResponseV1(session, option_unwrap(auth_err)))
+        let token: Text = text_slice(request.authorization, 7, text_length(request.authorization) - 7)
+        let now_s: Number = time_now_unix_ms() / 1000
+        let verified: Result[Text, Text] = ywt_verify(token, "yazabase", now_s, auth_secret)
+        return ok(YazaApiSessionResponseV1(session, http_response_ok_json("{\"status\":\"authorized\",\"user\":\"" + json_escape_text(result_unwrap(verified)) + "\"}")))
+
+    # RESTful Tables Catalog Endpoint: GET /api/v1/tables
+    if request.path == "/api/v1/tables":
+        let auth_err: Option[HttpResponse] = yaza_api_verify_auth(request, auth_secret)
+        if option_is_some(auth_err):
+            return ok(YazaApiSessionResponseV1(session, option_unwrap(auth_err)))
+        if request.method != "GET":
+            return ok(YazaApiSessionResponseV1(session, http_response_method_not_allowed("use GET for /api/v1/tables", true)))
+
+        let list_sql: Text = "SELECT table_name FROM sys_tables WHERE schema_name = 'public' ORDER BY table_name ASC;"
+        let outcome: YazaApiSqlOutcomeV1 = yaza_api_execute_sql(session, root_path, db_name, list_sql)
+        if outcome.error_message != "":
+            return ok(YazaApiSessionResponseV1(outcome.session, http_response_bad_request(outcome.error_message, true)))
+
+        let stmt: YazaDbSqlStatementResultV1 = option_unwrap(outcome.statement)
+        let qres: YazaSqlQueryResultV1 = option_unwrap(stmt.query_result)
+        let table_names: List[Text] = List[Text]()
+        var r: Number = 0
+        let row_count: Number = list_count(qres.rows)
+        while r < row_count:
+            let row: List[YazaSqlValueV1] = list_get(qres.rows, r)
+            if list_count(row) > 0:
+                list_push(table_names, json_string(list_get(row, 0).text_value))
+            set r = r + 1
+        return ok(YazaApiSessionResponseV1(outcome.session, http_response_ok_json("{\"tables\":" + json_array(table_names) + ",\"count\":" + number_text(row_count) + "}")))
+
+    # RESTful CRUD Routes: /api/v1/tables/<table_name> and /api/v1/tables/<table_name>/<id>
+    if text_starts_with(request.path, "/api/v1/tables/"):
+        let auth_err: Option[HttpResponse] = yaza_api_verify_auth(request, auth_secret)
+        if option_is_some(auth_err):
+            return ok(YazaApiSessionResponseV1(session, option_unwrap(auth_err)))
+
+        let prefix: Text = "/api/v1/tables/"
+        let prefix_len: Number = text_length(prefix)
+        let subpath: Text = text_slice(request.path, prefix_len, text_length(request.path) - prefix_len)
+        var table_name: Text = subpath
+        var record_id: Text = ""
+        let slash_pos: Number = text_find(subpath, "/")
+        if slash_pos >= 0:
+            set table_name = text_slice(subpath, 0, slash_pos)
+            set record_id = text_slice(subpath, slash_pos + 1, text_length(subpath) - slash_pos - 1)
+
+        # 1. GET /api/v1/tables/<table_name>/<id> - Single Record Lookup
+        if record_id != "" and request.method == "GET":
+            let get_sql: Text = "SELECT * FROM " + table_name + " WHERE id = " + record_id + ";"
+            let outcome: YazaApiSqlOutcomeV1 = yaza_api_execute_sql(session, root_path, db_name, get_sql)
+            if outcome.error_message != "":
+                return ok(YazaApiSessionResponseV1(outcome.session, http_response_bad_request(outcome.error_message, true)))
+            let stmt: YazaDbSqlStatementResultV1 = option_unwrap(outcome.statement)
+            let qres: YazaSqlQueryResultV1 = option_unwrap(stmt.query_result)
+            if list_count(qres.rows) == 0:
+                return ok(YazaApiSessionResponseV1(outcome.session, http_response_not_found("record with id " + record_id + " not found in table " + table_name, true)))
+            let col_names: List[Text] = List[Text]()
+            var c: Number = 0
+            let col_count: Number = list_count(qres.columns)
+            while c < col_count:
+                let proj: YazaSqlBoundProjectionV1 = list_get(qres.columns, c)
+                list_push(col_names, json_string(proj.output_name))
+                set c = c + 1
+            let rec_json: Text = "{\"table\":\"" + json_escape_text(table_name) + "\",\"columns\":" + json_array(col_names) + ",\"row\":" + yaza_api_row_json(list_get(qres.rows, 0)) + "}"
+            return ok(YazaApiSessionResponseV1(outcome.session, http_response_ok_json(rec_json)))
+
+        # 2. DELETE /api/v1/tables/<table_name>/<id> - Delete Record
+        if record_id != "" and request.method == "DELETE":
+            let del_sql: Text = "DELETE FROM " + table_name + " WHERE id = " + record_id + ";"
+            let outcome: YazaApiSqlOutcomeV1 = yaza_api_execute_sql(session, root_path, db_name, del_sql)
+            if outcome.error_message != "":
+                return ok(YazaApiSessionResponseV1(outcome.session, http_response_bad_request(outcome.error_message, true)))
+            let stmt: YazaDbSqlStatementResultV1 = option_unwrap(outcome.statement)
+            var aff: Number = 0
+            if option_is_some(stmt.write_commit):
+                set aff = option_unwrap(stmt.write_commit).affected_rows
+            return ok(YazaApiSessionResponseV1(outcome.session, http_response_ok_json("{\"status\":\"deleted\",\"table\":\"" + json_escape_text(table_name) + "\",\"id\":\"" + json_escape_text(record_id) + "\",\"affected_rows\":" + number_text(aff) + "}")))
+
+        # 3. PUT /api/v1/tables/<table_name>/<id> - Update Record
+        if record_id != "" and (request.method == "PUT" or request.method == "PATCH"):
+            var set_clause: Text = ""
+            if text_starts_with(request.body_text, "{"):
+                let set_opt: Option[Text] = json_extract_string(request.body_text, "set")
+                if option_is_some(set_opt): set set_clause = option_unwrap(set_opt)
+            if set_clause == "": set set_clause = text_trim(request.body_text)
+            if set_clause == "":
+                return ok(YazaApiSessionResponseV1(session, http_response_bad_request("update requires a 'set' clause in body", true)))
+            let update_sql: Text = "UPDATE " + table_name + " SET " + set_clause + " WHERE id = " + record_id + ";"
+            let outcome: YazaApiSqlOutcomeV1 = yaza_api_execute_sql(session, root_path, db_name, update_sql)
+            if outcome.error_message != "":
+                return ok(YazaApiSessionResponseV1(outcome.session, http_response_bad_request(outcome.error_message, true)))
+            let stmt: YazaDbSqlStatementResultV1 = option_unwrap(outcome.statement)
+            var aff: Number = 0
+            if option_is_some(stmt.write_commit):
+                set aff = option_unwrap(stmt.write_commit).affected_rows
+            return ok(YazaApiSessionResponseV1(outcome.session, http_response_ok_json("{\"status\":\"updated\",\"table\":\"" + json_escape_text(table_name) + "\",\"id\":\"" + json_escape_text(record_id) + "\",\"affected_rows\":" + number_text(aff) + "}")))
+
+        # 4. GET /api/v1/tables/<table_name> - Query Table Rows with pagination
+        if record_id == "" and request.method == "GET":
+            let limit: Number = http_query_param_number(request.query, "limit", 100)
+            let q_sql: Text = "SELECT * FROM " + table_name + " LIMIT " + number_text(limit) + ";"
+            let outcome: YazaApiSqlOutcomeV1 = yaza_api_execute_sql(session, root_path, db_name, q_sql)
+            if outcome.error_message != "":
+                return ok(YazaApiSessionResponseV1(outcome.session, http_response_bad_request(outcome.error_message, true)))
+            let stmt: YazaDbSqlStatementResultV1 = option_unwrap(outcome.statement)
+            let qres: YazaSqlQueryResultV1 = option_unwrap(stmt.query_result)
+            return ok(YazaApiSessionResponseV1(outcome.session, http_response_ok_json(yaza_api_select_json(qres))))
+
+        # 5. POST /api/v1/tables/<table_name> - Insert Record
+        if record_id == "" and request.method == "POST":
+            var insert_sql: Text = ""
+            if text_starts_with(request.body_text, "{"):
+                let vals_opt: Option[Text] = json_extract_string(request.body_text, "values")
+                let cols_opt: Option[Text] = json_extract_string(request.body_text, "columns")
+                if option_is_some(vals_opt):
+                    let vals: Text = option_unwrap(vals_opt)
+                    var vals_clause: Text = vals
+                    if not text_starts_with(vals_clause, "("):
+                        set vals_clause = "(" + vals_clause + ")"
+                    if option_is_some(cols_opt):
+                        var cols: Text = option_unwrap(cols_opt)
+                        if not text_starts_with(cols, "("):
+                            set cols = "(" + cols + ")"
+                        set insert_sql = "INSERT INTO " + table_name + " " + cols + " VALUES " + vals_clause + ";"
+                    else:
+                        set insert_sql = "INSERT INTO " + table_name + " VALUES " + vals_clause + ";"
+                else:
+                    let sql_opt: Option[Text] = json_extract_string(request.body_text, "sql")
+                    if option_is_some(sql_opt):
+                        set insert_sql = option_unwrap(sql_opt)
+                    else:
+                        set insert_sql = "INSERT INTO " + table_name + " VALUES (" + text_trim(request.body_text) + ");"
+            else:
+                var trimmed: Text = text_trim(request.body_text)
+                if not text_starts_with(trimmed, "("):
+                    set trimmed = "(" + trimmed + ")"
+                set insert_sql = "INSERT INTO " + table_name + " VALUES " + trimmed + ";"
+
+            let outcome: YazaApiSqlOutcomeV1 = yaza_api_execute_sql(session, root_path, db_name, insert_sql)
+            if outcome.error_message != "":
+                return ok(YazaApiSessionResponseV1(outcome.session, http_response_bad_request(outcome.error_message, true)))
+            let stmt: YazaDbSqlStatementResultV1 = option_unwrap(outcome.statement)
+            var aff: Number = 1
+            if option_is_some(stmt.write_commit):
+                set aff = option_unwrap(stmt.write_commit).affected_rows
+            return ok(YazaApiSessionResponseV1(outcome.session, http_response_created_json("{\"status\":\"created\",\"table\":\"" + json_escape_text(table_name) + "\",\"affected_rows\":" + number_text(aff) + "}")))
+
+        return ok(YazaApiSessionResponseV1(session, http_response_method_not_allowed("method not supported for table endpoint", true)))
+
+    # Raw SQL Execution Endpoint: POST /api/v1/sql
+    if request.path == "/api/v1/sql":
+        let auth_err: Option[HttpResponse] = yaza_api_verify_auth(request, auth_secret)
+        if option_is_some(auth_err):
+            return ok(YazaApiSessionResponseV1(session, option_unwrap(auth_err)))
+
+        if request.method != "POST":
+            return ok(YazaApiSessionResponseV1(session, http_response_method_not_allowed("use POST for /api/v1/sql", true)))
+
+        # Content negotiation
+        var prefer_ybif: Boolean = false
+        if text_find(request.accept, "application/x-ybif") >= 0:
+            set prefer_ybif = true
+        let as_json: Boolean = not prefer_ybif
+
+        # Extract SQL query
+        var sql: Text = ""
+        if text_starts_with(request.body_text, "{"):
+            let sql_opt: Option[Text] = json_extract_string(request.body_text, "sql")
+            if option_is_some(sql_opt):
+                set sql = option_unwrap(sql_opt)
+            else:
+                set sql = request.body_text
+        else:
+            set sql = text_trim(request.body_text)
+
+        if text_length(sql) == 0:
+            return ok(YazaApiSessionResponseV1(session, http_response_bad_request("SQL statement must not be empty", as_json)))
+
+        let outcome: YazaApiSqlOutcomeV1 = yaza_api_execute_sql(session, root_path, db_name, sql)
+        if outcome.error_message != "":
+            return ok(YazaApiSessionResponseV1(outcome.session, http_response_bad_request(outcome.error_message, as_json)))
+
+        let next_session: YazaDbSessionV1 = outcome.session
+        let stmt: YazaDbSqlStatementResultV1 = option_unwrap(outcome.statement)
+
+        if option_is_some(stmt.query_result):
+            let qres: YazaSqlQueryResultV1 = option_unwrap(stmt.query_result)
+            if prefer_ybif:
+                return ok(YazaApiSessionResponseV1(next_session, http_response_ok_ybif(yaza_api_select_ybif(qres))))
+            return ok(YazaApiSessionResponseV1(next_session, http_response_ok_json(yaza_api_select_json(qres))))
+
+        if option_is_some(stmt.write_commit):
+            let wres: YazaDbWriteCommitV1 = option_unwrap(stmt.write_commit)
+            if prefer_ybif:
+                let payload: Bytes = bytes_from_text(yaza_api_commit_json(wres))
+                return ok(YazaApiSessionResponseV1(next_session, http_response_ok_ybif(bytes_concat(ybif_header(), payload))))
+            return ok(YazaApiSessionResponseV1(next_session, http_response_ok_json(yaza_api_commit_json(wres))))
+
+        # DDL or no-op commit
+        if prefer_ybif:
+            let payload: Bytes = bytes_from_text("{\"status\":\"ok\"}")
+            return ok(YazaApiSessionResponseV1(next_session, http_response_ok_ybif(bytes_concat(ybif_header(), payload))))
+        return ok(YazaApiSessionResponseV1(next_session, http_response_ok_json("{\"status\":\"ok\"}")))
+
+    return ok(YazaApiSessionResponseV1(session, http_response_not_found("route not found: " + request.path, true)))
+
+# Asynchronous route request dispatcher (Core 2 Best Practice)
+async fn yaza_api_route_request_async(session: YazaDbSessionV1, root_path: Text, db_name: Text, request: HttpRequest, auth_secret: Text, state: YazaApiServerStateV1) -> Result[YazaApiSessionResponseV1, Text]:
+    return yaza_api_route_request_state(session, root_path, db_name, request, auth_secret, state)
+
+fn yaza_api_route_request_ex(session: YazaDbSessionV1, root_path: Text, db_name: Text, request: HttpRequest, auth_secret: Text, start_time_ms: Number, req_count: Number) -> Result[YazaApiSessionResponseV1, Text]:
+    let state: YazaApiServerStateV1 = YazaApiServerStateV1(yaza_api_default_service_config(db_name), start_time_ms, req_count, 0, 0)
+    return yaza_api_route_request_state(session, root_path, db_name, request, auth_secret, state)
+
+fn yaza_api_route_request(session: YazaDbSessionV1, db_name: Text, request: HttpRequest, auth_secret: Text) -> Result[YazaApiSessionResponseV1, Text]:
+    return yaza_api_route_request_ex(session, "", db_name, request, auth_secret, monotonic_ms(), 0)
+
+fn yaza_api_accept_matches_allowed(accept_hdr: Text, allowed_formats: TextList) -> Boolean:
+    if accept_hdr == "" or text_find(accept_hdr, "*/*") >= 0:
+        return true
+    var i: Number = 0
+    while i < list_count(allowed_formats):
+        let fmt: Text = list_get(allowed_formats, i)
+        if fmt == "json" and text_find(accept_hdr, "application/json") >= 0: return true
+        if (fmt == "ybif" or fmt == "yaza") and text_find(accept_hdr, "application/x-ybif") >= 0: return true
+        if text_find(accept_hdr, fmt) >= 0: return true
+        set i = i + 1
+    if text_find(accept_hdr, "text/plain") >= 0: return true
+    return false
+
+# Read one bounded Content-Length request completely before routing it.
+# A short TCP read must never turn a valid prefix of a request body into a query.
+fn yaza_api_read_full_http_request(conn: Number, max_body_bytes: Number) -> Result[Bytes, Text]:
+    let deadline_ms: Number = monotonic_ms() + 5000
+    let first_result: Result[Bytes, Text] = tcp_read(conn, 65536, 3000)
+    if not result_is_ok(first_result): return err(result_unwrap_error(first_result))
+    let first: Bytes = result_unwrap(first_result)
+    if bytes_length(first) == 0: return err("empty HTTP request")
+
+    let chunks: List[Bytes] = List[Bytes]()
+    list_push(chunks, first)
+    var raw_request: Bytes = first
+    var header_complete: Boolean = false
+    while not header_complete:
+        let request_text: Text = bytes_to_text(raw_request)
+        let header_end: Number = text_find(request_text, "\r\n\r\n")
+        if header_end >= 0:
+            if header_end > 16384: return err("HTTP headers exceed the 16 KiB limit")
+            set header_complete = true
+        else:
+            if bytes_length(raw_request) >= 16384: return err("HTTP headers exceed the 16 KiB limit")
+            let remaining_ms: Number = deadline_ms - monotonic_ms()
+            if remaining_ms <= 0: return err("timed out while reading HTTP headers")
+            var read_size: Number = 16384 - bytes_length(raw_request)
+            if read_size > 65536: set read_size = 65536
+            var read_timeout: Number = remaining_ms
+            if read_timeout > 3000: set read_timeout = 3000
+            let next_result: Result[Bytes, Text] = tcp_read(conn, read_size, read_timeout)
+            if not result_is_ok(next_result): return err(result_unwrap_error(next_result))
+            let next: Bytes = result_unwrap(next_result)
+            if bytes_length(next) == 0: return err("incomplete HTTP headers")
+            list_push(chunks, next)
+            let joined_headers: Result[Bytes, Text] = bytes_join(chunks)
+            if not result_is_ok(joined_headers): return err("could not buffer HTTP headers")
+            set raw_request = result_unwrap(joined_headers)
+
+    let partial_request_result: Result[HttpRequest, Text] = http_parse_request(raw_request)
+    if not result_is_ok(partial_request_result): return err(result_unwrap_error(partial_request_result))
+    let partial_request: HttpRequest = result_unwrap(partial_request_result)
+    if partial_request.content_length > max_body_bytes:
+        return err("YAZA_HTTP_PAYLOAD_TOO_LARGE")
+    let header_bytes: Number = bytes_length(raw_request) - bytes_length(partial_request.body)
+    let expected_total: Number = header_bytes + partial_request.content_length
+    var total_bytes: Number = bytes_length(raw_request)
+    while total_bytes < expected_total:
+        let remaining_ms: Number = deadline_ms - monotonic_ms()
+        if remaining_ms <= 0: return err("timed out while reading HTTP body")
+        var read_size: Number = expected_total - total_bytes
+        if read_size > 65536: set read_size = 65536
+        var read_timeout: Number = remaining_ms
+        if read_timeout > 3000: set read_timeout = 3000
+        let next_result: Result[Bytes, Text] = tcp_read(conn, read_size, read_timeout)
+        if not result_is_ok(next_result): return err(result_unwrap_error(next_result))
+        let next: Bytes = result_unwrap(next_result)
+        if bytes_length(next) == 0: return err("incomplete HTTP body")
+        list_push(chunks, next)
+        set total_bytes = total_bytes + bytes_length(next)
+
+    let complete_request: Result[Bytes, Text] = bytes_join(chunks)
+    if not result_is_ok(complete_request): return err("could not assemble HTTP request")
+    return complete_request
+
+fn yaza_api_handle_connection_state(session: YazaDbSessionV1, root_path: Text, db_name: Text, conn: Number, auth_secret: Text, state: YazaApiServerStateV1) -> Result[YazaApiConnectionResultV1, Text]:
+    var cur_state: YazaApiServerStateV1 = state
+    set cur_state.req_count = cur_state.req_count + 1
+
+    let req_id: Text = "req-" + number_text(monotonic_ms()) + "-" + number_text(cur_state.req_count)
+
+    # 1. Concurrency Admission Check (Gate A: max_in_flight overload protection)
+    if cur_state.in_flight_requests >= cur_state.config.resources.max_in_flight:
+        set cur_state.overload_rejections = cur_state.overload_rejections + 1
+        let err_resp: HttpResponse = http_response_service_unavailable("server maximum in-flight capacity reached (" + number_text(cur_state.config.resources.max_in_flight) + " slots)", true)
+        let err_bytes: Bytes = http_format_response_with_id(err_resp, req_id)
+        let ignored_write: Result[Number, Text] = tcp_write(conn, err_bytes, 3000)
+        return ok(YazaApiConnectionResultV1(session, cur_state))
+
+    set cur_state.in_flight_requests = cur_state.in_flight_requests + 1
+
+    let raw_bytes: Result[Bytes, Text] = yaza_api_read_full_http_request(conn, cur_state.config.max_request_body_bytes)
+    if not result_is_ok(raw_bytes):
+        let read_error: Text = result_unwrap_error(raw_bytes)
+        var err_resp: HttpResponse = http_response_bad_request(read_error, true)
+        if read_error == "YAZA_HTTP_PAYLOAD_TOO_LARGE":
+            set err_resp = http_response_payload_too_large("request payload exceeds maximum size limit of " + number_text(cur_state.config.max_request_body_bytes) + " bytes", true)
+        let err_bytes: Bytes = http_format_response_with_id(err_resp, req_id)
+        let ignored_write: Result[Number, Text] = tcp_write(conn, err_bytes, 3000)
+        set cur_state.in_flight_requests = cur_state.in_flight_requests - 1
+        return ok(YazaApiConnectionResultV1(session, cur_state))
+
+    let request_result: Result[HttpRequest, Text] = http_parse_request(result_unwrap(raw_bytes))
+    if not result_is_ok(request_result):
+        let err_resp: HttpResponse = http_response_bad_request(result_unwrap_error(request_result), true)
+        let err_bytes: Bytes = http_format_response_with_id(err_resp, "bad-request")
+        let ignored_write: Result[Number, Text] = tcp_write(conn, err_bytes, 3000)
+        set cur_state.in_flight_requests = cur_state.in_flight_requests - 1
+        return ok(YazaApiConnectionResultV1(session, cur_state))
+
+    let req: HttpRequest = result_unwrap(request_result)
+    var effective_req_id: Text = req.x_request_id
+    if effective_req_id == "": set effective_req_id = req_id
+
+    # 2. Size limit check (Gate D: max_request_body_bytes from config)
+    if req.content_length > cur_state.config.max_request_body_bytes or bytes_length(req.body) > cur_state.config.max_request_body_bytes:
+        let err_resp: HttpResponse = http_response_payload_too_large("request payload exceeds maximum size limit of " + number_text(cur_state.config.max_request_body_bytes) + " bytes", true)
+        let err_bytes: Bytes = http_format_response_with_id(err_resp, effective_req_id)
+        let ignored_write: Result[Number, Text] = tcp_write(conn, err_bytes, 3000)
+        set cur_state.in_flight_requests = cur_state.in_flight_requests - 1
+        return ok(YazaApiConnectionResultV1(session, cur_state))
+
+    # 3. Content Negotiation format policy check (Gate C: allowed_response_formats)
+    if not yaza_api_accept_matches_allowed(req.accept, cur_state.config.allowed_response_formats):
+        let err_resp: HttpResponse = http_response_not_acceptable("requested format in Accept header is not supported by API policy", true)
+        let err_bytes: Bytes = http_format_response_with_id(err_resp, effective_req_id)
+        let ignored_write: Result[Number, Text] = tcp_write(conn, err_bytes, 3000)
+        set cur_state.in_flight_requests = cur_state.in_flight_requests - 1
+        return ok(YazaApiConnectionResultV1(session, cur_state))
+
+    let routed_task: Task[Result[YazaApiSessionResponseV1, Text]] = spawn yaza_api_route_request_async(session, root_path, db_name, req, auth_secret, cur_state)
+    let routed_result: Result[YazaApiSessionResponseV1, Text] = routed_task.await
+    if not result_is_ok(routed_result):
+        let err_resp: HttpResponse = http_response_internal_error(result_unwrap_error(routed_result), true)
+        let err_bytes: Bytes = http_format_response_with_id(err_resp, effective_req_id)
+        let ignored_write: Result[Number, Text] = tcp_write(conn, err_bytes, 3000)
+        set cur_state.in_flight_requests = cur_state.in_flight_requests - 1
+        return ok(YazaApiConnectionResultV1(session, cur_state))
+
+    let routed: YazaApiSessionResponseV1 = result_unwrap(routed_result)
+    let resp_bytes: Bytes = http_format_response_with_id(routed.response, effective_req_id)
+    let write_result: Result[Number, Text] = tcp_write(conn, resp_bytes, 3000)
+    set cur_state.in_flight_requests = cur_state.in_flight_requests - 1
+    if not result_is_ok(write_result):
+        return err(result_unwrap_error(write_result))
+    return ok(YazaApiConnectionResultV1(routed.session, cur_state))
+
+# Handles a single HTTP request from a connected socket handle.
+async fn yaza_api_handle_connection_async(session: YazaDbSessionV1, root_path: Text, db_name: Text, conn: Number, auth_secret: Text, state: YazaApiServerStateV1) -> Result[YazaApiConnectionResultV1, Text]:
+    return yaza_api_handle_connection_state(session, root_path, db_name, conn, auth_secret, state)
+
+fn yaza_api_handle_connection_ex(session: YazaDbSessionV1, root_path: Text, db_name: Text, conn: Number, auth_secret: Text, start_time_ms: Number, req_count: Number) -> Result[YazaDbSessionV1, Text]:
+    let state: YazaApiServerStateV1 = YazaApiServerStateV1(yaza_api_default_service_config(db_name), start_time_ms, req_count, 0, 0)
+    let res: Result[YazaApiConnectionResultV1, Text] = yaza_api_handle_connection_state(session, root_path, db_name, conn, auth_secret, state)
+    if not result_is_ok(res): return err(result_unwrap_error(res))
+    return ok(result_unwrap(res).session)
+
+fn yaza_api_handle_connection(session: YazaDbSessionV1, db_name: Text, conn: Number, auth_secret: Text) -> Result[YazaDbSessionV1, Text]:
+    return yaza_api_handle_connection_ex(session, "", db_name, conn, auth_secret, monotonic_ms(), 0)
+
+# Bounded HTTP listener loop with custom API and resource configuration.
+fn yaza_api_serve_loop_config(session: YazaDbSessionV1, root_path: Text, db_name: Text, config: ApiServiceConfig, max_requests: Number, auth_secret: Text) -> Result[Number, Text]:
+    let listener_result: Result[Number, Text] = tcp_listen(config.bind_host, config.bind_port, 32)
+    if not result_is_ok(listener_result):
+        return err(result_unwrap_error(listener_result))
+    let listener: Number = result_unwrap(listener_result)
+
+    var current_session: YazaDbSessionV1 = session
+    var current_state: YazaApiServerStateV1 = yaza_api_server_state_with_config(config)
+
+    while max_requests <= 0 or current_state.req_count < max_requests:
+        let accept_result: Result[Number, Text] = tcp_accept(listener, 2000)
+        if result_is_ok(accept_result):
+            let client: Number = result_unwrap(accept_result)
+            let conn_task: Task[Result[YazaApiConnectionResultV1, Text]] = spawn yaza_api_handle_connection_async(current_session, root_path, db_name, client, auth_secret, current_state)
+            let handle_result: Result[YazaApiConnectionResultV1, Text] = conn_task.await
+            if result_is_ok(handle_result):
+                let outcome: YazaApiConnectionResultV1 = result_unwrap(handle_result)
+                set current_session = outcome.session
+                set current_state = outcome.state
+            let closed_client: Result[Boolean, Text] = tcp_close(client)
+
+    let closed_listener: Result[Boolean, Text] = tcp_close(listener)
+    return ok(current_state.req_count)
+
+# Bounded HTTP listener loop. Serves up to max_requests (or indefinitely if max_requests <= 0).
+fn yaza_api_serve_loop_ex(session: YazaDbSessionV1, root_path: Text, db_name: Text, host: Text, port: Number, max_requests: Number, auth_secret: Text) -> Result[Number, Text]:
+    var config: ApiServiceConfig = yaza_api_default_service_config(db_name)
+    set config.bind_host = host
+    set config.bind_port = port
+    return yaza_api_serve_loop_config(session, root_path, db_name, config, max_requests, auth_secret)
+
+fn yaza_api_serve_loop(session: YazaDbSessionV1, db_name: Text, host: Text, port: Number, max_requests: Number, auth_secret: Text) -> Result[Number, Text]:
+    return yaza_api_serve_loop_ex(session, "", db_name, host, port, max_requests, auth_secret)

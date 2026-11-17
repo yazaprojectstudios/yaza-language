@@ -1,0 +1,137 @@
+use "../yazabase/catalog_init_v1"
+use "../yazabase/checkpoint_v1"
+use "../yazabase/sql_dispatch_v1"
+
+fn yazabase_sql_multi_join_has_text_pair_v1(rows: List[List[YazaSqlValueV1]], left_text: Text, right_text: Text, left_null: Boolean, right_null: Boolean) -> Boolean:
+    var row_index: Number = 0
+    while row_index < list_count(rows):
+        let row: List[YazaSqlValueV1] = list_get(rows, row_index)
+        if list_count(row) == 2:
+            let left_value: YazaSqlValueV1 = list_get(row, 0)
+            let right_value: YazaSqlValueV1 = list_get(row, 1)
+            let left_matches: Boolean = (left_null and left_value.is_null) or (not left_null and not left_value.is_null and left_value.text_value == left_text)
+            let right_matches: Boolean = (right_null and right_value.is_null) or (not right_null and not right_value.is_null and right_value.text_value == right_text)
+            if left_matches and right_matches: return true
+        set row_index = row_index + 1
+    return false
+
+fn yazabase_sql_multi_join_persist_v1(root_path: Text) -> Result[Boolean, Text]:
+    let root: Number = root_open(root_path)?
+    let db_name: Text = "multi-join-persist-smoke.ydb"
+    let header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_from_text("multi-join-uuid1"), 0, 1, 1, 0, 2, 1)
+    let empty_storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, db_name, header)?
+    let empty_closed: Boolean = yaza_db_storage_close_v1(empty_storage)?
+    if not empty_closed: return err("YDBv1 multi-JOIN fixture could not close its empty database")
+    let initialized: YazaDbCatalogBootstrapV1 = yaza_db_catalog_initialize_v1(root, db_name)?
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+
+    let create_items: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(initialized.storage, initialized.wal, "CREATE TABLE items (id BIGINT PRIMARY KEY, label TEXT NOT NULL)", no_parameters)?
+    if not option_is_some(create_items.write_commit): return err("YDBv1 multi-JOIN fixture could not create items")
+    let create_profiles: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(create_items.storage, create_items.wal, "CREATE TABLE profiles (id BIGINT PRIMARY KEY, item_id BIGINT NOT NULL, note TEXT NOT NULL)", no_parameters)?
+    if not option_is_some(create_profiles.write_commit): return err("YDBv1 multi-JOIN fixture could not create profiles")
+    let create_audit: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(create_profiles.storage, create_profiles.wal, "CREATE TABLE audit (id BIGINT PRIMARY KEY, profile_id BIGINT NOT NULL, event TEXT NOT NULL)", no_parameters)?
+    if not option_is_some(create_audit.write_commit): return err("YDBv1 multi-JOIN fixture could not create audit")
+    let create_trace: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(create_audit.storage, create_audit.wal, "CREATE TABLE trace (id BIGINT PRIMARY KEY, profile_id BIGINT NOT NULL, marker TEXT NOT NULL)", no_parameters)?
+    if not option_is_some(create_trace.write_commit): return err("YDBv1 multi-JOIN fixture could not create trace")
+
+    let insert_items: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(create_trace.storage, create_trace.wal, "INSERT INTO items (id, label) VALUES (1, 'one'), (2, 'two')", no_parameters)?
+    if not option_is_some(insert_items.write_commit): return err("YDBv1 multi-JOIN fixture could not insert items")
+    let item_commit: YazaDbWriteCommitV1 = option_unwrap(insert_items.write_commit)
+    let insert_profiles: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(item_commit.storage, item_commit.wal, "INSERT INTO profiles (id, item_id, note) VALUES (10, 1, 'alpha'), (11, 1, 'omega'), (12, 2, 'beta'), (13, 2, 'gamma')", no_parameters)?
+    if not option_is_some(insert_profiles.write_commit): return err("YDBv1 multi-JOIN fixture could not insert profiles")
+    let profile_commit: YazaDbWriteCommitV1 = option_unwrap(insert_profiles.write_commit)
+    let insert_audit: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(profile_commit.storage, profile_commit.wal, "INSERT INTO audit (id, profile_id, event) VALUES (100, 10, 'view'), (101, 12, 'close'), (102, 10, 'open'), (103, 99, 'orphan'), (104, 11, 'edit')", no_parameters)?
+    if not option_is_some(insert_audit.write_commit): return err("YDBv1 multi-JOIN fixture could not insert audit rows")
+    let audit_commit: YazaDbWriteCommitV1 = option_unwrap(insert_audit.write_commit)
+    let insert_trace: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(audit_commit.storage, audit_commit.wal, "INSERT INTO trace (id, profile_id, marker) VALUES (200, 10, 'tag-a'), (201, 12, 'tag-b'), (202, 99, 'tag-orphan')", no_parameters)?
+    if not option_is_some(insert_trace.write_commit): return err("YDBv1 multi-JOIN fixture could not insert trace rows")
+    let trace_commit: YazaDbWriteCommitV1 = option_unwrap(insert_trace.write_commit)
+
+    let source: Text = "SELECT i.id, p.id, a.event, t.marker FROM items AS i INNER JOIN profiles AS p ON i.id = p.item_id INNER JOIN audit AS a ON p.id = a.profile_id INNER JOIN trace AS t ON a.profile_id = t.profile_id ORDER BY a.event"
+    let selected: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(trace_commit.storage, trace_commit.wal, source, no_parameters)?
+    if not option_is_some(selected.query_result): return err("YDBv1 three-table JOIN did not return a query result")
+    let rows: YazaSqlQueryResultV1 = option_unwrap(selected.query_result)
+    if list_count(rows.columns) != 4 or list_count(rows.rows) != 3: return err("YDBv1 four-table JOIN returned the wrong shape")
+    let first: List[YazaSqlValueV1] = list_get(rows.rows, 0)
+    let second: List[YazaSqlValueV1] = list_get(rows.rows, 1)
+    let third: List[YazaSqlValueV1] = list_get(rows.rows, 2)
+    if list_get(first, 0).integer_value != 2 or list_get(first, 1).integer_value != 12 or list_get(first, 2).text_value != "close" or list_get(first, 3).text_value != "tag-b": return err("YDBv1 four-table JOIN returned an incorrect first row")
+    if list_get(second, 0).integer_value != 1 or list_get(second, 1).integer_value != 10 or list_get(second, 2).text_value != "open" or list_get(second, 3).text_value != "tag-a": return err("YDBv1 four-table JOIN returned an incorrect second row")
+    if list_get(third, 0).integer_value != 1 or list_get(third, 1).integer_value != 10 or list_get(third, 2).text_value != "view" or list_get(third, 3).text_value != "tag-a": return err("YDBv1 four-table JOIN returned an incorrect third row")
+
+    let left_stage_source: Text = "SELECT a.event, t.marker FROM items AS i INNER JOIN profiles AS p ON i.id = p.item_id INNER JOIN audit AS a ON p.id = a.profile_id LEFT JOIN trace AS t ON a.profile_id = t.profile_id"
+    let left_stage: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(trace_commit.storage, trace_commit.wal, left_stage_source, no_parameters)?
+    if not option_is_some(left_stage.query_result): return err("YDBv1 multi-JOIN LEFT stage did not return a query result")
+    let left_stage_result: YazaSqlQueryResultV1 = option_unwrap(left_stage.query_result)
+    if list_count(left_stage_result.rows) != 4 or list_get(left_stage_result.columns, 0).nullable or not list_get(left_stage_result.columns, 1).nullable or not yazabase_sql_multi_join_has_text_pair_v1(left_stage_result.rows, "edit", "", false, true):
+        return err("YDBv1 later LEFT JOIN did not retain and null-extend an unmatched accumulated row")
+
+    let right_stage_source: Text = "SELECT a.event, t.marker FROM items AS i INNER JOIN profiles AS p ON i.id = p.item_id INNER JOIN audit AS a ON p.id = a.profile_id RIGHT JOIN trace AS t ON a.profile_id = t.profile_id"
+    let right_stage: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(trace_commit.storage, trace_commit.wal, right_stage_source, no_parameters)?
+    if not option_is_some(right_stage.query_result): return err("YDBv1 multi-JOIN RIGHT stage did not return a query result")
+    let right_stage_result: YazaSqlQueryResultV1 = option_unwrap(right_stage.query_result)
+    if list_count(right_stage_result.rows) != 4 or not list_get(right_stage_result.columns, 0).nullable or list_get(right_stage_result.columns, 1).nullable or not yazabase_sql_multi_join_has_text_pair_v1(right_stage_result.rows, "", "tag-orphan", true, false):
+        return err("YDBv1 later RIGHT JOIN did not retain and null-extend an unmatched right row")
+
+    let full_stage_source: Text = "SELECT a.event, t.marker FROM items AS i INNER JOIN profiles AS p ON i.id = p.item_id INNER JOIN audit AS a ON p.id = a.profile_id FULL JOIN trace AS t ON a.profile_id = t.profile_id"
+    let full_stage: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(trace_commit.storage, trace_commit.wal, full_stage_source, no_parameters)?
+    if not option_is_some(full_stage.query_result): return err("YDBv1 multi-JOIN FULL stage did not return a query result")
+    let full_stage_result: YazaSqlQueryResultV1 = option_unwrap(full_stage.query_result)
+    if list_count(full_stage_result.rows) != 5 or not list_get(full_stage_result.columns, 0).nullable or not list_get(full_stage_result.columns, 1).nullable or not yazabase_sql_multi_join_has_text_pair_v1(full_stage_result.rows, "edit", "", false, true) or not yazabase_sql_multi_join_has_text_pair_v1(full_stage_result.rows, "", "tag-orphan", true, false):
+        return err("YDBv1 later FULL JOIN did not retain both unmatched inputs and propagate nullability")
+
+    let chained_outer_source: Text = "SELECT a.event, t.marker FROM items AS i INNER JOIN profiles AS p ON i.id = p.item_id LEFT JOIN audit AS a ON p.id = a.profile_id FULL OUTER JOIN trace AS t ON a.profile_id = t.profile_id"
+    let chained_outer: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(trace_commit.storage, trace_commit.wal, chained_outer_source, no_parameters)?
+    if not option_is_some(chained_outer.query_result): return err("YDBv1 multi-JOIN outer-stage chain did not return a query result")
+    let chained_outer_result: YazaSqlQueryResultV1 = option_unwrap(chained_outer.query_result)
+    if list_count(chained_outer_result.rows) != 6 or not list_get(chained_outer_result.columns, 0).nullable or not list_get(chained_outer_result.columns, 1).nullable or not yazabase_sql_multi_join_has_text_pair_v1(chained_outer_result.rows, "", "", true, true):
+        return err("YDBv1 chained outer JOINs did not carry null rows and nullable metadata across stages")
+
+    let cross_stage_source: Text = "SELECT a.event, t.marker FROM items AS i INNER JOIN profiles AS p ON i.id = p.item_id INNER JOIN audit AS a ON p.id = a.profile_id CROSS JOIN trace AS t"
+    let cross_stage: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(trace_commit.storage, trace_commit.wal, cross_stage_source, no_parameters)?
+    if not option_is_some(cross_stage.query_result) or list_count(option_unwrap(cross_stage.query_result).rows) != 12:
+        return err("YDBv1 later CROSS JOIN did not produce its bounded Cartesian result")
+
+    let theta_stage_source: Text = "SELECT a.event, t.marker FROM items AS i INNER JOIN profiles AS p ON i.id = p.item_id INNER JOIN audit AS a ON p.id = a.profile_id INNER JOIN trace AS t ON t.id > a.id"
+    let theta_stage: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(trace_commit.storage, trace_commit.wal, theta_stage_source, no_parameters)?
+    if not option_is_some(theta_stage.query_result) or list_count(option_unwrap(theta_stage.query_result).rows) != 12:
+        return err("YDBv1 later INNER theta JOIN did not normalize its reversed operands")
+
+    let before_profiles: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(trace_commit.storage, trace_commit.wal, source, no_parameters, item_commit.commit_ts, 0, List[YazaDbTxnStatusV1]())?
+    if list_count(before_profiles.rows) != 0: return err("YDBv1 historical four-table JOIN exposed rows newer than the item snapshot")
+    let before_audit: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(trace_commit.storage, trace_commit.wal, source, no_parameters, profile_commit.commit_ts, 0, List[YazaDbTxnStatusV1]())?
+    if list_count(before_audit.rows) != 0: return err("YDBv1 historical four-table JOIN exposed rows newer than the profile snapshot")
+    let visible_audit: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(trace_commit.storage, trace_commit.wal, source, no_parameters, audit_commit.commit_ts, 0, List[YazaDbTxnStatusV1]())?
+    if list_count(visible_audit.rows) != 0: return err("YDBv1 historical four-table JOIN exposed trace rows newer than their snapshot")
+    let visible_trace: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(trace_commit.storage, trace_commit.wal, source, no_parameters, trace_commit.commit_ts, 0, List[YazaDbTxnStatusV1]())?
+    if list_count(visible_trace.rows) != 3: return err("YDBv1 historical four-table JOIN omitted rows visible at its snapshot")
+
+    let explain: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(trace_commit.storage, trace_commit.wal, "EXPLAIN " + source, no_parameters)?
+    if not option_is_some(explain.explain_text) or text_find(option_unwrap(explain.explain_text), "Left-deep bounded JOIN stages over clustered B+Tree scans") < 0:
+        return err("YDBv1 EXPLAIN did not describe the four-table join chain")
+    let outer_explain: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(explain.storage, explain.wal, "EXPLAIN " + chained_outer_source, no_parameters)?
+    if not option_is_some(outer_explain.explain_text): return err("YDBv1 EXPLAIN rejected a later FULL JOIN stage")
+    let cross_explain: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(outer_explain.storage, outer_explain.wal, "EXPLAIN " + cross_stage_source, no_parameters)?
+    if not option_is_some(cross_explain.explain_text): return err("YDBv1 EXPLAIN rejected a later CROSS JOIN stage")
+    let theta_explain: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(cross_explain.storage, cross_explain.wal, "EXPLAIN " + theta_stage_source, no_parameters)?
+    if not option_is_some(theta_explain.explain_text): return err("YDBv1 EXPLAIN rejected a later theta JOIN stage")
+    let wal_closed: Boolean = yaza_db_wal_log_close_v1(theta_explain.wal)?
+    let storage_closed: Boolean = yaza_db_storage_close_v1(theta_explain.storage)?
+    if not wal_closed or not storage_closed: return err("YDBv1 multi-JOIN fixture handles did not close")
+
+    let reopened: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, db_name)?
+    let reopened_select: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(reopened.storage, reopened.wal, source, no_parameters)?
+    if not option_is_some(reopened_select.query_result) or list_count(option_unwrap(reopened_select.query_result).rows) != 3:
+        return err("YDBv1 four-table JOIN did not survive close and reopen")
+    let reopened_wal_closed: Boolean = yaza_db_wal_log_close_v1(reopened_select.wal)?
+    let reopened_storage_closed: Boolean = yaza_db_storage_close_v1(reopened_select.storage)?
+    if not reopened_wal_closed or not reopened_storage_closed: return err("YDBv1 reopened multi-JOIN handles did not close")
+    let root_closed: Boolean = close(root)?
+    if not root_closed: return err("YDBv1 multi-JOIN fixture root did not close")
+    return ok(true)
+
+start:
+    let outcome: Result[Boolean, Text] = yazabase_sql_multi_join_persist_v1(arg(1))
+    if not result_is_ok(outcome): say result_unwrap_error(outcome)
+    elif result_unwrap(outcome): say "yazabase-sql-multi-join-persist-v1-ok"
+    else: say "YDBv1 multi-JOIN fixture returned false"

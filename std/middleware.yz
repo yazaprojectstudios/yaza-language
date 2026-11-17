@@ -1,0 +1,93 @@
+# Composable HTTP Request Middleware Pipeline for YAZA (CORS, Request-ID, Rate Limit, YWT/JWT Auth, RBAC).
+
+use "std/http"
+use "std/time"
+use "std/ywt"
+use "std/jwt"
+
+shape MiddlewareContext:
+    request: HttpRequest
+    request_id: Text
+    authenticated: Boolean
+    subject: Text
+    role: Text
+    auth_scheme: Text
+    rejected: Boolean
+    reject_response: HttpResponse
+
+fn middleware_begin(request: HttpRequest) -> MiddlewareContext:
+    var req_id: Text = request.x_request_id
+    if req_id == "":
+        set req_id = "req-" + number_text(time_now_monotonic_ms())
+    return MiddlewareContext(request, req_id, false, "", "", "", false, http_response_ok_json("{}"))
+
+fn middleware_reject(ctx: MiddlewareContext, response: HttpResponse) -> MiddlewareContext:
+    return MiddlewareContext(ctx.request, ctx.request_id, ctx.authenticated, ctx.subject, ctx.role, ctx.auth_scheme, true, response)
+
+fn middleware_cors_preflight(ctx: MiddlewareContext) -> MiddlewareContext:
+    if ctx.rejected: return ctx
+    if ctx.request.method == "OPTIONS":
+        return middleware_reject(ctx, http_response_no_content())
+    return ctx
+
+fn middleware_rate_limit(ctx: MiddlewareContext, in_flight: Number, max_in_flight: Number) -> MiddlewareContext:
+    if ctx.rejected: return ctx
+    if in_flight >= max_in_flight:
+        return middleware_reject(ctx, http_response_service_unavailable("maximum in-flight concurrency limit reached", true))
+    return ctx
+
+fn middleware_bearer_token(request: HttpRequest) -> Text:
+    let auth: Text = text_trim(request.authorization)
+    if text_starts_with(auth, "Bearer "):
+        return text_trim(text_slice(auth, 7, text_length(auth) - 7))
+    if text_starts_with(auth, "bearer "):
+        return text_trim(text_slice(auth, 7, text_length(auth) - 7))
+    return ""
+
+fn middleware_auth_ywt(ctx: MiddlewareContext, expected_issuer: Text, secret: Text) -> MiddlewareContext:
+    if ctx.rejected: return ctx
+    let token: Text = middleware_bearer_token(ctx.request)
+    if token == "":
+        return middleware_reject(ctx, http_response_unauthorized("missing Bearer YWT token", true))
+    let now_s: Number = time_now_unix_ms() / 1000
+    let verified: Result[YwtClaims, Text] = ywt_verify_claims(token, expected_issuer, now_s, secret)
+    if not result_is_ok(verified):
+        return middleware_reject(ctx, http_response_unauthorized(result_unwrap_error(verified), true))
+    let claims: YwtClaims = result_unwrap(verified)
+    var eff_role: Text = claims.role
+    if eff_role == "": set eff_role = "user"
+    return MiddlewareContext(ctx.request, ctx.request_id, true, claims.subject, eff_role, "ywt", false, ctx.reject_response)
+
+fn middleware_auth_jwt(ctx: MiddlewareContext, expected_issuer: Text, expected_audience: Text, secret: Text) -> MiddlewareContext:
+    if ctx.rejected: return ctx
+    let token: Text = middleware_bearer_token(ctx.request)
+    if token == "":
+        return middleware_reject(ctx, http_response_unauthorized("missing Bearer JWT token", true))
+    let now_s: Number = time_now_unix_ms() / 1000
+    let verified: Result[JwtClaims, Text] = jwt_verify_hs256(token, expected_issuer, expected_audience, now_s, secret)
+    if not result_is_ok(verified):
+        return middleware_reject(ctx, http_response_unauthorized(result_unwrap_error(verified), true))
+    let claims: JwtClaims = result_unwrap(verified)
+    var eff_role: Text = claims.role
+    if eff_role == "": set eff_role = "user"
+    return MiddlewareContext(ctx.request, ctx.request_id, true, claims.subject, eff_role, "jwt", false, ctx.reject_response)
+
+fn middleware_require_role(ctx: MiddlewareContext, required_role: Text) -> MiddlewareContext:
+    if ctx.rejected: return ctx
+    if not ctx.authenticated:
+        return middleware_reject(ctx, http_response_unauthorized("authentication required for this resource", true))
+    if ctx.role != required_role:
+        return middleware_reject(ctx, http_response_forbidden("role '" + required_role + "' required (current: '" + ctx.role + "')", true))
+    return ctx
+
+fn middleware_require_any_role(ctx: MiddlewareContext, allowed_roles_csv: Text) -> MiddlewareContext:
+    if ctx.rejected: return ctx
+    if not ctx.authenticated:
+        return middleware_reject(ctx, http_response_unauthorized("authentication required for this resource", true))
+    let allowed: TextList = text_split(allowed_roles_csv, ",")
+    var i: Number = 0
+    while i < list_count(allowed):
+        if text_trim(list_get(allowed, i)) == ctx.role:
+            return ctx
+        set i = i + 1
+    return middleware_reject(ctx, http_response_forbidden("insufficient role permissions (current: '" + ctx.role + "')", true))

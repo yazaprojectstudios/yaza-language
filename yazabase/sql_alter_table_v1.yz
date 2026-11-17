@@ -1,0 +1,196 @@
+# Bounded ALTER TABLE profile: append one nullable column or add conjunctive scalar CHECK terms.
+use "./sql_binder_v1"
+use "./sql_create_table_v1"
+use "./sql_insert_bind_v1"
+use "./sql_parser_v2"
+use "./sql_lexer_v1"
+use "./catalog_schema_v1"
+use "./row_v1"
+
+shape YazaSqlAlterTableAstV1:
+    version: Number
+    start_byte: Number
+    end_byte: Number
+    table_name: YazaSqlNameV2
+    column_name: YazaSqlNameV2
+    type_id: Number
+    precision: Number
+    scale: Number
+    nullable: Boolean
+    default_kind: Number
+    default_start_byte: Number
+    default_end_byte: Number
+    action_kind: Number
+    check_constraints: List[YazaSqlCreateCheckAstV1]
+
+shape YazaSqlAlterTablePlanV1:
+    catalog_version: Number
+    table_id: Number
+    table_name: Text
+    schema_version: Number
+    column: YazaSqlColumnSchemaV1
+    action_kind: Number
+    check_constraints: List[YazaSqlCreateCheckPlanV1]
+
+fn yaza_sql_parse_alter_table_v1(source: Text) -> Result[YazaSqlAlterTableAstV1, Text]:
+    let lexed: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(source)
+    if not result_is_ok(lexed): return err(result_unwrap_error(lexed))
+    let tokens: List[YazaSqlTokenV1] = result_unwrap(lexed)
+    let token_count: Number = list_count(tokens)
+    if token_count < 2: return err("SQL ALTER TABLE parser received an invalid token stream")
+    if not yaza_sql_v2_is_keyword(source, tokens, 0, "ALTER") or not yaza_sql_v2_is_keyword(source, tokens, 1, "TABLE"):
+        return err(yaza_sql_v2_parse_error(source, tokens, 0, "SQL parser expected ALTER TABLE at byte "))
+    let table_name_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, 2, false)
+    if not result_is_ok(table_name_result): return err(result_unwrap_error(table_name_result))
+    let table_name: YazaSqlNameV2 = result_unwrap(table_name_result)
+    if table_name.part_count != 1: return err(yaza_sql_v2_parse_error(source, tokens, 2, "SQL ALTER TABLE supports one-part table names at byte "))
+    var cursor: Number = 2 + table_name.consumed_tokens
+    if not yaza_sql_v2_is_keyword(source, tokens, cursor, "ADD"):
+        return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL ALTER TABLE supports ADD COLUMN or ADD CHECK at byte "))
+    set cursor = cursor + 1
+    let checks: List[YazaSqlCreateCheckAstV1] = List[YazaSqlCreateCheckAstV1]()
+    if yaza_sql_v2_is_keyword(source, tokens, cursor, "CHECK"):
+        if not yaza_sql_v2_is_symbol(source, tokens, cursor + 1, 40): return err(yaza_sql_v2_parse_error(source, tokens, cursor + 1, "SQL ALTER TABLE expected '(' after CHECK at byte "))
+        var clause_cursor: Number = cursor + 2
+        var check_done: Boolean = false
+        while not check_done:
+            if list_count(checks) >= 64: return err(yaza_sql_v2_parse_error(source, tokens, clause_cursor, "SQL ALTER TABLE CHECK conjunction exceeds the 64-clause profile at byte "))
+            let parsed_clause: YazaSqlCreateCheckClauseParseV1 = yaza_sql_parse_create_check_clause_v1(source, tokens, clause_cursor)?
+            if not list_try_push(checks, parsed_clause.clause): return err("SQL ALTER TABLE could not retain CHECK metadata")
+            set clause_cursor = clause_cursor + parsed_clause.consumed_tokens
+            if yaza_sql_v2_is_symbol(source, tokens, clause_cursor, 41):
+                set check_done = true
+            elif yaza_sql_v2_is_keyword(source, tokens, clause_cursor, "AND"):
+                set clause_cursor = clause_cursor + 1
+            else:
+                return err(yaza_sql_v2_parse_error(source, tokens, clause_cursor, "SQL ALTER TABLE CHECK supports comparison terms joined by AND at byte "))
+        set cursor = clause_cursor + 1
+        var statement_end: Number = list_get(tokens, cursor - 1).end_byte
+        if yaza_sql_v2_is_symbol(source, tokens, cursor, 59):
+            set statement_end = list_get(tokens, cursor).end_byte
+            set cursor = cursor + 1
+        if cursor >= token_count or list_get(tokens, cursor).kind != 0:
+            return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser supports one statement; unexpected token at byte "))
+        let first_token: YazaSqlTokenV1 = list_get(tokens, 0)
+        return ok(YazaSqlAlterTableAstV1(1, first_token.start_byte, statement_end, table_name, table_name, 0, 0, 0, true, 0, -1, -1, 2, checks))
+    if yaza_sql_v2_is_keyword(source, tokens, cursor, "COLUMN"): set cursor = cursor + 1
+    let column_name_result: Result[YazaSqlNameV2, Text] = yaza_sql_v2_parse_name(source, tokens, cursor, false)
+    if not result_is_ok(column_name_result): return err(result_unwrap_error(column_name_result))
+    let column_name: YazaSqlNameV2 = result_unwrap(column_name_result)
+    if column_name.part_count != 1: return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL ALTER TABLE column names must be unqualified at byte "))
+    set cursor = cursor + column_name.consumed_tokens
+    let type_result: Result[YazaSqlCreateTypeParseV1, Text] = yaza_sql_create_table_type_v1(source, tokens, cursor)
+    if not result_is_ok(type_result): return err(result_unwrap_error(type_result))
+    let parsed_type: YazaSqlCreateTypeParseV1 = result_unwrap(type_result)
+    set cursor = cursor + parsed_type.consumed_tokens
+    var nullable: Boolean = true
+    if yaza_sql_v2_is_keyword(source, tokens, cursor, "NOT"):
+        if not yaza_sql_v2_is_keyword(source, tokens, cursor + 1, "NULL"): return err(yaza_sql_v2_parse_error(source, tokens, cursor + 1, "SQL ALTER TABLE expected NULL after NOT at byte "))
+        set nullable = false
+        set cursor = cursor + 2
+    elif yaza_sql_v2_is_keyword(source, tokens, cursor, "NULL"):
+        set cursor = cursor + 1
+    var default_kind: Number = 0
+    var default_start_byte: Number = -1
+    var default_end_byte: Number = -1
+    if yaza_sql_v2_is_keyword(source, tokens, cursor, "DEFAULT"):
+        set cursor = cursor + 1
+        if cursor >= token_count: return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL ALTER TABLE DEFAULT requires a scalar literal at byte "))
+        let literal_token: YazaSqlTokenV1 = list_get(tokens, cursor)
+        if yaza_sql_v2_is_symbol(source, tokens, cursor, 43) or yaza_sql_v2_is_symbol(source, tokens, cursor, 45):
+            if cursor + 1 >= token_count or list_get(tokens, cursor + 1).kind != 3: return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL ALTER TABLE DEFAULT sign must precede a numeric literal at byte "))
+            set default_kind = 3
+            set default_start_byte = literal_token.start_byte
+            set default_end_byte = list_get(tokens, cursor + 1).end_byte
+            set cursor = cursor + 2
+        else:
+            let is_null_literal: Boolean = literal_token.kind == 1 and yaza_sql_v2_is_keyword(source, tokens, cursor, "NULL")
+            let is_boolean_literal: Boolean = literal_token.kind == 1 and (yaza_sql_v2_is_keyword(source, tokens, cursor, "TRUE") or yaza_sql_v2_is_keyword(source, tokens, cursor, "FALSE"))
+            if literal_token.kind != 3 and literal_token.kind != 4 and literal_token.kind != 8 and not is_null_literal and not is_boolean_literal: return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL ALTER TABLE DEFAULT must be a scalar literal at byte "))
+            set default_kind = literal_token.kind
+            set default_start_byte = literal_token.start_byte
+            set default_end_byte = literal_token.end_byte
+            set cursor = cursor + 1
+    if not nullable and default_kind == 0: return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL ALTER TABLE NOT NULL column requires a DEFAULT at byte "))
+    var statement_end: Number = list_get(tokens, cursor - 1).end_byte
+    if yaza_sql_v2_is_symbol(source, tokens, cursor, 59):
+        set statement_end = list_get(tokens, cursor).end_byte
+        set cursor = cursor + 1
+    if cursor >= token_count or list_get(tokens, cursor).kind != 0:
+        return err(yaza_sql_v2_parse_error(source, tokens, cursor, "SQL parser supports one statement; unexpected token at byte "))
+    let first_token: YazaSqlTokenV1 = list_get(tokens, 0)
+    return ok(YazaSqlAlterTableAstV1(1, first_token.start_byte, statement_end, table_name, column_name, parsed_type.type_id, parsed_type.precision, parsed_type.scale, nullable, default_kind, default_start_byte, default_end_byte, 1, checks))
+
+fn yaza_sql_bind_alter_table_v1(source: Text, alter: YazaSqlAlterTableAstV1, catalog: YazaSqlCatalogSnapshotV1, schema_versions: List[Number]) -> Result[YazaSqlAlterTablePlanV1, Text]:
+    if alter.version != 1 or not yaza_sql_bind_v1_span_valid(source, alter.start_byte, alter.end_byte): return err("SQL ALTER TABLE binder received an invalid AST version or span")
+    if catalog.version < 1 or list_count(catalog.tables) > 1024 or list_count(schema_versions) != list_count(catalog.tables): return err("SQL ALTER TABLE catalog metadata is outside its bound")
+    if not yaza_sql_bind_v1_name_valid(source, alter.table_name) or alter.table_name.part_count != 1 or not yaza_sql_bind_v1_name_valid(source, alter.column_name) or alter.column_name.part_count != 1:
+        return err("SQL ALTER TABLE supports one-part bounded identifiers only")
+    let table_name_result: Result[Text, Text] = yaza_sql_create_table_identifier_v1(source, alter.table_name.first_token)
+    if not result_is_ok(table_name_result): return err("SQL ALTER TABLE identifiers must be bounded unquoted ASCII names")
+    let table_name: Text = result_unwrap(table_name_result)
+    if alter.action_kind != 1 and alter.action_kind != 2: return err("SQL ALTER TABLE action kind is unsupported")
+    if (alter.action_kind == 1 and list_count(alter.check_constraints) != 0) or (alter.action_kind == 2 and (list_count(alter.check_constraints) < 1 or list_count(alter.check_constraints) > 64)):
+        return err("SQL ALTER TABLE action metadata is outside its bound")
+    var table_index: Number = 0
+    while table_index < list_count(catalog.tables):
+        let table: YazaSqlTableSchemaV1 = list_get(catalog.tables, table_index)
+        if table.name == table_name: break
+        set table_index = table_index + 1
+    if table_index >= list_count(catalog.tables): return err("SQL ALTER TABLE target does not exist")
+    let table: YazaSqlTableSchemaV1 = list_get(catalog.tables, table_index)
+    if table.table_id <= yaza_db_catalog_system_table_id_max_v1(): return err("SQL ALTER TABLE cannot modify a system catalog")
+    let schema_version: Number = list_get(schema_versions, table_index)
+    let column_count: Number = list_count(table.columns)
+    if column_count < 1 or column_count >= 1024 or schema_version < 1 or schema_version >= yaza_db_row_max_schema_epoch_v1() or schema_version > column_count: return err("SQL ALTER TABLE table schema is at its version or column bound")
+    if alter.action_kind == 2:
+        let plans: List[YazaSqlCreateCheckPlanV1] = List[YazaSqlCreateCheckPlanV1]()
+        var check_index: Number = 0
+        while check_index < list_count(alter.check_constraints):
+            let check_ast: YazaSqlCreateCheckAstV1 = list_get(alter.check_constraints, check_index)
+            if not yaza_sql_bind_v1_name_valid(source, check_ast.column_name) or check_ast.column_name.part_count != 1 or check_ast.literal_start_byte < 0 or check_ast.literal_end_byte <= check_ast.literal_start_byte or check_ast.literal_end_byte > text_length(source):
+                return err("SQL ALTER TABLE CHECK AST contains an invalid name or literal span")
+            let check_name_result: Result[Text, Text] = yaza_sql_create_table_identifier_v1(source, check_ast.column_name.first_token)
+            if not result_is_ok(check_name_result): return err("SQL ALTER TABLE CHECK column must be a bounded unquoted identifier")
+            let check_name: Text = result_unwrap(check_name_result)
+            var ordinal: Number = 0
+            while ordinal < column_count and list_get(table.columns, ordinal).name != check_name:
+                set ordinal = ordinal + 1
+            if ordinal >= column_count: return err("SQL ALTER TABLE CHECK references an unknown column")
+            let column: YazaSqlColumnSchemaV1 = list_get(table.columns, ordinal)
+            if not yaza_sql_bind_v1_comparison_valid(column.type_id, check_ast.comparison_operator): return err("SQL ALTER TABLE CHECK comparison is unsupported for its column type")
+            let token: YazaSqlTokenV1 = YazaSqlTokenV1(check_ast.literal_kind, check_ast.literal_start_byte, check_ast.literal_end_byte)
+            let literal_valid: Result[Boolean, Text] = yaza_sql_bind_insert_literal_v1(source, token, column)
+            if not result_is_ok(literal_valid) or not result_unwrap(literal_valid): return err("SQL ALTER TABLE CHECK literal does not match its column type")
+            let literal: Result[Text, Text] = text_try_slice(source, check_ast.literal_start_byte, check_ast.literal_end_byte - check_ast.literal_start_byte)
+            if not result_is_ok(literal): return err("SQL ALTER TABLE could not retain its CHECK literal")
+            if not list_try_push(plans, YazaSqlCreateCheckPlanV1(ordinal, check_ast.comparison_operator, result_unwrap(literal))): return err("SQL ALTER TABLE could not bind its CHECK clause")
+            set check_index = check_index + 1
+        return ok(YazaSqlAlterTablePlanV1(catalog.version, table.table_id, table_name, schema_version, YazaSqlColumnSchemaV1("", 0, true, -1, 0, 0, ""), 2, plans))
+    let column_name_result: Result[Text, Text] = yaza_sql_create_table_identifier_v1(source, alter.column_name.first_token)
+    if not result_is_ok(column_name_result): return err("SQL ALTER TABLE identifiers must be bounded unquoted ASCII names")
+    let column_name: Text = result_unwrap(column_name_result)
+    if alter.type_id != 1 and alter.type_id != 2 and alter.type_id != 3 and alter.type_id != 4 and alter.type_id != 6 and alter.type_id != 9 and alter.type_id != 10 and alter.type_id != 11 and alter.type_id != 12 and alter.type_id != 13 and alter.type_id != 14 and alter.type_id != 15 and alter.type_id != 16: return err("SQL ALTER TABLE type is outside the supported scalar profile")
+    if alter.type_id == 10 and not yaza_sql_decimal_parameters_valid_v1(alter.precision, alter.scale): return err("SQL ALTER TABLE DECIMAL precision or scale is invalid")
+    if alter.type_id != 10 and (alter.precision != 0 or alter.scale != 0): return err("SQL ALTER TABLE non-DECIMAL type has unexpected precision metadata")
+    if not alter.nullable and alter.default_kind == 0: return err("SQL ALTER TABLE NOT NULL column requires a DEFAULT")
+    var index: Number = 0
+    while index < column_count:
+        if list_get(table.columns, index).name == column_name: return err("SQL ALTER TABLE column already exists")
+        set index = index + 1
+    var default_expression: Text = ""
+    if alter.default_kind != 0:
+        if alter.default_start_byte < 0 or alter.default_end_byte <= alter.default_start_byte or alter.default_end_byte > text_length(source): return err("SQL ALTER TABLE DEFAULT literal span is invalid")
+        let candidate_column: YazaSqlColumnSchemaV1 = YazaSqlColumnSchemaV1(column_name, alter.type_id, alter.nullable, column_count, alter.precision, alter.scale, "")
+        let default_token: YazaSqlTokenV1 = YazaSqlTokenV1(alter.default_kind, alter.default_start_byte, alter.default_end_byte)
+        let literal_valid: Result[Boolean, Text] = yaza_sql_bind_insert_literal_v1(source, default_token, candidate_column)
+        if not result_is_ok(literal_valid) or not result_unwrap(literal_valid): return err("SQL ALTER TABLE DEFAULT literal does not match its column type or nullability")
+        if alter.default_kind == 4:
+            let decoded_text: Result[Text, Text] = yaza_sql_decode_text_literal_v1(source, alter.default_start_byte, alter.default_end_byte)
+            if not result_is_ok(decoded_text): return err("SQL ALTER TABLE DEFAULT text literal is not valid bounded UTF-8")
+        let sliced_default: Result[Text, Text] = text_try_slice(source, alter.default_start_byte, alter.default_end_byte - alter.default_start_byte)
+        if not result_is_ok(sliced_default): return err("SQL ALTER TABLE DEFAULT literal could not be retained")
+        set default_expression = result_unwrap(sliced_default)
+        let parsed_default: YazaSqlValueV1 = yaza_sql_insert_materialize_column_default_v1(default_expression, candidate_column)?
+        if parsed_default.is_null and not alter.nullable: return err("SQL ALTER TABLE NULL DEFAULT is invalid for a NOT NULL column")
+    return ok(YazaSqlAlterTablePlanV1(catalog.version, table.table_id, table_name, schema_version, YazaSqlColumnSchemaV1(column_name, alter.type_id, alter.nullable, column_count, alter.precision, alter.scale, default_expression), 1, List[YazaSqlCreateCheckPlanV1]()))

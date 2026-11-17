@@ -1,0 +1,80 @@
+use "std/fs"
+use "../../yazabase/checkpoint_v1"
+use "../../yazabase/wal_v1"
+
+fn full_scan_ns(root: Number, uuid: Bytes, expected_end: Number) -> Result[Number, Text]:
+    let start: Number = monotonic_ns()
+    let recovered_result: Result[Number, Text] = yaza_db_wal_recover_log_end_for_v1(root, 1, uuid)
+    if not result_is_ok(recovered_result): return err(result_unwrap_error(recovered_result))
+    let recovered: Number = result_unwrap(recovered_result)
+    let finish: Number = monotonic_ns()
+    if recovered != expected_end: return err("full WAL scan returned an unexpected end LSN")
+    return ok(finish - start)
+
+fn checkpoint_scan_ns(root: Number, uuid: Bytes, checkpoint_lsn: Number, expected_end: Number) -> Result[Number, Text]:
+    let start: Number = monotonic_ns()
+    let recovered_result: Result[Number, Text] = yaza_db_wal_recover_log_end_after_checkpoint_for_v1(root, 1, uuid, checkpoint_lsn)
+    if not result_is_ok(recovered_result): return err(result_unwrap_error(recovered_result))
+    let recovered: Number = result_unwrap(recovered_result)
+    let finish: Number = monotonic_ns()
+    if recovered != expected_end: return err("checkpoint-seeded WAL scan returned an unexpected end LSN")
+    return ok(finish - start)
+
+fn benchmark(root_path: Text) -> Result[Number, Text]:
+    let root: Number = root_open(root_path)?
+    let uuid: Bytes = bytes_from_text("checkpoint-test1")
+    let segment_name: Text = yaza_db_wal_segment_name_for_v1(0, uuid)?
+    let prefix_records: Number = 200000
+    let prefix_bytes: Number = prefix_records * yaza_db_wal_header_size_v1()
+    let wal_file: Number = open_rw(root, segment_name)?
+    let header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(uuid, 0, 1, 1, 0, 2, 1)
+    let begin_payload: Bytes = yaza_db_checkpoint_begin_payload_encode_v1(header)?
+    let begin_record: YazaDbWalRecordV1 = YazaDbWalRecordV1(prefix_bytes, 0, 0, yaza_db_wal_type_checkpoint_begin_v1(), 0, begin_payload)
+    let begin_record_bytes: Number = yaza_db_wal_write_segment_record_v1(wal_file, begin_record)?
+    let checkpoint_lsn: Number = prefix_bytes + begin_record_bytes
+    let end_payload: Bytes = yaza_db_checkpoint_end_payload_encode_v1(prefix_bytes, checkpoint_lsn, header)?
+    let end_record: YazaDbWalRecordV1 = YazaDbWalRecordV1(checkpoint_lsn, 0, 0, yaza_db_wal_type_checkpoint_end_v1(), 0, end_payload)
+    let end_record_bytes: Number = yaza_db_wal_write_segment_record_v1(wal_file, end_record)?
+    let tail_start_lsn: Number = checkpoint_lsn + end_record_bytes
+    var tail_index: Number = 0
+    while tail_index < 128:
+        let tail_lsn: Number = tail_start_lsn + tail_index * yaza_db_wal_header_size_v1()
+        let tail_record: YazaDbWalRecordV1 = YazaDbWalRecordV1(tail_lsn, 0, 0, yaza_db_wal_type_skip_v1(), 0, bytes_from_text(""))
+        let ignored_tail_bytes: Number = yaza_db_wal_write_segment_record_v1(wal_file, tail_record)?
+        set tail_index = tail_index + 1
+    let synced: Boolean = sync(wal_file)?
+    if not synced: fail("benchmark WAL segment sync failed")
+    let closed_file: Boolean = close(wal_file)?
+    if not closed_file: fail("benchmark WAL segment close failed")
+    let expected_end: Number = tail_start_lsn + 128 * yaza_db_wal_header_size_v1()
+    say "Synthetic scanner workload: prefix_bytes=" + number_text(prefix_bytes) + " tail_records=128"
+    say "Warmups: 2 alternating pairs; measured pairs: 7 (alternating order)"
+    var warmup: Number = 0
+    while warmup < 2:
+        if warmup % 2 == 0:
+            let ignored_full_warmup: Number = full_scan_ns(root, uuid, expected_end)?
+            let ignored_seeded_warmup: Number = checkpoint_scan_ns(root, uuid, checkpoint_lsn, expected_end)?
+        else:
+            let ignored_seeded_warmup: Number = checkpoint_scan_ns(root, uuid, checkpoint_lsn, expected_end)?
+            let ignored_full_warmup: Number = full_scan_ns(root, uuid, expected_end)?
+        set warmup = warmup + 1
+    var sample: Number = 0
+    while sample < 7:
+        var full_ns: Number = 0
+        var seeded_ns: Number = 0
+        if sample % 2 == 0:
+            set full_ns = full_scan_ns(root, uuid, expected_end)?
+            set seeded_ns = checkpoint_scan_ns(root, uuid, checkpoint_lsn, expected_end)?
+        else:
+            set seeded_ns = checkpoint_scan_ns(root, uuid, checkpoint_lsn, expected_end)?
+            set full_ns = full_scan_ns(root, uuid, expected_end)?
+        say "sample=" + number_text(sample + 1) + " full_scan_ns=" + number_text(full_ns) + " checkpoint_seeded_ns=" + number_text(seeded_ns)
+        set sample = sample + 1
+    let closed_root: Boolean = close(root)?
+    if not closed_root: return err("benchmark root close failed")
+    return ok(expected_end)
+
+start:
+    let outcome: Result[Number, Text] = benchmark(arg(1))
+    if not result_is_ok(outcome): fail(result_unwrap_error(outcome))
+    say "wal-recovery-benchmark-ok end_lsn=" + number_text(result_unwrap(outcome))

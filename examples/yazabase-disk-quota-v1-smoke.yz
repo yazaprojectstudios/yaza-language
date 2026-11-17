@@ -1,0 +1,108 @@
+use "std/fs"
+use "../yazabase/disk_quota_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/transaction_v1"
+use "../yazabase/wal_v1"
+
+fn yazabase_disk_quota_v1_cleanup(root: Number, database_name: Text, db_uuid: Bytes) -> Result[Boolean, Text]:
+    let wal_name: Text = yaza_db_wal_segment_name_for_v1(0, db_uuid)?
+    let owner_name: Text = yaza_db_disk_quota_owner_name_v1(db_uuid)?
+    let database_exists: Boolean = remove(root, database_name)?
+    let wal_exists: Boolean = remove(root, wal_name)?
+    let owner_exists: Boolean = remove(root, owner_name)?
+    if not database_exists or not wal_exists or not owner_exists: return err("YDBv1 disk quota fixture could not remove all scoped files")
+    return sync_directory(root)
+
+fn yazabase_disk_quota_v1_check(root_path: Text, mode: Text) -> Result[Text, Text]:
+    let root: Number = root_open(root_path)?
+    let database_name: Text = "disk-quota-smoke.ydb"
+    let db_uuid: Bytes = bytes_from_text("disk-quota-v1-01")
+    let initial_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(db_uuid, 0, 1, 1, 0, 2, 1)
+    let created: Result[YazaDbStorageHandleV1, Text] = yaza_db_storage_create_empty_v1(root, database_name, initial_header)
+    if mode == "create-denied" or mode == "invalid-config":
+        if result_is_ok(created):
+            let unexpected: YazaDbStorageHandleV1 = result_unwrap(created)
+            let ignored_close: Result[Boolean, Text] = yaza_db_storage_close_v1(unexpected)
+            let ignored_cleanup: Result[Boolean, Text] = yazabase_disk_quota_v1_cleanup(root, database_name, db_uuid)
+            let ignored_root_close: Result[Boolean, Text] = close(root)
+            return err("YDBv1 disk quota fixture unexpectedly created a database under a denied quota")
+        let create_error: Text = result_unwrap_error(created)
+        if mode == "invalid-config" and not text_starts_with(create_error, "YAZA_DB_MAX_DISK_BYTES"): return err("YDBv1 disk quota accepted or misreported an invalid limit")
+        if mode == "create-denied" and not text_starts_with(create_error, "YDBv1 database disk quota"): return err("YDBv1 disk quota did not deny database creation before file creation")
+        let database_probe: Result[Number, Text] = open_read(root, database_name)
+        if result_is_ok(database_probe):
+            let ignored_close: Result[Boolean, Text] = close(result_unwrap(database_probe))
+            return err("YDBv1 disk quota denial left the database file behind")
+        let owner_name: Text = yaza_db_disk_quota_owner_name_v1(db_uuid)?
+        let owner_probe: Result[Number, Text] = open_read(root, owner_name)
+        if result_is_ok(owner_probe):
+            let ignored_close: Result[Boolean, Text] = close(result_unwrap(owner_probe))
+            return err("YDBv1 disk quota denial left the UUID owner file behind")
+        let root_closed: Boolean = close(root)?
+        if not root_closed: return err("YDBv1 disk quota fixture could not close its empty root")
+        if mode == "invalid-config": return ok("invalid-config-rejected")
+        return ok("database-create-denied-cleanly")
+
+    let storage: YazaDbStorageHandleV1 = result_unwrap(created)
+    let wal_result: Result[YazaDbWalLogV1, Text] = yaza_db_wal_log_open_for_v1(root, db_uuid)
+    if not result_is_ok(wal_result):
+        let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(storage)
+        return err(result_unwrap_error(wal_result))
+    let wal: YazaDbWalLogV1 = result_unwrap(wal_result)
+    let initial_bytes: Number = file_size(storage.file)?
+    let segment_bytes: Number = file_size(wal.file)?
+    let reserved_wal_bytes: Number = yaza_db_disk_quota_current_wal_bytes_v1(root, db_uuid)?
+    if initial_bytes != yaza_db_storage_preallocation_granule_v1() or segment_bytes != 0 or reserved_wal_bytes != yaza_db_wal_segment_size_v1(): return err("YDBv1 disk quota fixture did not create the expected initial reservations")
+    if mode == "wal-rotation-denied":
+        let next_segment: Result[Number, Text] = yaza_db_wal_create_segment_v1(root, 1, db_uuid)
+        if result_is_ok(next_segment):
+            let created_segment: Number = result_unwrap(next_segment)
+            let ignored_close: Result[Boolean, Text] = close(created_segment)
+            let unexpected_segment_name: Text = yaza_db_wal_segment_name_for_v1(1, db_uuid)?
+            let ignored_remove: Result[Boolean, Text] = remove(root, unexpected_segment_name)
+            let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(wal)
+            let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(storage)
+            let ignored_cleanup: Result[Boolean, Text] = yazabase_disk_quota_v1_cleanup(root, database_name, db_uuid)
+            let ignored_root_close: Result[Boolean, Text] = close(root)
+            return err("YDBv1 disk quota allowed a WAL segment past the configured cap")
+        let rotation_error: Text = result_unwrap_error(next_segment)
+        if text_find(rotation_error, "YDBv1 database disk quota would be exceeded") < 0: return err("YDBv1 WAL segment creation failed for a reason other than its disk quota: " + rotation_error)
+        let next_segment_name: Text = yaza_db_wal_segment_name_for_v1(1, db_uuid)?
+        let next_segment_probe: Result[Number, Text] = open_read(root, next_segment_name)
+        if result_is_ok(next_segment_probe):
+            let ignored_close: Result[Boolean, Text] = close(result_unwrap(next_segment_probe))
+            return err("YDBv1 WAL quota denial left a new segment behind")
+        let wal_closed: Boolean = yaza_db_wal_log_close_v1(wal)?
+        let storage_closed: Boolean = yaza_db_storage_close_v1(storage)?
+        let cleaned: Boolean = yazabase_disk_quota_v1_cleanup(root, database_name, db_uuid)?
+        let root_closed: Boolean = close(root)?
+        if not wal_closed or not storage_closed or not cleaned or not root_closed: return err("YDBv1 disk quota fixture cleanup failed after WAL denial")
+        return ok("wal-segment-create-denied-cleanly")
+    let reserve: Number = yaza_db_storage_preallocated_page_count_v1()
+    let begin_result: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_begin_with_reserve_v1(storage, wal, reserve)
+    if result_is_ok(begin_result):
+        let unexpected_transaction: YazaDbWriteTransactionV1 = result_unwrap(begin_result)
+        let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(unexpected_transaction.wal)
+        let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(unexpected_transaction.storage)
+        let ignored_cleanup: Result[Boolean, Text] = yazabase_disk_quota_v1_cleanup(root, database_name, db_uuid)
+        let ignored_root_close: Result[Boolean, Text] = close(root)
+        return err("YDBv1 disk quota allowed capacity growth beyond the configured cap")
+    let growth_error: Text = result_unwrap_error(begin_result)
+    if text_find(growth_error, "YDBv1 database disk quota would be exceeded") < 0: return err("YDBv1 database capacity growth failed for a reason other than its disk quota: " + growth_error)
+    let database_bytes_after: Number = file_size(storage.file)?
+    let wal_bytes_after: Number = file_size(wal.file)?
+    if storage.header.page_count != reserve or database_bytes_after != initial_bytes or wal_bytes_after != segment_bytes: return err("YDBv1 disk quota denial changed database or WAL file size")
+    let wal_closed: Boolean = yaza_db_wal_log_close_v1(wal)?
+    let storage_closed: Boolean = yaza_db_storage_close_v1(storage)?
+    if not wal_closed or not storage_closed: return err("YDBv1 disk quota fixture could not close database handles")
+    let cleaned: Boolean = yazabase_disk_quota_v1_cleanup(root, database_name, db_uuid)?
+    let root_closed: Boolean = close(root)?
+    if not cleaned or not root_closed: return err("YDBv1 disk quota fixture cleanup failed")
+    return ok("database-growth-denied-with-files-unchanged")
+
+start:
+    let outcome: Result[Text, Text] = yazabase_disk_quota_v1_check(arg(1), arg(2))
+    if result_is_ok(outcome):
+        say "yazabase-disk-quota-v1-ok " + result_unwrap(outcome)
+    else:
+        say result_unwrap_error(outcome)

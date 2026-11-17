@@ -1,0 +1,211 @@
+# YazaBase Embedded & Standalone Client Helper for YAZA API, Microservice, and Monolith Projects.
+# Automatically locates the installed YazaBase runtime binary, ensures database initialization,
+# and connects only with explicitly configured credentials (YAZABASE_USER / YAZABASE_PASSWORD or arguments).
+
+use "std/crypto/hash"
+use "std/crypto/password"
+use "std/convert"
+use "std/time"
+
+shape YazaBaseConnection:
+    db_dir: Text
+    db_name: Text
+    username: Text
+    binary_path: Text
+    connected: Boolean
+
+fn yazabase_default_user() -> Text:
+    return env_get("YAZABASE_USER")
+
+fn yazabase_default_password() -> Text:
+    return env_get("YAZABASE_PASSWORD")
+
+fn yazabase_locate_binary() -> Text:
+    let env_bin: Text = env_get("YAZABASE_BIN")
+    if env_bin != "" and file_exists(env_bin): return env_bin
+
+    let executable: Text = arg(0)
+    var sep: Number = text_length(executable)
+    while sep > 0 and text_byte(executable, sep - 1) != 47:
+        set sep = sep - 1
+    if sep > 0:
+        let exe_dir: Text = text_slice(executable, 0, sep - 1)
+        if file_exists(exe_dir + "/yazabase"): return exe_dir + "/yazabase"
+        if file_exists(exe_dir + "/yazabase-cli"): return exe_dir + "/yazabase-cli"
+
+    if file_exists("/usr/local/bin/yazabase"): return "/usr/local/bin/yazabase"
+    if file_exists("/opt/homebrew/bin/yazabase"): return "/opt/homebrew/bin/yazabase"
+    let home_dir: Text = env_get("HOME")
+    if home_dir != "" and file_exists(home_dir + "/.yazabase/bin/yazabase"):
+        return home_dir + "/.yazabase/bin/yazabase"
+    if file_exists("build/yazabase-cli"): return "build/yazabase-cli"
+    return ""
+
+fn yazabase_ensure_dir_tree(path: Text) -> Number:
+    if path == "" or path == "." or path == "/" or is_directory(path):
+        return 0
+    var sep: Number = text_length(path)
+    while sep > 0 and text_byte(path, sep - 1) != 47:
+        set sep = sep - 1
+    if sep > 1:
+        let parent: Text = text_slice(path, 0, sep - 1)
+        let ignored: Number = yazabase_ensure_dir_tree(parent)
+    return directory_create(path)
+
+fn yazabase_credential_hash(password: Text) -> Result[Text, Text]:
+    let hash_result: Result[Text, PasswordHashError] = password_hash_argon2id(password)
+    if not result_is_ok(hash_result):
+        return err("Argon2id password hashing failed; install or repair the YAZA Argon2 provider")
+    return ok(result_unwrap(hash_result))
+
+fn yazabase_verify_legacy_pbkdf2(password: Text, stored_hash: Text) -> Boolean:
+    let hash_parts: TextList = text_split(stored_hash, ":")
+    if list_count(hash_parts) != 4 or list_get(hash_parts, 0) != "pbkdf2_sha256": return false
+    let iterations_result: Result[Number, Text] = number_try_parse(list_get(hash_parts, 1))
+    if not result_is_ok(iterations_result): return false
+    let iterations: Number = result_unwrap(iterations_result)
+    if iterations < 100000 or iterations > 500000: return false
+    let salt_result: Result[Bytes, Text] = convert_try_hex_decode(list_get(hash_parts, 2))
+    if not result_is_ok(salt_result): return false
+    let salt: Bytes = result_unwrap(salt_result)
+    if bytes_length(salt) < 16 or bytes_length(salt) > 64: return false
+    let expected_result: Result[Bytes, Text] = convert_try_hex_decode(list_get(hash_parts, 3))
+    if not result_is_ok(expected_result): return false
+    let expected: Bytes = result_unwrap(expected_result)
+    if bytes_length(expected) != 32: return false
+    let password_bytes_result: Result[Bytes, Text] = bytes_from_text_bounded(password, 1024)
+    if not result_is_ok(password_bytes_result): return false
+    let password_bytes: Bytes = result_unwrap(password_bytes_result)
+    let actual_result: Result[Bytes, Text] = crypto_pbkdf2_sha256(password_bytes, salt, iterations, 32)
+    let wiped: Number = bytes_zeroize(password_bytes)
+    if not result_is_ok(actual_result): return false
+    return bytes_equal_constant_time(expected, result_unwrap(actual_result))
+
+fn yazabase_set_credentials(db_dir: Text, username: Text, new_password: Text) -> Result[Boolean, Text]:
+    if text_trim(username) == "" or text_length(username) > 128 or text_find(username, "\n") >= 0 or text_find(username, "\r") >= 0 or text_find(username, "=") >= 0:
+        return err("YazaBase: username must be 1-128 characters and cannot contain line breaks or '='")
+    if text_length(new_password) < 16 or text_length(new_password) > 1024:
+        return err("YazaBase: password must contain 16-1024 characters")
+    if username == "yaza" and new_password == "yaza_dev_password":
+        return err("YazaBase: the development default password cannot be stored as a credential")
+    let ignored_dir: Number = yazabase_ensure_dir_tree(db_dir)
+    let hash_result: Result[Text, Text] = yazabase_credential_hash(new_password)
+    if not result_is_ok(hash_result): return err("YazaBase: could not derive password verifier: " + result_unwrap_error(hash_result))
+    let cred_path: Text = db_dir + "/.yaza_credentials"
+    let content: Text = "username=" + username + "\nhash=" + result_unwrap(hash_result) + "\n"
+    if file_write(cred_path, content) != 0:
+        return err("YazaBase: failed to write credential file at " + cred_path)
+    return ok(true)
+
+fn yazabase_verify_credentials(db_dir: Text, username: Text, password: Text) -> Boolean:
+    let cred_path: Text = db_dir + "/.yaza_credentials"
+    if not file_exists(cred_path): return false
+    let lines: TextList = text_lines(file_read(cred_path))
+    var stored_user: Text = ""
+    var stored_hash: Text = ""
+    var i: Number = 0
+    while i < list_count(lines):
+        let line: Text = text_trim(list_get(lines, i))
+        if text_starts_with(line, "username="):
+            set stored_user = text_slice(line, 9, text_length(line) - 9)
+        elif text_starts_with(line, "hash="):
+            set stored_hash = text_slice(line, 5, text_length(line) - 5)
+        set i = i + 1
+    if stored_user == "" or stored_hash == "": return false
+    if username != stored_user: return false
+    if text_starts_with(stored_hash, "$argon2id$"):
+        let verify_result: Result[Boolean, PasswordHashError] = password_verify_argon2id(password, stored_hash)
+        if not result_is_ok(verify_result): return false
+        return result_unwrap(verify_result)
+    return yazabase_verify_legacy_pbkdf2(password, stored_hash)
+
+fn yazabase_connect(db_dir: Text, db_name: Text, username: Text, password: Text) -> Result[YazaBaseConnection, Text]:
+    var eff_dir: Text = db_dir
+    if eff_dir == "": set eff_dir = "./data"
+    var eff_db: Text = db_name
+    if eff_db == "": set eff_db = "app"
+    var eff_user: Text = username
+    if eff_user == "": set eff_user = yazabase_default_user()
+    var eff_pass: Text = password
+    if eff_pass == "": set eff_pass = yazabase_default_password()
+
+    if eff_user == "" or eff_pass == "":
+        return err("YazaBase credentials are required; set YAZABASE_USER and YAZABASE_PASSWORD or pass credentials explicitly")
+
+    if not yazabase_verify_credentials(eff_dir, eff_user, eff_pass):
+        return err("YazaBase authentication failed for user '" + eff_user + "'")
+
+    let ignored_dir: Number = yazabase_ensure_dir_tree(eff_dir)
+    let bin_path: Text = yazabase_locate_binary()
+    let ydb_path: Text = eff_dir + "/" + eff_db
+    let ydb_legacy_path: Text = eff_dir + "/" + eff_db + ".ydb"
+    if bin_path != "" and not file_exists(ydb_path) and not file_exists(ydb_legacy_path):
+        let lock_dir: Text = eff_dir + "/.init_" + eff_db + ".lock"
+        if directory_create(lock_dir) == 0:
+            if not file_exists(ydb_path) and not file_exists(ydb_legacy_path):
+                let init_args: TextList = text_list()
+                list_push(init_args, "init")
+                list_push(init_args, eff_dir)
+                list_push(init_args, eff_db)
+                let ignored_init: Number = process(bin_path, init_args)
+        else:
+            var waited: Number = 0
+            while waited < 100 and not file_exists(ydb_path) and not file_exists(ydb_legacy_path):
+                let _slept: Boolean = sleep_ms(10)
+                set waited = waited + 1
+    return ok(YazaBaseConnection(eff_dir, eff_db, eff_user, bin_path, true))
+
+fn yazabase_connect_default(db_dir: Text, db_name: Text) -> Result[YazaBaseConnection, Text]:
+    return yazabase_connect(db_dir, db_name, yazabase_default_user(), yazabase_default_password())
+
+fn yazabase_run_sql_out(conn: YazaBaseConnection, sql: Text, typed_params: TextList) -> Result[Text, Text]:
+    if not conn.connected:
+        return err("YazaBase connection is closed")
+    if conn.binary_path == "":
+        return err("YazaBase binary not found; install YAZA or set YAZABASE_BIN")
+    var attempt: Number = 0
+    while attempt < 25:
+        let out_path: Text = conn.db_dir + "/.yb_sql_" + number_text(time_now_monotonic_ns()) + "_" + number_text(attempt) + ".tmp"
+        let args: TextList = text_list()
+        list_push(args, "sql")
+        list_push(args, "--csv-out")
+        list_push(args, out_path)
+        list_push(args, conn.db_dir)
+        list_push(args, conn.db_name)
+        list_push(args, sql)
+        var i: Number = 0
+        while i < list_count(typed_params):
+            list_push(args, "--param")
+            list_push(args, list_get(typed_params, i))
+            set i = i + 1
+        let status: Number = process(conn.binary_path, args)
+        var payload: Text = ""
+        if file_exists(out_path):
+            set payload = file_read(out_path)
+            let _rm: Number = file_remove(out_path)
+        if text_starts_with(payload, "ERR:"):
+            let err_msg: Text = text_slice(payload, 4, text_length(payload) - 4)
+            if text_find(err_msg, "locked") >= 0 and attempt + 1 < 25:
+                let _s: Boolean = sleep_ms(15)
+                set attempt = attempt + 1
+                continue
+            return err(err_msg)
+        if status != 0:
+            if attempt + 1 < 25 and text_find(payload, "locked") >= 0:
+                let _s: Boolean = sleep_ms(15)
+                set attempt = attempt + 1
+                continue
+            return err("YazaBase SQL execution failed with exit code " + number_text(status))
+        return ok(payload)
+    return err("YazaBase SQL execution timed out waiting for database lock")
+
+fn yazabase_exec_params(conn: YazaBaseConnection, sql: Text, typed_params: TextList) -> Result[Text, Text]:
+    return yazabase_run_sql_out(conn, sql, typed_params)
+
+fn yazabase_query_csv(conn: YazaBaseConnection, sql: Text, typed_params: TextList) -> Result[Text, Text]:
+    return yazabase_run_sql_out(conn, sql, typed_params)
+
+fn yazabase_exec_sql(conn: YazaBaseConnection, sql: Text) -> Result[Boolean, Text]:
+    let empty_params: TextList = text_list()
+    let _out: Text = yazabase_run_sql_out(conn, sql, empty_params)?
+    return ok(true)

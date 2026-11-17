@@ -1,0 +1,480 @@
+# Persist a bounded CREATE TABLE schema into the provisional YDBv1 catalogs.
+# It uses the shared transaction path, including catalog B+Tree split handling.
+use "./allocator_v1"
+use "./catalog_schema_v1"
+use "./catalog_snapshot_v1"
+use "./catalog_storage_v1"
+use "./page_image_v1"
+use "./query_v1"
+use "./sql_create_table_v1"
+use "./sql_binder_v1"
+use "./sql_insert_exec_v1"
+use "./sql_insert_write_v1"
+use "./storage_v1"
+use "./transaction_v1"
+use "./wal_v1"
+
+fn yaza_db_sql_create_table_close_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1) -> Unit:
+    let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(wal)
+    let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(storage)
+    return
+
+fn yaza_db_sql_create_table_ascii_name_v1(name: Text) -> Boolean:
+    let length: Number = text_length(name)
+    if length < 1 or length > 128: return false
+    var index: Number = 0
+    while index < length:
+        let byte: Number = text_byte(name, index)
+        if index == 0:
+            if not ((byte >= 97 and byte <= 122) or byte == 95): return false
+        elif not ((byte >= 97 and byte <= 122) or (byte >= 48 and byte <= 57) or byte == 95 or byte == 36):
+            return false
+        set index = index + 1
+    return true
+
+fn yaza_db_sql_create_table_plan_valid_v1(plan: YazaSqlCreateTablePlanV1) -> Boolean:
+    let column_count: Number = list_count(plan.columns)
+    let key_count: Number = list_count(plan.key_ordinals)
+    let unique_count: Number = list_count(plan.unique_ordinals)
+    let foreign_count: Number = list_count(plan.foreign_keys)
+    let check_count: Number = list_count(plan.check_constraints)
+    if plan.version != 1 or plan.catalog_version < 1 or not yaza_db_sql_create_table_ascii_name_v1(plan.table_name): return false
+    if column_count < 1 or column_count > 897 or key_count < 1 or key_count > column_count or list_count(plan.default_expressions) != column_count: return false
+    if unique_count > 64 or foreign_count > 64 or check_count > 64: return false
+    var column_index: Number = 0
+    while column_index < column_count:
+        let column: YazaSqlColumnSchemaV1 = list_get(plan.columns, column_index)
+        let default_expression: Text = list_get(plan.default_expressions, column_index)
+        if column.ordinal != column_index or not yaza_db_sql_create_table_ascii_name_v1(column.name) or text_length(default_expression) > 4096: return false
+        if column.type_id != 1 and column.type_id != 2 and column.type_id != 3 and column.type_id != 4 and column.type_id != 6 and column.type_id != 9 and column.type_id != 10 and column.type_id != 11 and column.type_id != 12 and column.type_id != 13 and column.type_id != 14 and column.type_id != 15 and column.type_id != 16: return false
+        if column.type_id == 10:
+            if not yaza_sql_decimal_parameters_valid_v1(column.precision, column.scale): return false
+        elif column.precision != 0 or column.scale != 0:
+            return false
+        if text_length(default_expression) > 0:
+            let default_value: Result[YazaSqlValueV1, Text] = yaza_sql_insert_materialize_default_v1(default_expression, column)
+            if not result_is_ok(default_value): return false
+        var prior: Number = 0
+        while prior < column_index:
+            if list_get(plan.columns, prior).name == column.name: return false
+            set prior = prior + 1
+        set column_index = column_index + 1
+    var key_index: Number = 0
+    while key_index < key_count:
+        let ordinal: Number = list_get(plan.key_ordinals, key_index)
+        if ordinal < 0 or ordinal >= column_count or list_get(plan.columns, ordinal).nullable: return false
+        var prior_key: Number = 0
+        while prior_key < key_index:
+            if list_get(plan.key_ordinals, prior_key) == ordinal: return false
+            set prior_key = prior_key + 1
+        set key_index = key_index + 1
+    var unique_index: Number = 0
+    while unique_index < unique_count:
+        let ordinal: Number = list_get(plan.unique_ordinals, unique_index)
+        if ordinal < 0 or ordinal >= column_count: return false
+        var prior_unique: Number = 0
+        while prior_unique < unique_index:
+            if list_get(plan.unique_ordinals, prior_unique) == ordinal: return false
+            set prior_unique = prior_unique + 1
+        set unique_index = unique_index + 1
+    var foreign_index: Number = 0
+    while foreign_index < foreign_count:
+        let foreign_key: YazaSqlCreateForeignKeyPlanV1 = list_get(plan.foreign_keys, foreign_index)
+        if foreign_key.local_column_ordinal < 0 or foreign_key.local_column_ordinal >= column_count or foreign_key.referenced_table_id <= 4 or foreign_key.referenced_column_ordinal < 0: return false
+        var prior_foreign: Number = 0
+        while prior_foreign < foreign_index:
+            let prior_key: YazaSqlCreateForeignKeyPlanV1 = list_get(plan.foreign_keys, prior_foreign)
+            if prior_key.local_column_ordinal == foreign_key.local_column_ordinal and prior_key.referenced_table_id == foreign_key.referenced_table_id and prior_key.referenced_column_ordinal == foreign_key.referenced_column_ordinal: return false
+            set prior_foreign = prior_foreign + 1
+        set foreign_index = foreign_index + 1
+    var check_index: Number = 0
+    while check_index < check_count:
+        let check: YazaSqlCreateCheckPlanV1 = list_get(plan.check_constraints, check_index)
+        if check.column_ordinal < 0 or check.column_ordinal >= column_count or check.comparison_operator < 1 or check.comparison_operator > 6 or text_length(check.literal) < 1 or text_length(check.literal) > 4096: return false
+        let checked_column: YazaSqlColumnSchemaV1 = list_get(plan.columns, check.column_ordinal)
+        if not yaza_sql_bind_v1_comparison_valid(checked_column.type_id, check.comparison_operator): return false
+        let checked_value: Result[YazaSqlValueV1, Text] = yaza_sql_insert_materialize_default_v1(check.literal, checked_column)
+        if not result_is_ok(checked_value): return false
+        set check_index = check_index + 1
+    return true
+
+fn yaza_db_sql_create_table_page_candidates_v1(storage: YazaDbStorageHandleV1, requested_count: Number) -> Result[List[Number], Text]:
+    if requested_count < 2 or requested_count > 130: return err("YDBv1 CREATE TABLE page-candidate request is outside its bounded profile")
+    let created: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(created): return err(result_unwrap_error(created))
+    let candidates: List[Number] = result_unwrap(created)
+    if not list_try_reserve(candidates, requested_count): return err("YDBv1 CREATE TABLE could not reserve page-candidate metadata")
+    let first: Number = yaza_db_allocator_find_free_existing_v1(storage)?
+    if not list_try_push(candidates, first): return err("YDBv1 CREATE TABLE could not record its first free-page candidate")
+    var previous: Number = first
+    while list_count(candidates) < requested_count:
+        let next: Number = yaza_db_allocator_find_free_existing_after_v1(storage, previous)?
+        if next <= previous or not list_try_push(candidates, next): return err("YDBv1 CREATE TABLE could not record ordered free-page candidates")
+        set previous = next
+    return ok(candidates)
+
+fn yaza_db_sql_create_table_values_v1() -> Result[List[YazaSqlValueV1], Text]:
+    return list_try_new()
+
+fn yaza_db_sql_create_table_push_integer_v1(values: List[YazaSqlValueV1], type_id: Number, value: Number) -> Boolean:
+    let made: Result[YazaSqlValueV1, Text] = yaza_sql_value_integer_v1(type_id, value)
+    if not result_is_ok(made): return false
+    return list_try_push(values, result_unwrap(made))
+
+fn yaza_db_sql_create_table_push_text_v1(values: List[YazaSqlValueV1], value: Text) -> Boolean:
+    return list_try_push(values, yaza_sql_value_text_v1(value))
+
+fn yaza_db_sql_create_table_push_boolean_v1(values: List[YazaSqlValueV1], value: Boolean) -> Boolean:
+    return list_try_push(values, yaza_sql_value_boolean_v1(value))
+
+fn yaza_db_sql_create_table_push_null_v1(values: List[YazaSqlValueV1], type_id: Number) -> Boolean:
+    let made: Result[YazaSqlValueV1, Text] = yaza_sql_value_null_v1(type_id)
+    if not result_is_ok(made): return false
+    return list_try_push(values, result_unwrap(made))
+
+fn yaza_db_sql_create_table_key_text_v1(plan: YazaSqlCreateTablePlanV1) -> Result[Text, Text]:
+    var output: Text = ""
+    var index: Number = 0
+    while index < list_count(plan.key_ordinals):
+        if index > 0:
+            let separated: Result[Text, Text] = text_try_concat(output, ",")
+            if not result_is_ok(separated): return err(result_unwrap_error(separated))
+            set output = result_unwrap(separated)
+        let ordinal: Number = list_get(plan.key_ordinals, index)
+        let digits: Result[Text, Text] = number_try_text(ordinal)
+        if not result_is_ok(digits): return err(result_unwrap_error(digits))
+        let joined: Result[Text, Text] = text_try_concat(output, result_unwrap(digits))
+        if not result_is_ok(joined): return err(result_unwrap_error(joined))
+        set output = result_unwrap(joined)
+        set index = index + 1
+    return ok(output)
+
+fn yaza_db_sql_create_table_row_v1(values: List[YazaSqlValueV1], nulls: List[Boolean]) -> Result[YazaSqlInsertMaterializedRowV1, Text]:
+    if list_count(values) == 0 or list_count(values) != list_count(nulls): return err("YDBv1 CREATE TABLE catalog row has inconsistent values/nulls")
+    return ok(YazaSqlInsertMaterializedRowV1(values, nulls))
+
+fn yaza_db_sql_create_table_batch_v1(table_id: Number, catalog_version: Number, columns: List[YazaSqlColumnSchemaV1], rows: List[YazaSqlInsertMaterializedRowV1]) -> Result[YazaSqlInsertMaterializedV1, Text]:
+    if table_id < 1 or catalog_version < 1 or list_count(columns) == 0 or list_count(rows) == 0 or list_count(rows) > 900:
+        return err("YDBv1 CREATE TABLE catalog batch is outside its supported bound")
+    return ok(YazaSqlInsertMaterializedV1(table_id, catalog_version, columns, rows))
+
+fn yaza_db_sql_create_table_sys_table_row_v1(plan: YazaSqlCreateTablePlanV1, table_id: Number, root_page_id: Number) -> Result[YazaSqlInsertMaterializedRowV1, Text]:
+    let values: List[YazaSqlValueV1] = yaza_db_sql_create_table_values_v1()?
+    if not yaza_db_sql_create_table_push_integer_v1(values, 4, table_id) or not yaza_db_sql_create_table_push_text_v1(values, "public") or not yaza_db_sql_create_table_push_text_v1(values, plan.table_name) or not yaza_db_sql_create_table_push_integer_v1(values, 4, root_page_id) or not yaza_db_sql_create_table_push_integer_v1(values, 2, 1) or not yaza_db_sql_create_table_push_integer_v1(values, 3, 0) or not yaza_db_sql_create_table_push_integer_v1(values, 4, 1):
+        return err("YDBv1 CREATE TABLE sys_tables row could not be built")
+    return yaza_db_sql_create_table_row_v1(values, [false, false, false, false, false, false, false])
+
+fn yaza_db_sql_create_table_sys_columns_row_v1(plan: YazaSqlCreateTablePlanV1, table_id: Number, ordinal: Number, key_ordinal: Number) -> Result[YazaSqlInsertMaterializedRowV1, Text]:
+    let column: YazaSqlColumnSchemaV1 = list_get(plan.columns, ordinal)
+    let values: List[YazaSqlValueV1] = yaza_db_sql_create_table_values_v1()?
+    if not yaza_db_sql_create_table_push_integer_v1(values, 4, table_id) or not yaza_db_sql_create_table_push_integer_v1(values, 3, ordinal) or not yaza_db_sql_create_table_push_text_v1(values, column.name) or not yaza_db_sql_create_table_push_integer_v1(values, 2, column.type_id) or not yaza_db_sql_create_table_push_boolean_v1(values, column.nullable):
+        return err("YDBv1 CREATE TABLE sys_columns row header could not be built")
+    if key_ordinal < 0:
+        if not yaza_db_sql_create_table_push_null_v1(values, 2): return err("YDBv1 CREATE TABLE sys_columns NULL key ordinal could not be built")
+    elif not yaza_db_sql_create_table_push_integer_v1(values, 2, key_ordinal):
+        return err("YDBv1 CREATE TABLE sys_columns key ordinal could not be built")
+    let type_flags: Number = yaza_db_catalog_column_type_flags_encode_v1(column.type_id, column.precision, column.scale)?
+    if not yaza_db_sql_create_table_push_integer_v1(values, 3, type_flags):
+        return err("YDBv1 CREATE TABLE sys_columns trailing fields could not be built")
+    let default_expression: Text = list_get(plan.default_expressions, ordinal)
+    let has_default: Boolean = text_length(default_expression) > 0
+    if has_default:
+        if not yaza_db_sql_create_table_push_text_v1(values, default_expression): return err("YDBv1 CREATE TABLE sys_columns DEFAULT literal could not be built")
+    elif not yaza_db_sql_create_table_push_null_v1(values, 9):
+        return err("YDBv1 CREATE TABLE sys_columns NULL default could not be built")
+    let null_key: Boolean = key_ordinal < 0
+    return yaza_db_sql_create_table_row_v1(values, [false, false, false, false, false, null_key, false, not has_default])
+
+fn yaza_db_sql_create_table_sys_index_row_v1(plan: YazaSqlCreateTablePlanV1, table_id: Number, index_id: Number, root_page_id: Number, key_text: Text) -> Result[YazaSqlInsertMaterializedRowV1, Text]:
+    let index_name: Text = plan.table_name + "_pk"
+    let values: List[YazaSqlValueV1] = yaza_db_sql_create_table_values_v1()?
+    if not yaza_db_sql_create_table_push_integer_v1(values, 4, index_id) or not yaza_db_sql_create_table_push_integer_v1(values, 4, table_id) or not yaza_db_sql_create_table_push_text_v1(values, index_name) or not yaza_db_sql_create_table_push_integer_v1(values, 4, root_page_id) or not yaza_db_sql_create_table_push_integer_v1(values, 2, 1) or not yaza_db_sql_create_table_push_boolean_v1(values, true) or not yaza_db_sql_create_table_push_text_v1(values, key_text):
+        return err("YDBv1 CREATE TABLE sys_indexes row could not be built")
+    return yaza_db_sql_create_table_row_v1(values, [false, false, false, false, false, false, false])
+
+fn yaza_db_sql_create_table_sys_unique_index_row_v1(table_id: Number, index_id: Number, root_page_id: Number, column_ordinal: Number) -> Result[YazaSqlInsertMaterializedRowV1, Text]:
+    if table_id < 1 or index_id < 1 or root_page_id < 2 or column_ordinal < 0: return err("YDBv1 CREATE TABLE UNIQUE index metadata is invalid")
+    let index_name: Text = "yaza_u_" + number_text(index_id)
+    let key_text: Text = number_text(column_ordinal)
+    let values: List[YazaSqlValueV1] = yaza_db_sql_create_table_values_v1()?
+    if not yaza_db_sql_create_table_push_integer_v1(values, 4, index_id) or not yaza_db_sql_create_table_push_integer_v1(values, 4, table_id) or not yaza_db_sql_create_table_push_text_v1(values, index_name) or not yaza_db_sql_create_table_push_integer_v1(values, 4, root_page_id) or not yaza_db_sql_create_table_push_integer_v1(values, 2, yaza_db_catalog_index_kind_secondary_active_v1()) or not yaza_db_sql_create_table_push_boolean_v1(values, true) or not yaza_db_sql_create_table_push_text_v1(values, key_text):
+        return err("YDBv1 CREATE TABLE UNIQUE sys_indexes row could not be built")
+    return yaza_db_sql_create_table_row_v1(values, [false, false, false, false, false, false, false])
+
+fn yaza_db_sql_create_table_sys_constraint_row_v1(plan: YazaSqlCreateTablePlanV1, table_id: Number, constraint_id: Number, key_text: Text) -> Result[YazaSqlInsertMaterializedRowV1, Text]:
+    let constraint_name: Text = plan.table_name + "_pkey"
+    let values: List[YazaSqlValueV1] = yaza_db_sql_create_table_values_v1()?
+    if not yaza_db_sql_create_table_push_integer_v1(values, 4, constraint_id) or not yaza_db_sql_create_table_push_integer_v1(values, 4, table_id) or not yaza_db_sql_create_table_push_text_v1(values, constraint_name) or not yaza_db_sql_create_table_push_integer_v1(values, 2, 1) or not yaza_db_sql_create_table_push_text_v1(values, key_text) or not yaza_db_sql_create_table_push_null_v1(values, 9):
+        return err("YDBv1 CREATE TABLE sys_constraints row could not be built")
+    return yaza_db_sql_create_table_row_v1(values, [false, false, false, false, false, true])
+
+fn yaza_db_sql_create_table_sys_unique_constraint_row_v1(table_id: Number, constraint_id: Number, index_id: Number, column_ordinal: Number) -> Result[YazaSqlInsertMaterializedRowV1, Text]:
+    if table_id < 1 or constraint_id < 1 or index_id < 1 or column_ordinal < 0: return err("YDBv1 CREATE TABLE UNIQUE constraint metadata is invalid")
+    let index_name: Text = "yaza_u_" + number_text(index_id)
+    let key_text: Text = number_text(column_ordinal)
+    let values: List[YazaSqlValueV1] = yaza_db_sql_create_table_values_v1()?
+    if not yaza_db_sql_create_table_push_integer_v1(values, 4, constraint_id) or not yaza_db_sql_create_table_push_integer_v1(values, 4, table_id) or not yaza_db_sql_create_table_push_text_v1(values, index_name) or not yaza_db_sql_create_table_push_integer_v1(values, 2, 2) or not yaza_db_sql_create_table_push_text_v1(values, key_text) or not yaza_db_sql_create_table_push_null_v1(values, 9):
+        return err("YDBv1 CREATE TABLE UNIQUE sys_constraints row could not be built")
+    return yaza_db_sql_create_table_row_v1(values, [false, false, false, false, false, true])
+
+fn yaza_db_sql_create_table_sys_foreign_constraint_row_v1(table_id: Number, constraint_id: Number, foreign_key: YazaSqlCreateForeignKeyPlanV1) -> Result[YazaSqlInsertMaterializedRowV1, Text]:
+    if table_id < 1 or constraint_id < 1 or foreign_key.local_column_ordinal < 0 or foreign_key.referenced_table_id <= 4 or foreign_key.referenced_column_ordinal < 0: return err("YDBv1 CREATE TABLE FOREIGN KEY metadata is invalid")
+    let constraint_name: Text = "yaza_fk_" + number_text(constraint_id)
+    let local_key_text: Text = number_text(foreign_key.local_column_ordinal)
+    let referenced_text: Text = number_text(foreign_key.referenced_table_id) + ":" + number_text(foreign_key.referenced_column_ordinal)
+    let values: List[YazaSqlValueV1] = yaza_db_sql_create_table_values_v1()?
+    if not yaza_db_sql_create_table_push_integer_v1(values, 4, constraint_id) or not yaza_db_sql_create_table_push_integer_v1(values, 4, table_id) or not yaza_db_sql_create_table_push_text_v1(values, constraint_name) or not yaza_db_sql_create_table_push_integer_v1(values, 2, 3) or not yaza_db_sql_create_table_push_text_v1(values, local_key_text) or not yaza_db_sql_create_table_push_text_v1(values, referenced_text):
+        return err("YDBv1 CREATE TABLE FOREIGN KEY sys_constraints row could not be built")
+    return yaza_db_sql_create_table_row_v1(values, [false, false, false, false, false, false])
+
+fn yaza_db_sql_create_table_sys_check_constraint_row_v1(table_id: Number, constraint_id: Number, check: YazaSqlCreateCheckPlanV1) -> Result[YazaSqlInsertMaterializedRowV1, Text]:
+    if table_id < 1 or constraint_id < 1 or check.column_ordinal < 0 or check.comparison_operator < 1 or check.comparison_operator > 6 or text_length(check.literal) < 1 or text_length(check.literal) > 4096: return err("YDBv1 CREATE TABLE CHECK metadata is invalid")
+    let constraint_name: Text = "yaza_ck_" + number_text(constraint_id)
+    let key_text: Text = number_text(check.column_ordinal)
+    let expression_text: Text = number_text(check.comparison_operator) + ":" + check.literal
+    if text_length(expression_text) > 4096: return err("YDBv1 CREATE TABLE CHECK expression exceeds its bound")
+    let values: List[YazaSqlValueV1] = yaza_db_sql_create_table_values_v1()?
+    if not yaza_db_sql_create_table_push_integer_v1(values, 4, constraint_id) or not yaza_db_sql_create_table_push_integer_v1(values, 4, table_id) or not yaza_db_sql_create_table_push_text_v1(values, constraint_name) or not yaza_db_sql_create_table_push_integer_v1(values, 2, 4) or not yaza_db_sql_create_table_push_text_v1(values, key_text) or not yaza_db_sql_create_table_push_text_v1(values, expression_text): return err("YDBv1 CREATE TABLE CHECK sys_constraints row could not be built")
+    return yaza_db_sql_create_table_row_v1(values, [false, false, false, false, false, false])
+
+fn yaza_db_sql_create_table_build_batches_v1(plan: YazaSqlCreateTablePlanV1, catalog: YazaDbCatalogRootV1, table_id: Number, index_id: Number, constraint_id: Number, root_page_id: Number, unique_root_ids: List[Number], catalog_version: Number) -> Result[List[YazaSqlInsertMaterializedV1], Text]:
+    if list_count(unique_root_ids) != list_count(plan.unique_ordinals): return err("YDBv1 CREATE TABLE UNIQUE roots do not match its bound constraints")
+    let key_text: Text = yaza_db_sql_create_table_key_text_v1(plan)?
+    let batches_created: Result[List[YazaSqlInsertMaterializedV1], Text] = list_try_new()
+    if not result_is_ok(batches_created): return err(result_unwrap_error(batches_created))
+    let batches: List[YazaSqlInsertMaterializedV1] = result_unwrap(batches_created)
+    let table_schema: List[YazaSqlColumnSchemaV1] = yaza_db_catalog_table_schema_v1(1)?
+    let table_rows_created: Result[List[YazaSqlInsertMaterializedRowV1], Text] = list_try_new()
+    if not result_is_ok(table_rows_created): return err(result_unwrap_error(table_rows_created))
+    let table_rows: List[YazaSqlInsertMaterializedRowV1] = result_unwrap(table_rows_created)
+    let table_row: YazaSqlInsertMaterializedRowV1 = yaza_db_sql_create_table_sys_table_row_v1(plan, table_id, root_page_id)?
+    if not list_try_push(table_rows, table_row): return err("YDBv1 CREATE TABLE could not stage sys_tables row")
+    let table_batch: YazaSqlInsertMaterializedV1 = yaza_db_sql_create_table_batch_v1(table_id, catalog_version, table_schema, table_rows)?
+    if not list_try_push(batches, table_batch): return err("YDBv1 CREATE TABLE could not stage sys_tables batch")
+
+    let column_schema: List[YazaSqlColumnSchemaV1] = yaza_db_catalog_table_schema_v1(2)?
+    let column_rows_created: Result[List[YazaSqlInsertMaterializedRowV1], Text] = list_try_new()
+    if not result_is_ok(column_rows_created): return err(result_unwrap_error(column_rows_created))
+    let column_rows: List[YazaSqlInsertMaterializedRowV1] = result_unwrap(column_rows_created)
+    if not list_try_reserve(column_rows, list_count(plan.columns)): return err("YDBv1 CREATE TABLE could not reserve sys_columns rows")
+    var column_index: Number = 0
+    while column_index < list_count(plan.columns):
+        var key_ordinal: Number = -1
+        var key_index: Number = 0
+        while key_index < list_count(plan.key_ordinals):
+            if list_get(plan.key_ordinals, key_index) == column_index: set key_ordinal = key_index
+            set key_index = key_index + 1
+        let column_row: YazaSqlInsertMaterializedRowV1 = yaza_db_sql_create_table_sys_columns_row_v1(plan, table_id, column_index, key_ordinal)?
+        if not list_try_push(column_rows, column_row): return err("YDBv1 CREATE TABLE could not stage sys_columns rows")
+        set column_index = column_index + 1
+    let column_batch: YazaSqlInsertMaterializedV1 = yaza_db_sql_create_table_batch_v1(table_id, catalog_version, column_schema, column_rows)?
+    if not list_try_push(batches, column_batch): return err("YDBv1 CREATE TABLE could not stage sys_columns batch")
+
+    let index_schema: List[YazaSqlColumnSchemaV1] = yaza_db_catalog_table_schema_v1(3)?
+    let index_rows_created: Result[List[YazaSqlInsertMaterializedRowV1], Text] = list_try_new()
+    if not result_is_ok(index_rows_created): return err(result_unwrap_error(index_rows_created))
+    let index_rows: List[YazaSqlInsertMaterializedRowV1] = result_unwrap(index_rows_created)
+    if not list_try_reserve(index_rows, list_count(plan.unique_ordinals) + 1): return err("YDBv1 CREATE TABLE could not reserve unique index catalog rows")
+    let index_row: YazaSqlInsertMaterializedRowV1 = yaza_db_sql_create_table_sys_index_row_v1(plan, table_id, index_id, root_page_id, key_text)?
+    if not list_try_push(index_rows, index_row): return err("YDBv1 CREATE TABLE could not stage sys_indexes row")
+    var unique_index: Number = 0
+    while unique_index < list_count(plan.unique_ordinals):
+        let unique_index_id: Number = table_id + 3 + unique_index * 2
+        let unique_row: YazaSqlInsertMaterializedRowV1 = yaza_db_sql_create_table_sys_unique_index_row_v1(table_id, unique_index_id, list_get(unique_root_ids, unique_index), list_get(plan.unique_ordinals, unique_index))?
+        if not list_try_push(index_rows, unique_row): return err("YDBv1 CREATE TABLE could not stage a UNIQUE sys_indexes row")
+        set unique_index = unique_index + 1
+    let index_batch: YazaSqlInsertMaterializedV1 = yaza_db_sql_create_table_batch_v1(table_id, catalog_version, index_schema, index_rows)?
+    if not list_try_push(batches, index_batch): return err("YDBv1 CREATE TABLE could not stage sys_indexes batch")
+
+    let constraint_schema: List[YazaSqlColumnSchemaV1] = yaza_db_catalog_table_schema_v1(4)?
+    let constraint_rows_created: Result[List[YazaSqlInsertMaterializedRowV1], Text] = list_try_new()
+    if not result_is_ok(constraint_rows_created): return err(result_unwrap_error(constraint_rows_created))
+    let constraint_rows: List[YazaSqlInsertMaterializedRowV1] = result_unwrap(constraint_rows_created)
+    if not list_try_reserve(constraint_rows, list_count(plan.unique_ordinals) + list_count(plan.foreign_keys) + list_count(plan.check_constraints) + 1): return err("YDBv1 CREATE TABLE could not reserve constraint catalog rows")
+    let constraint_row: YazaSqlInsertMaterializedRowV1 = yaza_db_sql_create_table_sys_constraint_row_v1(plan, table_id, constraint_id, key_text)?
+    if not list_try_push(constraint_rows, constraint_row): return err("YDBv1 CREATE TABLE could not stage sys_constraints row")
+    set unique_index = 0
+    while unique_index < list_count(plan.unique_ordinals):
+        let unique_index_id: Number = table_id + 3 + unique_index * 2
+        let unique_constraint_id: Number = table_id + 4 + unique_index * 2
+        let unique_row: YazaSqlInsertMaterializedRowV1 = yaza_db_sql_create_table_sys_unique_constraint_row_v1(table_id, unique_constraint_id, unique_index_id, list_get(plan.unique_ordinals, unique_index))?
+        if not list_try_push(constraint_rows, unique_row): return err("YDBv1 CREATE TABLE could not stage a UNIQUE sys_constraints row")
+        set unique_index = unique_index + 1
+    var foreign_index: Number = 0
+    while foreign_index < list_count(plan.foreign_keys):
+        let foreign_constraint_id: Number = table_id + 3 + list_count(plan.unique_ordinals) * 2 + foreign_index
+        let foreign_row: YazaSqlInsertMaterializedRowV1 = yaza_db_sql_create_table_sys_foreign_constraint_row_v1(table_id, foreign_constraint_id, list_get(plan.foreign_keys, foreign_index))?
+        if not list_try_push(constraint_rows, foreign_row): return err("YDBv1 CREATE TABLE could not stage a FOREIGN KEY sys_constraints row")
+        set foreign_index = foreign_index + 1
+    var check_index: Number = 0
+    while check_index < list_count(plan.check_constraints):
+        let check_constraint_id: Number = table_id + 3 + list_count(plan.unique_ordinals) * 2 + list_count(plan.foreign_keys) + check_index
+        let check_row: YazaSqlInsertMaterializedRowV1 = yaza_db_sql_create_table_sys_check_constraint_row_v1(table_id, check_constraint_id, list_get(plan.check_constraints, check_index))?
+        if not list_try_push(constraint_rows, check_row): return err("YDBv1 CREATE TABLE could not stage a CHECK sys_constraints row")
+        set check_index = check_index + 1
+    let constraint_batch: YazaSqlInsertMaterializedV1 = yaza_db_sql_create_table_batch_v1(table_id, catalog_version, constraint_schema, constraint_rows)?
+    if not list_try_push(batches, constraint_batch): return err("YDBv1 CREATE TABLE could not stage sys_constraints batch")
+    if list_count(batches) != 4 or catalog.generation < 1: return err("YDBv1 CREATE TABLE catalog batch assembly is inconsistent")
+    return ok(batches)
+
+fn yaza_db_sql_create_table_append_new_root_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, root_page_id: Number, leaf_page_id: Number) -> Result[YazaDbWalAppendV1, Text]:
+    if root_page_id < 2 or leaf_page_id < 2 or root_page_id == leaf_page_id: return err("YDBv1 CREATE TABLE root and initial leaf page IDs are invalid")
+    let record_length: Number = yaza_db_wal_header_size_v1() + yaza_db_wal_page_image_payload_size_v1()
+    let leaf_lsn: Number = yaza_db_wal_record_lsn_for_append_v1(wal, record_length)?
+    let leaf_image: Bytes = yaza_db_page_new_v1(leaf_page_id, leaf_lsn, 1, 0)?
+    let leaf_payload: Bytes = yaza_db_wal_page_image_payload_encode_v1(leaf_page_id, leaf_lsn, leaf_image)?
+    let leaf_append: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(wal, YazaDbWalRecordV1(0, 0, 0, yaza_db_wal_type_full_page_image_v1(), 0, leaf_payload))?
+    if leaf_append.record.lsn != leaf_lsn: return err("YDBv1 CREATE TABLE initial leaf image received an unexpected WAL LSN")
+    let leaf_applied: Boolean = yaza_db_storage_redo_page_image_v1(storage, leaf_append.record, leaf_append.log.next_lsn)?
+    if not leaf_applied: return err("YDBv1 CREATE TABLE initial leaf image replay did not complete")
+
+    let root_lsn: Number = yaza_db_wal_record_lsn_for_append_v1(leaf_append.log, record_length)?
+    let root_image: Bytes = yaza_db_page_new_v1(root_page_id, root_lsn, 2, 1)?
+    if not yaza_db_page_set_upper_v1(root_image, leaf_page_id): return err("YDBv1 CREATE TABLE root could not reference its initial leaf")
+    let root_final: Bytes = yaza_db_page_finalize_v1(root_image)?
+    let root_payload: Bytes = yaza_db_wal_page_image_payload_encode_v1(root_page_id, root_lsn, root_final)?
+    let root_append: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(leaf_append.log, YazaDbWalRecordV1(0, 0, 0, yaza_db_wal_type_full_page_image_v1(), 0, root_payload))?
+    if root_append.record.lsn != root_lsn: return err("YDBv1 CREATE TABLE root image received an unexpected WAL LSN")
+    let root_applied: Boolean = yaza_db_storage_redo_page_image_v1(storage, root_append.record, root_append.log.next_lsn)?
+    if not root_applied: return err("YDBv1 CREATE TABLE root image replay did not complete")
+    return ok(root_append)
+
+fn yaza_db_sql_create_table_append_catalog_root_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, catalog_page_id: Number, catalog: YazaDbCatalogRootV1) -> Result[YazaDbWalAppendV1, Text]:
+    let record_length: Number = yaza_db_wal_header_size_v1() + yaza_db_wal_page_image_payload_size_v1()
+    let expected_lsn: Number = yaza_db_wal_record_lsn_for_append_v1(wal, record_length)?
+    let image: Bytes = yaza_db_catalog_root_page_encode_v1(catalog_page_id, expected_lsn, catalog)?
+    let payload: Bytes = yaza_db_wal_page_image_payload_encode_v1(catalog_page_id, expected_lsn, image)?
+    let appended: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(wal, YazaDbWalRecordV1(0, 0, 0, yaza_db_wal_type_full_page_image_v1(), 0, payload))?
+    if appended.record.lsn != expected_lsn: return err("YDBv1 CREATE TABLE catalog descriptor received an unexpected WAL LSN")
+    let applied: Boolean = yaza_db_storage_redo_page_image_v1(storage, appended.record, appended.log.next_lsn)?
+    if not applied: return err("YDBv1 CREATE TABLE catalog descriptor replay did not complete")
+    return ok(appended)
+
+fn yaza_db_sql_create_table_write_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, plan: YazaSqlCreateTablePlanV1) -> Result[YazaDbWriteCommitV1, Text]:
+    if storage.root != wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid): return err("YDBv1 CREATE TABLE storage and WAL handles belong to different databases")
+    if not yaza_db_sql_create_table_plan_valid_v1(plan): return err("YDBv1 CREATE TABLE received an invalid bound schema plan")
+    let loaded: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(storage.file, storage.header)?
+    if loaded.sql_snapshot.version != plan.catalog_version: return err("YDBv1 CREATE TABLE plan was bound against a stale catalog snapshot")
+    if list_count(loaded.sql_snapshot.tables) >= yaza_db_catalog_max_table_records_v1(): return err("YDBv1 CREATE TABLE reached the catalog table-record profile limit")
+    var existing_index: Number = 0
+    while existing_index < list_count(loaded.sql_snapshot.tables):
+        if list_get(loaded.sql_snapshot.tables, existing_index).name == plan.table_name: return err("YDBv1 CREATE TABLE name already exists in the current catalog")
+        set existing_index = existing_index + 1
+    var existing_view_index: Number = 0
+    while existing_view_index < list_count(loaded.views):
+        if list_get(loaded.views, existing_view_index).name == plan.table_name: return err("YDBv1 CREATE TABLE name already exists as a view")
+        set existing_view_index = existing_view_index + 1
+    let catalog: YazaDbCatalogRootV1 = yaza_db_catalog_storage_read_root_v1(storage.file, storage.header)?
+    let unique_count: Number = list_count(plan.unique_ordinals)
+    let foreign_count: Number = list_count(plan.foreign_keys)
+    let check_count: Number = list_count(plan.check_constraints)
+    var foreign_index: Number = 0
+    while foreign_index < foreign_count:
+        let foreign_key: YazaSqlCreateForeignKeyPlanV1 = list_get(plan.foreign_keys, foreign_index)
+        var parent_index: Number = 0
+        while parent_index < list_count(loaded.sql_snapshot.tables) and list_get(loaded.sql_snapshot.tables, parent_index).table_id != foreign_key.referenced_table_id:
+            set parent_index = parent_index + 1
+        if parent_index >= list_count(loaded.sql_snapshot.tables): return err("YDBv1 CREATE TABLE FOREIGN KEY parent disappeared from its bound catalog snapshot")
+        let parent_table: YazaSqlTableSchemaV1 = list_get(loaded.sql_snapshot.tables, parent_index)
+        if parent_index >= list_count(loaded.root_page_ids): return err("YDBv1 CREATE TABLE FOREIGN KEY parent has no clustered root")
+        let parent_root: Number = list_get(loaded.root_page_ids, parent_index)
+        let parent_key_ordinals: List[Number] = yaza_db_query_clustered_key_ordinals_v1(storage.file, storage.header, catalog, parent_table.table_id, parent_root, loaded.sql_snapshot.version, list_count(parent_table.columns))?
+        if list_count(parent_key_ordinals) != 1 or list_get(parent_key_ordinals, 0) != foreign_key.referenced_column_ordinal: return err("YDBv1 FOREIGN KEY currently requires a single-column parent PRIMARY KEY")
+        set foreign_index = foreign_index + 1
+    let last_object_offset: Number = 2 + unique_count * 2 + foreign_count + check_count
+    let last_page_id_offset: Number = 3 + unique_count * 2
+    if catalog.next_object_id > yaza_db_catalog_max_object_id_v1() - last_object_offset or catalog.next_object_id > yaza_db_catalog_max_page_id_v1() - last_page_id_offset or catalog.generation >= yaza_db_catalog_max_page_id_v1(): return err("YDBv1 CREATE TABLE catalog object-ID or generation space is exhausted")
+    let table_id: Number = catalog.next_object_id
+    let index_id: Number = table_id + 1
+    let constraint_id: Number = table_id + 2
+    let next_catalog: YazaDbCatalogRootV1 = YazaDbCatalogRootV1(catalog.sys_tables_root, catalog.sys_columns_root, catalog.sys_indexes_root, catalog.sys_constraints_root, table_id + 3 + unique_count * 2 + foreign_count + check_count, catalog.generation + 1, catalog.sys_views_root)
+
+    let capacity: YazaDbWriteCapacityV1 = yaza_db_write_transaction_prepare_capacity_v1(storage, wal, yaza_db_write_transaction_default_free_page_reserve_v1())?
+    let roots: List[Number] = loaded.root_page_ids
+    let page_candidates: List[Number] = yaza_db_sql_create_table_page_candidates_v1(capacity.storage, 2 + unique_count * 2)?
+    let root_candidate: Number = list_get(page_candidates, 0)
+    let unique_roots_created: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(unique_roots_created): return err("YDBv1 CREATE TABLE could not allocate UNIQUE index root metadata")
+    let unique_root_ids: List[Number] = result_unwrap(unique_roots_created)
+    if not list_try_reserve(unique_root_ids, unique_count): return err("YDBv1 CREATE TABLE could not reserve UNIQUE index root metadata")
+    var unique_index: Number = 0
+    while unique_index < unique_count:
+        if not list_try_push(unique_root_ids, list_get(page_candidates, 2 + unique_index * 2)): return err("YDBv1 CREATE TABLE could not record a UNIQUE index root")
+        set unique_index = unique_index + 1
+    let batches: List[YazaSqlInsertMaterializedV1] = yaza_db_sql_create_table_build_batches_v1(plan, catalog, table_id, index_id, constraint_id, root_candidate, unique_root_ids, loaded.sql_snapshot.version)?
+    let table_key: List[Number] = [0]
+    let columns_key: List[Number] = [0, 1]
+    let index_key: List[Number] = [0]
+    let constraint_key: List[Number] = [0]
+    let table_preflight: Boolean = yaza_db_sql_insert_preflight_v1(capacity.storage, list_get(roots, 0), table_key, list_get(batches, 0))?
+    let columns_preflight: Boolean = yaza_db_sql_insert_preflight_v1(capacity.storage, list_get(roots, 1), columns_key, list_get(batches, 1))?
+    let index_preflight: Boolean = yaza_db_sql_insert_preflight_v1(capacity.storage, list_get(roots, 2), index_key, list_get(batches, 2))?
+    let constraint_preflight: Boolean = yaza_db_sql_insert_preflight_v1(capacity.storage, list_get(roots, 3), constraint_key, list_get(batches, 3))?
+    if not table_preflight or not columns_preflight or not index_preflight or not constraint_preflight: return err("YDBv1 CREATE TABLE catalog preflight was incomplete")
+
+    let begun: YazaDbWriteTransactionV1 = yaza_db_write_transaction_begin_prepared_v1(capacity.storage, capacity.wal)?
+    var current: YazaDbWriteTransactionV1 = begun
+    var allocation_index: Number = 0
+    while allocation_index < list_count(page_candidates):
+        let allocation_result: Result[YazaDbPageSpaceChangeV1, Text] = yaza_db_allocator_allocate_existing_v1(current.storage, current.wal, current.txn_id, current.last_lsn)
+        if not result_is_ok(allocation_result):
+            yaza_db_sql_create_table_close_v1(current.storage, current.wal)
+            return err("YDBv1 CREATE TABLE page allocation failed; reopen through recovery before reuse: " + result_unwrap_error(allocation_result))
+        let allocation: YazaDbPageSpaceChangeV1 = result_unwrap(allocation_result)
+        if allocation.page_id != list_get(page_candidates, allocation_index):
+            yaza_db_sql_create_table_close_v1(allocation.storage, allocation.wal)
+            return err("YDBv1 CREATE TABLE free-page candidates changed before allocation; reopen through recovery before retrying")
+        set current = YazaDbWriteTransactionV1(allocation.storage, allocation.wal, current.txn_id, current.commit_ts, allocation.record.lsn, current.pending_pages, current.pending_keys_hex, current.pending_rows_hex, true)
+        set allocation_index = allocation_index + 1
+    let root_image_result: Result[YazaDbWalAppendV1, Text] = yaza_db_sql_create_table_append_new_root_v1(current.storage, current.wal, list_get(page_candidates, 0), list_get(page_candidates, 1))
+    if not result_is_ok(root_image_result):
+        yaza_db_sql_create_table_close_v1(current.storage, current.wal)
+        return err("YDBv1 CREATE TABLE root initialization failed; reopen through recovery before reuse: " + result_unwrap_error(root_image_result))
+    let root_image: YazaDbWalAppendV1 = result_unwrap(root_image_result)
+    set current = YazaDbWriteTransactionV1(current.storage, root_image.log, current.txn_id, current.commit_ts, current.last_lsn, current.pending_pages, current.pending_keys_hex, current.pending_rows_hex, true)
+    set unique_index = 0
+    while unique_index < unique_count:
+        let unique_root_index: Number = 2 + unique_index * 2
+        let unique_root_result: Result[YazaDbWalAppendV1, Text] = yaza_db_sql_create_table_append_new_root_v1(current.storage, current.wal, list_get(page_candidates, unique_root_index), list_get(page_candidates, unique_root_index + 1))
+        if not result_is_ok(unique_root_result):
+            yaza_db_sql_create_table_close_v1(current.storage, current.wal)
+            return err("YDBv1 CREATE TABLE UNIQUE index root initialization failed; reopen through recovery before reuse: " + result_unwrap_error(unique_root_result))
+        let unique_root: YazaDbWalAppendV1 = result_unwrap(unique_root_result)
+        set current = YazaDbWriteTransactionV1(current.storage, unique_root.log, current.txn_id, current.commit_ts, current.last_lsn, current.pending_pages, current.pending_keys_hex, current.pending_rows_hex, true)
+        set unique_index = unique_index + 1
+    let descriptor_result: Result[YazaDbWalAppendV1, Text] = yaza_db_sql_create_table_append_catalog_root_v1(current.storage, current.wal, current.storage.header.catalog_root, next_catalog)
+    if not result_is_ok(descriptor_result):
+        yaza_db_sql_create_table_close_v1(current.storage, root_image.log)
+        return err("YDBv1 CREATE TABLE catalog reservation failed; reopen through recovery before reuse: " + result_unwrap_error(descriptor_result))
+    let descriptor: YazaDbWalAppendV1 = result_unwrap(descriptor_result)
+    set current = YazaDbWriteTransactionV1(current.storage, descriptor.log, current.txn_id, current.commit_ts, current.last_lsn, current.pending_pages, current.pending_keys_hex, current.pending_rows_hex, true)
+
+    var batch_index: Number = 0
+    while batch_index < 4:
+        let root_page_id: Number = list_get(roots, batch_index)
+        var key_ordinals: List[Number] = [0]
+        if batch_index == 1: set key_ordinals = [0, 1]
+        let batch: YazaSqlInsertMaterializedV1 = list_get(batches, batch_index)
+        var row_index: Number = 0
+        while row_index < list_count(batch.rows):
+            let row: YazaSqlInsertMaterializedRowV1 = list_get(batch.rows, row_index)
+            # CREATE TABLE holds the exclusive database storage lock, so no
+            # reader can observe this DDL before COMMIT. Store the reserved
+            # commit timestamp immediately; loser recovery still undoes rows
+            # when COMMIT is absent, and commit avoids a second WAL/page write
+            # for every catalog row.
+            let inserted: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_insert_committed_row_v1(current, root_page_id, row.values, row.nulls, batch.columns, key_ordinals)
+            if not result_is_ok(inserted):
+                let message: Text = result_unwrap_error(inserted)
+                yaza_db_sql_create_table_close_v1(current.storage, current.wal)
+                return err("YDBv1 CREATE TABLE catalog row write failed; reopen through recovery before reuse: " + message)
+            set current = result_unwrap(inserted)
+            set row_index = row_index + 1
+        set batch_index = batch_index + 1
+
+    let committed_result: Result[YazaDbWriteCommitV1, Text] = yaza_db_write_transaction_commit_v1(current)
+    if not result_is_ok(committed_result):
+        let message: Text = result_unwrap_error(committed_result)
+        yaza_db_sql_create_table_close_v1(current.storage, current.wal)
+        return err("YDBv1 CREATE TABLE commit requires recovery before reuse: " + message)
+    return ok(result_unwrap(committed_result))

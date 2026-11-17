@@ -1,0 +1,93 @@
+use "std/fs"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/session_v1"
+use "../yazabase/sql_executor_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/wal_v1"
+
+fn yazabase_session_point_select_bench_v1(root_path: Text) -> Result[Number, Text]:
+    let root: Number = root_open(root_path)?
+    let database_name: Text = "session-point-select.ydb"
+    let header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_from_text("sess-bench-uuid1"), 0, 1, 1, 0, 2, 1)
+    let empty_storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, database_name, header)?
+    let empty_closed: Boolean = yaza_db_storage_close_v1(empty_storage)?
+    if not empty_closed: return err("YDBv1 benchmark could not close its empty database")
+    let initialized: YazaDbCatalogBootstrapV1 = yaza_db_catalog_initialize_v1(root, database_name)?
+    let initialized_wal_closed: Boolean = yaza_db_wal_log_close_v1(initialized.wal)?
+    let initialized_storage_closed: Boolean = yaza_db_storage_close_v1(initialized.storage)?
+    if not initialized_wal_closed or not initialized_storage_closed: return err("YDBv1 benchmark could not close its initialized database")
+
+    var session: YazaDbSessionV1 = yaza_db_session_open_v1(root, database_name)?
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let create: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "CREATE TABLE point_probe (id BIGINT PRIMARY KEY, value BIGINT NOT NULL)", no_parameters)?
+    set session = create.session
+    let insert: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "INSERT INTO point_probe (id, value) VALUES (1, 9001)", no_parameters)?
+    set session = insert.session
+
+    let parameter: YazaSqlValueV1 = YazaSqlValueV1(4, 1, 0.0, false, "", bytes_empty(), false, -1, -1, false)
+    let parameters: List[YazaSqlValueV1] = [parameter]
+    let source: Text = "SELECT value FROM point_probe WHERE id = $1"
+    let warm: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, source, parameters)?
+    set session = warm.session
+    if not option_is_some(warm.statement.query_result): return err("YDBv1 benchmark warm-up did not return a row set")
+    let warm_query: YazaSqlQueryResultV1 = option_unwrap(warm.statement.query_result)
+    if list_count(warm_query.rows) != 1 or list_get(list_get(warm_query.rows, 0), 0).integer_value != 9001: return err("YDBv1 benchmark warm-up returned the wrong value")
+
+    let sample_result: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(sample_result): return err(result_unwrap_error(sample_result))
+    let samples: List[Number] = result_unwrap(sample_result)
+    if not list_try_reserve(samples, 9): return err("YDBv1 benchmark could not reserve its bounded sample list")
+    let profile_result: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(profile_result): return err(result_unwrap_error(profile_result))
+    let profile_ns: List[Number] = result_unwrap(profile_result)
+    var profile_slot: Number = 0
+    while profile_slot < 22:
+        if not list_try_push(profile_ns, 0): return err("YDBv1 benchmark could not initialize its bounded profile slots")
+        set profile_slot = profile_slot + 1
+    var checksum: Number = 0
+    var sample_index: Number = 0
+    while sample_index < 9:
+        let started_ns: Number = monotonic_ns()
+        var query_index: Number = 0
+        while query_index < 100:
+            let read: YazaDbSessionStatementV1 = yaza_db_session_execute_profiled_v1(session, source, parameters, profile_ns)?
+            set session = read.session
+            if not option_is_some(read.statement.query_result): return err("YDBv1 benchmark point SELECT returned no result set")
+            let result: YazaSqlQueryResultV1 = option_unwrap(read.statement.query_result)
+            if list_count(result.rows) != 1 or list_get(list_get(result.rows, 0), 0).integer_value != 9001: return err("YDBv1 benchmark point SELECT returned an incorrect value")
+            set checksum = checksum + list_get(list_get(result.rows, 0), 0).integer_value
+            set query_index = query_index + 1
+        let elapsed_ns: Number = monotonic_ns() - started_ns
+        if elapsed_ns <= 0: return err("YDBv1 benchmark monotonic clock did not advance")
+        if not list_try_push(samples, elapsed_ns / 100): return err("YDBv1 benchmark could not append its bounded latency sample")
+        set sample_index = sample_index + 1
+
+    var sort_index: Number = 0
+    while sort_index < list_count(samples):
+        var compare_index: Number = sort_index + 1
+        while compare_index < list_count(samples):
+            if list_get(samples, compare_index) < list_get(samples, sort_index):
+                let low_value: Number = list_get(samples, sort_index)
+                let high_value: Number = list_get(samples, compare_index)
+                let ignored_low: Boolean = list_try_set(samples, sort_index, high_value)
+                let ignored_high: Boolean = list_try_set(samples, compare_index, low_value)
+            set compare_index = compare_index + 1
+        set sort_index = sort_index + 1
+    let median_ns: Number = list_get(samples, 4)
+    let minimum_ns: Number = list_get(samples, 0)
+    let maximum_ns: Number = list_get(samples, list_count(samples) - 1)
+    say "warm_persistent_point_select_ns median=" + number_text(median_ns) + " min=" + number_text(minimum_ns) + " max=" + number_text(maximum_ns) + " samples=9 queries_per_sample=100"
+    say "warm_point_select_stage_ns lexer_catalog=" + number_text(list_get(profile_ns, 0) / 900) + " plan=" + number_text(list_get(profile_ns, 1) / 900) + " access=" + number_text(list_get(profile_ns, 2) / 900) + " materialize=" + number_text(list_get(profile_ns, 3) / 900)
+    say "warm_point_select_access_ns key_metadata=" + number_text(list_get(profile_ns, 4) / 900) + " primary_seek_and_row=" + number_text(list_get(profile_ns, 5) / 900) + " secondary_fallback=" + number_text(list_get(profile_ns, 6) / 900)
+    say "warm_point_select_detail_ns tuple_prepare=" + number_text(list_get(profile_ns, 14) / 900) + " key_encode=" + number_text(list_get(profile_ns, 15) / 900) + " btree_seek=" + number_text(list_get(profile_ns, 16) / 900) + " row_decode_verify=" + number_text(list_get(profile_ns, 17) / 900)
+    say "warm_point_select_seek_ns page_read=" + number_text(list_get(profile_ns, 18) / 900) + " page_header_crc=" + number_text(list_get(profile_ns, 19) / 900) + " allocation_role=" + number_text(list_get(profile_ns, 20) / 900) + " btree_route=" + number_text(list_get(profile_ns, 21) / 900)
+    say "verified_rows=" + number_text(checksum / 900)
+    let closed: Boolean = yaza_db_session_close_v1(session)?
+    if not closed: return err("YDBv1 benchmark could not close its SQL session")
+    return ok(0)
+
+start:
+    let result: Result[Number, Text] = yazabase_session_point_select_bench_v1(arg(1))
+    if not result_is_ok(result):
+        say "yazabase-session-point-select-bench-error: " + result_unwrap_error(result)
+        exit(1)

@@ -1,0 +1,96 @@
+# Provisional typed YIR for sequential printing and literal-bound range loops.
+use "hir"
+
+shape YirPrint:
+    value_name: Text
+    value_type: Text
+    text: Text
+    source_line: Number
+
+shape YirStatement:
+    kind: Text
+    loop_variable: Text
+    range_start: Number
+    range_end: Number
+    prints: List[YirPrint]
+    source_line: Number
+
+shape YirProgram:
+    statements: List[YirStatement]
+
+fn lower_hir_to_yir(program: HirProgram) -> YirProgram:
+    let statements: List[YirStatement] = List[YirStatement]()
+    var next_value: Number = 0
+    var index: Number = 0
+    while index < list_count(program.statements):
+        let statement: HirStatement = list_get(program.statements, index)
+        let prints: List[YirPrint] = List[YirPrint]()
+        if statement.kind == "say":
+            let value_name: Text = "%message" + number_text(next_value)
+            list_push(prints, YirPrint(value_name, "Text", statement.text, statement.source_line))
+            set next_value = next_value + 1
+            list_push(statements, YirStatement("say", "", 0, 0, prints, statement.source_line))
+        else:
+            if statement.kind == "range":
+                var body_index: Number = 0
+                while body_index < list_count(statement.body):
+                    let say: HirSay = list_get(statement.body, body_index)
+                    let value_name: Text = "%message" + number_text(next_value)
+                    list_push(prints, YirPrint(value_name, "Text", say.text, say.source_line))
+                    set next_value = next_value + 1
+                    set body_index = body_index + 1
+                list_push(statements, YirStatement("range", statement.loop_variable, statement.range_start, statement.range_end, prints, statement.source_line))
+            else:
+                fail("YIR lowering: unsupported HIR statement kind '" + statement.kind + "'")
+        set index = index + 1
+    return YirProgram(statements)
+
+fn verify_yir(program: YirProgram) -> Number:
+    if list_count(program.statements) == 0:
+        fail("YIR verifier: program must contain at least one statement")
+    var expected_value: Number = 0
+    var index: Number = 0
+    while index < list_count(program.statements):
+        let statement: YirStatement = list_get(program.statements, index)
+        if statement.kind != "say" and statement.kind != "range":
+            fail("YIR verifier: unknown statement kind")
+        if statement.kind == "say" and list_count(statement.prints) != 1:
+            fail("YIR verifier: a say statement must define exactly one Text value")
+        if statement.kind == "range" and (statement.loop_variable == "" or list_count(statement.prints) == 0):
+            fail("YIR verifier: range loop requires a variable and non-empty body")
+        var print_index: Number = 0
+        while print_index < list_count(statement.prints):
+            let instruction: YirPrint = list_get(statement.prints, print_index)
+            let expected_name: Text = "%message" + number_text(expected_value)
+            if instruction.value_name != expected_name:
+                fail("YIR verifier: values must be defined once in deterministic order")
+            if instruction.value_type != "Text":
+                fail("YIR verifier: println input must have type Text")
+            if instruction.source_line < 1:
+                fail("YIR verifier: source line must be positive")
+            set expected_value = expected_value + 1
+            set print_index = print_index + 1
+        set index = index + 1
+    return 0
+
+fn render_yir(program: YirProgram) -> Text:
+    var output: Text = "module @yaza_program\n\nfunc @main() -> i32 {\nentry:\n"
+    var index: Number = 0
+    while index < list_count(program.statements):
+        let statement: YirStatement = list_get(program.statements, index)
+        if statement.kind == "say":
+            let instruction: YirPrint = list_get(statement.prints, 0)
+            set output = output + "  " + instruction.value_name + ": Text = const.text \"" + instruction.text + "\"  ; source line " + number_text(instruction.source_line) + "\n"
+            set output = output + "  call @std.io.println(" + instruction.value_name + ")\n"
+        else:
+            set output = output + "  range " + statement.loop_variable + " = " + number_text(statement.range_start) + ".." + number_text(statement.range_end) + " {  ; source line " + number_text(statement.source_line) + "\n"
+            var print_index: Number = 0
+            while print_index < list_count(statement.prints):
+                let instruction: YirPrint = list_get(statement.prints, print_index)
+                set output = output + "    " + instruction.value_name + ": Text = const.text \"" + instruction.text + "\"  ; source line " + number_text(instruction.source_line) + "\n"
+                set output = output + "    call @std.io.println(" + instruction.value_name + ")\n"
+                set print_index = print_index + 1
+            set output = output + "  }\n"
+        set index = index + 1
+    set output = output + "  ret i32 0\n}\n"
+    return output

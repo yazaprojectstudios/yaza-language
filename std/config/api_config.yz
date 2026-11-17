@@ -1,0 +1,390 @@
+# YAZA API Configuration & Resource Profile Engine (Hardware-Aware Execution Phase 4)
+# Parses yaza.toml configuration, resolves named resource profiles (balanced, throughput, low_memory),
+# applies Adaptive Query Budgeting (AQB) arena parameters, validates resource invariants,
+# and formats human/JSON diagnostics for operator observability.
+
+use "std/convert"
+use "std/json"
+
+shape ApiResourcesConfig:
+    profile: Text
+    arena_mode: Text
+    process_arena_limit: Number
+    request_arena_initial: Number
+    request_arena_floor: Number
+    request_arena_ceiling: Number
+    max_in_flight: Number
+    max_query_work_units: Number
+    profile_source: Text
+    arena_mode_source: Text
+    process_limit_source: Text
+    request_initial_source: Text
+    request_floor_source: Text
+    request_ceiling_source: Text
+    max_in_flight_source: Text
+    work_units_source: Text
+
+shape ApiServiceConfig:
+    service_name: Text
+    bind_host: Text
+    bind_port: Number
+    default_response_format: Text
+    allowed_response_formats: TextList
+    max_request_body_bytes: Number
+    database_kind: Text
+    database_path: Text
+    database_username: Text
+    database_password: Text
+    resources: ApiResourcesConfig
+
+fn api_config_strip_quotes(raw: Text) -> Text:
+    let trimmed: Text = text_trim(raw)
+    let len: Number = text_length(trimmed)
+    if len >= 2 and text_byte(trimmed, 0) == 34 and text_byte(trimmed, len - 1) == 34:
+        return text_slice(trimmed, 1, len - 2)
+    return trimmed
+
+fn api_config_strip_comment(line: Text) -> Text:
+    var in_quotes: Boolean = false
+    var i: Number = 0
+    let len: Number = text_length(line)
+    while i < len:
+        let b: Number = text_byte(line, i)
+        if b == 34:
+            set in_quotes = not in_quotes
+        elif b == 35 and not in_quotes:
+            return text_slice(line, 0, i)
+        set i = i + 1
+    return line
+
+fn api_config_parse_byte_size(size_str: Text) -> Result[Number, Text]:
+    let clean: Text = text_trim(size_str)
+    if clean == "": return err("empty byte size")
+    let len: Number = text_length(clean)
+    if len > 3 and (text_slice(clean, len - 3, 3) == "GiB" or text_slice(clean, len - 3, 3) == "gib"):
+        let num_part: Text = text_trim(text_slice(clean, 0, len - 3))
+        let n_res: Result[Number, Text] = number_try_parse(num_part)
+        if not result_is_ok(n_res): return err("invalid number in GiB size: " + size_str)
+        return ok(result_unwrap(n_res) * 1073741824)
+    if len > 3 and (text_slice(clean, len - 3, 3) == "MiB" or text_slice(clean, len - 3, 3) == "mib"):
+        let num_part: Text = text_trim(text_slice(clean, 0, len - 3))
+        let n_res: Result[Number, Text] = number_try_parse(num_part)
+        if not result_is_ok(n_res): return err("invalid number in MiB size: " + size_str)
+        return ok(result_unwrap(n_res) * 1048576)
+    if len > 3 and (text_slice(clean, len - 3, 3) == "KiB" or text_slice(clean, len - 3, 3) == "kib"):
+        let num_part: Text = text_trim(text_slice(clean, 0, len - 3))
+        let n_res: Result[Number, Text] = number_try_parse(num_part)
+        if not result_is_ok(n_res): return err("invalid number in KiB size: " + size_str)
+        return ok(result_unwrap(n_res) * 1024)
+    if len > 2 and (text_slice(clean, len - 2, 2) == "GB" or text_slice(clean, len - 2, 2) == "gb"):
+        let num_part: Text = text_trim(text_slice(clean, 0, len - 2))
+        let n_res: Result[Number, Text] = number_try_parse(num_part)
+        if not result_is_ok(n_res): return err("invalid number in GB size: " + size_str)
+        return ok(result_unwrap(n_res) * 1073741824)
+    if len > 2 and (text_slice(clean, len - 2, 2) == "MB" or text_slice(clean, len - 2, 2) == "mb"):
+        let num_part: Text = text_trim(text_slice(clean, 0, len - 2))
+        let n_res: Result[Number, Text] = number_try_parse(num_part)
+        if not result_is_ok(n_res): return err("invalid number in MB size: " + size_str)
+        return ok(result_unwrap(n_res) * 1048576)
+    if len > 2 and (text_slice(clean, len - 2, 2) == "KB" or text_slice(clean, len - 2, 2) == "kb"):
+        let num_part: Text = text_trim(text_slice(clean, 0, len - 2))
+        let n_res: Result[Number, Text] = number_try_parse(num_part)
+        if not result_is_ok(n_res): return err("invalid number in KB size: " + size_str)
+        return ok(result_unwrap(n_res) * 1024)
+    if len > 1 and (text_slice(clean, len - 1, 1) == "B" or text_slice(clean, len - 1, 1) == "b"):
+        let num_part: Text = text_trim(text_slice(clean, 0, len - 1))
+        let n_res: Result[Number, Text] = number_try_parse(num_part)
+        if not result_is_ok(n_res): return err("invalid number in byte size: " + size_str)
+        return ok(result_unwrap(n_res))
+    let raw_res: Result[Number, Text] = number_try_parse(clean)
+    if not result_is_ok(raw_res): return err("invalid byte size format: " + size_str)
+    return ok(result_unwrap(raw_res))
+
+fn api_config_format_bytes(bytes_count: Number) -> Text:
+    if bytes_count >= 1073741824 and (bytes_count / 1073741824) * 1073741824 == bytes_count:
+        return number_text(bytes_count / 1073741824) + " GiB"
+    if bytes_count >= 1048576 and (bytes_count / 1048576) * 1048576 == bytes_count:
+        return number_text(bytes_count / 1048576) + " MiB"
+    if bytes_count >= 1024 and (bytes_count / 1024) * 1024 == bytes_count:
+        return number_text(bytes_count / 1024) + " KiB"
+    return number_text(bytes_count) + " B"
+
+fn api_resources_default_for_profile(profile_name: Text) -> Result[ApiResourcesConfig, Text]:
+    if profile_name == "balanced":
+        return ok(ApiResourcesConfig("balanced", "adaptive", 536870912, 1048576, 262144, 67108864, 32, 100000000, "default", "profile_default", "profile_default", "profile_default", "profile_default", "profile_default", "profile_default", "profile_default"))
+    if profile_name == "throughput":
+        return ok(ApiResourcesConfig("throughput", "adaptive", 2147483648, 4194304, 1048576, 268435456, 128, 500000000, "explicit", "profile_default", "profile_default", "profile_default", "profile_default", "profile_default", "profile_default", "profile_default"))
+    if profile_name == "low_memory":
+        return ok(ApiResourcesConfig("low_memory", "fixed", 134217728, 262144, 65536, 8388608, 8, 10000000, "explicit", "profile_default", "profile_default", "profile_default", "profile_default", "profile_default", "profile_default", "profile_default"))
+    return err("unknown resource profile '" + profile_name + "'; must be 'balanced', 'throughput', or 'low_memory'")
+
+fn api_resources_validate_invariants(res: ApiResourcesConfig) -> Result[Boolean, Text]:
+    if res.profile != "balanced" and res.profile != "throughput" and res.profile != "low_memory":
+        return err("invalid profile '" + res.profile + "'; expected 'balanced', 'throughput', or 'low_memory'")
+    if res.arena_mode != "adaptive" and res.arena_mode != "fixed":
+        return err("invalid arena_mode '" + res.arena_mode + "'; expected 'adaptive' or 'fixed'")
+    if res.request_arena_floor > res.request_arena_initial:
+        return err("request_arena_floor (" + number_text(res.request_arena_floor) + ") cannot exceed request_arena_initial (" + number_text(res.request_arena_initial) + ")")
+    if res.request_arena_initial > res.request_arena_ceiling:
+        return err("request_arena_initial (" + number_text(res.request_arena_initial) + ") cannot exceed request_arena_ceiling (" + number_text(res.request_arena_ceiling) + ")")
+    if res.request_arena_ceiling > res.process_arena_limit:
+        return err("request_arena_ceiling (" + number_text(res.request_arena_ceiling) + ") cannot exceed process_arena_limit (" + number_text(res.process_arena_limit) + ")")
+    if res.max_in_flight < 1:
+        return err("max_in_flight must be at least 1, got " + number_text(res.max_in_flight))
+    if res.max_query_work_units < 1:
+        return err("max_query_work_units must be at least 1, got " + number_text(res.max_query_work_units))
+    return ok(true)
+
+fn api_config_parse_string_list(raw: Text) -> TextList:
+    let result: TextList = text_list()
+    var clean: Text = text_trim(raw)
+    let len: Number = text_length(clean)
+    if len >= 2 and text_byte(clean, 0) == 91 and text_byte(clean, len - 1) == 93:
+        set clean = text_slice(clean, 1, len - 2)
+    let parts: TextList = text_split(clean, ",")
+    var i: Number = 0
+    while i < list_count(parts):
+        let item: Text = api_config_strip_quotes(text_trim(list_get(parts, i)))
+        if item != "":
+            list_push(result, item)
+        set i = i + 1
+    return result
+
+# Parses a yaza.toml content string into a fully resolved and validated ApiServiceConfig.
+fn api_config_parse(toml_content: Text) -> Result[ApiServiceConfig, Text]:
+    var service_name: Text = "yaza-service"
+    var bind_host: Text = "127.0.0.1"
+    var bind_port: Number = 8080
+    var default_response_format: Text = "json"
+    var allowed_response_formats: TextList = text_list()
+    list_push(allowed_response_formats, "json")
+    list_push(allowed_response_formats, "yaza")
+    list_push(allowed_response_formats, "ybif")
+    var max_request_body_bytes: Number = 65536
+    var database_kind: Text = "yazabase"
+    var database_path: Text = "./db/service.ydb"
+    let env_db_user: Text = env_get("YAZABASE_USER")
+    var database_username: Text = ""
+    if text_length(env_db_user) > 0:
+        set database_username = env_db_user
+    let env_db_pass: Text = env_get("YAZABASE_PASSWORD")
+    var database_password: Text = ""
+    if text_length(env_db_pass) > 0:
+        set database_password = env_db_pass
+
+    var current_section: Text = ""
+    var profile_name: Text = "balanced"
+    var explicit_profile: Boolean = false
+
+    # Explicit override trackers for resources
+    var has_arena_mode: Boolean = false
+    var ov_arena_mode: Text = ""
+    var has_process_limit: Boolean = false
+    var ov_process_limit: Number = 0
+    var has_request_initial: Boolean = false
+    var ov_request_initial: Number = 0
+    var has_request_floor: Boolean = false
+    var ov_request_floor: Number = 0
+    var has_request_ceiling: Boolean = false
+    var ov_request_ceiling: Number = 0
+    var has_max_in_flight: Boolean = false
+    var ov_max_in_flight: Number = 0
+    var has_work_units: Boolean = false
+    var ov_work_units: Number = 0
+
+    let lines: TextList = text_lines(toml_content)
+    var line_idx: Number = 0
+    let line_count: Number = list_count(lines)
+
+    while line_idx < line_count:
+        let raw_line: Text = list_get(lines, line_idx)
+        let clean_line: Text = text_trim(api_config_strip_comment(raw_line))
+        set line_idx = line_idx + 1
+
+        if clean_line != "":
+            if text_starts_with(clean_line, "[") and text_byte(clean_line, text_length(clean_line) - 1) == 93:
+                set current_section = text_slice(clean_line, 1, text_length(clean_line) - 2)
+            else:
+                let eq_pos: Number = text_find(clean_line, "=")
+                if eq_pos > 0:
+                    let key: Text = text_trim(text_slice(clean_line, 0, eq_pos))
+                    let val_raw: Text = text_trim(text_slice(clean_line, eq_pos + 1, text_length(clean_line) - eq_pos - 1))
+                    let val_str: Text = api_config_strip_quotes(val_raw)
+
+                    if current_section == "service":
+                        if key == "name": set service_name = val_str
+                    elif current_section == "api":
+                        if key == "bind":
+                            let colon_pos: Number = text_find(val_str, ":")
+                            if colon_pos > 0:
+                                set bind_host = text_slice(val_str, 0, colon_pos)
+                                let p_res: Result[Number, Text] = number_try_parse(text_slice(val_str, colon_pos + 1, text_length(val_str) - colon_pos - 1))
+                                if result_is_ok(p_res): set bind_port = result_unwrap(p_res)
+                            else:
+                                set bind_host = val_str
+                        elif key == "default_response_format":
+                            set default_response_format = val_str
+                        elif key == "allowed_response_formats":
+                            set allowed_response_formats = api_config_parse_string_list(val_raw)
+                        elif key == "max_request_body_bytes":
+                            let sz_res: Result[Number, Text] = api_config_parse_byte_size(val_str)
+                            if not result_is_ok(sz_res): return err("invalid max_request_body_bytes: " + result_unwrap_error(sz_res))
+                            set max_request_body_bytes = result_unwrap(sz_res)
+                    elif current_section == "database":
+                        if key == "kind" or key == "provider": set database_kind = val_str
+                        elif key == "path": set database_path = val_str
+                        elif key == "username" or key == "user":
+                            if text_length(env_db_user) == 0 and text_length(val_str) > 0:
+                                set database_username = val_str
+                        elif key == "password":
+                            if text_length(env_db_pass) == 0 and text_length(val_str) > 0:
+                                set database_password = val_str
+                    elif current_section == "api.resources":
+                        if key == "profile":
+                            set profile_name = val_str
+                            set explicit_profile = true
+                        elif key == "arena_mode":
+                            set has_arena_mode = true
+                            set ov_arena_mode = val_str
+                        elif key == "process_arena_limit":
+                            let sz_res: Result[Number, Text] = api_config_parse_byte_size(val_str)
+                            if not result_is_ok(sz_res): return err("invalid process_arena_limit: " + result_unwrap_error(sz_res))
+                            set has_process_limit = true
+                            set ov_process_limit = result_unwrap(sz_res)
+                        elif key == "request_arena_initial":
+                            let sz_res: Result[Number, Text] = api_config_parse_byte_size(val_str)
+                            if not result_is_ok(sz_res): return err("invalid request_arena_initial: " + result_unwrap_error(sz_res))
+                            set has_request_initial = true
+                            set ov_request_initial = result_unwrap(sz_res)
+                        elif key == "request_arena_floor":
+                            let sz_res: Result[Number, Text] = api_config_parse_byte_size(val_str)
+                            if not result_is_ok(sz_res): return err("invalid request_arena_floor: " + result_unwrap_error(sz_res))
+                            set has_request_floor = true
+                            set ov_request_floor = result_unwrap(sz_res)
+                        elif key == "request_arena_ceiling":
+                            let sz_res: Result[Number, Text] = api_config_parse_byte_size(val_str)
+                            if not result_is_ok(sz_res): return err("invalid request_arena_ceiling: " + result_unwrap_error(sz_res))
+                            set has_request_ceiling = true
+                            set ov_request_ceiling = result_unwrap(sz_res)
+                        elif key == "max_in_flight":
+                            let n_res: Result[Number, Text] = number_try_parse(val_str)
+                            if not result_is_ok(n_res): return err("invalid max_in_flight: " + val_str)
+                            set has_max_in_flight = true
+                            set ov_max_in_flight = result_unwrap(n_res)
+                        elif key == "max_query_work_units":
+                            let n_res: Result[Number, Text] = number_try_parse(val_str)
+                            if not result_is_ok(n_res): return err("invalid max_query_work_units: " + val_str)
+                            set has_work_units = true
+                            set ov_work_units = result_unwrap(n_res)
+                        elif key == "workers" or key == "worker_threads" or key == "event_loop" or key == "io_vectorization":
+                            let _accepted_runtime_hint: Text = val_str
+                        else:
+                            return err("unknown resource setting '" + key + "' in [api.resources]")
+
+    # Resolve profile defaults
+    let def_res: Result[ApiResourcesConfig, Text] = api_resources_default_for_profile(profile_name)
+    if not result_is_ok(def_res): return err(result_unwrap_error(def_res))
+    var base_res: ApiResourcesConfig = result_unwrap(def_res)
+    if explicit_profile:
+        set base_res.profile_source = "explicit"
+
+    # Apply explicit overrides
+    if has_arena_mode:
+        set base_res.arena_mode = ov_arena_mode
+        set base_res.arena_mode_source = "explicit"
+    if has_process_limit:
+        set base_res.process_arena_limit = ov_process_limit
+        set base_res.process_limit_source = "explicit"
+    if has_request_initial:
+        set base_res.request_arena_initial = ov_request_initial
+        set base_res.request_initial_source = "explicit"
+    if has_request_floor:
+        set base_res.request_arena_floor = ov_request_floor
+        set base_res.request_floor_source = "explicit"
+    if has_request_ceiling:
+        set base_res.request_arena_ceiling = ov_request_ceiling
+        set base_res.request_ceiling_source = "explicit"
+    if has_max_in_flight:
+        set base_res.max_in_flight = ov_max_in_flight
+        set base_res.max_in_flight_source = "explicit"
+    if has_work_units:
+        set base_res.max_query_work_units = ov_work_units
+        set base_res.work_units_source = "explicit"
+
+    # Validate all invariants
+    let inv_res: Result[Boolean, Text] = api_resources_validate_invariants(base_res)
+    if not result_is_ok(inv_res): return err(result_unwrap_error(inv_res))
+
+    return ok(ApiServiceConfig(service_name, bind_host, bind_port, default_response_format, allowed_response_formats, max_request_body_bytes, database_kind, database_path, database_username, database_password, base_res))
+
+fn api_config_format_diagnostics(config: ApiServiceConfig) -> Text:
+    let r: ApiResourcesConfig = config.resources
+    var out: Text = "YAZA API Configuration & Resource Profile Diagnostics\n"
+    set out = out + "=====================================================\n"
+    set out = out + "Service:\n"
+    set out = out + "  Name                    : " + config.service_name + "\n"
+    set out = out + "  Bind                    : " + config.bind_host + ":" + number_text(config.bind_port) + "\n"
+    set out = out + "  Max Request Body        : " + number_text(config.max_request_body_bytes) + " bytes (" + api_config_format_bytes(config.max_request_body_bytes) + ")\n"
+    set out = out + "  Default Response Format : " + config.default_response_format + "\n"
+    set out = out + "  Allowed Formats         : " + text_join(config.allowed_response_formats, ", ") + "\n"
+    set out = out + "Database:\n"
+    set out = out + "  Kind                    : " + config.database_kind + "\n"
+    set out = out + "  Path                    : " + config.database_path + "\n"
+    set out = out + "  Username                : " + config.database_username + "\n"
+    set out = out + "Resource Envelope (AQB):\n"
+    set out = out + "  Selected Profile        : " + r.profile + " [" + r.profile_source + "]\n"
+    set out = out + "  Arena Budget Mode       : " + r.arena_mode + " [" + r.arena_mode_source + "]\n"
+    set out = out + "  Process Arena Limit     : " + number_text(r.process_arena_limit) + " bytes (" + api_config_format_bytes(r.process_arena_limit) + ") [" + r.process_limit_source + "]\n"
+    set out = out + "  Request Arena Initial   : " + number_text(r.request_arena_initial) + " bytes (" + api_config_format_bytes(r.request_arena_initial) + ") [" + r.request_initial_source + "]\n"
+    set out = out + "  Request Arena Floor     : " + number_text(r.request_arena_floor) + " bytes (" + api_config_format_bytes(r.request_arena_floor) + ") [" + r.request_floor_source + "]\n"
+    set out = out + "  Request Arena Ceiling   : " + number_text(r.request_arena_ceiling) + " bytes (" + api_config_format_bytes(r.request_arena_ceiling) + ") [" + r.request_ceiling_source + "]\n"
+    set out = out + "  Max Concurrency (Slots) : " + number_text(r.max_in_flight) + " in-flight [" + r.max_in_flight_source + "]\n"
+    set out = out + "  Max Query Work Units    : " + number_text(r.max_query_work_units) + " units [" + r.work_units_source + "]\n"
+    set out = out + "  Invariant Verification  : PASS (floor <= initial <= ceiling <= process_limit)"
+    return out
+
+fn api_config_to_json(config: ApiServiceConfig) -> Text:
+    let r: ApiResourcesConfig = config.resources
+    let formats_json: List[Text] = List[Text]()
+    var i: Number = 0
+    while i < list_count(config.allowed_response_formats):
+        list_push(formats_json, json_string(list_get(config.allowed_response_formats, i)))
+        set i = i + 1
+
+    var out: Text = "{"
+    set out = out + "\"schema\":\"yaza.api_config\","
+    set out = out + "\"schema_version\":1,"
+    set out = out + "\"service\":{"
+    set out = out + "\"name\":\"" + json_escape_text(config.service_name) + "\","
+    set out = out + "\"bind_host\":\"" + json_escape_text(config.bind_host) + "\","
+    set out = out + "\"bind_port\":" + number_text(config.bind_port) + ","
+    set out = out + "\"default_response_format\":\"" + json_escape_text(config.default_response_format) + "\","
+    set out = out + "\"allowed_response_formats\":" + json_array(formats_json) + ","
+    set out = out + "\"max_request_body_bytes\":" + number_text(config.max_request_body_bytes)
+    set out = out + "},"
+    set out = out + "\"database\":{"
+    set out = out + "\"kind\":\"" + json_escape_text(config.database_kind) + "\","
+    set out = out + "\"path\":\"" + json_escape_text(config.database_path) + "\","
+    set out = out + "\"username\":\"" + json_escape_text(config.database_username) + "\""
+    set out = out + "},"
+    set out = out + "\"resources\":{"
+    set out = out + "\"profile\":\"" + json_escape_text(r.profile) + "\","
+    set out = out + "\"profile_source\":\"" + json_escape_text(r.profile_source) + "\","
+    set out = out + "\"arena_mode\":\"" + json_escape_text(r.arena_mode) + "\","
+    set out = out + "\"arena_mode_source\":\"" + json_escape_text(r.arena_mode_source) + "\","
+    set out = out + "\"process_arena_limit_bytes\":" + number_text(r.process_arena_limit) + ","
+    set out = out + "\"process_limit_source\":\"" + json_escape_text(r.process_limit_source) + "\","
+    set out = out + "\"request_arena_initial_bytes\":" + number_text(r.request_arena_initial) + ","
+    set out = out + "\"request_initial_source\":\"" + json_escape_text(r.request_initial_source) + "\","
+    set out = out + "\"request_arena_floor_bytes\":" + number_text(r.request_arena_floor) + ","
+    set out = out + "\"request_floor_source\":\"" + json_escape_text(r.request_floor_source) + "\","
+    set out = out + "\"request_arena_ceiling_bytes\":" + number_text(r.request_arena_ceiling) + ","
+    set out = out + "\"request_ceiling_source\":\"" + json_escape_text(r.request_ceiling_source) + "\","
+    set out = out + "\"max_in_flight\":" + number_text(r.max_in_flight) + ","
+    set out = out + "\"max_in_flight_source\":\"" + json_escape_text(r.max_in_flight_source) + "\","
+    set out = out + "\"max_query_work_units\":" + number_text(r.max_query_work_units) + ","
+    set out = out + "\"work_units_source\":\"" + json_escape_text(r.work_units_source) + "\","
+    set out = out + "\"invariants_valid\":true"
+    set out = out + "}"
+    set out = out + "}"
+    return out

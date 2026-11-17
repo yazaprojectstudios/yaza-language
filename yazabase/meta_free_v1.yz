@@ -1,0 +1,57 @@
+# Provisional YDBv1 META/FREE page codecs.
+# The architecture PDF assigns page-type IDs but does not define their payloads.
+use "./page_v1"
+
+shape YazaDbMetaPageV1:
+    header: YazaDbPageHeaderV1
+    kind: Number
+    payload_version: Number
+    payload: Bytes
+
+fn yaza_db_meta_page_envelope_size_v1() -> Number:
+    return 16
+
+fn yaza_db_meta_page_max_payload_v1() -> Number:
+    return yaza_db_page_size_v1() - yaza_db_page_header_size_v1() - yaza_db_meta_page_envelope_size_v1()
+
+fn yaza_db_meta_page_encode_v1(page_id: Number, page_lsn: Number, kind: Number, payload_version: Number, payload: Bytes) -> Result[Bytes, Text]:
+    let payload_length: Number = bytes_length(payload)
+    if kind < 1 or kind > 65535: return err("YDBv1 META kind must be a non-zero u16")
+    if payload_version != 1: return err("YDBv1 META payload version is unsupported")
+    if payload_length > yaza_db_meta_page_max_payload_v1(): return err("YDBv1 META payload exceeds one page")
+    let total_length: Number = yaza_db_meta_page_envelope_size_v1() + payload_length
+    let data_start: Number = yaza_db_page_size_v1() - total_length
+    let page: Bytes = yaza_db_page_new_v1(page_id, page_lsn, 4, 0)?
+    if not yaza_db_write_uint_le_v1(page, 16, total_length, 2): return err("YDBv1 META occupied length could not be written")
+    if not yaza_db_write_uint_le_v1(page, 18, data_start, 2): return err("YDBv1 META payload offset could not be written")
+    if not yaza_db_write_bytes_v1(page, data_start, bytes_from_text("YMET")): return err("YDBv1 META magic could not be written")
+    if not yaza_db_write_uint_le_v1(page, data_start + 4, kind, 2): return err("YDBv1 META kind could not be written")
+    if not yaza_db_write_uint_le_v1(page, data_start + 6, payload_version, 2): return err("YDBv1 META payload version could not be written")
+    if not yaza_db_write_uint_le_v1(page, data_start + 8, payload_length, 4): return err("YDBv1 META payload length could not be written")
+    if not yaza_db_write_uint_le_v1(page, data_start + 12, 0, 4): return err("YDBv1 META reserved bytes could not be cleared")
+    if not yaza_db_write_bytes_v1(page, data_start + yaza_db_meta_page_envelope_size_v1(), payload): return err("YDBv1 META payload could not be copied")
+    return yaza_db_page_finalize_v1(page)
+
+fn yaza_db_meta_page_decode_v1(page: Bytes, expected_page_id: Number) -> Result[YazaDbMetaPageV1, Text]:
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, expected_page_id)?
+    if header.page_type != 4: return err("YDBv1 page is not a META page")
+    let magic: Bytes = bytes_try_slice(page, header.data_start, 4)?
+    if not bytes_equal(magic, bytes_from_text("YMET")): return err("YDBv1 META magic is invalid")
+    let kind: Number = yaza_db_read_uint_le_v1(page, header.data_start + 4, 2)?
+    let payload_version: Number = yaza_db_read_uint_le_v1(page, header.data_start + 6, 2)?
+    let payload_length: Number = yaza_db_read_uint_le_v1(page, header.data_start + 8, 4)?
+    let reserved: Number = yaza_db_read_uint_le_v1(page, header.data_start + 12, 4)?
+    if kind == 0 or payload_version != 1 or reserved != 0: return err("YDBv1 META envelope fields are invalid")
+    if payload_length != header.space_used - yaza_db_meta_page_envelope_size_v1(): return err("YDBv1 META payload length does not match the page")
+    if payload_length > yaza_db_meta_page_max_payload_v1(): return err("YDBv1 META payload exceeds one page")
+    let payload: Bytes = bytes_try_slice(page, header.data_start + yaza_db_meta_page_envelope_size_v1(), payload_length)?
+    return ok(YazaDbMetaPageV1(header, kind, payload_version, payload))
+
+fn yaza_db_free_page_encode_v1(page_id: Number, page_lsn: Number) -> Result[Bytes, Text]:
+    let page: Bytes = yaza_db_page_new_v1(page_id, page_lsn, 6, 0)?
+    return yaza_db_page_finalize_v1(page)
+
+fn yaza_db_free_page_validate_v1(page: Bytes, expected_page_id: Number) -> Result[YazaDbPageHeaderV1, Text]:
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, expected_page_id)?
+    if header.page_type != 6: return err("YDBv1 page is not a FREE page")
+    return ok(header)

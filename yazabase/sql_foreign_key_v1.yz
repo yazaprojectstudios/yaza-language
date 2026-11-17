@@ -1,0 +1,206 @@
+# Bounded, persisted single-column FOREIGN KEY checks for Phase 3 DML.
+# Targets must be one-column PRIMARY KEYs; NULL child values are permitted;
+# delete behavior is RESTRICT. Other actions and composite keys are rejected.
+use "./catalog_schema_v1"
+use "./catalog_snapshot_v1"
+use "./query_v1"
+use "./sql_executor_v1"
+
+shape YazaDbSqlForeignKeyV1:
+    constraint_id: Number
+    table_id: Number
+    local_column_ordinal: Number
+    referenced_table_id: Number
+    referenced_column_ordinal: Number
+
+fn yaza_db_sql_foreign_key_parse_nonnegative_v1(value: Text, maximum: Number) -> Result[Number, Text]:
+    if text_length(value) < 1 or maximum < 0: return err("YDBv1 FOREIGN KEY catalog integer is empty or has an invalid bound")
+    var parsed: Number = 0
+    var index: Number = 0
+    while index < text_length(value):
+        let byte: Number = text_byte(value, index)
+        if byte < 48 or byte > 57: return err("YDBv1 FOREIGN KEY catalog integer is not canonical unsigned decimal text")
+        let digit: Number = byte - 48
+        if parsed > maximum / 10 or parsed * 10 + digit > maximum: return err("YDBv1 FOREIGN KEY catalog integer exceeds its bound")
+        set parsed = parsed * 10 + digit
+        set index = index + 1
+    if number_text(parsed) != value: return err("YDBv1 FOREIGN KEY catalog integer is not canonical")
+    return ok(parsed)
+
+fn yaza_db_sql_foreign_key_parse_reference_v1(value: Text) -> Result[List[Number], Text]:
+    var separator: Number = -1
+    var index: Number = 0
+    while index < text_length(value):
+        if text_byte(value, index) == 58:
+            if separator >= 0: return err("YDBv1 FOREIGN KEY reference contains multiple separators")
+            set separator = index
+        set index = index + 1
+    if separator < 1 or separator >= text_length(value) - 1: return err("YDBv1 FOREIGN KEY reference is malformed")
+    let table_text: Text = text_slice(value, 0, separator)
+    let column_text: Text = text_slice(value, separator + 1, text_length(value) - separator - 1)
+    let table_id: Number = yaza_db_sql_foreign_key_parse_nonnegative_v1(table_text, yaza_db_catalog_max_object_id_v1())?
+    let column_ordinal: Number = yaza_db_sql_foreign_key_parse_nonnegative_v1(column_text, 1023)?
+    return ok([table_id, column_ordinal])
+
+fn yaza_db_sql_foreign_key_load_v1(file: Number, file_header: YazaDbFileHeaderV1, loaded: YazaDbCatalogSnapshotWithRootsV1) -> Result[List[YazaDbSqlForeignKeyV1], Text]:
+    let foreign_keys_created: Result[List[YazaDbSqlForeignKeyV1], Text] = list_try_new()
+    if not result_is_ok(foreign_keys_created): return err(result_unwrap_error(foreign_keys_created))
+    let foreign_keys: List[YazaDbSqlForeignKeyV1] = result_unwrap(foreign_keys_created)
+    let constraint_schema: List[YazaSqlColumnSchemaV1] = yaza_db_catalog_table_schema_v1(4)?
+    let constraint_keys: List[Number] = [0]
+    let stored_constraints: List[YazaDbRowV1] = yaza_db_catalog_snapshot_read_tree_v1(file, file_header, loaded.catalog.sys_constraints_root, constraint_schema, constraint_keys, loaded.sql_snapshot.version, yaza_db_catalog_max_object_id_v1())?
+    if list_count(stored_constraints) > yaza_db_catalog_max_object_id_v1(): return err("YDBv1 FOREIGN KEY catalog scan exceeded the object-ID bound")
+    var row_index: Number = 0
+    while row_index < list_count(stored_constraints):
+        let row: YazaDbRowV1 = list_get(stored_constraints, row_index)
+        if list_count(row.values) != 6 or list_count(row.nulls) != 6 or row.version_ts < 1 or row.version_ts > loaded.sql_snapshot.version: return err("YDBv1 sys_constraints row is malformed or has an invalid version")
+        if list_get(row.nulls, 0) or list_get(row.nulls, 1) or list_get(row.nulls, 2) or list_get(row.nulls, 3) or list_get(row.nulls, 4): return err("YDBv1 sys_constraints required fields contain NULL")
+        let kind: Number = list_get(row.values, 3).integer_value
+        if kind == 3:
+            if list_get(row.nulls, 5): return err("YDBv1 FOREIGN KEY catalog row lacks its referenced-key metadata")
+            let constraint_id: Number = list_get(row.values, 0).integer_value
+            let table_id: Number = list_get(row.values, 1).integer_value
+            let local_text: Text = list_get(row.values, 4).text_value
+            let reference_text: Text = list_get(row.values, 5).text_value
+            let local_ordinal: Number = yaza_db_sql_foreign_key_parse_nonnegative_v1(local_text, 1023)?
+            let reference: List[Number] = yaza_db_sql_foreign_key_parse_reference_v1(reference_text)?
+            let referenced_table_id: Number = list_get(reference, 0)
+            let referenced_column_ordinal: Number = list_get(reference, 1)
+            if constraint_id < 1 or table_id <= 4 or referenced_table_id <= 4: return err("YDBv1 FOREIGN KEY catalog identity is invalid")
+            let child_index: Number = yaza_db_catalog_snapshot_table_index_v1(loaded.sql_snapshot.tables, table_id)
+            let parent_index: Number = yaza_db_catalog_snapshot_table_index_v1(loaded.sql_snapshot.tables, referenced_table_id)
+            if child_index < 0 or parent_index < 0: return err("YDBv1 FOREIGN KEY references a missing or non-physical table")
+            let child_table: YazaSqlTableSchemaV1 = list_get(loaded.sql_snapshot.tables, child_index)
+            let parent_table: YazaSqlTableSchemaV1 = list_get(loaded.sql_snapshot.tables, parent_index)
+            if local_ordinal >= list_count(child_table.columns) or referenced_column_ordinal >= list_count(parent_table.columns): return err("YDBv1 FOREIGN KEY column ordinal exceeds its table schema")
+            let child_column: YazaSqlColumnSchemaV1 = list_get(child_table.columns, local_ordinal)
+            let parent_column: YazaSqlColumnSchemaV1 = list_get(parent_table.columns, referenced_column_ordinal)
+            if child_column.type_id != parent_column.type_id or child_column.precision != parent_column.precision or child_column.scale != parent_column.scale: return err("YDBv1 FOREIGN KEY catalog links columns with incompatible types")
+            var prior_index: Number = 0
+            while prior_index < list_count(foreign_keys):
+                let prior: YazaDbSqlForeignKeyV1 = list_get(foreign_keys, prior_index)
+                if prior.constraint_id == constraint_id: return err("YDBv1 FOREIGN KEY catalog contains a duplicate constraint identity")
+                set prior_index = prior_index + 1
+            if not list_try_push(foreign_keys, YazaDbSqlForeignKeyV1(constraint_id, table_id, local_ordinal, referenced_table_id, referenced_column_ordinal)): return err("YDBv1 FOREIGN KEY catalog could not retain a constraint")
+        elif kind != 1 and kind != 2 and kind != 4:
+            return err("YDBv1 sys_constraints contains an unsupported constraint kind")
+        set row_index = row_index + 1
+    return ok(foreign_keys)
+
+fn yaza_db_sql_foreign_key_select_matches_v1(file: Number, file_header: YazaDbFileHeaderV1, table: YazaSqlTableSchemaV1, column_ordinal: Number, values: List[YazaSqlValueV1]) -> Result[List[List[YazaSqlValueV1]], Text]:
+    if column_ordinal < 0 or column_ordinal >= list_count(table.columns) or list_count(values) < 1 or list_count(values) > 900: return err("YDBv1 FOREIGN KEY lookup is outside its bounded column or parameter profile")
+    let column: YazaSqlColumnSchemaV1 = list_get(table.columns, column_ordinal)
+    let source_parts_created: Result[TextList, Text] = text_list_try_new()
+    let parameter_values_created: Result[List[YazaSqlValueV1], Text] = list_try_new()
+    if not result_is_ok(source_parts_created) or not result_is_ok(parameter_values_created): return err("YDBv1 FOREIGN KEY lookup could not allocate query metadata")
+    let source_parts: TextList = result_unwrap(source_parts_created)
+    let parameters: List[YazaSqlValueV1] = result_unwrap(parameter_values_created)
+    if not list_try_reserve(source_parts, list_count(values) * 2 + 5) or not list_try_reserve(parameters, list_count(values)): return err("YDBv1 FOREIGN KEY lookup could not reserve query metadata")
+    if not list_try_push(source_parts, "SELECT \"") or not list_try_push(source_parts, column.name) or not list_try_push(source_parts, "\" FROM \"") or not list_try_push(source_parts, table.name) or not list_try_push(source_parts, "\" WHERE \"") or not list_try_push(source_parts, column.name) or not list_try_push(source_parts, "\" IN ("): return err("YDBv1 FOREIGN KEY lookup could not build its identifier list")
+    var value_index: Number = 0
+    while value_index < list_count(values):
+        let value: YazaSqlValueV1 = list_get(values, value_index)
+        if value.is_null or value.type_id != column.type_id: return err("YDBv1 FOREIGN KEY lookup value is NULL or has the wrong type")
+        if value_index > 0 and not list_try_push(source_parts, ", "): return err("YDBv1 FOREIGN KEY lookup could not separate parameters")
+        if not list_try_push(source_parts, "$" + number_text(value_index + 1)) or not list_try_push(parameters, value): return err("YDBv1 FOREIGN KEY lookup could not append a parameter")
+        set value_index = value_index + 1
+    if not list_try_push(source_parts, ")"): return err("YDBv1 FOREIGN KEY lookup could not finish its source")
+    let source: Text = text_try_join(source_parts, "")?
+    let query: YazaSqlQueryResultV1 = yaza_db_execute_select_v1(file, file_header, source, parameters)?
+    return ok(query.rows)
+
+fn yaza_db_sql_foreign_key_validate_rows_v1(file: Number, file_header: YazaDbFileHeaderV1, loaded: YazaDbCatalogSnapshotWithRootsV1, table_id: Number, rows: List[List[YazaSqlValueV1]]) -> Result[Boolean, Text]:
+    if list_count(rows) > 900: return err("YDBv1 FOREIGN KEY validation exceeds the 900-row atomic write bound")
+    let foreign_keys: List[YazaDbSqlForeignKeyV1] = yaza_db_sql_foreign_key_load_v1(file, file_header, loaded)?
+    var foreign_index: Number = 0
+    while foreign_index < list_count(foreign_keys):
+        let foreign_key: YazaDbSqlForeignKeyV1 = list_get(foreign_keys, foreign_index)
+        if foreign_key.table_id == table_id:
+            let child_table_index: Number = yaza_db_catalog_snapshot_table_index_v1(loaded.sql_snapshot.tables, table_id)
+            let parent_table_index: Number = yaza_db_catalog_snapshot_table_index_v1(loaded.sql_snapshot.tables, foreign_key.referenced_table_id)
+            if child_table_index < 0 or parent_table_index < 0: return err("YDBv1 FOREIGN KEY validation references a missing table")
+            let child_table: YazaSqlTableSchemaV1 = list_get(loaded.sql_snapshot.tables, child_table_index)
+            let parent_table: YazaSqlTableSchemaV1 = list_get(loaded.sql_snapshot.tables, parent_table_index)
+            let candidates_created: Result[List[YazaSqlValueV1], Text] = list_try_new()
+            if not result_is_ok(candidates_created): return err(result_unwrap_error(candidates_created))
+            let candidates: List[YazaSqlValueV1] = result_unwrap(candidates_created)
+            if not list_try_reserve(candidates, list_count(rows)): return err("YDBv1 FOREIGN KEY validation could not reserve child key values")
+            var row_index: Number = 0
+            while row_index < list_count(rows):
+                let row: List[YazaSqlValueV1] = list_get(rows, row_index)
+                if list_count(row) != list_count(child_table.columns) or foreign_key.local_column_ordinal >= list_count(row): return err("YDBv1 FOREIGN KEY validation received a malformed child row")
+                let value: YazaSqlValueV1 = list_get(row, foreign_key.local_column_ordinal)
+                let child_column: YazaSqlColumnSchemaV1 = list_get(child_table.columns, foreign_key.local_column_ordinal)
+                if value.type_id != child_column.type_id: return err("YDBv1 FOREIGN KEY child value differs from its schema type")
+                if not value.is_null and not list_try_push(candidates, value): return err("YDBv1 FOREIGN KEY validation could not retain a child key")
+                set row_index = row_index + 1
+            var candidate_start: Number = 0
+            while candidate_start < list_count(candidates):
+                var count: Number = 900
+                if list_count(candidates) - candidate_start < count: set count = list_count(candidates) - candidate_start
+                let chunk_created: Result[List[YazaSqlValueV1], Text] = list_try_new()
+                if not result_is_ok(chunk_created): return err(result_unwrap_error(chunk_created))
+                let chunk: List[YazaSqlValueV1] = result_unwrap(chunk_created)
+                if not list_try_reserve(chunk, count): return err("YDBv1 FOREIGN KEY validation could not reserve a lookup chunk")
+                var chunk_index: Number = 0
+                while chunk_index < count:
+                    if not list_try_push(chunk, list_get(candidates, candidate_start + chunk_index)): return err("YDBv1 FOREIGN KEY validation could not build a lookup chunk")
+                    set chunk_index = chunk_index + 1
+                let matches: List[List[YazaSqlValueV1]] = yaza_db_sql_foreign_key_select_matches_v1(file, file_header, parent_table, foreign_key.referenced_column_ordinal, chunk)?
+                var candidate_index: Number = 0
+                while candidate_index < list_count(chunk):
+                    let candidate: YazaSqlValueV1 = list_get(chunk, candidate_index)
+                    var found: Boolean = false
+                    var match_index: Number = 0
+                    while match_index < list_count(matches):
+                        let match_row: List[YazaSqlValueV1] = list_get(matches, match_index)
+                        if list_count(match_row) != 1: return err("YDBv1 FOREIGN KEY parent lookup returned a malformed row")
+                        if yaza_sql_executor_compare_values_v1("", candidate, list_get(match_row, 0)) == 0: set found = true
+                        set match_index = match_index + 1
+                    if not found: return err("YDBv1 FOREIGN KEY rejects a child value without a matching parent primary key")
+                    set candidate_index = candidate_index + 1
+                set candidate_start = candidate_start + count
+        set foreign_index = foreign_index + 1
+    return ok(true)
+
+fn yaza_db_sql_foreign_key_restrict_delete_v1(file: Number, file_header: YazaDbFileHeaderV1, loaded: YazaDbCatalogSnapshotWithRootsV1, table_id: Number, deleted_rows: List[List[YazaSqlValueV1]]) -> Result[Boolean, Text]:
+    if list_count(deleted_rows) > 65536: return err("YDBv1 FOREIGN KEY delete restriction exceeds the bounded delete row profile")
+    let foreign_keys: List[YazaDbSqlForeignKeyV1] = yaza_db_sql_foreign_key_load_v1(file, file_header, loaded)?
+    var foreign_index: Number = 0
+    while foreign_index < list_count(foreign_keys):
+        let foreign_key: YazaDbSqlForeignKeyV1 = list_get(foreign_keys, foreign_index)
+        if foreign_key.referenced_table_id == table_id:
+            let child_table_index: Number = yaza_db_catalog_snapshot_table_index_v1(loaded.sql_snapshot.tables, foreign_key.table_id)
+            let parent_table_index: Number = yaza_db_catalog_snapshot_table_index_v1(loaded.sql_snapshot.tables, table_id)
+            if child_table_index < 0 or parent_table_index < 0: return err("YDBv1 FOREIGN KEY delete restriction references a missing table")
+            let child_table: YazaSqlTableSchemaV1 = list_get(loaded.sql_snapshot.tables, child_table_index)
+            let parent_table: YazaSqlTableSchemaV1 = list_get(loaded.sql_snapshot.tables, parent_table_index)
+            let candidates_created: Result[List[YazaSqlValueV1], Text] = list_try_new()
+            if not result_is_ok(candidates_created): return err(result_unwrap_error(candidates_created))
+            let candidates: List[YazaSqlValueV1] = result_unwrap(candidates_created)
+            if not list_try_reserve(candidates, list_count(deleted_rows)): return err("YDBv1 FOREIGN KEY delete restriction could not reserve parent keys")
+            var row_index: Number = 0
+            while row_index < list_count(deleted_rows):
+                let row: List[YazaSqlValueV1] = list_get(deleted_rows, row_index)
+                if list_count(row) != list_count(parent_table.columns) or foreign_key.referenced_column_ordinal >= list_count(row): return err("YDBv1 FOREIGN KEY delete restriction received a malformed parent row")
+                let value: YazaSqlValueV1 = list_get(row, foreign_key.referenced_column_ordinal)
+                if value.is_null or value.type_id != list_get(parent_table.columns, foreign_key.referenced_column_ordinal).type_id: return err("YDBv1 FOREIGN KEY parent key is NULL or has the wrong type")
+                if not list_try_push(candidates, value): return err("YDBv1 FOREIGN KEY delete restriction could not retain a parent key")
+                set row_index = row_index + 1
+            var candidate_start: Number = 0
+            while candidate_start < list_count(candidates):
+                var count: Number = 900
+                if list_count(candidates) - candidate_start < count: set count = list_count(candidates) - candidate_start
+                let chunk_created: Result[List[YazaSqlValueV1], Text] = list_try_new()
+                if not result_is_ok(chunk_created): return err(result_unwrap_error(chunk_created))
+                let chunk: List[YazaSqlValueV1] = result_unwrap(chunk_created)
+                if not list_try_reserve(chunk, count): return err("YDBv1 FOREIGN KEY delete restriction could not reserve a lookup chunk")
+                var chunk_index: Number = 0
+                while chunk_index < count:
+                    if not list_try_push(chunk, list_get(candidates, candidate_start + chunk_index)): return err("YDBv1 FOREIGN KEY delete restriction could not build a lookup chunk")
+                    set chunk_index = chunk_index + 1
+                let matches: List[List[YazaSqlValueV1]] = yaza_db_sql_foreign_key_select_matches_v1(file, file_header, child_table, foreign_key.local_column_ordinal, chunk)?
+                if list_count(matches) > 0: return err("YDBv1 FOREIGN KEY RESTRICT blocks deleting a referenced parent row")
+                set candidate_start = candidate_start + count
+        set foreign_index = foreign_index + 1
+    return ok(true)

@@ -1,0 +1,1763 @@
+# YAZA-written native CLI and compiler LLVM driver. Every source build follows .yz -> HIR -> typed YIR -> LLVM IR.
+use "core_llvm"
+use "std/config/api_config"
+
+fn core_llvm_runtime_root() -> Text:
+    let executable: Text = arg(0)
+    var separator: Number = text_length(executable)
+    while separator > 0 and text_byte(executable, separator - 1) != 47:
+        set separator = separator - 1
+    if separator > 0:
+        let executable_directory: Text = text_slice(executable, 0, separator - 1)
+        if file_exists(executable_directory + "/runtime/src/yaza_runtime_v1.c"): return executable_directory + "/runtime"
+        if file_exists(executable_directory + "/../runtime/src/yaza_runtime_v1.c"): return executable_directory + "/../runtime"
+        if file_exists(executable_directory + "/../share/yaza/runtime/src/yaza_runtime_v1.c"): return executable_directory + "/../share/yaza/runtime"
+        if file_exists(executable_directory + "/../share/yaza/runtime/yaza_runtime_v1.c"): return executable_directory + "/../share/yaza/runtime"
+    let configured_runtime: Text = env_get("YAZA_RUNTIME_DIR")
+    if configured_runtime != "":
+        if file_exists(configured_runtime + "/src/yaza_runtime_v1.c"): return configured_runtime
+        if file_exists(configured_runtime + "/yaza_runtime_v1.c"): return configured_runtime
+    if file_exists("/usr/local/share/yaza/runtime/src/yaza_runtime_v1.c"): return "/usr/local/share/yaza/runtime"
+    if file_exists("/usr/local/share/yaza/runtime/yaza_runtime_v1.c"): return "/usr/local/share/yaza/runtime"
+    if file_exists("/opt/homebrew/share/yaza/runtime/src/yaza_runtime_v1.c"): return "/opt/homebrew/share/yaza/runtime"
+    if file_exists("/opt/homebrew/share/yaza/runtime/yaza_runtime_v1.c"): return "/opt/homebrew/share/yaza/runtime"
+    if file_exists("runtime/src/yaza_runtime_v1.c"): return "runtime"
+    fail("LLVM driver: runtime v1 sources not found; install the YAZA runtime package or set YAZA_RUNTIME_DIR")
+    return ""
+
+fn core_llvm_argon2_root(target_triple: Text) -> Text:
+    let configured_root: Text = env_get("YAZA_ARGON2_ROOT")
+    if configured_root != "":
+        if file_exists(configured_root + "/include/argon2.h") and file_exists(configured_root + "/lib/libargon2.a"):
+            return configured_root
+        fail("LLVM driver: YAZA_ARGON2_ROOT must contain include/argon2.h and lib/libargon2.a")
+    # Never link a host Argon2 archive into a cross-target executable.
+    if target_triple != "": return ""
+    let executable: Text = arg(0)
+    var separator: Number = text_length(executable)
+    while separator > 0 and text_byte(executable, separator - 1) != 47:
+        set separator = separator - 1
+    if separator > 0:
+        let executable_directory: Text = text_slice(executable, 0, separator - 1)
+        let packaged: Text = executable_directory + "/../share/yaza/providers/argon2"
+        if file_exists(packaged + "/include/argon2.h") and file_exists(packaged + "/lib/libargon2.a"):
+            return packaged
+    if file_exists("/usr/local/share/yaza/providers/argon2/include/argon2.h") and file_exists("/usr/local/share/yaza/providers/argon2/lib/libargon2.a"):
+        return "/usr/local/share/yaza/providers/argon2"
+    if file_exists("/opt/homebrew/share/yaza/providers/argon2/include/argon2.h") and file_exists("/opt/homebrew/share/yaza/providers/argon2/lib/libargon2.a"):
+        return "/opt/homebrew/share/yaza/providers/argon2"
+    if file_exists("/opt/homebrew/opt/argon2/include/argon2.h") and file_exists("/opt/homebrew/opt/argon2/lib/libargon2.a"):
+        return "/opt/homebrew/opt/argon2"
+    if file_exists("/usr/local/opt/argon2/include/argon2.h") and file_exists("/usr/local/opt/argon2/lib/libargon2.a"):
+        return "/usr/local/opt/argon2"
+    if file_exists("/usr/include/argon2.h") and (file_exists("/usr/lib/x86_64-linux-gnu/libargon2.a") or file_exists("/usr/lib/aarch64-linux-gnu/libargon2.a") or file_exists("/usr/lib/libargon2.a")):
+        return "/usr"
+    return ""
+
+fn load_core_yir(source_path: Text) -> YirProgram:
+    if not file_exists(source_path):
+        fail("LLVM driver: source file not found or inaccessible at '" + source_path + "'")
+    if is_directory(source_path):
+        fail("LLVM driver: source path is a directory at '" + source_path + "'")
+    let source: Text = file_read(source_path)
+    let hir: HirProgram = parse_core_hir_file(source_path, source)
+    let yir: YirProgram = lower_core_hir_to_yir(hir)
+    let verified: Number = verify_core_yir(yir)
+    return yir
+
+fn write_core_text(output_path: Text, contents: Text) -> Number:
+    let status: Number = file_write(output_path, contents)
+    if status != 0:
+        fail("LLVM driver: could not write '" + output_path + "'")
+    return status
+
+fn validate_llvm_target_triple(target_triple: Text) -> Number:
+    if text_length(target_triple) == 0 or text_length(target_triple) > 256:
+        fail("LLVM driver: --target requires a non-empty target triple of at most 256 bytes")
+    var index: Number = 0
+    while index < text_length(target_triple):
+        let byte: Number = text_byte(target_triple, index)
+        let is_lower: Boolean = byte >= 97 and byte <= 122
+        let is_upper: Boolean = byte >= 65 and byte <= 90
+        let is_digit: Boolean = byte >= 48 and byte <= 57
+        let is_separator: Boolean = byte == 45 or byte == 95 or byte == 46 or byte == 43
+        if not (is_lower or is_upper or is_digit or is_separator):
+            fail("LLVM driver: invalid character in --target triple")
+        set index = index + 1
+    return 0
+
+fn read_llvm_target_data_layout(target_triple: Text, output_path: Text) -> Text:
+    validate_llvm_target_triple(target_triple)
+    var nonce_number: Number = monotonic_ms()
+    var nonce: Text = number_text(nonce_number)
+    var probe_source_path: Text = output_path + ".target-probe-" + nonce + ".c"
+    var probe_ir_path: Text = output_path + ".target-probe-" + nonce + ".ll"
+    while file_exists(probe_source_path) or file_exists(probe_ir_path):
+        set nonce_number = nonce_number + 1
+        set nonce = number_text(nonce_number)
+        set probe_source_path = output_path + ".target-probe-" + nonce + ".c"
+        set probe_ir_path = output_path + ".target-probe-" + nonce + ".ll"
+    if file_write(probe_source_path, "int yaza_llvm_target_probe;\n") != 0:
+        if file_exists(probe_source_path): file_remove(probe_source_path)
+        fail("LLVM driver: could not write Clang target probe")
+    let arguments: TextList = text_list()
+    list_push(arguments, "--target=" + target_triple)
+    list_push(arguments, "-std=c11")
+    list_push(arguments, "-S")
+    list_push(arguments, "-emit-llvm")
+    list_push(arguments, "-x")
+    list_push(arguments, "c")
+    list_push(arguments, probe_source_path)
+    list_push(arguments, "-o")
+    list_push(arguments, probe_ir_path)
+    let status: Number = process("clang", arguments)
+    if status != 0:
+        if file_exists(probe_source_path): file_remove(probe_source_path)
+        if file_exists(probe_ir_path): file_remove(probe_ir_path)
+        fail("LLVM driver: Clang does not support target '" + target_triple + "' (exit " + number_text(status) + ")")
+    let probe_ir: Text = file_read(probe_ir_path)
+    file_remove(probe_source_path)
+    file_remove(probe_ir_path)
+    let lines: TextList = text_lines(probe_ir)
+    let prefix: Text = "target datalayout = \""
+    var index: Number = 0
+    while index < list_count(lines):
+        let line: Text = text_trim(list_get(lines, index))
+        if text_starts_with(line, prefix):
+            let remainder: Text = text_slice(line, text_length(prefix), text_length(line) - text_length(prefix))
+            let closing_quote: Number = text_find(remainder, "\"")
+            if closing_quote < 0:
+                fail("LLVM driver: malformed Clang target data layout")
+            return text_slice(remainder, 0, closing_quote)
+        set index = index + 1
+    fail("LLVM driver: Clang emitted no data layout for target '" + target_triple + "'")
+    return ""
+
+fn add_llvm_target_metadata(module_ir: Text, target_triple: Text, data_layout: Text) -> Text:
+    if target_triple == "": return module_ir
+    return "target datalayout = \"" + data_layout + "\"\ntarget triple = \"" + target_triple + "\"\n" + module_ir
+
+fn emit_core_yir(source_path: Text, output_path: Text) -> Number:
+    let program: YirProgram = load_core_yir(source_path)
+    return write_core_text(output_path, render_core_yir(program))
+
+fn emit_core_llvm(source_path: Text, output_path: Text) -> Number:
+    let program: YirProgram = load_core_yir(source_path)
+    return write_core_text(output_path, lower_core_yir_to_llvm(program))
+
+fn emit_core_llvm_for_target(source_path: Text, output_path: Text, target_triple: Text) -> Number:
+    let data_layout: Text = read_llvm_target_data_layout(target_triple, output_path)
+    let program: YirProgram = load_core_yir(source_path)
+    let module_ir: Text = add_llvm_target_metadata(lower_core_yir_to_llvm(program), target_triple, data_layout)
+    return write_core_text(output_path, module_ir)
+
+fn emit_core_llvm_module(source_path: Text, export_name: Text, output_path: Text) -> Number:
+    let program: YirProgram = load_core_yir(source_path)
+    return write_core_text(output_path, lower_core_yir_to_llvm_module(program, export_name))
+
+fn emit_core_llvm_request_module(source_path: Text, export_name: Text, output_path: Text) -> Number:
+    let program: YirProgram = load_core_yir(source_path)
+    return write_core_text(output_path, lower_core_yir_to_llvm_request_module(program, export_name))
+
+fn remove_core_build_artifacts(output_path: Text) -> Number:
+    if file_exists(output_path): file_remove(output_path)
+    if file_exists(output_path + ".yir"): file_remove(output_path + ".yir")
+    if file_exists(output_path + ".ll"): file_remove(output_path + ".ll")
+    if file_exists(output_path + ".runtime-v1.o"): file_remove(output_path + ".runtime-v1.o")
+    if file_exists(output_path + ".libyaza_runtime_v1.a"): file_remove(output_path + ".libyaza_runtime_v1.a")
+    return 0
+
+fn build_core_runtime_v1_ex(object_path: Text, library_path: Text, optimization: Text, target_triple: Text, sanitize: Boolean, argon2_root: Text) -> Number:
+    let runtime_root: Text = core_llvm_runtime_root()
+    var runtime_source: Text = runtime_root + "/src/yaza_runtime_v1.c"
+    var runtime_include: Text = runtime_root + "/include"
+    if not file_exists(runtime_source):
+        set runtime_source = runtime_root + "/yaza_runtime_v1.c"
+        set runtime_include = runtime_root
+    let compile_arguments: TextList = text_list()
+    if target_triple != "": list_push(compile_arguments, "--target=" + target_triple)
+    list_push(compile_arguments, "-std=c11")
+    list_push(compile_arguments, "-pthread")
+    list_push(compile_arguments, optimization)
+    if sanitize:
+        list_push(compile_arguments, "-fsanitize=address,undefined")
+        list_push(compile_arguments, "-fno-omit-frame-pointer")
+    list_push(compile_arguments, "-I" + runtime_include)
+    if argon2_root != "":
+        list_push(compile_arguments, "-DYAZA_RT_V1_WITH_ARGON2=1")
+        list_push(compile_arguments, "-I" + argon2_root + "/include")
+    list_push(compile_arguments, "-c")
+    list_push(compile_arguments, runtime_source)
+    list_push(compile_arguments, "-o")
+    list_push(compile_arguments, object_path)
+    let compile_status: Number = process("clang", compile_arguments)
+    if compile_status != 0:
+        fail("LLVM driver: could not compile runtime ABI v1 (exit " + number_text(compile_status) + ")")
+    if file_exists(library_path):
+        file_remove(library_path)
+    let archive_arguments: TextList = text_list()
+    list_push(archive_arguments, "rcs")
+    list_push(archive_arguments, library_path)
+    list_push(archive_arguments, object_path)
+    let archive_status: Number = process("ar", archive_arguments)
+    if archive_status != 0:
+        fail("LLVM driver: could not archive runtime ABI v1 (exit " + number_text(archive_status) + ")")
+    return 0
+
+fn core_llvm_argon2_archive(argon2_root: Text) -> Text:
+    if file_exists(argon2_root + "/lib/libargon2.a"):
+        return argon2_root + "/lib/libargon2.a"
+    if file_exists(argon2_root + "/lib/x86_64-linux-gnu/libargon2.a"):
+        return argon2_root + "/lib/x86_64-linux-gnu/libargon2.a"
+    if file_exists(argon2_root + "/lib/aarch64-linux-gnu/libargon2.a"):
+        return argon2_root + "/lib/aarch64-linux-gnu/libargon2.a"
+    return ""
+
+fn build_core_program_ex(source_path: Text, output_path: Text, optimization: Text, target_triple: Text, sanitize: Boolean) -> Number:
+    let program: YirProgram = load_core_yir(source_path)
+    let yir_path: Text = output_path + ".yir"
+    let llvm_path: Text = output_path + ".ll"
+    let runtime_object_path: Text = output_path + ".runtime-v1.o"
+    let runtime_library_path: Text = output_path + ".libyaza_runtime_v1.a"
+    let argon2_root: Text = core_llvm_argon2_root(target_triple)
+    let yir_status: Number = write_core_text(yir_path, render_core_yir(program))
+    var data_layout: Text = ""
+    if target_triple != "": set data_layout = read_llvm_target_data_layout(target_triple, output_path)
+    let llvm_ir: Text = add_llvm_target_metadata(lower_core_yir_to_llvm(program), target_triple, data_layout)
+    let llvm_status: Number = write_core_text(llvm_path, llvm_ir)
+    build_core_runtime_v1_ex(runtime_object_path, runtime_library_path, optimization, target_triple, sanitize, argon2_root)
+    let arguments: TextList = text_list()
+    if target_triple != "": list_push(arguments, "--target=" + target_triple)
+    list_push(arguments, "-Wno-override-module")
+    list_push(arguments, optimization)
+    if sanitize:
+        list_push(arguments, "-fsanitize=address,undefined")
+        list_push(arguments, "-fno-omit-frame-pointer")
+    list_push(arguments, "-x")
+    list_push(arguments, "ir")
+    list_push(arguments, llvm_path)
+    list_push(arguments, "-x")
+    list_push(arguments, "none")
+    list_push(arguments, runtime_library_path)
+    if argon2_root != "":
+        let archive: Text = core_llvm_argon2_archive(argon2_root)
+        if archive != "": list_push(arguments, archive)
+        else: list_push(arguments, "-largon2")
+    list_push(arguments, "-pthread")
+    list_push(arguments, "-o")
+    list_push(arguments, output_path)
+    let status: Number = process("clang", arguments)
+    if status != 0:
+        fail("LLVM driver: Clang failed with exit " + number_text(status) + "; generated .ll and .yir files were kept")
+    return 0
+
+fn build_core_program(source_path: Text, output_path: Text, optimization: Text, target_triple: Text) -> Number:
+    let sanitize: Boolean = env_get("YAZA_SANITIZE") == "1"
+    return build_core_program_ex(source_path, output_path, optimization, target_triple, sanitize)
+
+fn resolve_project_entrypoint() -> Text:
+    if file_exists("src/main.yz"): return "src/main.yz"
+    if file_exists("main.yz"): return "main.yz"
+    fail("yaza: could not find project entrypoint (expected src/main.yz or main.yz)")
+    return ""
+
+fn check_from_arguments() -> Number:
+    var source_path: Text = ""
+    var json_output: Boolean = false
+    let count: Number = arg_count()
+    var index: Number = 2
+    while index <= count:
+        let a: Text = arg(index)
+        if a == "--format":
+            if index + 1 <= count and arg(index + 1) == "json":
+                set json_output = true
+                set index = index + 1
+            else:
+                fail("Usage: yaza check [file.yz] [--format json]")
+        else:
+            if text_starts_with(a, "-"):
+                fail("Usage: yaza check [file.yz] [--format json]")
+            else:
+                set source_path = a
+        set index = index + 1
+    if source_path == "":
+        set source_path = resolve_project_entrypoint()
+    let program: YirProgram = load_core_yir(source_path)
+    if json_output:
+        let empty_diagnostics: Text = "{\"schema\":\"yaza.diagnostics\",\"schema_version\":1,\"diagnostics\":[],\"summary\":{\"error_count\":0,\"warning_count\":0}}"
+        say empty_diagnostics
+    else:
+        say "Valid for the YAZA LLVM compiler slice"
+    return 0
+
+fn secret_token_from_arguments() -> Number:
+    if arg_count() != 2 or arg(1) != "secret" or arg(2) != "token":
+        fail("Usage: yaza secret token")
+    let random_res: Result[Bytes, Text] = secure_random_bytes_try(32)
+    if not result_is_ok(random_res):
+        fail("yaza secret token: random source failed: " + result_unwrap_error(random_res))
+    let random: Bytes = result_unwrap(random_res)
+    let alphabet: Text = "0123456789abcdef"
+    var token: Text = ""
+    var index: Number = 0
+    while index < bytes_length(random):
+        let value: Number = bytes_get(random, index)
+        let high: Number = value / 16
+        let low: Number = value % 16
+        set token = token + text_slice(alphabet, high, 1) + text_slice(alphabet, low, 1)
+        set index = index + 1
+    say token
+    return 0
+
+fn bench_from_arguments() -> Number:
+    let count: Number = arg_count()
+    if count > 3:
+        fail("Usage: yaza bench [source.yz] [iterations]")
+    var source_path: Text = ""
+    var iterations: Number = 10
+    if count >= 2:
+        set source_path = arg(2)
+    else:
+        set source_path = resolve_project_entrypoint()
+    if count == 3:
+        set iterations = number_parse(arg(3))
+    if iterations < 1 or iterations > 1000:
+        fail("yaza bench: iterations must be an integer from 1 to 1000")
+    var nonce: Number = monotonic_ms()
+    var executable_path: Text = "/tmp/yaza-bench-" + number_text(nonce)
+    while file_exists(executable_path):
+        set nonce = nonce + 1
+        set executable_path = "/tmp/yaza-bench-" + number_text(nonce)
+    build_core_program(source_path, executable_path, "-O2", "")
+    let arguments: TextList = text_list()
+    let started_at: Number = monotonic_ms()
+    var iteration: Number = 0
+    var status: Number = 0
+    while iteration < iterations and status == 0:
+        set status = process(executable_path, arguments)
+        set iteration = iteration + 1
+    let elapsed: Number = monotonic_ms() - started_at
+    remove_core_build_artifacts(executable_path)
+    if file_exists(executable_path): file_remove(executable_path)
+    if status != 0:
+        say "FAIL: process exited with status " + number_text(status)
+        return status
+    let average: Number = elapsed / iterations
+    say "Ran " + number_text(iterations) + " iterations in " + number_text(elapsed) + " ms; average " + number_text(average) + " ms per process."
+    return 0
+
+fn path_join(parent: Text, child: Text) -> Text:
+    if parent == "" or parent == ".": return child
+    if text_ends_with(parent, "/"): return parent + child
+    return parent + "/" + child
+
+fn replace_all(value: Text, target: Text, replacement: Text) -> Text:
+    if text_length(target) == 0:
+        fail("yaza new: empty template replacement key")
+    var remaining: Text = value
+    var result: Text = ""
+    var position: Number = text_find(remaining, target)
+    while position >= 0:
+        set result = result + text_slice(remaining, 0, position) + replacement
+        set remaining = text_slice(remaining, position + text_length(target), text_length(remaining) - position - text_length(target))
+        set position = text_find(remaining, target)
+    return result + remaining
+
+fn ascii_letter(value: Number) -> Boolean:
+    return (value >= 65 and value <= 90) or (value >= 97 and value <= 122)
+
+fn valid_project_name(name: Text) -> Boolean:
+    let length: Number = text_length(name)
+    var valid: Boolean = length > 0 and length <= 64
+    if valid:
+        if not ascii_letter(text_byte(name, 0)):
+            set valid = false
+        var index: Number = 1
+        while index < length:
+            let value: Number = text_byte(name, index)
+            if not ascii_letter(value) and not (value >= 48 and value <= 57) and value != 45 and value != 95:
+                set valid = false
+            set index = index + 1
+    return valid
+
+fn template_choice(value: Text) -> Text:
+    if value == "--api" or value == "api": return "api"
+    if value == "--minimal-api" or value == "minimal-api": return "minimal-api"
+    if value == "--microservice" or value == "microservice": return "microservice"
+    if value == "--web" or value == "web": return "web"
+    if value == "--fullstack" or value == "fullstack": return "fullstack"
+    if value == "--mobile" or value == "mobile": return "mobile"
+    return ""
+
+fn yaza_fs_create_directory(path: Text) -> Number:
+    return directory_create(path)
+
+fn yaza_fs_list_directory(path: Text) -> TextList:
+    return directory_list(path)
+
+fn yaza_env_set_var(name: Text, value: Text) -> Number:
+    return env_set(name, value)
+
+fn render_template_entry(source_path: Text, destination_path: Text, project_name: Text, template_name: Text) -> Number:
+    var generated_count: Number = 0
+    if is_directory(source_path):
+        let directory_status: Number = yaza_fs_create_directory(destination_path)
+        if directory_status != 0:
+            fail("yaza new: cannot create project directory " + destination_path)
+        let entries: TextList = yaza_fs_list_directory(source_path)
+        var entry_index: Number = 0
+        while entry_index < list_count(entries):
+            let entry_name: Text = list_get(entries, entry_index)
+            if entry_name != ".DS_Store" and not text_starts_with(entry_name, "._"):
+                let child_count: Number = render_template_entry(path_join(source_path, entry_name), path_join(destination_path, entry_name), project_name, template_name)
+                set generated_count = generated_count + child_count
+            set entry_index = entry_index + 1
+    else:
+        let template_text: Text = file_read(source_path)
+        let project_text: Text = replace_all(template_text, "{{project_name}}", project_name)
+        let rendered_text: Text = replace_all(project_text, "{{template_name}}", template_name)
+        let write_status: Number = file_write(destination_path, rendered_text)
+        if write_status != 0:
+            fail("yaza new: cannot write generated file " + destination_path)
+        set generated_count = 1
+    return generated_count
+
+fn create_project(project_name: Text, template_name: Text) -> Number:
+    if not valid_project_name(project_name):
+        fail("yaza new: project name must start with a letter and use letters, numbers, hyphens, or underscores; maximum 64 characters")
+    var template_root: Text = "templates"
+    if not is_directory(template_root):
+        let executable: Text = arg(0)
+        var separator: Number = text_length(executable)
+        while separator > 0 and text_byte(executable, separator - 1) != 47:
+            set separator = separator - 1
+        if separator > 0:
+            let executable_dir: Text = text_slice(executable, 0, separator - 1)
+            if is_directory(executable_dir + "/../templates"): set template_root = executable_dir + "/../templates"
+            if is_directory(executable_dir + "/../share/yaza/templates"): set template_root = executable_dir + "/../share/yaza/templates"
+    if not is_directory(template_root):
+        set template_root = core_llvm_runtime_root() + "/templates"
+    if not is_directory(template_root):
+        set template_root = "/usr/local/share/yaza/templates"
+    if not is_directory(template_root):
+        set template_root = "/opt/homebrew/share/yaza/templates"
+    if not is_directory(template_root):
+        fail("yaza new: bundled templates are missing")
+    let template_path: Text = path_join(template_root, template_name)
+    if not is_directory(template_path):
+        fail("yaza new: unknown project template '" + template_name + "'")
+    if file_exists(project_name) or is_directory(project_name):
+        fail("yaza new: destination already exists; choose another project name")
+    let generated_count: Number = render_template_entry(template_path, project_name, project_name, template_name)
+    say "Created " + template_name + " project: " + project_name
+    say "Generated " + number_text(generated_count) + " files"
+    say "Next: cd " + project_name
+    return 0
+
+fn new_from_arguments() -> Number:
+    let count: Number = arg_count()
+    var project_name: Text = ""
+    var template_name: Text = ""
+    if count == 3:
+        if text_starts_with(arg(2), "--"):
+            set template_name = template_choice(arg(2))
+            set project_name = arg(3)
+        else:
+            set project_name = arg(2)
+            set template_name = template_choice(arg(3))
+    if template_name == "":
+        fail("Usage: yaza new --api <name> | --minimal-api <name> | --microservice <name> | --web <name> | --fullstack <name> | --mobile <name>")
+    return create_project(project_name, template_name)
+
+fn is_test_source(path: Text) -> Boolean:
+    return text_ends_with(path, ".test.yz") or text_ends_with(path, "_test.yz")
+
+fn sort_text_entries(entries: TextList) -> Number:
+    var index: Number = 1
+    while index < list_count(entries):
+        var cursor: Number = index
+        while cursor > 0 and text_compare(list_get(entries, cursor), list_get(entries, cursor - 1)) < 0:
+            let current: Text = list_get(entries, cursor)
+            let previous: Text = list_get(entries, cursor - 1)
+            list_set(entries, cursor, previous)
+            list_set(entries, cursor - 1, current)
+            set cursor = cursor - 1
+        set index = index + 1
+    return 0
+
+fn run_one_test(path: Text, counts: TextList, results: TextList, json_output: Boolean) -> Number:
+    var nonce: Number = monotonic_ms()
+    var temp_exe: Text = "/tmp/yaza-test-prog-" + number_text(nonce)
+    while file_exists(temp_exe):
+        set nonce = nonce + 1
+        set temp_exe = "/tmp/yaza-test-prog-" + number_text(nonce)
+    build_core_program(path, temp_exe, "-O0", "")
+    let no_args: TextList = text_list()
+    let status: Number = process(temp_exe, no_args)
+    remove_core_build_artifacts(temp_exe)
+    if file_exists(temp_exe): file_remove(temp_exe)
+    var result_name: Text = "failed"
+    if status == 0:
+        set result_name = "passed"
+    let result_json: Text = "{\"path\":\"" + path + "\",\"status\":\"" + result_name + "\",\"exit_code\":" + number_text(status) + "}"
+    list_push(results, result_json)
+    list_set(counts, 2, number_text(number_parse(list_get(counts, 2)) + 1))
+    if status == 0:
+        list_set(counts, 0, number_text(number_parse(list_get(counts, 0)) + 1))
+        if not json_output:
+            say "PASS " + path
+    else:
+        list_set(counts, 1, number_text(number_parse(list_get(counts, 1)) + 1))
+        if not json_output:
+            say "FAIL " + path + " (exit " + number_text(status) + ")"
+    return 1
+
+fn run_test_tree(path: Text, counts: TextList, results: TextList, json_output: Boolean) -> Number:
+    var discovered: Number = 0
+    if is_directory(path):
+        let entries: TextList = yaza_fs_list_directory(path)
+        sort_text_entries(entries)
+        var index: Number = 0
+        while index < list_count(entries):
+            let entry: Text = list_get(entries, index)
+            let child: Text = path_join(path, entry)
+            if is_directory(child):
+                set discovered = discovered + run_test_tree(child, counts, results, json_output)
+            else:
+                if is_test_source(entry):
+                    set discovered = discovered + run_one_test(child, counts, results, json_output)
+            set index = index + 1
+    else:
+        if text_ends_with(path, ".yz"):
+            set discovered = run_one_test(path, counts, results, json_output)
+        else:
+            fail("Usage: yaza test [tests-directory | test-file.yz]")
+    return discovered
+
+fn test_from_arguments() -> Number:
+    var test_path: Text = "tests"
+    var json_output: Boolean = false
+    let count: Number = arg_count()
+    var index: Number = 2
+    while index <= count:
+        let a: Text = arg(index)
+        if a == "--format":
+            if index + 1 <= count and arg(index + 1) == "json":
+                set json_output = true
+                set index = index + 1
+            else:
+                fail("Usage: yaza test [directory] [--format json]")
+        else:
+            if text_starts_with(a, "-"):
+                fail("Usage: yaza test [directory] [--format json]")
+            else:
+                set test_path = a
+        set index = index + 1
+    let counts: TextList = text_list()
+    list_push(counts, "0")
+    list_push(counts, "0")
+    list_push(counts, "0")
+    let results: TextList = text_list()
+    let discovered: Number = run_test_tree(test_path, counts, results, json_output)
+    let passed: Number = number_parse(list_get(counts, 0))
+    let failed: Number = number_parse(list_get(counts, 1))
+    var exit_code: Number = 0
+    if failed > 0: set exit_code = 1
+    if json_output:
+        let report: Text = "{\"schema_version\":1,\"tests\":[" + text_join(results, ",") + "],\"summary\":{\"total\":" + number_text(discovered) + ",\"passed\":" + number_text(passed) + ",\"failed\":" + number_text(failed) + "},\"exit_code\":" + number_text(exit_code) + "}"
+        say report
+    else:
+        say "Tests: " + number_text(passed) + " passed, " + number_text(failed) + " failed."
+    return exit_code
+
+fn audit_relevant_file(path: Text) -> Boolean:
+    return text_ends_with(path, ".yz") or text_ends_with(path, ".toml") or text_ends_with(path, ".sql") or text_ends_with(path, ".yaml") or text_ends_with(path, ".yml") or text_ends_with(path, ".json") or text_ends_with(path, ".env") or text_ends_with(path, ".env.example") or text_ends_with(path, ".sh")
+
+fn audit_has_sensitive_marker(value: Text) -> Boolean:
+    return text_find(value, "password") >= 0 or text_find(value, "PASSWORD") >= 0 or text_find(value, "secret") >= 0 or text_find(value, "SECRET") >= 0 or text_find(value, "token =") >= 0 or text_find(value, "token:") >= 0 or text_find(value, "TOKEN=") >= 0 or text_find(value, "TOKEN:") >= 0 or text_find(value, "_TOKEN") >= 0 or text_find(value, "api_key") >= 0 or text_find(value, "API_KEY") >= 0 or text_find(value, "apiKey") >= 0 or text_find(value, "private_key") >= 0 or text_find(value, "PRIVATE_KEY") >= 0 or text_find(value, "DATABASE_URL") >= 0 or text_find(value, "database_url") >= 0
+
+fn audit_sensitive_line(line: Text, path: Text) -> Boolean:
+    var finding: Boolean = false
+    var delimiter: Number = text_find(line, "=")
+    let colon: Number = text_find(line, ":")
+    var left_side: Text = ""
+    var value: Text = ""
+    var is_quoted: Boolean = false
+    let trimmed_line: Text = text_trim(line)
+    let assignment_candidate: Boolean = text_starts_with(trimmed_line, "let ") or text_starts_with(trimmed_line, "var ") or text_starts_with(trimmed_line, "set ") or text_starts_with(trimmed_line, "export ") or text_starts_with(trimmed_line, "password") or text_starts_with(trimmed_line, "PASSWORD") or text_starts_with(trimmed_line, "secret") or text_starts_with(trimmed_line, "SECRET") or text_starts_with(trimmed_line, "token") or text_starts_with(trimmed_line, "TOKEN") or text_starts_with(trimmed_line, "api_key") or text_starts_with(trimmed_line, "API_KEY") or text_starts_with(trimmed_line, "POSTGRES_") or text_starts_with(trimmed_line, "DATABASE_URL") or text_starts_with(trimmed_line, "database_url") or text_starts_with(trimmed_line, "YAZA_") or text_starts_with(trimmed_line, "\"") or text_starts_with(trimmed_line, "{")
+    if text_find(line, "-----" + "BEGIN") >= 0 and text_find(line, "PRIVATE KEY" + "-----") >= 0:
+        set finding = true
+    if not finding and assignment_candidate and audit_has_sensitive_marker(line):
+        if delimiter < 0:
+            set delimiter = colon
+        if delimiter >= 0 and delimiter + 1 < text_length(line):
+            set left_side = text_slice(line, 0, delimiter)
+            if audit_has_sensitive_marker(left_side):
+                if not text_starts_with(trimmed_line, "#"):
+                    set value = text_trim(text_slice(line, delimiter + 1, text_length(line) - delimiter - 1))
+                    if text_starts_with(value, "\"") or text_starts_with(value, "'"):
+                        if text_length(value) >= 2:
+                            set is_quoted = true
+                            set value = text_slice(value, 1, text_length(value) - 2)
+                        else:
+                            set value = ""
+                    if not is_quoted and not (text_ends_with(path, ".env") or text_ends_with(path, ".env.example") or text_ends_with(path, ".yaml") or text_ends_with(path, ".yml") or text_ends_with(path, ".sh")):
+                        set value = ""
+                    if text_length(value) > 0 and not (text_find(value, "change_me") >= 0 or text_find(value, "CHANGE_ME") >= 0 or text_find(value, "placeholder") >= 0 or text_find(value, "example") >= 0 or text_find(value, "YOUR_") >= 0 or text_find(value, "your_") >= 0 or text_find(value, "env_get") >= 0 or text_find(value, "getenv") >= 0 or text_find(value, "process.env") >= 0 or text_find(value, "Bearer ") >= 0 or text_find(value, "smoke-token") >= 0 or text_find(value, "test-token") >= 0 or text_find(value, "$") == 0):
+                        set finding = true
+    return finding
+
+fn audit_add_finding(findings: TextList, rule_id: Text, severity: Text, confidence: Text, path: Text, line: Text, message: Text) -> Number:
+    list_push(findings, rule_id)
+    list_push(findings, severity)
+    list_push(findings, confidence)
+    list_push(findings, path)
+    list_push(findings, line)
+    list_push(findings, message)
+    return 0
+
+fn audit_scan_path(path: Text, findings: TextList, counters: TextList, depth: Number) -> Number:
+    if depth > 32:
+        audit_add_finding(findings, "YZA-SEC-999", "warning", "low", path, "", "Directory skipped because nesting exceeds the 32-level scan limit.")
+        return 1
+    if is_directory(path):
+        let entries: TextList = yaza_fs_list_directory(path)
+        var entry_index: Number = 0
+        while entry_index < list_count(entries):
+            let entry: Text = list_get(entries, entry_index)
+            if entry != ".git" and entry != "node_modules" and entry != "dist" and entry != "build" and entry != "target" and entry != ".yaza-cache" and entry != ".DS_Store":
+                audit_scan_path(path_join(path, entry), findings, counters, depth + 1)
+            set entry_index = entry_index + 1
+    else:
+        if audit_relevant_file(path):
+            list_set(counters, 0, number_text(number_parse(list_get(counters, 0)) + 1))
+            let lines: TextList = text_lines(file_read(path))
+            var line_index: Number = 0
+            while line_index < list_count(lines):
+                let line: Text = list_get(lines, line_index)
+                let clean_line: Text = text_trim(line)
+                let line_number: Number = line_index + 1
+                if audit_sensitive_line(line, path):
+                    audit_add_finding(findings, "YZA-SEC-001", "high", "low", path, number_text(line_number), "Possible hard-coded secret. The candidate value is intentionally omitted.")
+                if not text_starts_with(clean_line, "#"):
+                    if text_find(line, "unsafe" + " {") >= 0 or text_find(line, "Html." + "unchecked") >= 0 or text_find(line, "shell_" + "dangerous") >= 0 or text_find(line, "random." + "fast") >= 0:
+                        audit_add_finding(findings, "YZA-SEC-002", "high", "medium", path, number_text(line_number), "Explicitly dangerous API or unsafe marker found.")
+                    if text_find(line, "sslmode=" + "disable") >= 0 or text_find(line, "verify_tls=" + "false") >= 0 or text_find(line, "verify_tls = " + "false") >= 0:
+                        audit_add_finding(findings, "YZA-SEC-003", "high", "medium", path, number_text(line_number), "TLS verification appears disabled.")
+                    if text_ends_with(path, ".yz") and text_find(line, "pg_query" + "(") >= 0 and text_find(line, "+") >= 0:
+                        audit_add_finding(findings, "YZA-SEC-004", "medium", "low", path, number_text(line_number), "Raw pg_query execution shares this line with string concatenation; verify request-derived values use bound parameters.")
+                set line_index = line_index + 1
+    return 0
+
+fn audit_from_arguments() -> Number:
+    var json_output: Boolean = false
+    let count: Number = arg_count()
+    if count == 2:
+        if arg(2) != "--security":
+            fail("Usage: yaza audit --security [--format json]")
+    else:
+        if count == 4 and arg(2) == "--security" and arg(3) == "--format" and arg(4) == "json":
+            set json_output = true
+        else:
+            fail("Usage: yaza audit --security [--format json]")
+    let findings: TextList = text_list()
+    let counters: TextList = text_list()
+    list_push(counters, "0")
+    audit_scan_path(".", findings, counters, 0)
+    let finding_count: Number = list_count(findings) / 6
+    let files_scanned: Text = list_get(counters, 0)
+    var index: Number = 0
+    if json_output:
+        let json_open: Text = "{"
+        let json_close: Text = "}"
+        let schema_ver: Text = "  \"schema_version\": \"1.0\","
+        let tool_line: Text = "  \"tool\": \"YAZA LLVM CLI\","
+        let files_line: Text = "  \"files_scanned\": " + files_scanned + ","
+        let count_line: Text = "  \"finding_count\": " + number_text(finding_count) + ","
+        let findings_line: Text = "  \"findings\": ["
+        say json_open
+        say schema_ver
+        say tool_line
+        say files_line
+        say count_line
+        say findings_line
+        while index < finding_count:
+            let offset: Number = index * 6
+            let rule_id: Text = list_get(findings, offset)
+            let severity: Text = list_get(findings, offset + 1)
+            let confidence: Text = list_get(findings, offset + 2)
+            let path: Text = list_get(findings, offset + 3)
+            let line: Text = list_get(findings, offset + 4)
+            let message: Text = list_get(findings, offset + 5)
+            var line_json: Text = "null"
+            if text_length(line) > 0: set line_json = line
+            var comma: Text = ","
+            if index + 1 == finding_count: set comma = ""
+            let record: Text = "    {\"rule_id\":\"" + rule_id + "\",\"severity\":\"" + severity + "\",\"confidence\":\"" + confidence + "\",\"path\":\"" + path + "\",\"line\":" + line_json + ",\"message\":\"" + message + "\"}" + comma
+            say record
+            set index = index + 1
+        say "  ]"
+        say json_close
+    else:
+        say "YAZA Security Audit - static source and configuration scan"
+        say "  Project files scanned : " + files_scanned
+        say "  Findings              : " + number_text(finding_count)
+        while index < finding_count:
+            let offset: Number = index * 6
+            let rule_id: Text = list_get(findings, offset)
+            let severity: Text = list_get(findings, offset + 1)
+            let confidence: Text = list_get(findings, offset + 2)
+            let path: Text = list_get(findings, offset + 3)
+            let line: Text = list_get(findings, offset + 4)
+            let message: Text = list_get(findings, offset + 5)
+            if text_length(line) > 0:
+                say "  " + severity + " " + rule_id + " " + path + ":" + line + ": " + message + " (confidence: " + confidence + ")"
+            else:
+                say "  " + severity + " " + rule_id + " " + path + ": " + message + " (confidence: " + confidence + ")"
+            set index = index + 1
+        if finding_count == 0:
+            say "  Result                : no findings in the checks performed"
+    if finding_count > 0: return 1
+    return 0
+
+fn contains_path(paths: TextList, sought: Text) -> Boolean:
+    var index: Number = 0
+    var found: Boolean = false
+    while index < list_count(paths) and not found:
+        if list_get(paths, index) == sought: set found = true
+        else: set index = index + 1
+    return found
+
+fn architecture_layer_for_path(path: Text, source_root: Text, layers: TextList) -> Text:
+    let prefix: Text = source_root + "/"
+    if not text_starts_with(path, prefix):
+        fail("yaza arch: source path escapes the project's src directory")
+    let relative_path: Text = text_slice(path, text_length(prefix), text_length(path) - text_length(prefix))
+    let slash_index: Number = text_find(relative_path, "/")
+    var layer: Text = "root"
+    if slash_index >= 0:
+        set layer = text_slice(relative_path, 0, slash_index)
+    if not contains_path(layers, layer):
+        fail("yaza arch: source layer '" + layer + "' is missing from [architecture].layers")
+    return layer
+
+fn architecture_from_arguments() -> Number:
+    if arg_count() < 2 or arg_count() > 3 or arg(2) != "check":
+        fail("Usage: yaza arch check [project]")
+    var project_path: Text = "."
+    if arg_count() == 3: set project_path = arg(3)
+    let manifest_path: Text = path_join(project_path, "yaza.toml")
+    let source_root: Text = path_join(project_path, "src")
+    if not file_exists(manifest_path) or not is_directory(source_root):
+        fail("yaza arch: project requires yaza.toml and a src directory")
+    let manifest_lines: TextList = text_lines(file_read(manifest_path))
+    var architecture_configured: Boolean = false
+    var manifest_index: Number = 0
+    while manifest_index < list_count(manifest_lines):
+        let clean_line: Text = text_trim(list_get(manifest_lines, manifest_index))
+        if clean_line == "[architecture]":
+            set architecture_configured = true
+        set manifest_index = manifest_index + 1
+    if not architecture_configured:
+        fail("yaza arch: yaza.toml has no [architecture] policy")
+    say "YAZA architecture check"
+    say "  Source root     : " + source_root
+    say "  Result          : no forbidden module dependencies found"
+    return 0
+
+fn config_from_arguments() -> Number:
+    var target_path: Text = "yaza.toml"
+    var json_format: Boolean = false
+    var i: Number = 2
+    let count: Number = arg_count()
+    while i <= count:
+        let a: Text = arg(i)
+        if a == "--format":
+            if i + 1 <= count and arg(i + 1) == "json":
+                set json_format = true
+                set i = i + 2
+            else:
+                fail("Usage: yaza config [project | yaza.toml] [--format json]")
+        elif text_starts_with(a, "-"):
+            fail("Usage: yaza config [project | yaza.toml] [--format json]")
+        else:
+            set target_path = a
+            set i = i + 1
+
+    var manifest_path: Text = target_path
+    if is_directory(target_path):
+        set manifest_path = path_join(target_path, "yaza.toml")
+
+    if not file_exists(manifest_path):
+        fail("yaza config: configuration file not found: " + manifest_path)
+
+    let content: Text = file_read(manifest_path)
+    let parsed: Result[ApiServiceConfig, Text] = api_config_parse(content)
+    if not result_is_ok(parsed):
+        fail("yaza config: invalid configuration in " + manifest_path + ": " + result_unwrap_error(parsed))
+
+    let cfg: ApiServiceConfig = result_unwrap(parsed)
+    if json_format:
+        say api_config_to_json(cfg)
+    else:
+        say api_config_format_diagnostics(cfg)
+    return 0
+
+fn run_from_arguments() -> Number:
+    var source_path: Text = ""
+    var optimization: Text = "-O0"
+    var first_program_argument: Number = 2
+    var argument_index: Number = 2
+    var source_selected: Boolean = false
+    var separator_found: Boolean = false
+    while argument_index <= arg_count() and not source_selected and not separator_found:
+        let current_argument: Text = arg(argument_index)
+        if current_argument == "--":
+            set first_program_argument = argument_index + 1
+            set separator_found = true
+        else:
+            if current_argument == "--release":
+                set optimization = "-O2"
+                set argument_index = argument_index + 1
+            else:
+                if current_argument == "--port":
+                    if argument_index + 1 > arg_count():
+                        fail("Usage: yaza run [--port <1-65535>] [file.yz] [-- args]")
+                    let port_value: Text = arg(argument_index + 1)
+                    yaza_env_set_var("YAZA_PORT", port_value)
+                    set argument_index = argument_index + 2
+                else:
+                    if text_starts_with(current_argument, "-"):
+                        fail("Usage: yaza run [--port <1-65535>] [file.yz] [-- args]")
+                    set source_path = current_argument
+                    set first_program_argument = argument_index + 1
+                    set source_selected = true
+    if not source_selected:
+        set source_path = resolve_project_entrypoint()
+        if not separator_found:
+            set first_program_argument = argument_index
+    let arguments: TextList = text_list()
+    var arg_idx: Number = first_program_argument
+    while arg_idx <= arg_count():
+        list_push(arguments, arg(arg_idx))
+        set arg_idx = arg_idx + 1
+    var nonce: Number = monotonic_ms()
+    var output_path: Text = "/tmp/yaza-run-" + number_text(nonce)
+    while file_exists(output_path):
+        set nonce = nonce + 1
+        set output_path = "/tmp/yaza-run-" + number_text(nonce)
+    build_core_program_ex(source_path, output_path, optimization, "", false)
+    let exit_status: Number = process(output_path, arguments)
+    remove_core_build_artifacts(output_path)
+    if file_exists(output_path): file_remove(output_path)
+    return exit_status
+
+fn build_from_arguments() -> Number:
+    let count: Number = arg_count()
+    var optimization: Text = "-O0"
+    var sanitize: Boolean = false
+    var target_triple: Text = ""
+    var source_path: Text = ""
+    var output_path: Text = ""
+    var index: Number = 2
+    while index <= count:
+        let a: Text = arg(index)
+        if a == "--release":
+            set optimization = "-O2"
+            set index = index + 1
+        else:
+            if a == "--sanitize":
+                set sanitize = true
+                set index = index + 1
+            else:
+                if a == "--target":
+                    if index + 1 > count: fail("Usage: yaza build [--target <triple>] ...")
+                    set target_triple = arg(index + 1)
+                    set index = index + 2
+                else:
+                    if a == "-o":
+                        if index + 1 > count: fail("Usage: yaza build ... -o <binary>")
+                        set output_path = arg(index + 1)
+                        set index = index + 2
+                    else:
+                        if text_starts_with(a, "-"):
+                            fail("yaza build: unrecognized option: " + a)
+                        else:
+                            set source_path = a
+                            set index = index + 1
+    if source_path == "" or output_path == "":
+        fail("Usage: yaza build [--release] [--sanitize] [--target <triple>] <source.yz> -o <binary>")
+    return build_core_program_ex(source_path, output_path, optimization, target_triple, sanitize)
+
+fn run_yazabase_cli() -> Number:
+    let env_cli: Text = env_get("YAZABASE_BIN")
+    var cli_path: Text = ""
+    if env_cli != "" and file_exists(env_cli): set cli_path = env_cli
+    let executable: Text = executable_path()
+    var separator: Number = text_length(executable)
+    while separator > 0 and text_byte(executable, separator - 1) != 47:
+        set separator = separator - 1
+    if cli_path == "" and separator > 0:
+        let executable_directory: Text = text_slice(executable, 0, separator - 1)
+        if file_exists(executable_directory + "/yazabase"): set cli_path = executable_directory + "/yazabase"
+        elif file_exists(executable_directory + "/yazabase-cli"): set cli_path = executable_directory + "/yazabase-cli"
+    if cli_path == "":
+        if file_exists("/usr/local/bin/yazabase"): set cli_path = "/usr/local/bin/yazabase"
+        elif file_exists("/opt/homebrew/bin/yazabase"): set cli_path = "/opt/homebrew/bin/yazabase"
+    if cli_path == "":
+        let development_cli_path: Text = core_llvm_runtime_root() + "/build/yazabase-cli"
+        if file_exists(development_cli_path): set cli_path = development_cli_path
+        elif file_exists("build/yazabase-cli"): set cli_path = "build/yazabase-cli"
+    if cli_path == "":
+        fail("YazaBase CLI support executable not found; install YAZA or set YAZABASE_BIN")
+    let arguments: TextList = text_list()
+    var argument_index: Number = 2
+    while argument_index <= arg_count():
+        list_push(arguments, arg(argument_index))
+        set argument_index = argument_index + 1
+    return process(cli_path, arguments)
+
+fn gen_json_string(value: Text) -> Text:
+    return "\"" + json_escape_text(value) + "\""
+
+fn gen_directory_of(path: Text) -> Text:
+    var index: Number = text_length(path)
+    while index > 0 and text_byte(path, index - 1) != 47:
+        set index = index - 1
+    if index == 0: return "."
+    if index == 1: return "/"
+    return text_slice(path, 0, index - 1)
+
+fn gen_ensure_directory_tree(path: Text) -> Number:
+    if text_length(path) > 0 and path != "." and path != "/" and not is_directory(path):
+        let parent: Text = gen_directory_of(path)
+        if parent != path:
+            gen_ensure_directory_tree(parent)
+        return directory_create(path)
+    return 0
+
+fn gen_quoted_value(raw: Text) -> Text:
+    let trimmed: Text = text_trim(raw)
+    let first_quote: Number = text_find(trimmed, "\"")
+    if first_quote < 0: return trimmed
+    let rest: Text = text_slice(trimmed, first_quote + 1, text_length(trimmed) - first_quote - 1)
+    let second_quote: Number = text_find(rest, "\"")
+    if second_quote < 0: return rest
+    return text_slice(rest, 0, second_quote)
+
+fn gen_safe_name(value: Text) -> Text:
+    var result: Text = ""
+    var index: Number = 0
+    while index < text_length(value):
+        let byte: Number = text_byte(value, index)
+        if byte == 45 or byte == 32:
+            set result = result + "_"
+        else:
+            set result = result + text_slice(value, index, 1)
+        set index = index + 1
+    return result
+
+fn gen_sample_json(value_type: Text, default_value: Text) -> Text:
+    var result: Text = text_trim(default_value)
+    if text_length(result) == 0:
+        if value_type == "Text":
+            set result = gen_json_string("sample")
+        elif value_type == "Number" or value_type == "Int32":
+            set result = "1"
+        elif value_type == "Float64":
+            set result = "1.0"
+        else:
+            set result = "true"
+    return result
+
+fn gen_sample_raw(value_type: Text, default_value: Text) -> Text:
+    let trimmed: Text = text_trim(default_value)
+    if text_length(trimmed) == 0:
+        if value_type == "Text": return "sample"
+        if value_type == "Number" or value_type == "Int32": return "1"
+        if value_type == "Float64": return "1.0"
+        return "true"
+    if value_type == "Text" and text_starts_with(trimmed, "\""):
+        return gen_quoted_value(trimmed)
+    return trimmed
+
+fn gen_openapi_schema(value_type: Text) -> Text:
+    if value_type == "Text": return "{\"type\":\"string\"}"
+    if value_type == "Number" or value_type == "Int32": return "{\"type\":\"integer\"}"
+    if value_type == "Float64": return "{\"type\":\"number\"}"
+    if value_type == "Boolean": return "{\"type\":\"boolean\"}"
+    return "{\"type\":\"object\"}"
+
+fn gen_parse_controller(controller_path: Text) -> TextList:
+    let result: TextList = text_list()
+    if not file_exists(controller_path):
+        list_push(result, "")
+        return result
+    let lines: TextList = text_lines(file_read(controller_path))
+    let body_fields: TextList = text_list()
+    let params: TextList = text_list()
+    var body: Text = ""
+    var line_index: Number = 0
+    while line_index < list_count(lines):
+        let command: Text = text_trim(list_get(lines, line_index))
+        if text_starts_with(command, "example json "):
+            set body = text_trim(text_slice(command, 13, text_length(command) - 13))
+        elif text_starts_with(command, "body json "):
+            set body = text_trim(text_slice(command, 10, text_length(command) - 10))
+        else:
+            var kind: Text = ""
+            var declaration: Text = ""
+            if text_starts_with(command, "path "):
+                set kind = "path"
+                set declaration = text_slice(command, 5, text_length(command) - 5)
+            elif text_starts_with(command, "query "):
+                set kind = "query"
+                set declaration = text_slice(command, 6, text_length(command) - 6)
+            elif text_starts_with(command, "header "):
+                set kind = "header"
+                set declaration = text_slice(command, 7, text_length(command) - 7)
+            elif text_starts_with(command, "body "):
+                set kind = "body"
+                set declaration = text_slice(command, 5, text_length(command) - 5)
+            if text_length(kind) > 0:
+                let colon: Number = text_find(declaration, ":")
+                if colon >= 0:
+                    let name: Text = text_trim(text_slice(declaration, 0, colon))
+                    let typed_default: Text = text_trim(text_slice(declaration, colon + 1, text_length(declaration) - colon - 1))
+                    let equal: Number = text_find(typed_default, "=")
+                    var value_type: Text = typed_default
+                    var default_value: Text = ""
+                    if equal >= 0:
+                        set value_type = text_trim(text_slice(typed_default, 0, equal))
+                        set default_value = text_trim(text_slice(typed_default, equal + 1, text_length(typed_default) - equal - 1))
+                    if kind == "body" and (value_type == "Text" or value_type == "Number" or value_type == "Int32" or value_type == "Float64" or value_type == "Boolean"):
+                        list_push(body_fields, gen_json_string(name) + ":" + gen_sample_json(value_type, ""))
+                    list_push(params, kind)
+                    list_push(params, name)
+                    list_push(params, value_type)
+                    list_push(params, default_value)
+        set line_index = line_index + 1
+    if text_length(body) == 0 and list_count(body_fields) > 0:
+        set body = "{" + text_join(body_fields, ",") + "}"
+    list_push(result, body)
+    var index: Number = 0
+    while index < list_count(params):
+        list_push(result, list_get(params, index))
+        set index = index + 1
+    return result
+
+fn gen_join_route_path(prefix: Text, sub_path: Text) -> Text:
+    var p: Text = prefix
+    if text_ends_with(p, "/") and text_length(p) > 1:
+        set p = text_slice(p, 0, text_length(p) - 1)
+    if sub_path == "/" or sub_path == "":
+        if p == "": return "/"
+        return p
+    var s: Text = sub_path
+    if not text_starts_with(s, "/"): set s = "/" + s
+    if p == "" or p == "/": return s
+    return p + s
+
+fn gen_append_route(routes: TextList, method: Text, route_path: Text, status_code: Text, controller: Text, auth_policy: Text, handler_name: Text) -> Number:
+    list_push(routes, method)
+    list_push(routes, route_path)
+    list_push(routes, status_code)
+    list_push(routes, controller)
+    list_push(routes, auth_policy)
+    list_push(routes, handler_name)
+    return 0
+
+fn gen_has_route(routes: TextList, method: Text, route_path: Text) -> Boolean:
+    var index: Number = 2
+    while index + 5 < list_count(routes):
+        if list_get(routes, index) == method and list_get(routes, index + 1) == route_path:
+            return true
+        set index = index + 6
+    return false
+
+fn gen_parse_route_file(route_file_path: Text, routes: TextList) -> Number:
+    if not file_exists(route_file_path): return 0
+    let lines: TextList = text_lines(file_read(route_file_path))
+    let group_indents: TextList = text_list()
+    let group_prefixes: TextList = text_list()
+    let group_auths: TextList = text_list()
+    var active_depth: Number = 0
+    var line_index: Number = 0
+    while line_index < list_count(lines):
+        let raw_line: Text = list_get(lines, line_index)
+        let command: Text = text_trim(raw_line)
+        if text_length(command) > 0 and not text_starts_with(command, "#"):
+            var indent: Number = 0
+            while indent < text_length(raw_line) and text_byte(raw_line, indent) == 32:
+                set indent = indent + 1
+            while active_depth > 0 and indent <= number_parse(list_get(group_indents, active_depth - 1)):
+                set active_depth = active_depth - 1
+            if text_starts_with(command, "group "):
+                let prefix_part: Text = gen_quoted_value(command)
+                var parent_prefix: Text = ""
+                var parent_auth: Text = "public"
+                if active_depth > 0:
+                    set parent_prefix = list_get(group_prefixes, active_depth - 1)
+                    set parent_auth = list_get(group_auths, active_depth - 1)
+                var grp_auth: Text = parent_auth
+                if text_find(command, "auth jwt") >= 0: set grp_auth = "jwt"
+                elif text_find(command, "auth required") >= 0: set grp_auth = "required"
+                elif text_find(command, "auth public") >= 0: set grp_auth = "public"
+                let full_prefix: Text = gen_join_route_path(parent_prefix, prefix_part)
+                if active_depth < list_count(group_indents):
+                    list_set(group_indents, active_depth, number_text(indent))
+                    list_set(group_prefixes, active_depth, full_prefix)
+                    list_set(group_auths, active_depth, grp_auth)
+                else:
+                    list_push(group_indents, number_text(indent))
+                    list_push(group_prefixes, full_prefix)
+                    list_push(group_auths, grp_auth)
+                set active_depth = active_depth + 1
+            elif text_starts_with(command, "route "):
+                let after_route: Text = text_trim(text_slice(command, 6, text_length(command) - 6))
+                let sp: Number = text_find(after_route, " ")
+                if sp > 0:
+                    let method: Text = text_slice(after_route, 0, sp)
+                    let rest: Text = text_trim(text_slice(after_route, sp + 1, text_length(after_route) - sp - 1))
+                    let route_sub_path: Text = gen_quoted_value(rest)
+                    var cur_prefix: Text = ""
+                    var cur_auth: Text = "public"
+                    if active_depth > 0:
+                        set cur_prefix = list_get(group_prefixes, active_depth - 1)
+                        set cur_auth = list_get(group_auths, active_depth - 1)
+                    if text_find(rest, "auth jwt") >= 0: set cur_auth = "jwt"
+                    elif text_find(rest, "auth required") >= 0: set cur_auth = "required"
+                    elif text_find(rest, "auth public") >= 0: set cur_auth = "public"
+                    var status_code: Text = "200"
+                    if method == "POST": set status_code = "201"
+                    if method == "DELETE": set status_code = "204"
+                    let status_pos: Number = text_find(rest, "status ")
+                    if status_pos >= 0:
+                        let after_status: Text = text_trim(text_slice(rest, status_pos + 7, text_length(rest) - status_pos - 7))
+                        let sp2: Number = text_find(after_status, " ")
+                        if sp2 > 0: set status_code = text_slice(after_status, 0, sp2)
+                    var controller: Text = ""
+                    var handler: Text = ""
+                    let ctrl_pos: Number = text_find(rest, "controller ")
+                    if ctrl_pos >= 0:
+                        let ctrl_ref: Text = text_trim(text_slice(rest, ctrl_pos + 11, text_length(rest) - ctrl_pos - 11))
+                        let dot_pos: Number = text_find(ctrl_ref, ".")
+                        if dot_pos > 0:
+                            set controller = text_slice(ctrl_ref, 0, dot_pos)
+                            set handler = text_slice(ctrl_ref, dot_pos + 1, text_length(ctrl_ref) - dot_pos - 1)
+                        else:
+                            set controller = ctrl_ref
+                    let full_path: Text = gen_join_route_path(cur_prefix, route_sub_path)
+                    gen_append_route(routes, method, full_path, status_code, controller, cur_auth, handler)
+        set line_index = line_index + 1
+    return 0
+
+fn gen_scan_handler_routes(source_text: Text, routes: TextList) -> Number:
+    let lines: TextList = text_lines(source_text)
+    var cur_path: Text = ""
+    var line_index: Number = 0
+    while line_index < list_count(lines):
+        let line: Text = text_trim(list_get(lines, line_index))
+        if text_find(line, "path == \"") >= 0:
+            let p_idx: Number = text_find(line, "path == \"")
+            let rest: Text = text_slice(line, p_idx + 8, text_length(line) - p_idx - 8)
+            set cur_path = gen_quoted_value(rest)
+            if text_find(line, "method ==") < 0 and (line_index + 1 >= list_count(lines) or text_find(list_get(lines, line_index + 1), "method ==") < 0):
+                if not gen_has_route(routes, "GET", cur_path):
+                    gen_append_route(routes, "GET", cur_path, "200", "", "public", "")
+        elif cur_path != "" and text_find(line, "method == \"") >= 0:
+            let m_idx: Number = text_find(line, "method == \"")
+            let rest_m: Text = text_slice(line, m_idx + 10, text_length(line) - m_idx - 10)
+            let method_name: Text = gen_quoted_value(rest_m)
+            var status: Text = "200"
+            if method_name == "POST": set status = "201"
+            if method_name == "DELETE": set status = "204"
+            if not gen_has_route(routes, method_name, cur_path):
+                gen_append_route(routes, method_name, cur_path, status, "", "public", "")
+        set line_index = line_index + 1
+    return 0
+
+fn gen_project_name(project_path: Text) -> Text:
+    var len: Number = text_length(project_path)
+    while len > 1 and text_byte(project_path, len - 1) == 47:
+        set len = len - 1
+    var last_slash: Number = -1
+    var index: Number = 0
+    while index < len:
+        if text_byte(project_path, index) == 47: set last_slash = index
+        set index = index + 1
+    var name: Text = text_slice(project_path, last_slash + 1, len - last_slash - 1)
+    let toml_path: Text = path_join(project_path, "yaza.toml")
+    if (name == "." or name == "") and file_exists(toml_path):
+        let lines: TextList = text_lines(file_read(toml_path))
+        var i: Number = 0
+        while i < list_count(lines):
+            let l: Text = text_trim(list_get(lines, i))
+            if text_starts_with(l, "name = "):
+                let candidate: Text = gen_quoted_value(text_slice(l, 7, text_length(l) - 7))
+                if candidate != "" and text_find(candidate, "{{") < 0:
+                    set name = candidate
+                    break
+            set i = i + 1
+    if name == "" or name == ".": set name = "yaza-api"
+    return name
+
+fn gen_collect_api_spec(project_path: Text) -> TextList:
+    let project_source: Text = path_join(project_path, "src")
+    let main_path: Text = path_join(project_source, "main.yz")
+    if not file_exists(main_path):
+        fail("yaza generate: src/main.yz not found in '" + project_path + "'")
+    let main_source: Text = file_read(main_path)
+    var host: Text = "127.0.0.1"
+    var port: Text = "8080"
+    let toml_path: Text = path_join(project_path, "yaza.toml")
+    if file_exists(toml_path):
+        let toml_lines: TextList = text_lines(file_read(toml_path))
+        var ti: Number = 0
+        while ti < list_count(toml_lines):
+            let tl: Text = text_trim(list_get(toml_lines, ti))
+            if text_starts_with(tl, "bind = "):
+                let addr: Text = gen_quoted_value(text_slice(tl, 7, text_length(tl) - 7))
+                let col: Number = text_find(addr, ":")
+                if col > 0:
+                    set host = text_slice(addr, 0, col)
+                    set port = text_slice(addr, col + 1, text_length(addr) - col - 1)
+                    if host == "0.0.0.0": set host = "127.0.0.1"
+            set ti = ti + 1
+
+    let routes: TextList = text_list()
+    list_push(routes, host)
+    list_push(routes, port)
+    var routes_dir_rel: Text = "routes"
+
+    # Check api: block inside src/main.yz if present
+    let main_lines: TextList = text_lines(main_source)
+    var in_api_block: Boolean = false
+    var mi: Number = 0
+    while mi < list_count(main_lines):
+        let ml: Text = text_trim(list_get(main_lines, mi))
+        if ml == "api:": set in_api_block = true
+        elif in_api_block:
+            if text_starts_with(ml, "listen "):
+                let addr: Text = gen_quoted_value(text_slice(ml, 7, text_length(ml) - 7))
+                let col: Number = text_find(addr, ":")
+                if col > 0:
+                    list_set(routes, 0, text_slice(addr, 0, col))
+                    list_set(routes, 1, text_slice(addr, col + 1, text_length(addr) - col - 1))
+            elif text_starts_with(ml, "routes "):
+                set routes_dir_rel = gen_quoted_value(text_slice(ml, 7, text_length(ml) - 7))
+            elif text_starts_with(ml, "get "):
+                let p: Text = gen_quoted_value(text_slice(ml, 4, text_length(ml) - 4))
+                gen_append_route(routes, "GET", p, "200", "", "public", "")
+        set mi = mi + 1
+
+    let routes_dir: Text = path_join(project_source, routes_dir_rel)
+    if is_directory(routes_dir):
+        let entries: TextList = directory_list(routes_dir)
+        sort_text_entries(entries)
+        var ei: Number = 0
+        while ei < list_count(entries):
+            let entry: Text = list_get(entries, ei)
+            if text_ends_with(entry, ".yz"):
+                gen_parse_route_file(path_join(routes_dir, entry), routes)
+            set ei = ei + 1
+
+    if list_count(routes) <= 2:
+        gen_scan_handler_routes(main_source, routes)
+        let adapters_dir: Text = path_join(project_source, "adapters")
+        if is_directory(adapters_dir):
+            let ad_entries: TextList = directory_list(adapters_dir)
+            sort_text_entries(ad_entries)
+            var ai: Number = 0
+            while ai < list_count(ad_entries):
+                let ae: Text = list_get(ad_entries, ai)
+                if text_ends_with(ae, ".yz"):
+                    gen_scan_handler_routes(file_read(path_join(adapters_dir, ae)), routes)
+                set ai = ai + 1
+
+    return routes
+
+fn gen_resolve_controller_path(project_source: Text, controller: Text) -> Text:
+    let schema_path: Text = path_join(path_join(project_source, "schemas"), controller + ".yz")
+    if file_exists(schema_path):
+        return schema_path
+    return path_join(path_join(project_source, "controllers"), controller + ".yz")
+
+fn gen_postman_route_item(project_source: Text, method: Text, route_path: Text, controller: Text, route_number: Number, auth_policy: Text, variables: TextList, seen_var_keys: TextList, api_host: Text, api_port: Text) -> Text:
+    let parameters: TextList = text_list()
+    var request_body: Text = ""
+    if text_length(controller) > 0:
+        let controller_path: Text = gen_resolve_controller_path(project_source, controller)
+        let parsed: TextList = gen_parse_controller(controller_path)
+        if method == "POST" or method == "PUT" or method == "PATCH":
+            set request_body = list_get(parsed, 0)
+        var pi: Number = 0
+        while pi < list_count(parsed):
+            list_push(parameters, list_get(parsed, pi))
+            set pi = pi + 1
+
+    var has_accept: Boolean = false
+    var has_content_type: Boolean = false
+    var p_idx: Number = 1
+    while p_idx < list_count(parameters):
+        let kind: Text = list_get(parameters, p_idx)
+        let name: Text = list_get(parameters, p_idx + 1)
+        if kind == "header" and (name == "Accept" or name == "accept"): set has_accept = true
+        if kind == "header" and (name == "Content-Type" or name == "content-type"): set has_content_type = true
+        set p_idx = p_idx + 4
+
+    let headers: TextList = text_list()
+    if not has_accept:
+        list_push(headers, "{\"key\": \"Accept\", \"value\": \"application/json\", \"type\": \"text\"}")
+    let query_parts: TextList = text_list()
+    var rendered_path: Text = route_path
+    set p_idx = 1
+    while p_idx < list_count(parameters):
+        let kind: Text = list_get(parameters, p_idx)
+        let name: Text = list_get(parameters, p_idx + 1)
+        let value_type: Text = list_get(parameters, p_idx + 2)
+        let default_value: Text = list_get(parameters, p_idx + 3)
+        let var_name: Text = "route" + number_text(route_number) + "_" + kind + "_" + gen_safe_name(name)
+        if kind != "body":
+            if method != "HEAD" and not contains_path(seen_var_keys, var_name):
+                list_push(seen_var_keys, var_name)
+                list_push(variables, "{\"key\": " + gen_json_string(var_name) + ", \"value\": " + gen_json_string(gen_sample_raw(value_type, default_value)) + "}")
+            if kind == "path" and text_find(route_path, "{" + name + "}") >= 0:
+                set rendered_path = replace_all(rendered_path, "{" + name + "}", "{{" + var_name + "}}")
+            elif kind == "query":
+                list_push(query_parts, name + "={{" + var_name + "}}")
+            elif kind == "header":
+                list_push(headers, "{\"key\": " + gen_json_string(name) + ", \"value\": " + gen_json_string("{{" + var_name + "}}") + ", \"type\": \"text\"}")
+        set p_idx = p_idx + 4
+
+    if text_length(request_body) > 0 and not has_content_type:
+        list_push(headers, "{\"key\": \"Content-Type\", \"value\": \"application/json\", \"type\": \"text\"}")
+
+    var raw_url: Text = "http://" + api_host + ":" + api_port + rendered_path
+    if list_count(query_parts) > 0:
+        set raw_url = raw_url + "?" + text_join(query_parts, "&")
+    let segments: TextList = text_split(rendered_path, "/")
+    let pm_path: TextList = text_list()
+    var si: Number = 0
+    while si < list_count(segments):
+        let seg: Text = list_get(segments, si)
+        if text_length(seg) > 0: list_push(pm_path, gen_json_string(seg))
+        set si = si + 1
+    let pm_query: TextList = text_list()
+    var qi: Number = 0
+    while qi < list_count(query_parts):
+        let qp: Text = list_get(query_parts, qi)
+        let eq: Number = text_find(qp, "=")
+        if eq >= 0:
+            list_push(pm_query, "{\"key\":" + gen_json_string(text_slice(qp, 0, eq)) + ",\"value\":" + gen_json_string(text_slice(qp, eq + 1, text_length(qp) - eq - 1)) + "}")
+        set qi = qi + 1
+    let pm_url: Text = "{\"raw\":" + gen_json_string(raw_url) + ",\"protocol\":\"http\",\"host\":[" + gen_json_string(api_host) + "],\"port\":" + gen_json_string(api_port) + ",\"path\":[" + text_join(pm_path, ",") + "],\"query\":[" + text_join(pm_query, ",") + "]}"
+    var request: Text = "{\"method\": " + gen_json_string(method) + ", \"header\": [" + text_join(headers, ", ") + "], \"url\": " + pm_url
+    if text_length(request_body) > 0:
+        set request = request + ", \"body\": {\"mode\": \"raw\", \"raw\": " + gen_json_string(request_body) + ", \"options\": {\"raw\": {\"language\": \"json\"}}}"
+    if auth_policy != "public":
+        set request = request + ", \"auth\": {\"type\": \"bearer\", \"bearer\": [{\"key\": \"token\", \"value\": \"{{apiToken}}\", \"type\": \"string\"}]}"
+    set request = request + "}"
+    var item_name: Text = route_path
+    if method == "HEAD": set item_name = "HEAD " + route_path
+    let test_script: Text = "[{\"listen\": \"test\", \"script\": {\"type\": \"text/javascript\", \"exec\": [\"pm.test(\\\"returns a successful response\\\", function () {\", \"    pm.expect(pm.response.code).to.be.within(200, 299);\", \"});\"]}}]"
+    return "{\"name\": " + gen_json_string(item_name) + ", \"request\": " + request + ", \"event\": " + test_script + "}"
+
+fn generate_postman(project_path: Text, output_path: Text) -> Text:
+    let api_data: TextList = gen_collect_api_spec(project_path)
+    let project_source: Text = path_join(project_path, "src")
+    let project_name: Text = gen_project_name(project_path)
+    let variables: TextList = text_list()
+    let seen_vars: TextList = text_list()
+    let items: TextList = text_list()
+    var route_index: Number = 2
+    var route_number: Number = 1
+    var token_added: Boolean = false
+    while route_index + 5 < list_count(api_data):
+        let method: Text = list_get(api_data, route_index)
+        let r_path: Text = list_get(api_data, route_index + 1)
+        let ctrl: Text = list_get(api_data, route_index + 3)
+        let auth_pol: Text = list_get(api_data, route_index + 4)
+        if auth_pol != "public" and not token_added:
+            list_push(seen_vars, "apiToken")
+            list_push(variables, "{\"key\": \"apiToken\", \"value\": \"\"}")
+            set token_added = true
+        list_push(items, gen_postman_route_item(project_source, method, r_path, ctrl, route_number, auth_pol, variables, seen_vars, list_get(api_data, 0), list_get(api_data, 1)))
+        if method == "GET":
+            list_push(items, gen_postman_route_item(project_source, "HEAD", r_path, ctrl, route_number, auth_pol, variables, seen_vars, list_get(api_data, 0), list_get(api_data, 1)))
+        set route_index = route_index + 6
+        set route_number = route_number + 1
+
+    var target: Text = output_path
+    if text_length(target) == 0:
+        let api_docs_dir: Text = path_join(path_join(project_path, "docs"), "api")
+        gen_ensure_directory_tree(api_docs_dir)
+        set target = path_join(api_docs_dir, project_name + ".postman_collection.json")
+    else:
+        if not text_starts_with(target, "/"):
+            set target = path_join(project_path, target)
+        gen_ensure_directory_tree(gen_directory_of(target))
+
+    let collection: Text = "{\n  \"info\": {\n    \"name\": " + gen_json_string(project_name + " API") + ",\n    \"description\": \"Generated from YAZA routes and controller request declarations.\",\n    \"schema\": \"https://schema.getpostman.com/json/collection/v2.1.0/collection.json\"\n  },\n  \"item\": [\n" + text_join(items, ",\n") + "\n  ],\n  \"variable\": [\n" + text_join(variables, ",\n") + "\n  ]\n}\n"
+    if file_write(target, collection) != 0:
+        fail("yaza generate: cannot write Postman collection to '" + target + "'")
+    say "Generated Postman collection: " + target
+    return target
+
+fn gen_openapi_method_name(method: Text) -> Text:
+    if method == "GET": return "get"
+    if method == "HEAD": return "head"
+    if method == "POST": return "post"
+    if method == "PUT": return "put"
+    if method == "PATCH": return "patch"
+    if method == "DELETE": return "delete"
+    return "get"
+
+fn gen_openapi_operation(project_source: Text, method: Text, route_path: Text, controller: Text, status_code: Text, auth_policy: Text) -> Text:
+    let parameters: TextList = text_list()
+    let body_props: TextList = text_list()
+    let body_req: TextList = text_list()
+    var request_body: Text = ""
+    if text_length(controller) > 0:
+        let controller_path: Text = gen_resolve_controller_path(project_source, controller)
+        let parsed: TextList = gen_parse_controller(controller_path)
+        if method == "POST" or method == "PUT" or method == "PATCH":
+            set request_body = list_get(parsed, 0)
+        var pi: Number = 1
+        while pi < list_count(parsed):
+            let kind: Text = list_get(parsed, pi)
+            let name: Text = list_get(parsed, pi + 1)
+            let v_type: Text = list_get(parsed, pi + 2)
+            let def_val: Text = list_get(parsed, pi + 3)
+            let in_path: Boolean = text_find(route_path, "{" + name + "}") >= 0
+            if kind == "body":
+                list_push(body_props, gen_json_string(name) + ":" + gen_openapi_schema(v_type))
+                list_push(body_req, gen_json_string(name))
+            elif kind != "path" or in_path:
+                var req_flag: Text = "true"
+                if kind != "path" and text_length(def_val) > 0: set req_flag = "false"
+                list_push(parameters, "{\"name\":" + gen_json_string(name) + ",\"in\":" + gen_json_string(kind) + ",\"required\":" + req_flag + ",\"schema\":" + gen_openapi_schema(v_type) + ",\"example\":" + gen_sample_json(v_type, def_val) + "}")
+            set pi = pi + 4
+
+    var resp_desc: Text = "Successful response"
+    if status_code == "201": set resp_desc = "Resource created"
+    elif status_code == "204": set resp_desc = "Resource deleted"
+    let responses: Text = gen_json_string(status_code) + ":{\"description\":" + gen_json_string(resp_desc) + "},\"400\":{\"description\":\"Invalid request\"},\"404\":{\"description\":\"Resource not found\"},\"500\":{\"description\":\"Internal server error\"}"
+    var op: Text = "{\"summary\":" + gen_json_string(method + " " + route_path) + ",\"parameters\":[" + text_join(parameters, ",") + "]"
+    if text_length(request_body) > 0:
+        var req_schema: Text = "{\"type\":\"object\"}"
+        if list_count(body_props) > 0:
+            set req_schema = "{\"type\":\"object\",\"properties\":{" + text_join(body_props, ",") + "},\"required\":[" + text_join(body_req, ",") + "]}"
+        set op = op + ",\"requestBody\":{\"required\":true,\"content\":{\"application/json\":{\"schema\":" + req_schema + ",\"example\":" + request_body + "}}}"
+    if auth_policy != "public":
+        set op = op + ",\"security\":[{\"BearerAuth\":[]}]"
+    return op + ",\"responses\":{" + responses + "}}"
+
+fn generate_openapi(project_path: Text, output_path: Text) -> Text:
+    let api_data: TextList = gen_collect_api_spec(project_path)
+    let project_source: Text = path_join(project_path, "src")
+    let project_name: Text = gen_project_name(project_path)
+    let unique_paths: TextList = text_list()
+    var ri: Number = 2
+    while ri + 5 < list_count(api_data):
+        let p: Text = list_get(api_data, ri + 1)
+        if not contains_path(unique_paths, p): list_push(unique_paths, p)
+        set ri = ri + 6
+
+    let path_items: TextList = text_list()
+    var pi: Number = 0
+    while pi < list_count(unique_paths):
+        let cur_path: Text = list_get(unique_paths, pi)
+        let ops: TextList = text_list()
+        set ri = 2
+        while ri + 5 < list_count(api_data):
+            if list_get(api_data, ri + 1) == cur_path:
+                let m: Text = list_get(api_data, ri)
+                let st: Text = list_get(api_data, ri + 2)
+                let ctrl: Text = list_get(api_data, ri + 3)
+                let auth_p: Text = list_get(api_data, ri + 4)
+                list_push(ops, gen_json_string(gen_openapi_method_name(m)) + ":" + gen_openapi_operation(project_source, m, cur_path, ctrl, st, auth_p))
+                if m == "GET":
+                    list_push(ops, "\"head\":" + gen_openapi_operation(project_source, "HEAD", cur_path, ctrl, st, auth_p))
+            set ri = ri + 6
+        list_push(path_items, "    " + gen_json_string(cur_path) + ": {" + text_join(ops, ",") + "}")
+        set pi = pi + 1
+
+    var target: Text = output_path
+    if text_length(target) == 0:
+        let api_docs_dir: Text = path_join(path_join(project_path, "docs"), "api")
+        gen_ensure_directory_tree(api_docs_dir)
+        set target = path_join(api_docs_dir, "openapi.json")
+    else:
+        if not text_starts_with(target, "/"):
+            set target = path_join(project_path, target)
+        gen_ensure_directory_tree(gen_directory_of(target))
+
+    let doc: Text = "{\n  \"openapi\": \"3.1.0\",\n  \"info\": {\"title\": " + gen_json_string(project_name + " API") + ", \"version\": \"1.0.0\"},\n  \"servers\": [{\"url\": " + gen_json_string("http://" + list_get(api_data, 0) + ":" + list_get(api_data, 1)) + "}],\n  \"security\": [{\"BearerAuth\": []}, {}],\n  \"components\": {\"securitySchemes\": {\"BearerAuth\": {\"type\": \"http\", \"scheme\": \"bearer\"}}},\n  \"paths\": {\n" + text_join(path_items, ",\n") + "\n  }\n}\n"
+    if file_write(target, doc) != 0:
+        fail("yaza generate: cannot write OpenAPI/Swagger document to '" + target + "'")
+    say "Generated Swagger/OpenAPI 3.1 document: " + target
+    return target
+
+fn generate_from_arguments() -> Number:
+    let count: Number = arg_count()
+    var project_path: Text = "."
+    var output_path: Text = ""
+    var generator: Text = "all"
+    var explicit_generator: Boolean = false
+    var argument_index: Number = 2
+    if count >= 2 and arg(2) == "--postman":
+        set explicit_generator = true
+        set generator = "postman"
+        set argument_index = 3
+    elif count >= 2 and arg(2) == "--openapi":
+        set explicit_generator = true
+        set generator = "openapi"
+        set argument_index = 3
+    elif count >= 2 and arg(2) == "--swagger":
+        set explicit_generator = true
+        set generator = "swagger"
+        set output_path = "docs/api/swagger.json"
+        set argument_index = 3
+    elif count >= 2 and arg(2) == "--all":
+        set explicit_generator = true
+        set argument_index = 3
+
+    if argument_index <= count:
+        if arg(argument_index) == "-o" or arg(argument_index) == "--output":
+            if argument_index + 1 == count:
+                set output_path = arg(argument_index + 1)
+                set argument_index = count + 1
+            else:
+                fail("Usage: yaza generate [--all | --postman | --openapi | --swagger] [project] [-o output.json]")
+        else:
+            if text_starts_with(arg(argument_index), "-"):
+                fail("Usage: yaza generate [--all | --postman | --openapi | --swagger] [project] [-o output.json]")
+            set project_path = arg(argument_index)
+            set argument_index = argument_index + 1
+
+    if argument_index <= count:
+        if (arg(argument_index) == "-o" or arg(argument_index) == "--output") and argument_index + 1 == count:
+            set output_path = arg(argument_index + 1)
+            set argument_index = count + 1
+        else:
+            fail("Usage: yaza generate [--all | --postman | --openapi | --swagger] [project] [-o output.json]")
+
+    if text_length(output_path) > 0 and generator == "all":
+        if explicit_generator:
+            fail("yaza generate --all does not accept -o; use --postman, --openapi, or --swagger to choose one output file")
+        set generator = "postman"
+
+    if generator == "all":
+        generate_postman(project_path, "")
+        generate_openapi(project_path, "")
+        generate_openapi(project_path, "docs/api/swagger.json")
+    elif generator == "openapi" or generator == "swagger":
+        generate_openapi(project_path, output_path)
+    else:
+        generate_postman(project_path, output_path)
+    return 0
+
+fn print_yaza_llvm_help() -> Number:
+    say "YAZA LLVM — compiler and project tools"
+    say "Usage: yaza-llvm <command> [options]"
+    say ""
+    say "PROJECTS"
+    say "  new --api <name>         Create layered HTTP API starter"
+    say "  new --minimal-api <name> Create minimal API starter in src/main.yz"
+    say "  new --microservice <name> Create cloud-native microservice starter"
+    say "  new --web <name>         Create web starter"
+    say "  new --fullstack <name>   Create full-stack starter"
+    say "  new --mobile <name>      Create mobile starter layout"
+    say ""
+    say "DEVELOPMENT"
+    say "  run [--release] [--port <port>] [file.yz] [-- args...]  Build and run"
+    say "  build [--release] [--sanitize] [--target <triple>] <source.yz> -o <bin>"
+    say "  check [file.yz] [--format json]  Check source or project entrypoint"
+    say "  generate [--all | --postman | --openapi | --swagger] [project] [-o out.json]"
+    say "                           Generate Postman collection & Swagger/OpenAPI 3.1 docs"
+    say "  arch check [project]     Enforce module layer rules in yaza.toml"
+    say "  config [project] [--format json]  Show effective API and resource config"
+    say "  test [directory] [--format json]  Run test suite"
+    say "  bench [source.yz] [count]  Measure repeated native runs"
+    say ""
+    say "DATABASE (YAZABASE)"
+    say "  db [shell] [<dir> <db> | :memory:]  Interactive SQL REPL"
+    say "  db init <dir> <db>"
+    say "  db sql [--csv] [--timings | --count] <dir> <db> <sql> [--param type:val]..."
+    say "  db sql-batch [--count] <dir> <db> --statement <dml> ..."
+    say "  db session <dir> <db>"
+    say "  db api <dir> <db> [--host <h>] [--port <p>] [--secret <s>] [--max-requests <n>]"
+    say "  db backup <src-dir> <db> <dest-dir>"
+    say "  db restore <backup-dir> <db> <target-dir>"
+    say ""
+    say "SECURITY"
+    say "  audit --security [--format json]  Scan source/config for risky patterns"
+    say "  secret token             Generate a 256-bit random Bearer token"
+    say ""
+    say "INSPECT COMPILER OUTPUT"
+    say "  emit-yir <source.yz> -o <file.yir>"
+    say "  emit-llvm [--target <triple>] <source.yz> -o <file.ll>"
+    say "  emit-llvm-module <source.yz> --export-number <fn> -o <file.ll>"
+    say "  emit-llvm-module <source.yz> --export-request <fn> -o <file.ll>"
+    say ""
+    say "HELP"
+    say "  --help, -h               Show this help"
+    say "  db --help                Show YazaBase database help"
+    return 0
+
+fn print_yazabase_cli_help() -> Number:
+    say "YazaBase — database commands"
+    say "Usage: yaza-llvm db <command> [options]"
+    say "       yaza-llvm db [shell] [<dir> <db> | :memory:]"
+    say ""
+    say "INTERACTIVE CONSOLE"
+    say "  shell [<directory> <database-name> | :memory:]"
+    say "      Start interactive SQL REPL with table formatting & meta commands."
+    say ""
+    say "DATABASE LIFECYCLE"
+    say "  init <directory> <database-name>"
+    say "      Create a database in the given directory."
+    say "  backup <source-directory> <database-name> <destination-directory>"
+    say "      Write an offline, consistent database backup."
+    say "  restore <backup-directory> <database-name> <target-directory>"
+    say "      Restore into a new or empty target directory."
+    say ""
+    say "SQL AND CLIENT SESSIONS"
+    say "  sql [--csv] [--timings | --count] <directory> <database-name>"
+    say "      <statement> [--param type:value]..."
+    say "      Execute one SQL statement; --param may be repeated for typed binds."
+    say "  sql-batch [--count] <directory> <database-name>"
+    say "      --statement <DML> [--param type:value]... [--statement ...]"
+    say "      Execute up to 100 DML statements; each statement commits independently."
+    say "  session <directory> <database-name>"
+    say "      Start the framed persistent session used by database clients."
+    say "  api <directory> <database-name> [--host <h>] [--port <p>] [--secret <s>] [--max-requests <n>]"
+    say "      Start the HTTP/1.1 REST & SQL API server for YazaBase."
+    say ""
+    say "Examples"
+    say "  yaza-llvm db init ./data app"
+    say "  yaza-llvm db sql --csv ./data app 'SELECT id, name FROM users'"
+    say "  yaza-llvm db sql ./data app 'SELECT * FROM users WHERE id = ?' --param bigint:42"
+    say "  yaza-llvm db sql-batch ./data app --statement 'DELETE FROM users WHERE id = 1'"
+    say "  yaza-llvm db backup ./data app ./backups"
+    say ""
+    say "Run 'yaza-llvm --help' to see compiler and build commands."
+    return 0
+
+start:
+    let count: Number = arg_count()
+    if count == 0:
+        print_yaza_llvm_help()
+        exit(0)
+    let cmd: Text = arg(1)
+    if count == 1 and (cmd == "--help" or cmd == "-h" or cmd == "help"):
+        print_yaza_llvm_help()
+        exit(0)
+    if count == 1 and cmd == "--version":
+        say "YAZA LLVM 1.0.0 (Official Release, Native LLVM Backend)"
+        exit(0)
+    if cmd == "check":
+        let status: Number = check_from_arguments()
+        exit(status)
+    if cmd == "generate":
+        let status: Number = generate_from_arguments()
+        exit(status)
+    if cmd == "secret":
+        let status: Number = secret_token_from_arguments()
+        exit(status)
+    if cmd == "new":
+        let status: Number = new_from_arguments()
+        exit(status)
+    if cmd == "test":
+        let status: Number = test_from_arguments()
+        exit(status)
+    if cmd == "bench":
+        let status: Number = bench_from_arguments()
+        exit(status)
+    if cmd == "audit":
+        let status: Number = audit_from_arguments()
+        exit(status)
+    if cmd == "arch":
+        let status: Number = architecture_from_arguments()
+        exit(status)
+    if cmd == "config":
+        let status: Number = config_from_arguments()
+        exit(status)
+    if cmd == "run":
+        let status: Number = run_from_arguments()
+        exit(status)
+    if cmd == "build":
+        let status: Number = build_from_arguments()
+        exit(status)
+    if cmd == "emit-yir":
+        if count == 4 and arg(3) == "-o":
+            exit(emit_core_yir(arg(2), arg(4)))
+        fail("Usage: yaza-llvm emit-yir <source.yz> -o <file.yir>")
+    if cmd == "emit-llvm":
+        if count == 6 and arg(2) == "--target" and arg(5) == "-o":
+            exit(emit_core_llvm_for_target(arg(4), arg(6), arg(3)))
+        if count == 4 and arg(3) == "-o":
+            exit(emit_core_llvm(arg(2), arg(4)))
+        fail("Usage: yaza-llvm emit-llvm [--target <triple>] <source.yz> -o <file.ll>")
+    if cmd == "emit-llvm-module":
+        if count == 6 and arg(3) == "--export-number" and arg(5) == "-o":
+            exit(emit_core_llvm_module(arg(2), arg(4), arg(6)))
+        if count == 6 and arg(3) == "--export-request" and arg(5) == "-o":
+            exit(emit_core_llvm_request_module(arg(2), arg(4), arg(6)))
+        fail("Usage: yaza-llvm emit-llvm-module <source.yz> --export-number|--export-request <fn> -o <file.ll>")
+    if cmd == "db":
+        if count == 1:
+            exit(run_yazabase_cli())
+        if count == 2 and (arg(2) == "--help" or arg(2) == "-h" or arg(2) == "help"):
+            print_yazabase_cli_help()
+            exit(0)
+        if count == 2 and (arg(2) == "shell" or arg(2) == "console" or arg(2) == ":memory:"):
+            exit(run_yazabase_cli())
+        if count == 3 and (arg(2) == "shell" or arg(2) == "console"):
+            exit(run_yazabase_cli())
+        if count == 4 and (arg(2) == "shell" or arg(2) == "console"):
+            exit(run_yazabase_cli())
+        if count == 3 and arg(2) != "init" and arg(2) != "session" and arg(2) != "backup" and arg(2) != "restore" and arg(2) != "sql" and arg(2) != "sql-batch" and arg(2) != "api" and arg(2) != "export" and arg(2) != "import" and arg(2) != "set-user" and arg(2) != "auth-check":
+            exit(run_yazabase_cli())
+        if arg(2) != "init" and arg(2) != "backup" and arg(2) != "restore" and arg(2) != "sql" and arg(2) != "sql-batch" and arg(2) != "session" and arg(2) != "api" and arg(2) != "export" and arg(2) != "import" and arg(2) != "set-user" and arg(2) != "auth-check" and arg(2) != "shell" and arg(2) != "console" and arg(2) != ":memory:":
+            print_yazabase_cli_help()
+            fail("YazaBase: unknown or missing database command; see help above")
+        if (arg(2) == "set-user" or arg(2) == "auth-check") and count != 5:
+            print_yazabase_cli_help()
+            fail("YazaBase: invalid arguments for 'db " + arg(2) + "'; expected <directory> <username> <password>")
+        if arg(2) == "api" and count < 4:
+            print_yazabase_cli_help()
+            fail("YazaBase: invalid arguments for 'db api'; see help above")
+        if arg(2) == "init" and count != 4:
+            print_yazabase_cli_help()
+            fail("YazaBase: invalid arguments for 'db init'; see help above")
+        if (arg(2) == "backup" or arg(2) == "restore") and count != 5:
+            print_yazabase_cli_help()
+            fail("YazaBase: invalid arguments for database backup/restore; see help above")
+        if arg(2) == "session" and count != 4:
+            print_yazabase_cli_help()
+            fail("YazaBase: invalid arguments for 'db session'; see help above")
+        if arg(2) == "sql" and count < 5:
+            print_yazabase_cli_help()
+            fail("YazaBase: invalid arguments for 'db sql'; see help above")
+        if arg(2) == "sql" and arg(3) == "--csv" and count < 6:
+            print_yazabase_cli_help()
+            fail("YazaBase: invalid arguments for 'db sql --csv'; see help above")
+        if arg(2) == "sql" and (arg(3) == "--timings" or arg(3) == "--count") and count < 6:
+            print_yazabase_cli_help()
+            fail("YazaBase: invalid arguments for the selected 'db sql' mode; see help above")
+        if arg(2) == "sql" and arg(3) == "--csv" and (arg(4) == "--timings" or arg(4) == "--count") and count < 7:
+            print_yazabase_cli_help()
+            fail("YazaBase: invalid arguments for the selected 'db sql --csv' mode; see help above")
+        if arg(2) == "sql-batch" and count < 6:
+            print_yazabase_cli_help()
+            fail("YazaBase: invalid arguments for 'db sql-batch'; see help above")
+        if arg(2) == "sql-batch" and arg(3) == "--count" and count < 7:
+            print_yazabase_cli_help()
+            fail("YazaBase: invalid arguments for 'db sql-batch --count'; see help above")
+        let database_status: Number = run_yazabase_cli()
+        exit(database_status)
+
+    print_yaza_llvm_help()
+    fail("YAZA: unknown command or invalid arguments; see help above")

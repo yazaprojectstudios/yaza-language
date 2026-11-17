@@ -1,0 +1,584 @@
+use "std/fs"
+use "../yazabase/btree_scan_v1"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/catalog_snapshot_v1"
+use "../yazabase/key_codec_v1"
+use "../yazabase/mvcc_history_v1"
+use "../yazabase/page_v1"
+use "../yazabase/page_wal_v1"
+use "../yazabase/row_v1"
+use "../yazabase/sql_dispatch_v1"
+use "../yazabase/sql_binder_v1"
+use "../yazabase/sql_literal_v1"
+use "../yazabase/sql_parser_v3"
+use "../yazabase/query_v1"
+use "../yazabase/wal_v1"
+
+fn yaza_base_sql_prefix_limit_plan_eligible_v1(source: Text, catalog: YazaSqlCatalogSnapshotV1) -> Boolean:
+    let parsed: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(source)
+    if not result_is_ok(parsed): return false
+    let bound: Result[YazaSqlBoundPlanV1, Text] = yaza_sql_bind_select_v1(source, result_unwrap(parsed), catalog)
+    if not result_is_ok(bound): return false
+    return yaza_db_query_prefix_limit_eligible_v1(result_unwrap(bound))
+
+fn yaza_base_sql_prefix_limit_eligibility_v1(catalog: YazaSqlCatalogSnapshotV1) -> Boolean:
+    if not yaza_base_sql_prefix_limit_plan_eligible_v1("SELECT id FROM accounts LIMIT 2", catalog): return false
+    if yaza_base_sql_prefix_limit_plan_eligible_v1("SELECT id FROM accounts WHERE id > 0 LIMIT 2", catalog): return false
+    if yaza_base_sql_prefix_limit_plan_eligible_v1("SELECT DISTINCT id FROM accounts LIMIT 2", catalog): return false
+    if yaza_base_sql_prefix_limit_plan_eligible_v1("SELECT id FROM accounts ORDER BY id LIMIT 2", catalog): return false
+    if yaza_base_sql_prefix_limit_plan_eligible_v1("SELECT COUNT(*) FROM accounts LIMIT 2", catalog): return false
+    if yaza_base_sql_prefix_limit_plan_eligible_v1("SELECT id, COUNT(*) FROM accounts GROUP BY id LIMIT 2", catalog): return false
+    if yaza_base_sql_prefix_limit_plan_eligible_v1("SELECT COUNT(*) AS n FROM accounts HAVING COUNT(*) > 0 LIMIT 2", catalog): return false
+    return not yaza_base_sql_prefix_limit_plan_eligible_v1("SELECT id FROM accounts LIMIT 70000", catalog)
+
+fn yazabase_sql_create_table_persist_v1(root_path: Text) -> Result[Number, Text]:
+    let invalid_utf8_fragment: Text = text_slice("é", 0, 1)
+    let invalid_utf8_literal: Text = "'" + invalid_utf8_fragment + "'"
+    let invalid_utf8_decode: Result[Text, Text] = yaza_sql_decode_text_literal_v1(invalid_utf8_literal, 0, text_length(invalid_utf8_literal))
+    if result_is_ok(invalid_utf8_decode): return err("YDBv1 SQL literal decoder accepted an invalid UTF-8 slice")
+    let root: Number = root_open(root_path)?
+    let db_name: Text = "create-table-persist-smoke.ydb"
+    let header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_from_text("ct-persist-uuid1"), 0, 1, 1, 0, 2, 1)
+    let empty_storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, db_name, header)?
+    let empty_closed: Boolean = yaza_db_storage_close_v1(empty_storage)?
+    if not empty_closed: return err("YDBv1 CREATE TABLE could not close the empty database before catalog initialization")
+
+    let initialized: YazaDbCatalogBootstrapV1 = yaza_db_catalog_initialize_v1(root, db_name)?
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let source: Text = "CREATE TABLE accounts (id BIGINT PRIMARY KEY, email TEXT NOT NULL DEFAULT 'pending', active BOOL DEFAULT TRUE, points INTEGER DEFAULT -2)"
+    let create_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(initialized.storage, initialized.wal, source, no_parameters)?
+    if create_result.statement_kind != yaza_db_sql_statement_kind_create_table_v1() or not option_is_some(create_result.write_commit): return err("YDBv1 SQL dispatcher did not return a CREATE TABLE commit")
+    let committed: YazaDbWriteCommitV1 = option_unwrap(create_result.write_commit)
+    if committed.txn_id != 1 or committed.commit_ts != 2: return err("YDBv1 CREATE TABLE did not publish the expected first transaction")
+    let wal_closed: Boolean = yaza_db_wal_log_close_v1(committed.wal)?
+    let storage_closed: Boolean = yaza_db_storage_close_v1(committed.storage)?
+    if not wal_closed or not storage_closed: return err("YDBv1 CREATE TABLE committed handles did not close")
+
+    let recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, db_name)?
+    let after: YazaSqlCatalogSnapshotV1 = yaza_db_catalog_snapshot_load_v1(recovered.storage.file, recovered.storage.header)?
+    if after.version != 2 or list_count(after.tables) != 5: return err("YDBv1 CREATE TABLE did not persist a visible catalog entry")
+    let accounts_index: Number = yaza_db_catalog_snapshot_table_index_v1(after.tables, 13)
+    if accounts_index < 0: return err("YDBv1 CREATE TABLE catalog does not contain the allocated table ID")
+    let accounts: YazaSqlTableSchemaV1 = list_get(after.tables, accounts_index)
+    if accounts.name != "accounts" or list_count(accounts.columns) != 4: return err("YDBv1 CREATE TABLE did not persist the table columns")
+    if list_get(accounts.columns, 0).name != "id" or list_get(accounts.columns, 0).type_id != 4 or list_get(accounts.columns, 0).nullable: return err("YDBv1 CREATE TABLE primary-key column metadata is incorrect")
+    if list_get(accounts.columns, 1).name != "email" or list_get(accounts.columns, 1).type_id != 9 or list_get(accounts.columns, 1).nullable: return err("YDBv1 CREATE TABLE text column metadata is incorrect")
+    if list_get(accounts.columns, 2).name != "active" or list_get(accounts.columns, 2).type_id != 1 or not list_get(accounts.columns, 2).nullable: return err("YDBv1 CREATE TABLE nullable column metadata is incorrect")
+    if list_get(accounts.columns, 3).name != "points" or list_get(accounts.columns, 3).type_id != 3 or not list_get(accounts.columns, 3).nullable: return err("YDBv1 CREATE TABLE integer expression column metadata is incorrect")
+
+    let selected_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(recovered.storage, recovered.wal, "SELECT id, email, active FROM accounts", no_parameters)?
+    if selected_result.statement_kind != yaza_db_sql_statement_kind_select_v1() or not option_is_some(selected_result.query_result): return err("YDBv1 SQL dispatcher did not return a SELECT result")
+    let selected: YazaSqlQueryResultV1 = option_unwrap(selected_result.query_result)
+    if list_count(selected.columns) != 3 or list_count(selected.rows) != 0: return err("YDBv1 CREATE TABLE did not create a queryable empty table")
+
+    let duplicate_insert: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(recovered.storage, recovered.wal, "INSERT INTO accounts (id, email, active, points) VALUES (7, 'duplicate-a', TRUE, NULL), (7, 'duplicate-b', FALSE, NULL)", no_parameters)
+    if result_is_ok(duplicate_insert): return err("YDBv1 catalog-driven INSERT accepted duplicate primary keys in one batch")
+    let insert_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(recovered.storage, recovered.wal, "INSERT INTO accounts (id, email, active, points) VALUES (1, 'one@example.test', TRUE, NULL), (2, 'two@example.test', FALSE, NULL)", no_parameters)?
+    if insert_result.statement_kind != yaza_db_sql_statement_kind_insert_v1() or not option_is_some(insert_result.write_commit): return err("YDBv1 SQL dispatcher did not return an INSERT commit")
+    let inserted: YazaDbWriteCommitV1 = option_unwrap(insert_result.write_commit)
+    if inserted.txn_id != 2 or inserted.commit_ts != 3: return err("YDBv1 catalog-driven INSERT did not commit the expected transaction")
+    let id_parameter: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 3)?
+    let email_parameter: YazaSqlValueV1 = yaza_sql_value_text_v1("three@example.test")
+    let active_parameter: YazaSqlValueV1 = yaza_sql_value_null_v1(1)?
+    let points_parameter: YazaSqlValueV1 = yaza_sql_value_null_v1(3)?
+    let parameters: List[YazaSqlValueV1] = [id_parameter, email_parameter, active_parameter, points_parameter]
+    let parameter_insert_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(inserted.storage, inserted.wal, "INSERT INTO accounts (id, email, active, points) VALUES ($1, $2, $3, $4)", parameters)?
+    if not option_is_some(parameter_insert_result.write_commit): return err("YDBv1 SQL dispatcher did not return the parameter INSERT commit")
+    let parameter_insert: YazaDbWriteCommitV1 = option_unwrap(parameter_insert_result.write_commit)
+    if parameter_insert.txn_id != 3 or parameter_insert.commit_ts != 4: return err("YDBv1 catalog-driven parameter INSERT did not commit the expected transaction")
+    let bulk_parts_result: Result[TextList, Text] = text_list_try_new()
+    if not result_is_ok(bulk_parts_result): return err("YDBv1 bulk SQL INSERT could not allocate its source fragments")
+    let bulk_parts: TextList = result_unwrap(bulk_parts_result)
+    if not list_try_reserve(bulk_parts, 800) or not list_try_push(bulk_parts, "INSERT INTO accounts (id, email, active, points) VALUES "): return err("YDBv1 bulk SQL INSERT could not reserve its source fragments")
+    var bulk_id: Number = 4
+    while bulk_id <= 403:
+        if bulk_id > 4:
+            if not list_try_push(bulk_parts, ", "): return err("YDBv1 bulk SQL INSERT could not append its row delimiter")
+        let bulk_id_text: Text = number_text(bulk_id)
+        let bulk_row: Text = "(" + bulk_id_text + ", 'bulk-" + bulk_id_text + "@example.test', TRUE, NULL)"
+        if not list_try_push(bulk_parts, bulk_row): return err("YDBv1 bulk SQL INSERT could not append a row")
+        set bulk_id = bulk_id + 1
+    let bulk_source_result: Result[Text, Text] = text_try_join(bulk_parts, "")
+    if not result_is_ok(bulk_source_result): return err("YDBv1 bulk SQL INSERT could not join its source fragments")
+    let bulk_source: Text = result_unwrap(bulk_source_result)
+    let bulk_insert_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(parameter_insert.storage, parameter_insert.wal, bulk_source, no_parameters)?
+    if bulk_insert_result.statement_kind != yaza_db_sql_statement_kind_insert_v1() or not option_is_some(bulk_insert_result.write_commit): return err("YDBv1 SQL dispatcher did not return a split-capable bulk INSERT commit")
+    let bulk_insert: YazaDbWriteCommitV1 = option_unwrap(bulk_insert_result.write_commit)
+    if bulk_insert.txn_id != 4 or bulk_insert.commit_ts != 5: return err("YDBv1 bulk SQL INSERT did not commit the expected transaction")
+    let table_roots: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(bulk_insert.storage.file, bulk_insert.storage.header)?
+    let table_root_id: Number = list_get(table_roots.root_page_ids, accounts_index)
+    let account_key_ordinals: List[Number] = [0]
+    let empty_transaction_statuses: List[YazaDbTxnStatusV1] = List[YazaDbTxnStatusV1]()
+    let history_key_value: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 1)?
+    let history_key_text: YazaSqlValueV1 = yaza_sql_value_text_v1("")
+    let history_key_active: YazaSqlValueV1 = yaza_sql_value_boolean_v1(false)
+    let history_key_points: YazaSqlValueV1 = yaza_sql_value_integer_v1(3, 0)?
+    let history_key_values: List[YazaSqlValueV1] = [history_key_value, history_key_text, history_key_active, history_key_points]
+    let history_key_nulls: List[Boolean] = [false, false, false, false]
+    let history_key: Bytes = yaza_db_key_encode_composite_v1(history_key_values, history_key_nulls, accounts.columns, account_key_ordinals)?
+    let table_root_page: Bytes = yaza_db_storage_read_page_v1(bulk_insert.storage.file, bulk_insert.storage.header, table_root_id)?
+    let table_root_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(table_root_page, table_root_id)?
+    if table_root_header.page_type != 2 or table_root_header.level != 1 or table_root_header.count < 1: return err("YDBv1 bulk SQL INSERT did not retain the split leaves under its inner root")
+    let rejected_delete_order: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(bulk_insert.storage, bulk_insert.wal, "DELETE FROM accounts WHERE id > 400 ORDER BY id", no_parameters)
+    if result_is_ok(rejected_delete_order): return err("YDBv1 SQL DELETE accepted ORDER BY outside its supported grammar")
+    let delete_id_value: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 2)?
+    let delete_id_parameter: List[YazaSqlValueV1] = [delete_id_value]
+    let delete_one_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(bulk_insert.storage, bulk_insert.wal, "DELETE FROM accounts WHERE id = $1", delete_id_parameter)?
+    if delete_one_result.statement_kind != yaza_db_sql_statement_kind_delete_v1() or not option_is_some(delete_one_result.write_commit): return err("YDBv1 SQL dispatcher did not return a primary-key DELETE commit")
+    let delete_one: YazaDbWriteCommitV1 = option_unwrap(delete_one_result.write_commit)
+    if delete_one.txn_id != 5 or delete_one.commit_ts != 6: return err("YDBv1 primary-key DELETE did not commit the expected transaction")
+    let deleted_key_id: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 2)?
+    let deleted_key_text: YazaSqlValueV1 = yaza_sql_value_text_v1("")
+    let deleted_key_active: YazaSqlValueV1 = yaza_sql_value_boolean_v1(false)
+    let deleted_key_points: YazaSqlValueV1 = yaza_sql_value_integer_v1(3, 0)?
+    let deleted_key_values: List[YazaSqlValueV1] = [deleted_key_id, deleted_key_text, deleted_key_active, deleted_key_points]
+    let deleted_key_nulls: List[Boolean] = [false, false, false, false]
+    let deleted_key: Bytes = yaza_db_key_encode_composite_v1(deleted_key_values, deleted_key_nulls, accounts.columns, account_key_ordinals)?
+    let deleted_seek: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(delete_one.storage.file, delete_one.storage.header, table_root_id, deleted_key)?
+    let deleted_page: Bytes = yaza_db_storage_read_page_v1(delete_one.storage.file, delete_one.storage.header, deleted_seek.leaf_page_id)?
+    let deleted_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(deleted_page, deleted_seek.leaf_page_id)?
+    let deleted_slot_index: Number = yaza_db_page_lower_bound_v1(deleted_page, deleted_key, deleted_seek.leaf_page_id)?
+    if deleted_slot_index >= deleted_header.count: return err("YDBv1 SQL DELETE did not retain its clustered row as a tombstone")
+    let deleted_stored_key: Bytes = yaza_db_page_slot_key_v1(deleted_page, deleted_slot_index, deleted_seek.leaf_page_id)?
+    if not bytes_equal(deleted_stored_key, deleted_key): return err("YDBv1 SQL DELETE tombstone is stored under a different key")
+    let deleted_slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(deleted_page, deleted_slot_index, deleted_seek.leaf_page_id)?
+    let deleted_tombstone: YazaDbRowV1 = yaza_db_row_decode_v1(deleted_slot.payload, accounts.columns)?
+    if not deleted_tombstone.deleted or deleted_tombstone.undo_ref <= 0 or deleted_tombstone.version_ts != delete_one.commit_ts: return err("YDBv1 SQL DELETE tombstone flags, LSN, or timestamp are invalid")
+    let before_delete_rows: Option[YazaDbRowV1] = yaza_db_mvcc_resolve_row_history_v1(root, delete_one.wal.db_uuid, delete_one.wal.next_lsn, deleted_key, deleted_tombstone, 5, 0, empty_transaction_statuses, accounts.columns)?
+    if not option_is_some(before_delete_rows) or list_get(option_unwrap(before_delete_rows).values, 1).text_value != "two@example.test": return err("YDBv1 MVCC history did not restore the row before DELETE")
+    let after_delete_rows: Option[YazaDbRowV1] = yaza_db_mvcc_resolve_row_history_v1(root, delete_one.wal.db_uuid, delete_one.wal.next_lsn, deleted_key, deleted_tombstone, delete_one.commit_ts, 0, empty_transaction_statuses, accounts.columns)?
+    if option_is_some(after_delete_rows): return err("YDBv1 MVCC history returned a visible tombstone as a live row")
+    let deleted_point_rows: List[YazaDbRowV1] = yaza_db_btree_read_rows_by_key_v1(delete_one.storage.file, delete_one.storage.header, table_root_id, accounts.columns, account_key_ordinals, delete_one.commit_ts, deleted_key)?
+    if list_count(deleted_point_rows) != 0: return err("YDBv1 point lookup returned a deleted tombstone")
+    let before_delete_query: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(delete_one.storage, delete_one.wal, "SELECT email FROM accounts WHERE id = 2", no_parameters, 5, 0, empty_transaction_statuses)?
+    if list_count(before_delete_query.rows) != 1 or list_get(list_get(before_delete_query.rows, 0), 0).text_value != "two@example.test": return err("YDBv1 historical SQL SELECT did not return the row before DELETE")
+    let after_delete_query: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(delete_one.storage, delete_one.wal, "SELECT email FROM accounts WHERE id = 2", no_parameters, delete_one.commit_ts, 0, empty_transaction_statuses)?
+    if list_count(after_delete_query.rows) != 0: return err("YDBv1 historical SQL SELECT returned a row deleted at its snapshot")
+    let delete_range_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(delete_one.storage, delete_one.wal, "DELETE FROM accounts WHERE id >= 300", no_parameters)?
+    if not option_is_some(delete_range_result.write_commit): return err("YDBv1 SQL dispatcher did not return a predicate DELETE commit")
+    let delete_range: YazaDbWriteCommitV1 = option_unwrap(delete_range_result.write_commit)
+    if delete_range.txn_id != 6 or delete_range.commit_ts != 7: return err("YDBv1 predicate DELETE did not commit the expected transaction")
+    let deleted_range_check: YazaSqlQueryResultV1 = yaza_db_execute_select_v1(delete_range.storage.file, delete_range.storage.header, "SELECT id FROM accounts WHERE id >= 300", no_parameters)?
+    if list_count(deleted_range_check.rows) != 0: return err("YDBv1 104-row predicate DELETE left rows visible in its committed snapshot")
+    let rejected_update_key: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(delete_range.storage, delete_range.wal, "UPDATE accounts SET id = 30 WHERE id = 3", no_parameters)
+    if result_is_ok(rejected_update_key): return err("YDBv1 SQL UPDATE accepted mutation of its clustered primary key")
+    let rejected_update_null: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(delete_range.storage, delete_range.wal, "UPDATE accounts SET email = NULL WHERE id = 3", no_parameters)
+    if result_is_ok(rejected_update_null): return err("YDBv1 SQL UPDATE accepted NULL for a NOT NULL column")
+    let rejected_update_duplicate: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(delete_range.storage, delete_range.wal, "UPDATE accounts SET active = TRUE, active = FALSE WHERE id = 3", no_parameters)
+    if result_is_ok(rejected_update_duplicate): return err("YDBv1 SQL UPDATE accepted a repeated target column")
+    let rejected_update_without_where: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(delete_range.storage, delete_range.wal, "UPDATE accounts SET active = FALSE", no_parameters)
+    if result_is_ok(rejected_update_without_where): return err("YDBv1 SQL UPDATE accepted a missing WHERE clause")
+    let rejected_update_order: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(delete_range.storage, delete_range.wal, "UPDATE accounts SET active = FALSE WHERE id = 3 ORDER BY id", no_parameters)
+    if result_is_ok(rejected_update_order): return err("YDBv1 SQL UPDATE accepted ORDER BY outside its supported grammar")
+    let rejected_update_missing_parameter: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(delete_range.storage, delete_range.wal, "UPDATE accounts SET email = $1 WHERE id = 3", no_parameters)
+    if result_is_ok(rejected_update_missing_parameter): return err("YDBv1 SQL UPDATE accepted a missing SET bind parameter")
+    let wrong_update_parameter: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 99)?
+    let wrong_update_parameters: List[YazaSqlValueV1] = [wrong_update_parameter]
+    let rejected_update_parameter_type: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(delete_range.storage, delete_range.wal, "UPDATE accounts SET email = $1 WHERE id = 3", wrong_update_parameters)
+    if result_is_ok(rejected_update_parameter_type): return err("YDBv1 SQL UPDATE accepted a SET parameter with the wrong type")
+    let null_update_parameter: YazaSqlValueV1 = yaza_sql_value_null_v1(9)?
+    let null_update_parameters: List[YazaSqlValueV1] = [null_update_parameter]
+    let rejected_update_parameter_null: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(delete_range.storage, delete_range.wal, "UPDATE accounts SET email = $1 WHERE id = 3", null_update_parameters)
+    if result_is_ok(rejected_update_parameter_null): return err("YDBv1 SQL UPDATE accepted a NULL SET parameter for a NOT NULL column")
+    let mixed_update_text: YazaSqlValueV1 = yaza_sql_value_text_v1("mixed@example.test")
+    let wrong_mixed_id: YazaSqlValueV1 = yaza_sql_value_text_v1("3")
+    let wrong_mixed_parameters: List[YazaSqlValueV1] = [mixed_update_text, wrong_mixed_id]
+    let rejected_update_mixed_type: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(delete_range.storage, delete_range.wal, "UPDATE accounts SET email = :value WHERE id = :id", wrong_mixed_parameters)
+    if result_is_ok(rejected_update_mixed_type): return err("YDBv1 SQL UPDATE accepted a named parameter with an incompatible WHERE type")
+    let update_parameter: YazaSqlValueV1 = yaza_sql_value_text_v1("patched@example.test")
+    let update_parameters: List[YazaSqlValueV1] = [update_parameter]
+    let update_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(delete_range.storage, delete_range.wal, "UPDATE accounts SET email = $1, active = FALSE WHERE id >= 1 AND id <= 3", update_parameters)?
+    if update_result.statement_kind != yaza_db_sql_statement_kind_update_v1() or not option_is_some(update_result.write_commit): return err("YDBv1 SQL dispatcher did not return a predicate UPDATE commit")
+    let updated: YazaDbWriteCommitV1 = option_unwrap(update_result.write_commit)
+    if updated.txn_id != 7 or updated.commit_ts != 8: return err("YDBv1 predicate UPDATE did not commit the expected transaction")
+    let updated_rows: List[YazaDbRowV1] = yaza_db_btree_read_rows_by_key_v1(updated.storage.file, updated.storage.header, table_root_id, accounts.columns, account_key_ordinals, updated.commit_ts, history_key)?
+    if list_count(updated_rows) != 1 or list_get(updated_rows, 0).undo_ref <= 0: return err("YDBv1 SQL UPDATE did not persist a WAL undo reference in its current row")
+    let versioned_row: YazaDbRowV1 = list_get(updated_rows, 0)
+    if list_get(versioned_row.values, 0).integer_value != 1 or versioned_row.version_ts != updated.commit_ts: return err("YDBv1 SQL UPDATE undo-reference fixture selected the wrong current row")
+    let update_record: YazaDbWalRecordV1 = yaza_db_wal_read_record_at_v1(root, updated.wal.db_uuid, versioned_row.undo_ref, updated.wal.next_lsn)?
+    if update_record.rec_type != yaza_db_wal_type_leaf_update_v1(): return err("YDBv1 SQL UPDATE undo reference does not point to a LEAF_UPDATE record")
+    let prior_snapshot_rows: Option[YazaDbRowV1] = yaza_db_mvcc_resolve_row_history_v1(root, updated.wal.db_uuid, updated.wal.next_lsn, history_key, versioned_row, 7, 0, empty_transaction_statuses, accounts.columns)?
+    if not option_is_some(prior_snapshot_rows) or list_get(option_unwrap(prior_snapshot_rows).values, 1).text_value != "one@example.test": return err("YDBv1 MVCC history lookup did not resolve the pre-UPDATE snapshot")
+    let prior_update_query: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(updated.storage, updated.wal, "SELECT email FROM accounts WHERE id = 1", no_parameters, 7, 0, empty_transaction_statuses)?
+    if list_count(prior_update_query.rows) != 1 or list_get(list_get(prior_update_query.rows, 0), 0).text_value != "one@example.test": return err("YDBv1 historical SQL SELECT did not return the row before UPDATE")
+    let clipped_log_result: Result[Option[YazaDbRowV1], Text] = yaza_db_mvcc_resolve_row_history_v1(root, updated.wal.db_uuid, versioned_row.undo_ref, history_key, versioned_row, 7, 0, empty_transaction_statuses, accounts.columns)
+    if result_is_ok(clipped_log_result): return err("YDBv1 MVCC history lookup accepted a WAL end before its undo record")
+    let update_mutation: YazaDbWalLeafMutationV1 = yaza_db_wal_leaf_mutation_payload_decode_v1(update_record)?
+    let before_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(update_mutation.before_image, update_mutation.page_id)?
+    let before_slot_index: Number = yaza_db_page_lower_bound_v1(update_mutation.before_image, history_key, update_mutation.page_id)?
+    if before_slot_index >= before_header.count: return err("YDBv1 SQL UPDATE WAL before-image is missing its prior key")
+    let before_key: Bytes = yaza_db_page_slot_key_v1(update_mutation.before_image, before_slot_index, update_mutation.page_id)?
+    if not bytes_equal(before_key, history_key): return err("YDBv1 SQL UPDATE WAL before-image is missing its prior row")
+    let before_slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(update_mutation.before_image, before_slot_index, update_mutation.page_id)?
+    let before_row: YazaDbRowV1 = yaza_db_row_decode_v1(before_slot.payload, accounts.columns)?
+    if list_get(before_row.values, 1).text_value != "one@example.test" or before_row.undo_ref != 0: return err("YDBv1 SQL UPDATE WAL before-image did not retain the previous committed row")
+    let numbered_update_text: YazaSqlValueV1 = yaza_sql_value_text_v1("numbered-mixed@example.test")
+    let numbered_update_id: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 1)?
+    let numbered_update_parameters: List[YazaSqlValueV1] = [numbered_update_text, numbered_update_id]
+    let numbered_update_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(updated.storage, updated.wal, "UPDATE accounts SET email = $1 WHERE id = $2", numbered_update_parameters)?
+    if numbered_update_result.statement_kind != yaza_db_sql_statement_kind_update_v1() or not option_is_some(numbered_update_result.write_commit): return err("YDBv1 dispatcher did not return a numbered SET/WHERE UPDATE commit")
+    let numbered_updated: YazaDbWriteCommitV1 = option_unwrap(numbered_update_result.write_commit)
+    if numbered_updated.txn_id != 8 or numbered_updated.commit_ts != 9: return err("YDBv1 numbered SET/WHERE UPDATE did not commit the expected transaction")
+    let numbered_current_rows: List[YazaDbRowV1] = yaza_db_btree_read_rows_by_key_v1(numbered_updated.storage.file, numbered_updated.storage.header, table_root_id, accounts.columns, account_key_ordinals, numbered_updated.commit_ts, history_key)?
+    if list_count(numbered_current_rows) != 1: return err("YDBv1 multi-version fixture could not read the twice-updated row")
+    let numbered_current_row: YazaDbRowV1 = list_get(numbered_current_rows, 0)
+    let middle_snapshot_rows: Option[YazaDbRowV1] = yaza_db_mvcc_resolve_row_history_v1(root, numbered_updated.wal.db_uuid, numbered_updated.wal.next_lsn, history_key, numbered_current_row, 8, 0, empty_transaction_statuses, accounts.columns)?
+    if not option_is_some(middle_snapshot_rows) or list_get(option_unwrap(middle_snapshot_rows).values, 1).text_value != "patched@example.test": return err("YDBv1 MVCC history lookup did not resolve the intermediate snapshot")
+    let oldest_snapshot_rows: Option[YazaDbRowV1] = yaza_db_mvcc_resolve_row_history_v1(root, numbered_updated.wal.db_uuid, numbered_updated.wal.next_lsn, history_key, numbered_current_row, 7, 0, empty_transaction_statuses, accounts.columns)?
+    if not option_is_some(oldest_snapshot_rows) or list_get(option_unwrap(oldest_snapshot_rows).values, 1).text_value != "one@example.test": return err("YDBv1 MVCC history lookup did not traverse multiple undo records")
+    let middle_update_query: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(numbered_updated.storage, numbered_updated.wal, "SELECT email FROM accounts WHERE id = 1", no_parameters, 8, 0, empty_transaction_statuses)?
+    if list_count(middle_update_query.rows) != 1 or list_get(list_get(middle_update_query.rows, 0), 0).text_value != "patched@example.test": return err("YDBv1 historical SQL SELECT did not return the intermediate UPDATE version")
+    let oldest_update_query: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(numbered_updated.storage, numbered_updated.wal, "SELECT email FROM accounts WHERE id = 1", no_parameters, 7, 0, empty_transaction_statuses)?
+    if list_count(oldest_update_query.rows) != 1 or list_get(list_get(oldest_update_query.rows, 0), 0).text_value != "one@example.test": return err("YDBv1 historical SQL SELECT did not traverse multiple UPDATE versions")
+    let question_update_parameter: YazaSqlValueV1 = yaza_sql_value_text_v1("question-style@example.test")
+    let question_update_id: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 3)?
+    let question_update_parameters: List[YazaSqlValueV1] = [question_update_parameter, question_update_id]
+    let question_update_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(numbered_updated.storage, numbered_updated.wal, "UPDATE accounts SET email = ? WHERE id = ?", question_update_parameters)?
+    if question_update_result.statement_kind != yaza_db_sql_statement_kind_update_v1() or not option_is_some(question_update_result.write_commit): return err("YDBv1 dispatcher did not return an anonymous SET parameter UPDATE commit")
+    let question_updated: YazaDbWriteCommitV1 = option_unwrap(question_update_result.write_commit)
+    if question_updated.txn_id != 9 or question_updated.commit_ts != 10: return err("YDBv1 anonymous SET parameter UPDATE did not commit the expected transaction")
+    let where_only_parameter: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 3)?
+    let where_only_parameters: List[YazaSqlValueV1] = [where_only_parameter]
+    let where_only_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(question_updated.storage, question_updated.wal, "UPDATE accounts SET active = TRUE WHERE id = $1", where_only_parameters)?
+    if where_only_result.statement_kind != yaza_db_sql_statement_kind_update_v1() or not option_is_some(where_only_result.write_commit): return err("YDBv1 dispatcher did not return a WHERE-only parameter UPDATE commit")
+    let where_only_updated: YazaDbWriteCommitV1 = option_unwrap(where_only_result.write_commit)
+    if where_only_updated.txn_id != 10 or where_only_updated.commit_ts != 11: return err("YDBv1 WHERE-only parameter UPDATE did not commit the expected transaction")
+    let named_update_parameter: YazaSqlValueV1 = yaza_sql_value_text_v1("named-style@example.test")
+    let named_update_id: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 4)?
+    let named_update_parameters: List[YazaSqlValueV1] = [named_update_parameter, named_update_id]
+    let named_update_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(where_only_updated.storage, where_only_updated.wal, "UPDATE accounts SET email = :value WHERE id = :id", named_update_parameters)?
+    if named_update_result.statement_kind != yaza_db_sql_statement_kind_update_v1() or not option_is_some(named_update_result.write_commit): return err("YDBv1 dispatcher did not return a named SET parameter UPDATE commit")
+    let named_updated: YazaDbWriteCommitV1 = option_unwrap(named_update_result.write_commit)
+    if named_updated.txn_id != 11 or named_updated.commit_ts != 12: return err("YDBv1 named SET parameter UPDATE did not commit the expected transaction")
+    let seed_points_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(named_updated.storage, named_updated.wal, "UPDATE accounts SET points = 7 WHERE id = 3", no_parameters)?
+    let seed_points: YazaDbWriteCommitV1 = option_unwrap(seed_points_result.write_commit)
+    if seed_points.txn_id != 12 or seed_points.commit_ts != 13: return err("YDBv1 integer-expression seed UPDATE did not commit in order")
+    let add_amount: YazaSqlValueV1 = yaza_sql_value_integer_v1(3, 5)?
+    let add_target: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 3)?
+    let add_parameters: List[YazaSqlValueV1] = [add_amount, add_target]
+    let add_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(seed_points.storage, seed_points.wal, "UPDATE accounts SET points = points + $1 WHERE id = $2", add_parameters)?
+    let added: YazaDbWriteCommitV1 = option_unwrap(add_result.write_commit)
+    if added.txn_id != 13 or added.commit_ts != 14: return err("YDBv1 parameterized integer addition did not commit in order")
+    let subtract_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(added.storage, added.wal, "UPDATE accounts SET points = points - 2 WHERE id = 3", no_parameters)?
+    let subtracted: YazaDbWriteCommitV1 = option_unwrap(subtract_result.write_commit)
+    if subtracted.txn_id != 14 or subtracted.commit_ts != 15: return err("YDBv1 literal integer subtraction did not commit in order")
+    let set_max_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(subtracted.storage, subtracted.wal, "UPDATE accounts SET points = 2147483647 WHERE id = 3", no_parameters)?
+    let set_max: YazaDbWriteCommitV1 = option_unwrap(set_max_result.write_commit)
+    if set_max.txn_id != 15 or set_max.commit_ts != 16: return err("YDBv1 INTEGER maximum setup did not commit in order")
+    let rejected_overflow: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(set_max.storage, set_max.wal, "UPDATE accounts SET points = points + 1 WHERE id = 3", no_parameters)
+    if result_is_ok(rejected_overflow): return err("YDBv1 UPDATE integer addition wrapped past INTEGER maximum")
+    let set_min_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(set_max.storage, set_max.wal, "UPDATE accounts SET points = -2147483648 WHERE id = 3", no_parameters)?
+    let set_min: YazaDbWriteCommitV1 = option_unwrap(set_min_result.write_commit)
+    if set_min.txn_id != 16 or set_min.commit_ts != 17: return err("YDBv1 INTEGER minimum setup indicates overflow preflight wrote transaction state")
+    let rejected_underflow: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(set_min.storage, set_min.wal, "UPDATE accounts SET points = points - 1 WHERE id = 3", no_parameters)
+    if result_is_ok(rejected_underflow): return err("YDBv1 UPDATE integer subtraction wrapped below INTEGER minimum")
+    let increment_min_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(set_min.storage, set_min.wal, "UPDATE accounts SET points = points + 1 WHERE id = 3", no_parameters)?
+    let incremented_min: YazaDbWriteCommitV1 = option_unwrap(increment_min_result.write_commit)
+    if incremented_min.txn_id != 17 or incremented_min.commit_ts != 18: return err("YDBv1 INTEGER underflow rejection wrote transaction state")
+    let null_arithmetic_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(incremented_min.storage, incremented_min.wal, "UPDATE accounts SET points = points + 1 WHERE id = 1", no_parameters)?
+    if not option_is_some(null_arithmetic_result.write_commit): return err("YDBv1 integer arithmetic did not update a row whose source value is NULL")
+    let null_arithmetic: YazaDbWriteCommitV1 = option_unwrap(null_arithmetic_result.write_commit)
+    if null_arithmetic.txn_id != 18 or null_arithmetic.commit_ts != 19: return err("YDBv1 NULL-propagating arithmetic did not commit in order")
+    let parameter_wal_closed: Boolean = yaza_db_wal_log_close_v1(null_arithmetic.wal)?
+    let parameter_storage_closed: Boolean = yaza_db_storage_close_v1(null_arithmetic.storage)?
+    if not parameter_wal_closed or not parameter_storage_closed: return err("YDBv1 SQL DELETE handles did not close")
+    let inserted_recovery: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, db_name)?
+    let prefix_catalog: YazaSqlCatalogSnapshotV1 = yaza_db_catalog_snapshot_load_v1(inserted_recovery.storage.file, inserted_recovery.storage.header)?
+    if not yaza_base_sql_prefix_limit_eligibility_v1(prefix_catalog): return err("YDBv1 SELECT prefix LIMIT accepted a query shape that must retain a full scan")
+    let rows_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(inserted_recovery.storage, inserted_recovery.wal, "SELECT id, email, active, points FROM accounts", no_parameters)?
+    if not option_is_some(rows_result.query_result): return err("YDBv1 SQL dispatcher did not return the reopened SELECT result")
+    let rows: YazaSqlQueryResultV1 = option_unwrap(rows_result.query_result)
+    if list_count(rows.rows) != 298 or list_count(list_get(rows.rows, 0)) != 4: return err("YDBv1 persistent DELETE row count was incorrect after reopen")
+    let prefix_limit_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(rows_result.storage, rows_result.wal, "SELECT id FROM accounts LIMIT 2", no_parameters)?
+    if not option_is_some(prefix_limit_result.query_result): return err("YDBv1 persistent prefix LIMIT did not return a result")
+    let prefix_limit_query: YazaSqlQueryResultV1 = option_unwrap(prefix_limit_result.query_result)
+    if list_count(prefix_limit_query.rows) != 2 or list_get(list_get(prefix_limit_query.rows, 0), 0).integer_value != 1 or list_get(list_get(prefix_limit_query.rows, 1), 0).integer_value != 3: return err("YDBv1 persistent prefix LIMIT did not count visible rows across a tombstone")
+    let snapshot_prefix_limit: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(prefix_limit_result.storage, prefix_limit_result.wal, "SELECT id FROM accounts LIMIT 2", no_parameters, 19, 0, List[YazaDbTxnStatusV1]())?
+    if list_count(snapshot_prefix_limit.rows) != 2 or list_get(list_get(snapshot_prefix_limit.rows, 0), 0).integer_value != 1 or list_get(list_get(snapshot_prefix_limit.rows, 1), 0).integer_value != 3: return err("YDBv1 historical prefix LIMIT did not count snapshot-visible rows across a tombstone")
+    if list_get(list_get(rows.rows, 0), 0).integer_value != 1 or list_get(list_get(rows.rows, 0), 1).text_value != "numbered-mixed@example.test" or list_get(list_get(rows.rows, 0), 2).boolean_value: return err("YDBv1 catalog-driven UPDATE did not persist the numbered mixed-clause parameter values")
+    if list_get(list_get(rows.rows, 1), 0).integer_value != 3 or list_get(list_get(rows.rows, 1), 1).text_value != "question-style@example.test" or not list_get(list_get(rows.rows, 1), 2).boolean_value: return err("YDBv1 SQL UPDATE did not persist the anonymous mixed-clause and WHERE-only parameter values")
+    if list_get(list_get(rows.rows, 2), 0).integer_value != 4 or list_get(list_get(rows.rows, 2), 1).text_value != "named-style@example.test" or not list_get(list_get(rows.rows, 2), 2).boolean_value: return err("YDBv1 SQL UPDATE did not persist the named mixed-clause parameter")
+    if not list_get(list_get(rows.rows, 0), 3).is_null or list_get(list_get(rows.rows, 1), 3).integer_value != -2147483647: return err("YDBv1 integer arithmetic or SQL NULL propagation failed after recovery")
+    if list_get(list_get(rows.rows, 297), 0).integer_value != 299 or list_get(list_get(rows.rows, 297), 1).text_value != "bulk-299@example.test": return err("YDBv1 SQL DELETE removed or reordered an unrelated row")
+    let point_literal_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(rows_result.storage, rows_result.wal, "SELECT id, email FROM accounts WHERE id = 299", no_parameters)?
+    if not option_is_some(point_literal_result.query_result): return err("YDBv1 clustered-key literal lookup did not return a SELECT result")
+    let point_literal: YazaSqlQueryResultV1 = option_unwrap(point_literal_result.query_result)
+    if list_count(point_literal.rows) != 1 or list_get(list_get(point_literal.rows, 0), 0).integer_value != 299 or list_get(list_get(point_literal.rows, 0), 1).text_value != "bulk-299@example.test": return err("YDBv1 clustered-key literal lookup failed through a split tree")
+    let point_id_parameter: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 3)?
+    let point_parameters: List[YazaSqlValueV1] = [point_id_parameter]
+    let point_parameter_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(point_literal_result.storage, point_literal_result.wal, "SELECT id, email FROM accounts WHERE id = $1", point_parameters)?
+    if not option_is_some(point_parameter_result.query_result): return err("YDBv1 clustered-key parameter lookup did not return a SELECT result")
+    let point_parameter: YazaSqlQueryResultV1 = option_unwrap(point_parameter_result.query_result)
+    if list_count(point_parameter.rows) != 1 or list_get(list_get(point_parameter.rows, 0), 0).integer_value != 3: return err("YDBv1 clustered-key parameter lookup returned the wrong row")
+    let point_missing_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(point_parameter_result.storage, point_parameter_result.wal, "SELECT id FROM accounts WHERE id = 999", no_parameters)?
+    if not option_is_some(point_missing_result.query_result): return err("YDBv1 clustered-key miss did not return a SELECT result")
+    let point_missing: YazaSqlQueryResultV1 = option_unwrap(point_missing_result.query_result)
+    if list_count(point_missing.rows) != 0: return err("YDBv1 clustered-key lookup returned a row for a missing key")
+    let range_fallback_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(point_missing_result.storage, point_missing_result.wal, "SELECT id FROM accounts WHERE id >= 299", no_parameters)?
+    if not option_is_some(range_fallback_result.query_result): return err("YDBv1 range predicate fallback did not return a SELECT result")
+    let range_fallback: YazaSqlQueryResultV1 = option_unwrap(range_fallback_result.query_result)
+    if list_count(range_fallback.rows) != 1 or list_get(list_get(range_fallback.rows, 0), 0).integer_value != 299: return err("YDBv1 range predicate fallback returned incorrect rows")
+    let text_fallback_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(range_fallback_result.storage, range_fallback_result.wal, "SELECT id FROM accounts WHERE email = 'numbered-mixed@example.test'", no_parameters)?
+    if not option_is_some(text_fallback_result.query_result): return err("YDBv1 non-key TEXT predicate fallback did not return a SELECT result")
+    let text_fallback: YazaSqlQueryResultV1 = option_unwrap(text_fallback_result.query_result)
+    if list_count(text_fallback.rows) != 1 or list_get(list_get(text_fallback.rows, 0), 0).integer_value != 1: return err("YDBv1 non-key TEXT predicate fallback returned incorrect rows")
+    let active_scan_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(text_fallback_result.storage, text_fallback_result.wal, "SELECT id FROM accounts WHERE active = TRUE", no_parameters)?
+    if not option_is_some(active_scan_result.query_result): return err("YDBv1 non-key BOOLEAN predicate scan did not return a SELECT result")
+    let active_scan: YazaSqlQueryResultV1 = option_unwrap(active_scan_result.query_result)
+    if list_count(active_scan.rows) != 297 or list_get(list_get(active_scan.rows, 0), 0).integer_value != 3 or list_get(list_get(active_scan.rows, 296), 0).integer_value != 299: return err("YDBv1 non-key BOOLEAN predicate scan returned incorrect rows")
+    let historical_text_scan: YazaSqlQueryResultV1 = yaza_db_execute_select_at_snapshot_v1(active_scan_result.storage, active_scan_result.wal, "SELECT id FROM accounts WHERE email = 'one@example.test'", no_parameters, 7, 0, empty_transaction_statuses)?
+    if list_count(historical_text_scan.rows) != 1 or list_get(list_get(historical_text_scan.rows, 0), 0).integer_value != 1: return err("YDBv1 historical non-key TEXT predicate scan returned incorrect rows")
+    let composite_create_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(active_scan_result.storage, active_scan_result.wal, "CREATE TABLE tenant_rows (tenant INTEGER NOT NULL, id BIGINT NOT NULL, payload TEXT, PRIMARY KEY (tenant, id))", no_parameters)?
+    if not option_is_some(composite_create_result.write_commit): return err("YDBv1 composite-key table creation did not commit")
+    let composite_created: YazaDbWriteCommitV1 = option_unwrap(composite_create_result.write_commit)
+    let composite_insert_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(composite_created.storage, composite_created.wal, "INSERT INTO tenant_rows (tenant, id, payload) VALUES (1, 7, 'one-seven'), (1, 8, 'one-eight'), (2, 7, 'two-seven')", no_parameters)?
+    if not option_is_some(composite_insert_result.write_commit): return err("YDBv1 composite-key rows did not commit")
+    let composite_inserted: YazaDbWriteCommitV1 = option_unwrap(composite_insert_result.write_commit)
+    let composite_tenant_parameter: YazaSqlValueV1 = yaza_sql_value_integer_v1(3, 1)?
+    let composite_id_parameter: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 8)?
+    let composite_parameters: List[YazaSqlValueV1] = [composite_tenant_parameter, composite_id_parameter]
+    let composite_lookup_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(composite_inserted.storage, composite_inserted.wal, "SELECT tenant, id, payload FROM tenant_rows WHERE tenant = $1 AND id = $2", composite_parameters)?
+    if not option_is_some(composite_lookup_result.query_result): return err("YDBv1 complete composite-key equality did not return a SELECT result")
+    let composite_lookup: YazaSqlQueryResultV1 = option_unwrap(composite_lookup_result.query_result)
+    if list_count(composite_lookup.rows) != 1 or list_get(list_get(composite_lookup.rows, 0), 0).integer_value != 1 or list_get(list_get(composite_lookup.rows, 0), 1).integer_value != 8 or list_get(list_get(composite_lookup.rows, 0), 2).text_value != "one-eight": return err("YDBv1 complete composite-key equality returned the wrong row")
+    let partial_composite_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(composite_lookup_result.storage, composite_lookup_result.wal, "SELECT tenant, id FROM tenant_rows WHERE tenant = 1", no_parameters)?
+    if not option_is_some(partial_composite_result.query_result): return err("YDBv1 partial composite-key predicate did not return a SELECT result")
+    let partial_composite: YazaSqlQueryResultV1 = option_unwrap(partial_composite_result.query_result)
+    if list_count(partial_composite.rows) != 2: return err("YDBv1 partial composite-key predicate did not use the correct scan result")
+
+    let sum_create_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(partial_composite_result.storage, partial_composite_result.wal, "CREATE TABLE sum_probe (id BIGINT PRIMARY KEY, value INTEGER)", no_parameters)?
+    if not option_is_some(sum_create_result.write_commit): return err("YDBv1 persistent SUM table did not commit CREATE TABLE")
+    let sum_created: YazaDbWriteCommitV1 = option_unwrap(sum_create_result.write_commit)
+    let sum_insert_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(sum_created.storage, sum_created.wal, "INSERT INTO sum_probe (id, value) VALUES (1, 5), (2, -2), (3, NULL)", no_parameters)?
+    if not option_is_some(sum_insert_result.write_commit): return err("YDBv1 persistent SUM inputs did not commit INSERT")
+    let sum_inserted: YazaDbWriteCommitV1 = option_unwrap(sum_insert_result.write_commit)
+    let sum_select_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(sum_inserted.storage, sum_inserted.wal, "SELECT SUM(value) AS total FROM sum_probe", no_parameters)?
+    if not option_is_some(sum_select_result.query_result): return err("YDBv1 persistent SELECT SUM did not return a result")
+    let sum_query: YazaSqlQueryResultV1 = option_unwrap(sum_select_result.query_result)
+    if list_count(sum_query.rows) != 1 or list_count(list_get(sum_query.rows, 0)) != 1: return err("YDBv1 persistent SELECT SUM returned an invalid aggregate row")
+    let sum_value: YazaSqlValueV1 = list_get(list_get(sum_query.rows, 0), 0)
+    if sum_value.type_id != 4 or sum_value.is_null or sum_value.integer_value != 3: return err("YDBv1 persistent SELECT SUM returned an incorrect value or NULL behavior")
+
+    let extrema_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(sum_select_result.storage, sum_select_result.wal, "SELECT MIN(value), MAX(value) FROM sum_probe", no_parameters)?
+    if not option_is_some(extrema_result.query_result): return err("YDBv1 persistent SELECT MIN/MAX did not return a result")
+    let extrema_query: YazaSqlQueryResultV1 = option_unwrap(extrema_result.query_result)
+    if list_count(extrema_query.rows) != 1 or list_count(list_get(extrema_query.rows, 0)) != 2: return err("YDBv1 persistent SELECT MIN/MAX returned an invalid row")
+    let extrema_row: List[YazaSqlValueV1] = list_get(extrema_query.rows, 0)
+    if list_get(extrema_row, 0).is_null or list_get(extrema_row, 0).integer_value != -2 or list_get(extrema_row, 1).is_null or list_get(extrema_row, 1).integer_value != 5:
+        return err("YDBv1 persistent SELECT MIN/MAX returned incorrect values or NULL behavior")
+
+    let average_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(extrema_result.storage, extrema_result.wal, "SELECT AVG(value) FROM sum_probe", no_parameters)?
+    if not option_is_some(average_result.query_result): return err("YDBv1 persistent SELECT AVG did not return a result")
+    let average_query: YazaSqlQueryResultV1 = option_unwrap(average_result.query_result)
+    let average_value: YazaSqlValueV1 = list_get(list_get(average_query.rows, 0), 0)
+    if average_value.type_id != 6 or average_value.is_null or average_value.float_value != 1.5: return err("YDBv1 persistent SELECT AVG returned an incorrect result")
+
+    let grouped_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(average_result.storage, average_result.wal, "SELECT value, COUNT(*) AS n FROM sum_probe GROUP BY value ORDER BY value", no_parameters)?
+    if not option_is_some(grouped_result.query_result): return err("YDBv1 persistent GROUP BY did not return a result")
+    let grouped_query: YazaSqlQueryResultV1 = option_unwrap(grouped_result.query_result)
+    if list_count(grouped_query.rows) != 3: return err("YDBv1 persistent GROUP BY returned the wrong number of keys")
+    let null_group: List[YazaSqlValueV1] = list_get(grouped_query.rows, 0)
+    let negative_group: List[YazaSqlValueV1] = list_get(grouped_query.rows, 1)
+    let positive_group: List[YazaSqlValueV1] = list_get(grouped_query.rows, 2)
+    if not list_get(null_group, 0).is_null or list_get(null_group, 1).integer_value != 1: return err("YDBv1 persistent GROUP BY did not form the NULL group")
+    if list_get(negative_group, 0).integer_value != -2 or list_get(negative_group, 1).integer_value != 1: return err("YDBv1 persistent GROUP BY returned an incorrect negative key")
+    if list_get(positive_group, 0).integer_value != 5 or list_get(positive_group, 1).integer_value != 1: return err("YDBv1 persistent GROUP BY returned an incorrect positive key")
+
+    let having_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(grouped_result.storage, grouped_result.wal, "SELECT value, COUNT(*) AS n FROM sum_probe GROUP BY value HAVING COUNT(*) = 1 ORDER BY value", no_parameters)?
+    if not option_is_some(having_result.query_result): return err("YDBv1 persistent HAVING did not return a SELECT result")
+    let having_query: YazaSqlQueryResultV1 = option_unwrap(having_result.query_result)
+    if list_count(having_query.rows) != 3: return err("YDBv1 persistent HAVING filtered the wrong grouped rows")
+    if list_get(list_get(having_query.rows, 0), 0).type_id != 3 or not list_get(list_get(having_query.rows, 0), 0).is_null: return err("YDBv1 persistent HAVING changed NULL group ordering")
+    if list_get(list_get(having_query.rows, 1), 0).integer_value != -2 or list_get(list_get(having_query.rows, 2), 0).integer_value != 5: return err("YDBv1 persistent HAVING returned incorrect group keys")
+
+    let text_key_create_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(having_result.storage, having_result.wal, "CREATE TABLE text_keys (key TEXT PRIMARY KEY, value TEXT NOT NULL)", no_parameters)?
+    if not option_is_some(text_key_create_result.write_commit): return err("YDBv1 TEXT clustered-key table did not commit CREATE TABLE")
+    let text_key_created: YazaDbWriteCommitV1 = option_unwrap(text_key_create_result.write_commit)
+    let text_key_insert_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(text_key_created.storage, text_key_created.wal, "INSERT INTO text_keys (key, value) VALUES ('quote''key', 'apostrophe'), ('', 'empty'), ('é', 'utf8')", no_parameters)?
+    if not option_is_some(text_key_insert_result.write_commit): return err("YDBv1 TEXT clustered-key rows did not commit INSERT")
+    let text_key_inserted: YazaDbWriteCommitV1 = option_unwrap(text_key_insert_result.write_commit)
+    let escaped_text_key_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(text_key_inserted.storage, text_key_inserted.wal, "SELECT value FROM text_keys WHERE key = 'quote''key'", no_parameters)?
+    if not option_is_some(escaped_text_key_result.query_result): return err("YDBv1 escaped TEXT clustered-key literal lookup did not return a result")
+    let escaped_text_key: YazaSqlQueryResultV1 = option_unwrap(escaped_text_key_result.query_result)
+    if list_count(escaped_text_key.rows) != 1 or list_get(list_get(escaped_text_key.rows, 0), 0).text_value != "apostrophe": return err("YDBv1 escaped TEXT clustered-key literal lookup decoded the wrong key")
+    let empty_text_key_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(escaped_text_key_result.storage, escaped_text_key_result.wal, "SELECT value FROM text_keys WHERE key = ''", no_parameters)?
+    if not option_is_some(empty_text_key_result.query_result): return err("YDBv1 empty TEXT clustered-key literal lookup did not return a result")
+    let empty_text_key: YazaSqlQueryResultV1 = option_unwrap(empty_text_key_result.query_result)
+    if list_count(empty_text_key.rows) != 1 or list_get(list_get(empty_text_key.rows, 0), 0).text_value != "empty": return err("YDBv1 empty TEXT clustered-key literal lookup returned the wrong row")
+    let unicode_text_key_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(empty_text_key_result.storage, empty_text_key_result.wal, "SELECT value FROM text_keys WHERE key = 'é'", no_parameters)?
+    if not option_is_some(unicode_text_key_result.query_result): return err("YDBv1 UTF-8 TEXT clustered-key literal lookup did not return a result")
+    let unicode_text_key: YazaSqlQueryResultV1 = option_unwrap(unicode_text_key_result.query_result)
+    if list_count(unicode_text_key.rows) != 1 or list_get(list_get(unicode_text_key.rows, 0), 0).text_value != "utf8": return err("YDBv1 UTF-8 TEXT clustered-key literal lookup returned the wrong row")
+    let missing_text_key_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(unicode_text_key_result.storage, unicode_text_key_result.wal, "SELECT value FROM text_keys WHERE key = 'missing'", no_parameters)?
+    if not option_is_some(missing_text_key_result.query_result): return err("YDBv1 missing TEXT clustered-key literal lookup did not return a result")
+    let missing_text_key: YazaSqlQueryResultV1 = option_unwrap(missing_text_key_result.query_result)
+    if list_count(missing_text_key.rows) != 0: return err("YDBv1 missing TEXT clustered-key literal lookup returned a row")
+
+    let left_group_key_id: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 0)?
+    let left_group_key_email: YazaSqlValueV1 = yaza_sql_value_text_v1("group-left@example.test")
+    let left_group_key_active: YazaSqlValueV1 = yaza_sql_value_boolean_v1(true)
+    let left_group_key_points: YazaSqlValueV1 = yaza_sql_value_null_v1(3)?
+    let left_group_key_values: List[YazaSqlValueV1] = [left_group_key_id, left_group_key_email, left_group_key_active, left_group_key_points]
+    let left_group_key_nulls: List[Boolean] = [false, false, false, true]
+    let left_group_key: Bytes = yaza_db_key_encode_composite_v1(left_group_key_values, left_group_key_nulls, accounts.columns, account_key_ordinals)?
+    let right_group_key_id: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 1000)?
+    let right_group_key_email: YazaSqlValueV1 = yaza_sql_value_text_v1("group-right@example.test")
+    let right_group_key_values: List[YazaSqlValueV1] = [right_group_key_id, right_group_key_email, left_group_key_active, left_group_key_points]
+    let right_group_key: Bytes = yaza_db_key_encode_composite_v1(right_group_key_values, left_group_key_nulls, accounts.columns, account_key_ordinals)?
+    let left_group_leaf: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(missing_text_key_result.storage.file, missing_text_key_result.storage.header, table_root_id, left_group_key)?
+    let right_group_leaf: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(missing_text_key_result.storage.file, missing_text_key_result.storage.header, table_root_id, right_group_key)?
+    if left_group_leaf.leaf_page_id == right_group_leaf.leaf_page_id: return err("YDBv1 grouped INSERT fixture did not select two distinct existing leaves")
+    let grouped_leaf_insert_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(missing_text_key_result.storage, missing_text_key_result.wal, "INSERT INTO accounts (id, email, active, points) VALUES (0, 'group-left@example.test', TRUE, NULL), (1000, 'group-right@example.test', TRUE, NULL)", no_parameters)?
+    if not option_is_some(grouped_leaf_insert_result.write_commit): return err("YDBv1 cross-leaf grouped INSERT did not commit")
+    let grouped_leaf_select_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(grouped_leaf_insert_result.storage, grouped_leaf_insert_result.wal, "SELECT id, email FROM accounts WHERE id IN (0, 1000)", no_parameters)?
+    if not option_is_some(grouped_leaf_select_result.query_result): return err("YDBv1 cross-leaf grouped INSERT verification did not return a query")
+    let grouped_leaf_rows: YazaSqlQueryResultV1 = option_unwrap(grouped_leaf_select_result.query_result)
+    if list_count(grouped_leaf_rows.rows) != 2: return err("YDBv1 cross-leaf grouped INSERT did not expose both committed rows")
+
+    let defaults_insert_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(grouped_leaf_select_result.storage, grouped_leaf_select_result.wal, "INSERT INTO accounts (id) VALUES (1001)", no_parameters)?
+    if not option_is_some(defaults_insert_result.write_commit): return err("YDBv1 omitted-column INSERT did not commit its DEFAULT values")
+    let defaults_inserted: YazaDbWriteCommitV1 = option_unwrap(defaults_insert_result.write_commit)
+    let defaults_select_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(defaults_inserted.storage, defaults_inserted.wal, "SELECT email, active, points FROM accounts WHERE id = 1001", no_parameters)?
+    if not option_is_some(defaults_select_result.query_result): return err("YDBv1 omitted-column DEFAULT verification did not return a query")
+    let defaults_query: YazaSqlQueryResultV1 = option_unwrap(defaults_select_result.query_result)
+    if list_count(defaults_query.rows) != 1 or list_count(list_get(defaults_query.rows, 0)) != 3: return err("YDBv1 omitted-column DEFAULT verification returned an invalid row")
+    let defaults_row: List[YazaSqlValueV1] = list_get(defaults_query.rows, 0)
+    if list_get(defaults_row, 0).text_value != "pending" or not list_get(defaults_row, 1).boolean_value or list_get(defaults_row, 2).is_null or list_get(defaults_row, 2).integer_value != -2: return err("YDBv1 omitted-column INSERT did not materialize persisted TEXT, BOOLEAN, and signed integer defaults")
+
+    let explicit_defaults_insert_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(defaults_select_result.storage, defaults_select_result.wal, "INSERT INTO accounts (id, email, active, points) VALUES (1002, DEFAULT, DEFAULT, DEFAULT)", no_parameters)?
+    if not option_is_some(explicit_defaults_insert_result.write_commit): return err("YDBv1 INSERT with explicit DEFAULT values did not commit")
+    let explicit_defaults_inserted: YazaDbWriteCommitV1 = option_unwrap(explicit_defaults_insert_result.write_commit)
+    let no_primary_default: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(explicit_defaults_inserted.storage, explicit_defaults_inserted.wal, "INSERT INTO accounts (id, email, active, points) VALUES (DEFAULT, DEFAULT, DEFAULT, DEFAULT)", no_parameters)
+    if result_is_ok(no_primary_default): return err("YDBv1 INSERT DEFAULT invented a value for a NOT NULL primary key without a declared default")
+    let explicit_defaults_select_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(explicit_defaults_inserted.storage, explicit_defaults_inserted.wal, "SELECT email, active, points FROM accounts WHERE id = 1002", no_parameters)?
+    if not option_is_some(explicit_defaults_select_result.query_result): return err("YDBv1 explicit DEFAULT verification did not return a query")
+    let explicit_defaults_query: YazaSqlQueryResultV1 = option_unwrap(explicit_defaults_select_result.query_result)
+    if list_count(explicit_defaults_query.rows) != 1: return err("YDBv1 explicit DEFAULT INSERT did not produce one row")
+    let explicit_defaults_row: List[YazaSqlValueV1] = list_get(explicit_defaults_query.rows, 0)
+    if list_get(explicit_defaults_row, 0).text_value != "pending" or not list_get(explicit_defaults_row, 1).boolean_value or list_get(explicit_defaults_row, 2).is_null or list_get(explicit_defaults_row, 2).integer_value != -2: return err("YDBv1 explicit DEFAULT INSERT did not materialize persisted TEXT, BOOLEAN, and signed integer defaults")
+    let override_defaults_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(explicit_defaults_select_result.storage, explicit_defaults_select_result.wal, "UPDATE accounts SET email = 'custom@example.test', active = FALSE, points = 99 WHERE id = 1002", no_parameters)?
+    if not option_is_some(override_defaults_result.write_commit): return err("YDBv1 pre-DEFAULT override UPDATE did not commit")
+    let override_defaults: YazaDbWriteCommitV1 = option_unwrap(override_defaults_result.write_commit)
+    let rejected_update_default_not_null: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(override_defaults.storage, override_defaults.wal, "UPDATE text_keys SET value = DEFAULT WHERE key = 'é'", no_parameters)
+    if result_is_ok(rejected_update_default_not_null): return err("YDBv1 SQL UPDATE accepted DEFAULT for a NOT NULL column without a declared DEFAULT")
+    let rejected_update_default_arith: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(override_defaults.storage, override_defaults.wal, "UPDATE accounts SET points = points + DEFAULT WHERE id = 1002", no_parameters)
+    if result_is_ok(rejected_update_default_arith): return err("YDBv1 SQL UPDATE accepted DEFAULT as an arithmetic operand")
+    let update_defaults_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(override_defaults.storage, override_defaults.wal, "UPDATE accounts SET email = DEFAULT, active = DEFAULT, points = DEFAULT WHERE id = 1002", no_parameters)?
+    if not option_is_some(update_defaults_result.write_commit): return err("YDBv1 SQL UPDATE with DEFAULT values did not commit")
+    let update_defaults: YazaDbWriteCommitV1 = option_unwrap(update_defaults_result.write_commit)
+    let update_defaults_select_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(update_defaults.storage, update_defaults.wal, "SELECT email, active, points FROM accounts WHERE id = 1002", no_parameters)?
+    if not option_is_some(update_defaults_select_result.query_result): return err("YDBv1 UPDATE DEFAULT verification did not return a query")
+    let update_defaults_query: YazaSqlQueryResultV1 = option_unwrap(update_defaults_select_result.query_result)
+    if list_count(update_defaults_query.rows) != 1: return err("YDBv1 UPDATE DEFAULT verification did not return one row")
+    let update_defaults_row: List[YazaSqlValueV1] = list_get(update_defaults_query.rows, 0)
+    if list_get(update_defaults_row, 0).text_value != "pending" or not list_get(update_defaults_row, 1).boolean_value or list_get(update_defaults_row, 2).is_null or list_get(update_defaults_row, 2).integer_value != -2: return err("YDBv1 SQL UPDATE SET col = DEFAULT did not materialize persisted TEXT, BOOLEAN, and signed integer defaults")
+
+    let update_expr_create_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(update_defaults_select_result.storage, update_defaults_select_result.wal, "CREATE TABLE update_expr_probe (id INTEGER PRIMARY KEY, left_value INTEGER NULL, right_value INTEGER NULL, label TEXT NULL, label_copy TEXT NULL, wide_value BIGINT NULL, ratio_value DOUBLE NULL, ratio_step DOUBLE NULL)", no_parameters)?
+    if not option_is_some(update_expr_create_result.write_commit): return err("YDBv1 UPDATE expression fixture did not create its probe table")
+    let update_expr_created: YazaDbWriteCommitV1 = option_unwrap(update_expr_create_result.write_commit)
+    let update_expr_insert_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(update_expr_created.storage, update_expr_created.wal, "INSERT INTO update_expr_probe (id, left_value, right_value, label, wide_value, ratio_value, ratio_step) VALUES (1, 4, 7, 'alpha', 9223372036854775807, 1.5, 0.5), (2, NULL, 3, 'beta', -9223372036854775807, NULL, 2.0)", no_parameters)?
+    if not option_is_some(update_expr_insert_result.write_commit): return err("YDBv1 UPDATE expression fixture did not seed its probe rows")
+    let update_expr_inserted: YazaDbWriteCommitV1 = option_unwrap(update_expr_insert_result.write_commit)
+    let update_expr_copy_attempt: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(update_expr_inserted.storage, update_expr_inserted.wal, "UPDATE update_expr_probe SET left_value = right_value, label_copy = label WHERE id = 1", no_parameters)
+    if not result_is_ok(update_expr_copy_attempt): return err("YDBv1 source-column copy UPDATE failed: " + result_unwrap_error(update_expr_copy_attempt))
+    let update_expr_copy_result: YazaDbSqlStatementResultV1 = result_unwrap(update_expr_copy_attempt)
+    if not option_is_some(update_expr_copy_result.write_commit): return err("YDBv1 UPDATE did not copy source-column values")
+    let update_expr_copied: YazaDbWriteCommitV1 = option_unwrap(update_expr_copy_result.write_commit)
+    let update_expr_copy_select: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(update_expr_copied.storage, update_expr_copied.wal, "SELECT left_value, right_value, label_copy FROM update_expr_probe WHERE id = 1", no_parameters)?
+    if not option_is_some(update_expr_copy_select.query_result): return err("YDBv1 UPDATE source-column copy verification did not return a query")
+    let update_expr_copy_query: YazaSqlQueryResultV1 = option_unwrap(update_expr_copy_select.query_result)
+    if list_count(update_expr_copy_query.rows) != 1: return err("YDBv1 UPDATE source-column copy selected the wrong number of rows")
+    let update_expr_copy_row: List[YazaSqlValueV1] = list_get(update_expr_copy_query.rows, 0)
+    if list_get(update_expr_copy_row, 0).integer_value != 7 or list_get(update_expr_copy_row, 1).integer_value != 7 or list_get(update_expr_copy_row, 2).text_value != "alpha": return err("YDBv1 UPDATE did not copy values from the pre-update row")
+    let update_nullable_default_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(update_expr_copy_select.storage, update_expr_copy_select.wal, "UPDATE update_expr_probe SET label_copy = DEFAULT WHERE id = 1", no_parameters)?
+    if not option_is_some(update_nullable_default_result.write_commit): return err("YDBv1 UPDATE DEFAULT on nullable column without declared default did not commit")
+    let update_nullable_default: YazaDbWriteCommitV1 = option_unwrap(update_nullable_default_result.write_commit)
+    let update_nullable_default_select: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(update_nullable_default.storage, update_nullable_default.wal, "SELECT label_copy FROM update_expr_probe WHERE id = 1", no_parameters)?
+    if not option_is_some(update_nullable_default_select.query_result): return err("YDBv1 UPDATE nullable DEFAULT verification did not return a query")
+    let update_nullable_default_query: YazaSqlQueryResultV1 = option_unwrap(update_nullable_default_select.query_result)
+    if list_count(update_nullable_default_query.rows) != 1 or not list_get(list_get(update_nullable_default_query.rows, 0), 0).is_null: return err("YDBv1 UPDATE SET col = DEFAULT on nullable column without declared default did not materialize NULL")
+    let update_expr_add_attempt: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(update_nullable_default_select.storage, update_nullable_default_select.wal, "UPDATE update_expr_probe SET left_value = left_value + right_value WHERE id = 1", no_parameters)
+    if not result_is_ok(update_expr_add_attempt): return err("YDBv1 source-column arithmetic UPDATE failed: " + result_unwrap_error(update_expr_add_attempt))
+    let update_expr_add_result: YazaDbSqlStatementResultV1 = result_unwrap(update_expr_add_attempt)
+    if not option_is_some(update_expr_add_result.write_commit): return err("YDBv1 UPDATE could not add two integer source columns")
+    let update_expr_added: YazaDbWriteCommitV1 = option_unwrap(update_expr_add_result.write_commit)
+    let update_expr_null_attempt: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(update_expr_added.storage, update_expr_added.wal, "UPDATE update_expr_probe SET left_value = left_value + right_value WHERE id = 2", no_parameters)
+    if not result_is_ok(update_expr_null_attempt): return err("YDBv1 NULL arithmetic UPDATE failed: " + result_unwrap_error(update_expr_null_attempt))
+    let update_expr_null_result: YazaDbSqlStatementResultV1 = result_unwrap(update_expr_null_attempt)
+    if not option_is_some(update_expr_null_result.write_commit): return err("YDBv1 UPDATE column arithmetic did not preserve SQL NULL propagation")
+    let update_expr_multiply_attempt: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(update_expr_null_result.storage, update_expr_null_result.wal, "UPDATE update_expr_probe SET left_value = left_value * 2 WHERE id = 1", no_parameters)
+    if not result_is_ok(update_expr_multiply_attempt): return err("YDBv1 integer multiplication UPDATE failed: " + result_unwrap_error(update_expr_multiply_attempt))
+    let update_expr_multiply_result: YazaDbSqlStatementResultV1 = result_unwrap(update_expr_multiply_attempt)
+    if not option_is_some(update_expr_multiply_result.write_commit): return err("YDBv1 UPDATE did not multiply integer columns")
+    let update_expr_multiplied: YazaDbWriteCommitV1 = option_unwrap(update_expr_multiply_result.write_commit)
+    let update_expr_divide_attempt: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(update_expr_multiplied.storage, update_expr_multiplied.wal, "UPDATE update_expr_probe SET left_value = left_value / 3 WHERE id = 1", no_parameters)
+    if not result_is_ok(update_expr_divide_attempt): return err("YDBv1 integer division UPDATE failed: " + result_unwrap_error(update_expr_divide_attempt))
+    let update_expr_divide_result: YazaDbSqlStatementResultV1 = result_unwrap(update_expr_divide_attempt)
+    if not option_is_some(update_expr_divide_result.write_commit): return err("YDBv1 UPDATE did not divide integer columns")
+    let update_expr_divided: YazaDbWriteCommitV1 = option_unwrap(update_expr_divide_result.write_commit)
+    let update_expr_divide_zero: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(update_expr_divided.storage, update_expr_divided.wal, "UPDATE update_expr_probe SET left_value = left_value / 0 WHERE id = 1", no_parameters)
+    if result_is_ok(update_expr_divide_zero): return err("YDBv1 UPDATE integer division accepted a zero divisor")
+    let update_expr_range_overflow: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(update_expr_divided.storage, update_expr_divided.wal, "UPDATE update_expr_probe SET left_value = left_value * 2000000000 WHERE id = 1", no_parameters)
+    if result_is_ok(update_expr_range_overflow): return err("YDBv1 UPDATE integer multiplication accepted an out-of-range INTEGER result")
+    let update_expr_modulo_attempt: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(update_expr_divided.storage, update_expr_divided.wal, "UPDATE update_expr_probe SET left_value = left_value % 4 WHERE id = 1", no_parameters)
+    if not result_is_ok(update_expr_modulo_attempt): return err("YDBv1 integer remainder UPDATE failed: " + result_unwrap_error(update_expr_modulo_attempt))
+    let update_expr_modulo_result: YazaDbSqlStatementResultV1 = result_unwrap(update_expr_modulo_attempt)
+    if not option_is_some(update_expr_modulo_result.write_commit): return err("YDBv1 UPDATE did not calculate integer remainder")
+    let update_expr_modulo: YazaDbWriteCommitV1 = option_unwrap(update_expr_modulo_result.write_commit)
+    let update_expr_reject: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(update_expr_modulo.storage, update_expr_modulo.wal, "UPDATE update_expr_probe SET left_value = label WHERE id = 1", no_parameters)
+    if result_is_ok(update_expr_reject): return err("YDBv1 UPDATE source-column copy accepted mismatched SQL types")
+    let update_expr_bigint_overflow: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(update_expr_modulo.storage, update_expr_modulo.wal, "UPDATE update_expr_probe SET wide_value = wide_value + 1 WHERE id = 1", no_parameters)
+    if result_is_ok(update_expr_bigint_overflow): return err("YDBv1 UPDATE BIGINT addition accepted overflow")
+    let update_expr_min_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(update_expr_modulo.storage, update_expr_modulo.wal, "UPDATE update_expr_probe SET wide_value = wide_value - 1 WHERE id = 2", no_parameters)?
+    if not option_is_some(update_expr_min_result.write_commit): return err("YDBv1 UPDATE could not produce BIGINT minimum")
+    let update_expr_min: YazaDbWriteCommitV1 = option_unwrap(update_expr_min_result.write_commit)
+    let update_expr_min_divide: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(update_expr_min.storage, update_expr_min.wal, "UPDATE update_expr_probe SET wide_value = wide_value / -1 WHERE id = 2", no_parameters)
+    if result_is_ok(update_expr_min_divide): return err("YDBv1 UPDATE BIGINT minimum divided by negative one did not reject overflow")
+    let update_expr_min_modulo: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(update_expr_min.storage, update_expr_min.wal, "UPDATE update_expr_probe SET wide_value = wide_value % -1 WHERE id = 2", no_parameters)?
+    if not option_is_some(update_expr_min_modulo.write_commit): return err("YDBv1 UPDATE BIGINT minimum remainder by negative one did not commit")
+    let update_expr_modulo_final: YazaDbWriteCommitV1 = option_unwrap(update_expr_min_modulo.write_commit)
+    let update_expr_verify_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(update_expr_modulo_final.storage, update_expr_modulo_final.wal, "SELECT id, left_value, wide_value FROM update_expr_probe WHERE id > 0 ORDER BY id", no_parameters)?
+    if not option_is_some(update_expr_verify_result.query_result): return err("YDBv1 UPDATE arithmetic verification did not return a query")
+    let update_expr_verify: YazaSqlQueryResultV1 = option_unwrap(update_expr_verify_result.query_result)
+    if list_count(update_expr_verify.rows) != 2 or list_get(list_get(update_expr_verify.rows, 0), 1).integer_value != 1 or list_get(list_get(update_expr_verify.rows, 0), 2).integer_value != 9223372036854775807 or not list_get(list_get(update_expr_verify.rows, 1), 1).is_null or list_get(list_get(update_expr_verify.rows, 1), 2).integer_value != 0: return err("YDBv1 UPDATE column arithmetic returned incorrect values, NULL semantics, or BIGINT boundaries")
+
+    let double_add_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(update_expr_verify_result.storage, update_expr_verify_result.wal, "UPDATE update_expr_probe SET ratio_value = ratio_value + ratio_step WHERE id = 1", no_parameters)?
+    if not option_is_some(double_add_result.write_commit): return err("YDBv1 DOUBLE addition UPDATE did not commit")
+    let double_added: YazaDbWriteCommitV1 = option_unwrap(double_add_result.write_commit)
+    let double_mul_sub_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(double_added.storage, double_added.wal, "UPDATE update_expr_probe SET ratio_value = ratio_value * 3.0, ratio_step = ratio_step - 0.25 WHERE id = 1", no_parameters)?
+    if not option_is_some(double_mul_sub_result.write_commit): return err("YDBv1 DOUBLE multiply/subtract UPDATE did not commit")
+    let double_mul_sub: YazaDbWriteCommitV1 = option_unwrap(double_mul_sub_result.write_commit)
+    let double_bind_divisor: YazaSqlValueV1 = yaza_sql_value_double_v1(2.0)
+    let double_div_params: List[YazaSqlValueV1] = [double_bind_divisor]
+    let double_div_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(double_mul_sub.storage, double_mul_sub.wal, "UPDATE update_expr_probe SET ratio_value = ratio_value / $1 WHERE id = 1", double_div_params)?
+    if not option_is_some(double_div_result.write_commit): return err("YDBv1 DOUBLE bind division UPDATE did not commit")
+    let double_div: YazaDbWriteCommitV1 = option_unwrap(double_div_result.write_commit)
+    let double_null_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(double_div.storage, double_div.wal, "UPDATE update_expr_probe SET ratio_value = ratio_value + ratio_step WHERE id = 2", no_parameters)?
+    if not option_is_some(double_null_result.write_commit): return err("YDBv1 DOUBLE NULL propagation UPDATE did not commit")
+    let double_null_updated: YazaDbWriteCommitV1 = option_unwrap(double_null_result.write_commit)
+    let double_div_zero: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(double_null_updated.storage, double_null_updated.wal, "UPDATE update_expr_probe SET ratio_value = ratio_value / 0.0 WHERE id = 1", no_parameters)
+    if result_is_ok(double_div_zero): return err("YDBv1 UPDATE DOUBLE division accepted a zero divisor")
+    let double_mod_reject: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(double_null_updated.storage, double_null_updated.wal, "UPDATE update_expr_probe SET ratio_value = ratio_value % 2.0 WHERE id = 1", no_parameters)
+    if result_is_ok(double_mod_reject): return err("YDBv1 UPDATE DOUBLE arithmetic accepted modulo")
+    let double_verify_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(double_null_updated.storage, double_null_updated.wal, "SELECT id, ratio_value, ratio_step FROM update_expr_probe WHERE id > 0 ORDER BY id", no_parameters)?
+    if not option_is_some(double_verify_result.query_result): return err("YDBv1 DOUBLE UPDATE verification did not return a query")
+    let double_verify: YazaSqlQueryResultV1 = option_unwrap(double_verify_result.query_result)
+    if list_count(double_verify.rows) != 2 or list_get(list_get(double_verify.rows, 0), 1).float_value != 3.0 or list_get(list_get(double_verify.rows, 0), 2).float_value != 0.25 or not list_get(list_get(double_verify.rows, 1), 1).is_null or list_get(list_get(double_verify.rows, 1), 2).float_value != 2.0: return err("YDBv1 DOUBLE UPDATE arithmetic returned incorrect values or NULL semantics")
+
+    let final_wal_closed: Boolean = yaza_db_wal_log_close_v1(double_verify_result.wal)?
+    let final_storage_closed: Boolean = yaza_db_storage_close_v1(double_verify_result.storage)?
+    if not final_wal_closed or not final_storage_closed: return err("YDBv1 CREATE TABLE recovered handles did not close")
+    let removed: Boolean = remove(root, db_name)?
+    if not removed: return err("YDBv1 CREATE TABLE fixture could not remove its database")
+    let synced: Boolean = sync_directory(root)?
+    if not synced: return err("YDBv1 CREATE TABLE fixture cleanup sync failed")
+    let root_closed: Boolean = close(root)?
+    if not root_closed: return err("YDBv1 CREATE TABLE fixture root did not close")
+    return ok(after.version)
+
+start:
+    let outcome: Result[Number, Text] = yazabase_sql_create_table_persist_v1(arg(1))
+    if result_is_ok(outcome):
+        say "yazabase-sql-create-table-persist-v1-ok catalog-version=" + number_text(result_unwrap(outcome)) + " arena-peak-bytes=" + number_text(arena_peak_used())
+    else:
+        say result_unwrap_error(outcome)

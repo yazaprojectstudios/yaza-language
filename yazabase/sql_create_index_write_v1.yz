@@ -1,0 +1,607 @@
+# Transactional secondary-index build helpers for the bounded YDBv1 profile.
+use "./allocator_v1"
+use "./btree_scan_v1"
+use "./catalog_schema_v1"
+use "./catalog_snapshot_v1"
+use "./catalog_storage_v1"
+use "./catalog_v1"
+use "./index_catalog_v1"
+use "./key_codec_v1"
+use "./page_v1"
+use "./query_v1"
+use "./row_v1"
+use "./sql_create_index_v1"
+use "./sql_decimal_v1"
+use "./secondary_index_v1"
+use "./sql_create_table_write_v1"
+use "./sql_executor_v1"
+use "./storage_v1"
+use "./transaction_v1"
+use "./wal_v1"
+
+shape YazaDbSqlCreateIndexPreflightBatchV1:
+    row_count: Number
+    cell_count: Number
+    source_payload_bytes: Number
+    cursor_length: Number
+    unique_probe_work: Number
+    unique_collision_scan_rows: Number
+
+shape YazaDbSqlCreateIndexUniqueCheckV1:
+    duplicate: Boolean
+    rows_scanned: Number
+
+shape YazaDbSqlCreateIndexStateV1:
+    storage: YazaDbStorageHandleV1
+    wal: YazaDbWalLogV1
+    index_id: Number
+    root_page_id: Number
+    index_kind: Number
+    source_row_count: Number
+
+shape YazaDbSqlCreateIndexBatchV1:
+    storage: YazaDbStorageHandleV1
+    wal: YazaDbWalLogV1
+    row_count: Number
+    inserted_count: Number
+    cursor_length: Number
+
+fn yaza_db_sql_create_index_validate_source_row_v1(source_row: YazaDbRowV1, plan: YazaSqlCreateIndexPlanV1, primary_key_ordinals: List[Number], entry_columns: List[YazaSqlColumnSchemaV1], entry_key_ordinals: List[Number]) -> Result[Boolean, Text]:
+    let entry: YazaDbSqlCreateIndexEntryV1 = yaza_db_sql_create_index_entry_v1(source_row, plan, primary_key_ordinals, entry_columns, entry_key_ordinals)?
+    return ok(bytes_length(entry.key) > 0 and bytes_length(entry.key) <= 2048)
+
+fn yaza_db_sql_create_index_value_equal_v1(left: YazaSqlValueV1, right: YazaSqlValueV1) -> Boolean:
+    if left.type_id != right.type_id or left.source_literal or right.source_literal: return false
+    if left.type_id == 1: return left.boolean_value == right.boolean_value
+    if left.type_id == 2 or left.type_id == 3 or left.type_id == 4 or left.type_id == 11 or left.type_id == 13 or left.type_id == 14 or left.type_id == 15: return left.integer_value == right.integer_value
+    if left.type_id == 6: return left.float_value == right.float_value
+    if left.type_id == 10: return yaza_sql_decimal_compare_text_v1(left.text_value, right.text_value) == 0
+    if left.type_id == 9 or left.type_id == 12: return left.text_value == right.text_value
+    if left.type_id == 16: return bytes_equal(left.bytes_value, right.bytes_value)
+    return false
+
+fn yaza_db_sql_create_index_existing_entry_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, entry: YazaDbSqlCreateIndexEntryV1, entry_columns: List[YazaSqlColumnSchemaV1], entry_key_ordinals: List[Number]) -> Result[Boolean, Text]:
+    let seek: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(file, file_header, root_page_id, entry.key)?
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(seek.leaf_page, seek.leaf_page_id)?
+    if header.page_type != 1 or header.level != 0: return err("YDBv1 secondary-index idempotence lookup did not resolve a leaf")
+    let slot_index: Number = yaza_db_page_lower_bound_v1(seek.leaf_page, entry.key, seek.leaf_page_id)?
+    if slot_index >= header.count: return ok(false)
+    let stored_key: Bytes = yaza_db_page_slot_key_v1(seek.leaf_page, slot_index, seek.leaf_page_id)?
+    if not bytes_equal(stored_key, entry.key): return ok(false)
+    let slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(seek.leaf_page, slot_index, seek.leaf_page_id)?
+    let existing: YazaDbRowV1 = yaza_db_row_decode_for_schema_v1(slot.payload, entry_columns, 1)?
+    if existing.deleted or list_count(existing.values) != list_count(entry.values) or list_count(existing.nulls) != list_count(entry.nulls):
+        return err("YDBv1 secondary-index existing entry has an invalid row payload")
+    var field: Number = 0
+    while field < list_count(entry.values):
+        if list_get(existing.nulls, field) != list_get(entry.nulls, field): return err("YDBv1 secondary-index resume found a key with mismatched NULL metadata")
+        if not yaza_db_sql_create_index_value_equal_v1(list_get(existing.values, field), list_get(entry.values, field)):
+            return err("YDBv1 secondary-index resume found a key with a mismatched payload")
+        set field = field + 1
+    let checked_key: Bytes = yaza_db_key_encode_composite_v1(existing.values, existing.nulls, entry_columns, entry_key_ordinals)?
+    if not bytes_equal(checked_key, entry.key): return err("YDBv1 secondary-index existing payload does not reproduce its physical key")
+    return ok(true)
+
+fn yaza_db_sql_create_index_copy_cursor_v1(cursor_buffer: Bytes, source_row: YazaDbRowV1, table_columns: List[YazaSqlColumnSchemaV1], primary_key_ordinals: List[Number]) -> Result[Number, Text]:
+    let key: Bytes = yaza_db_key_encode_composite_v1(source_row.values, source_row.nulls, table_columns, primary_key_ordinals)?
+    let key_length: Number = bytes_length(key)
+    if key_length < 1 or key_length > 2048 or key_length > bytes_length(cursor_buffer): return err("YDBv1 secondary-index source cursor exceeds its 2 KiB buffer")
+    var index: Number = 0
+    while index < key_length:
+        if not bytes_try_set(cursor_buffer, index, bytes_get(key, index)): return err("YDBv1 secondary-index source cursor could not be updated")
+        set index = index + 1
+    return ok(key_length)
+
+fn yaza_db_sql_create_index_unique_duplicate_before_v1(file: Number, file_header: YazaDbFileHeaderV1, table_root_page_id: Number, plan: YazaSqlCreateIndexPlanV1, schema_version: Number, primary_key_ordinals: List[Number], visible_ts: Number, current_row: YazaDbRowV1, current_key: Bytes, cursor_buffer: Bytes) -> Result[YazaDbSqlCreateIndexUniqueCheckV1, Text]:
+    if not plan.is_unique or plan.index_column_ordinal < 0 or plan.index_column_ordinal >= list_count(plan.table_columns) or plan.index_column_ordinal >= list_count(current_row.values) or list_get(current_row.nulls, plan.index_column_ordinal) or bytes_length(current_key) < 1 or bytes_length(current_key) > bytes_length(cursor_buffer):
+        return err("YDBv1 UNIQUE INDEX collision check received invalid source metadata")
+    var cursor_length: Number = 0
+    var rows_scanned: Number = 0
+    var duplicate: Boolean = false
+    var done: Boolean = false
+    var scan_failed: Boolean = false
+    while not done and not duplicate and not scan_failed:
+        arena_scope 8388608:
+            let start_key_result: Result[Bytes, Text] = bytes_try_slice(cursor_buffer, 0, cursor_length)
+            if not result_is_ok(start_key_result): set scan_failed = true
+            else:
+                let start_key: Bytes = result_unwrap(start_key_result)
+                let prior_rows_result: Result[List[YazaDbRowV1], Text] = yaza_db_btree_read_rows_after_key_for_schema_v1(file, file_header, table_root_page_id, plan.table_columns, schema_version, primary_key_ordinals, visible_ts, start_key, 512)
+                if not result_is_ok(prior_rows_result): set scan_failed = true
+                else:
+                    let prior_rows: List[YazaDbRowV1] = result_unwrap(prior_rows_result)
+                    if list_count(prior_rows) == 0: set done = true
+                    var row_index: Number = 0
+                    while row_index < list_count(prior_rows) and not done and not duplicate and not scan_failed:
+                        let prior_row: YazaDbRowV1 = list_get(prior_rows, row_index)
+                        let prior_key_result: Result[Bytes, Text] = yaza_db_key_encode_composite_v1(prior_row.values, prior_row.nulls, plan.table_columns, primary_key_ordinals)
+                        if not result_is_ok(prior_key_result): set scan_failed = true
+                        else:
+                            let prior_key: Bytes = result_unwrap(prior_key_result)
+                            let order: Number = yaza_db_compare_bytes_v1(prior_key, current_key)
+                            if order >= 0: set done = true
+                            else:
+                                set rows_scanned = rows_scanned + 1
+                                let indexed_ordinal: Number = plan.index_column_ordinal
+                                if not list_get(prior_row.nulls, indexed_ordinal) and yaza_db_sql_create_index_value_equal_v1(list_get(prior_row.values, indexed_ordinal), list_get(current_row.values, indexed_ordinal)):
+                                    set duplicate = true
+                                else:
+                                    let copied: Result[Number, Text] = yaza_db_sql_create_index_copy_cursor_v1(cursor_buffer, prior_row, plan.table_columns, primary_key_ordinals)
+                                    if not result_is_ok(copied): set scan_failed = true
+                                    else: set cursor_length = result_unwrap(copied)
+                        set row_index = row_index + 1
+                    if not scan_failed and not done and not duplicate and list_count(prior_rows) < 512: set done = true
+    if scan_failed: return err("YDBv1 UNIQUE INDEX collision scan could not read or encode its source rows")
+    return ok(YazaDbSqlCreateIndexUniqueCheckV1(duplicate, rows_scanned))
+
+fn yaza_db_sql_create_index_preflight_batch_v1(file: Number, file_header: YazaDbFileHeaderV1, table_root_page_id: Number, plan: YazaSqlCreateIndexPlanV1, schema_version: Number, primary_key_ordinals: List[Number], entry_columns: List[YazaSqlColumnSchemaV1], entry_key_ordinals: List[Number], visible_ts: Number, cursor_buffer: Bytes, cursor_length: Number, unique_bucket_heads: List[Number], unique_hashes: List[Number], unique_scan_cursor_buffer: Bytes, unique_probe_work: Number, unique_collision_scan_rows: Number) -> Result[YazaDbSqlCreateIndexPreflightBatchV1, Text]:
+    if cursor_length < 0 or cursor_length > bytes_length(cursor_buffer) or cursor_length > 2048: return err("YDBv1 secondary-index preflight cursor length is invalid")
+    let failures_result: Result[TextList, Text] = text_list_try_new()
+    if not result_is_ok(failures_result): return err("YDBv1 secondary-index preflight could not allocate error metadata")
+    let failures: TextList = result_unwrap(failures_result)
+    var failed: Boolean = false
+    var output_row_count: Number = 0
+    var output_cell_count: Number = 0
+    var output_payload_bytes: Number = 0
+    var output_cursor_length: Number = cursor_length
+    var output_unique_probe_work: Number = unique_probe_work
+    var output_unique_collision_scan_rows: Number = unique_collision_scan_rows
+    arena_scope 67108864:
+        var start_after_key: Bytes = bytes_from_text("")
+        let start_key_result: Result[Bytes, Text] = bytes_try_slice(cursor_buffer, 0, cursor_length)
+        if not result_is_ok(start_key_result):
+            set failed = true
+            if not list_try_push(failures, result_unwrap_error(start_key_result)): set failed = true
+        else:
+            set start_after_key = result_unwrap(start_key_result)
+        if not failed:
+            let rows_result: Result[List[YazaDbRowV1], Text] = yaza_db_btree_read_rows_after_key_for_schema_v1(file, file_header, table_root_page_id, plan.table_columns, schema_version, primary_key_ordinals, visible_ts, start_after_key, 512)
+            if not result_is_ok(rows_result):
+                set failed = true
+                if not list_try_push(failures, result_unwrap_error(rows_result)): set failed = true
+            else:
+                let rows: List[YazaDbRowV1] = result_unwrap(rows_result)
+                set output_row_count = list_count(rows)
+                var row_index: Number = 0
+                while row_index < list_count(rows) and not failed:
+                    let row: YazaDbRowV1 = list_get(rows, row_index)
+                    let cells: Number = list_count(row.values)
+                    if cells != list_count(plan.table_columns) or cells != list_count(row.nulls):
+                        set failed = true
+                        if not list_try_push(failures, "YDBv1 secondary-index preflight found a malformed source row"): set failed = true
+                    else:
+                        if output_cell_count > 1048576 - cells:
+                            set failed = true
+                            if not list_try_push(failures, "YDBv1 secondary-index preflight exceeded its 1,048,576-cell bound"): set failed = true
+                        else:
+                            set output_cell_count = output_cell_count + cells
+                            let encoded_source: Result[Bytes, Text] = yaza_db_row_encode_for_schema_v1(row.values, row.nulls, plan.table_columns, row.version_ts, schema_version)
+                            if not result_is_ok(encoded_source):
+                                set failed = true
+                                if not list_try_push(failures, result_unwrap_error(encoded_source)): set failed = true
+                            else:
+                                let source_bytes: Number = bytes_length(result_unwrap(encoded_source))
+                                if source_bytes > 67108864 - output_payload_bytes:
+                                    set failed = true
+                                    if not list_try_push(failures, "YDBv1 secondary-index preflight exceeded its 64 MiB source-payload bound"): set failed = true
+                                else:
+                                    set output_payload_bytes = output_payload_bytes + source_bytes
+                                    let entry_result: Result[Boolean, Text] = yaza_db_sql_create_index_validate_source_row_v1(row, plan, primary_key_ordinals, entry_columns, entry_key_ordinals)
+                                    if not result_is_ok(entry_result):
+                                        set failed = true
+                                        if not list_try_push(failures, result_unwrap_error(entry_result)): set failed = true
+                                    elif not result_unwrap(entry_result):
+                                        set failed = true
+                                        if not list_try_push(failures, "YDBv1 secondary-index physical key is outside its bound"): set failed = true
+                                    if not failed:
+                                        if plan.is_unique:
+                                            let indexed_ordinal: Number = plan.index_column_ordinal
+                                            if indexed_ordinal < 0 or indexed_ordinal >= list_count(row.values) or indexed_ordinal >= list_count(row.nulls):
+                                                set failed = true
+                                                if not list_try_push(failures, "YDBv1 UNIQUE INDEX preflight column is outside the source row"): set failed = true
+                                            elif not list_get(row.nulls, indexed_ordinal):
+                                                let unique_key_result: Result[Bytes, Text] = yaza_db_key_encode_composite_v1(row.values, row.nulls, plan.table_columns, [indexed_ordinal])
+                                                if not result_is_ok(unique_key_result):
+                                                    set failed = true
+                                                    if not list_try_push(failures, "YDBv1 UNIQUE INDEX value could not be encoded"): set failed = true
+                                                else:
+                                                    let unique_key: Bytes = result_unwrap(unique_key_result)
+                                                    if list_count(unique_bucket_heads) != 131072 or list_count(unique_hashes) >= 65536:
+                                                        set failed = true
+                                                        if not list_try_push(failures, "YDBv1 UNIQUE INDEX values exceed their bounded hash-set limits"): set failed = true
+                                                    else:
+                                                        let current_row_key_result: Result[Bytes, Text] = yaza_db_key_encode_composite_v1(row.values, row.nulls, plan.table_columns, primary_key_ordinals)
+                                                        if not result_is_ok(current_row_key_result):
+                                                            set failed = true
+                                                            if not list_try_push(failures, "YDBv1 UNIQUE INDEX source cursor key could not be encoded"): set failed = true
+                                                        else:
+                                                            let current_row_key: Bytes = result_unwrap(current_row_key_result)
+                                                            let unique_hash: Number = bytes_crc32c(unique_key)
+                                                            var bucket: Number = unique_hash % list_count(unique_bucket_heads)
+                                                            var probes: Number = 0
+                                                            var duplicate: Boolean = false
+                                                            while list_get(unique_bucket_heads, bucket) != 0 and not duplicate and not failed:
+                                                                let prior_index: Number = list_get(unique_bucket_heads, bucket) - 1
+                                                                if prior_index < 0 or prior_index >= list_count(unique_hashes):
+                                                                    set failed = true
+                                                                    if not list_try_push(failures, "YDBv1 UNIQUE INDEX hash table contains an invalid entry"): set failed = true
+                                                                else:
+                                                                    set output_unique_probe_work = output_unique_probe_work + 1
+                                                                    if output_unique_probe_work > 1048576:
+                                                                        set failed = true
+                                                                        if not list_try_push(failures, "YDBv1 UNIQUE INDEX exceeded its 1,048,576 hash-probe bound"): set failed = true
+                                                                    elif list_get(unique_hashes, prior_index) == unique_hash:
+                                                                        let exact_check: Result[YazaDbSqlCreateIndexUniqueCheckV1, Text] = yaza_db_sql_create_index_unique_duplicate_before_v1(file, file_header, table_root_page_id, plan, schema_version, primary_key_ordinals, visible_ts, row, current_row_key, unique_scan_cursor_buffer)
+                                                                        if not result_is_ok(exact_check):
+                                                                            set failed = true
+                                                                            if not list_try_push(failures, "YDBv1 UNIQUE INDEX collision verification failed"): set failed = true
+                                                                        else:
+                                                                            let checked: YazaDbSqlCreateIndexUniqueCheckV1 = result_unwrap(exact_check)
+                                                                            if checked.rows_scanned > 1048576 - output_unique_collision_scan_rows:
+                                                                                set failed = true
+                                                                                if not list_try_push(failures, "YDBv1 UNIQUE INDEX exceeded its 1,048,576 collision-scan row bound"): set failed = true
+                                                                            else:
+                                                                                set output_unique_collision_scan_rows = output_unique_collision_scan_rows + checked.rows_scanned
+                                                                                set duplicate = checked.duplicate
+                                                                    if not duplicate and not failed:
+                                                                        set bucket = (bucket + 1) % list_count(unique_bucket_heads)
+                                                                        set probes = probes + 1
+                                                                        if probes >= list_count(unique_bucket_heads):
+                                                                            set failed = true
+                                                                            if not list_try_push(failures, "YDBv1 UNIQUE INDEX hash table is full"): set failed = true
+                                                            if duplicate and not failed:
+                                                                set failed = true
+                                                                if not list_try_push(failures, "YDBv1 UNIQUE INDEX cannot be built because the table has duplicate non-NULL values"): set failed = true
+                                                            if not failed:
+                                                                if not list_try_push(unique_hashes, unique_hash):
+                                                                    set failed = true
+                                                                    if not list_try_push(failures, "YDBv1 UNIQUE INDEX hash metadata growth failed"): set failed = true
+                                                                if not failed and not list_try_set(unique_bucket_heads, bucket, list_count(unique_hashes)):
+                                                                    set failed = true
+                                                                    if not list_try_push(failures, "YDBv1 UNIQUE INDEX hash table update failed"): set failed = true
+                                    if not failed:
+                                        let copied_result: Result[Number, Text] = yaza_db_sql_create_index_copy_cursor_v1(cursor_buffer, row, plan.table_columns, primary_key_ordinals)
+                                        if not result_is_ok(copied_result):
+                                            set failed = true
+                                            if not list_try_push(failures, result_unwrap_error(copied_result)): set failed = true
+                                        else: set output_cursor_length = result_unwrap(copied_result)
+                    set row_index = row_index + 1
+    if failed:
+        if list_count(failures) > 0: return err(list_get(failures, 0))
+        return err("YDBv1 secondary-index preflight failed")
+    return ok(YazaDbSqlCreateIndexPreflightBatchV1(output_row_count, output_cell_count, output_payload_bytes, output_cursor_length, output_unique_probe_work, output_unique_collision_scan_rows))
+
+fn yaza_db_sql_create_index_build_batch_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, plan: YazaSqlCreateIndexPlanV1, table_root_page_id: Number, schema_version: Number, primary_key_ordinals: List[Number], entry_columns: List[YazaSqlColumnSchemaV1], entry_key_ordinals: List[Number], index_root_page_id: Number, visible_ts: Number, cursor_buffer: Bytes, cursor_length: Number) -> Result[YazaDbSqlCreateIndexBatchV1, Text]:
+    if storage.root != wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid) or cursor_length < 0 or cursor_length > bytes_length(cursor_buffer) or cursor_length > 2048:
+        return err("YDBv1 secondary-index build batch identity or cursor is invalid")
+    let failures_result: Result[TextList, Text] = text_list_try_new()
+    if not result_is_ok(failures_result): return err("YDBv1 secondary-index batch could not allocate error metadata")
+    let failures: TextList = result_unwrap(failures_result)
+    var failed: Boolean = false
+    var output_row_count: Number = 0
+    var output_inserted_count: Number = 0
+    var output_cursor_length: Number = cursor_length
+    var output_storage_file: Number = storage.file
+    var output_storage_checkpoint_lsn: Number = storage.header.checkpoint_lsn
+    var output_storage_next_txn_id: Number = storage.header.next_txn_id
+    var output_storage_next_commit_ts: Number = storage.header.next_commit_ts
+    var output_storage_catalog_root: Number = storage.header.catalog_root
+    var output_storage_page_count: Number = storage.header.page_count
+    var output_storage_flags: Number = storage.header.flags
+    var output_wal_file: Number = wal.file
+    var output_wal_segment_index: Number = wal.segment_index
+    var output_wal_segment_base_lsn: Number = wal.segment_base_lsn
+    var output_wal_next_lsn: Number = wal.next_lsn
+    arena_scope 67108864:
+        let start_key_result: Result[Bytes, Text] = bytes_try_slice(cursor_buffer, 0, cursor_length)
+        if not result_is_ok(start_key_result):
+            set failed = true
+            if not list_try_push(failures, result_unwrap_error(start_key_result)): set failed = true
+        if not failed:
+            let rows_result: Result[List[YazaDbRowV1], Text] = yaza_db_btree_read_rows_after_key_for_schema_v1(storage.file, storage.header, table_root_page_id, plan.table_columns, schema_version, primary_key_ordinals, visible_ts, result_unwrap(start_key_result), 512)
+            if not result_is_ok(rows_result):
+                set failed = true
+                if not list_try_push(failures, result_unwrap_error(rows_result)): set failed = true
+            else:
+                let rows: List[YazaDbRowV1] = result_unwrap(rows_result)
+                set output_row_count = list_count(rows)
+                let entries_result: Result[List[YazaDbSqlCreateIndexEntryV1], Text] = list_try_new()
+                if not result_is_ok(entries_result):
+                    set failed = true
+                    if not list_try_push(failures, result_unwrap_error(entries_result)): set failed = true
+                else:
+                    let entries: List[YazaDbSqlCreateIndexEntryV1] = result_unwrap(entries_result)
+                    if not list_try_reserve(entries, list_count(rows)):
+                        set failed = true
+                        if not list_try_push(failures, "YDBv1 secondary-index batch could not reserve its bounded entry list"): set failed = true
+                    var row_index: Number = 0
+                    while row_index < list_count(rows) and not failed:
+                        let source_row: YazaDbRowV1 = list_get(rows, row_index)
+                        let entry_result: Result[YazaDbSqlCreateIndexEntryV1, Text] = yaza_db_sql_create_index_entry_v1(source_row, plan, primary_key_ordinals, entry_columns, entry_key_ordinals)
+                        if not result_is_ok(entry_result):
+                            set failed = true
+                            if not list_try_push(failures, result_unwrap_error(entry_result)): set failed = true
+                        else:
+                            let entry: YazaDbSqlCreateIndexEntryV1 = result_unwrap(entry_result)
+                            let exists_result: Result[Boolean, Text] = yaza_db_sql_create_index_existing_entry_v1(storage.file, storage.header, index_root_page_id, entry, entry_columns, entry_key_ordinals)
+                            if not result_is_ok(exists_result):
+                                set failed = true
+                                if not list_try_push(failures, result_unwrap_error(exists_result)): set failed = true
+                            elif not result_unwrap(exists_result) and not list_try_push(entries, entry):
+                                set failed = true
+                                if not list_try_push(failures, "YDBv1 secondary-index batch could not stage a missing entry"): set failed = true
+                            if not failed:
+                                let cursor_result: Result[Number, Text] = yaza_db_sql_create_index_copy_cursor_v1(cursor_buffer, source_row, plan.table_columns, primary_key_ordinals)
+                                if not result_is_ok(cursor_result):
+                                    set failed = true
+                                    if not list_try_push(failures, result_unwrap_error(cursor_result)): set failed = true
+                                else: set output_cursor_length = result_unwrap(cursor_result)
+                        set row_index = row_index + 1
+                    if not failed and list_count(entries) > 0:
+                        let begun_result: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_begin_with_reserve_v1(storage, wal, yaza_db_write_transaction_default_free_page_reserve_v1())
+                        if not result_is_ok(begun_result):
+                            set failed = true
+                            if not list_try_push(failures, result_unwrap_error(begun_result)): set failed = true
+                        else:
+                            var current: YazaDbWriteTransactionV1 = result_unwrap(begun_result)
+                            var entry_index: Number = 0
+                            while entry_index < list_count(entries) and not failed:
+                                let entry: YazaDbSqlCreateIndexEntryV1 = list_get(entries, entry_index)
+                                let inserted_result: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_insert_committed_row_v1(current, index_root_page_id, entry.values, entry.nulls, entry_columns, entry_key_ordinals)
+                                if not result_is_ok(inserted_result):
+                                    set failed = true
+                                    yaza_db_sql_create_index_close_v1(current.storage, current.wal)
+                                    if not list_try_push(failures, "YDBv1 secondary-index batch write failed; recovery is required: " + result_unwrap_error(inserted_result)): set failed = true
+                                else: set current = result_unwrap(inserted_result)
+                                set entry_index = entry_index + 1
+                            if not failed:
+                                let committed_result: Result[YazaDbWriteCommitV1, Text] = yaza_db_write_transaction_commit_v1(current)
+                                if not result_is_ok(committed_result):
+                                    set failed = true
+                                    if not list_try_push(failures, "YDBv1 secondary-index batch commit requires recovery: " + result_unwrap_error(committed_result)): set failed = true
+                                else:
+                                    let committed: YazaDbWriteCommitV1 = result_unwrap(committed_result)
+                                    set output_storage_file = committed.storage.file
+                                    set output_storage_checkpoint_lsn = committed.storage.header.checkpoint_lsn
+                                    set output_storage_next_txn_id = committed.storage.header.next_txn_id
+                                    set output_storage_next_commit_ts = committed.storage.header.next_commit_ts
+                                    set output_storage_catalog_root = committed.storage.header.catalog_root
+                                    set output_storage_page_count = committed.storage.header.page_count
+                                    set output_storage_flags = committed.storage.header.flags
+                                    set output_wal_file = committed.wal.file
+                                    set output_wal_segment_index = committed.wal.segment_index
+                                    set output_wal_segment_base_lsn = committed.wal.segment_base_lsn
+                                    set output_wal_next_lsn = committed.wal.next_lsn
+                                    set output_inserted_count = list_count(entries)
+    if failed:
+        if list_count(failures) > 0: return err(list_get(failures, 0))
+        return err("YDBv1 secondary-index batch failed")
+    let output_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(storage.header.db_uuid, output_storage_checkpoint_lsn, output_storage_next_txn_id, output_storage_next_commit_ts, output_storage_catalog_root, output_storage_page_count, output_storage_flags)
+    let output_storage: YazaDbStorageHandleV1 = YazaDbStorageHandleV1(storage.root, output_storage_file, storage.lock, storage.identity_lock, output_header)
+    let output_wal: YazaDbWalLogV1 = YazaDbWalLogV1(wal.root, wal.db_uuid, output_wal_file, output_wal_segment_index, output_wal_segment_base_lsn, output_wal_next_lsn)
+    return ok(YazaDbSqlCreateIndexBatchV1(output_storage, output_wal, output_row_count, output_inserted_count, output_cursor_length))
+
+fn yaza_db_sql_create_index_close_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1) -> Unit:
+    let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(wal)
+    let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(storage)
+    return
+
+fn yaza_db_sql_create_index_publish_building_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, plan: YazaSqlCreateIndexPlanV1, key_columns_text: Text) -> Result[YazaDbSqlCreateIndexStateV1, Text]:
+    if storage.root != wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid): return err("YDBv1 CREATE INDEX storage and WAL handles belong to different databases")
+    let catalog: YazaDbCatalogRootV1 = yaza_db_catalog_storage_read_root_v1(storage.file, storage.header)?
+    if catalog.next_object_id > yaza_db_catalog_max_object_id_v1() or catalog.next_object_id > yaza_db_catalog_max_page_id_v1() - 1 or catalog.generation >= yaza_db_catalog_max_page_id_v1():
+        return err("YDBv1 CREATE INDEX catalog object-ID or generation space is exhausted")
+    let index_id: Number = catalog.next_object_id
+    let next_catalog: YazaDbCatalogRootV1 = YazaDbCatalogRootV1(catalog.sys_tables_root, catalog.sys_columns_root, catalog.sys_indexes_root, catalog.sys_constraints_root, index_id + 1, catalog.generation + 1, catalog.sys_views_root)
+    let capacity: YazaDbWriteCapacityV1 = yaza_db_write_transaction_prepare_capacity_v1(storage, wal, yaza_db_write_transaction_default_free_page_reserve_v1())?
+    let root_candidate: Number = yaza_db_allocator_find_free_existing_v1(capacity.storage)?
+    let begun: YazaDbWriteTransactionV1 = yaza_db_write_transaction_begin_prepared_v1(capacity.storage, capacity.wal)?
+    let root_allocation_result: Result[YazaDbPageSpaceChangeV1, Text] = yaza_db_allocator_allocate_existing_v1(begun.storage, begun.wal, begun.txn_id, begun.last_lsn)
+    if not result_is_ok(root_allocation_result):
+        yaza_db_sql_create_index_close_v1(begun.storage, begun.wal)
+        return err("YDBv1 CREATE INDEX root allocation failed; reopen through recovery: " + result_unwrap_error(root_allocation_result))
+    let root_allocation: YazaDbPageSpaceChangeV1 = result_unwrap(root_allocation_result)
+    if root_allocation.page_id != root_candidate:
+        yaza_db_sql_create_index_close_v1(root_allocation.storage, root_allocation.wal)
+        return err("YDBv1 CREATE INDEX free-page candidate changed; reopen through recovery")
+    var current: YazaDbWriteTransactionV1 = YazaDbWriteTransactionV1(root_allocation.storage, root_allocation.wal, begun.txn_id, begun.commit_ts, root_allocation.record.lsn, begun.pending_pages, begun.pending_keys_hex, begun.pending_rows_hex, true)
+    let leaf_allocation_result: Result[YazaDbPageSpaceChangeV1, Text] = yaza_db_allocator_allocate_existing_v1(current.storage, current.wal, current.txn_id, current.last_lsn)
+    if not result_is_ok(leaf_allocation_result):
+        yaza_db_sql_create_index_close_v1(current.storage, current.wal)
+        return err("YDBv1 CREATE INDEX initial leaf allocation failed; reopen through recovery: " + result_unwrap_error(leaf_allocation_result))
+    let leaf_allocation: YazaDbPageSpaceChangeV1 = result_unwrap(leaf_allocation_result)
+    if leaf_allocation.page_id == root_allocation.page_id:
+        yaza_db_sql_create_index_close_v1(leaf_allocation.storage, leaf_allocation.wal)
+        return err("YDBv1 CREATE INDEX allocated its root and leaf to one page; reopen through recovery")
+    set current = YazaDbWriteTransactionV1(leaf_allocation.storage, leaf_allocation.wal, current.txn_id, current.commit_ts, leaf_allocation.record.lsn, current.pending_pages, current.pending_keys_hex, current.pending_rows_hex, true)
+    let root_image_result: Result[YazaDbWalAppendV1, Text] = yaza_db_sql_create_table_append_new_root_v1(current.storage, current.wal, root_allocation.page_id, leaf_allocation.page_id)
+    if not result_is_ok(root_image_result):
+        yaza_db_sql_create_index_close_v1(current.storage, current.wal)
+        return err("YDBv1 CREATE INDEX root initialization failed; reopen through recovery: " + result_unwrap_error(root_image_result))
+    let root_image: YazaDbWalAppendV1 = result_unwrap(root_image_result)
+    let descriptor_result: Result[YazaDbWalAppendV1, Text] = yaza_db_sql_create_table_append_catalog_root_v1(current.storage, root_image.log, current.storage.header.catalog_root, next_catalog)
+    if not result_is_ok(descriptor_result):
+        yaza_db_sql_create_index_close_v1(current.storage, root_image.log)
+        return err("YDBv1 CREATE INDEX catalog reservation failed; reopen through recovery: " + result_unwrap_error(descriptor_result))
+    let descriptor: YazaDbWalAppendV1 = result_unwrap(descriptor_result)
+    set current = YazaDbWriteTransactionV1(current.storage, descriptor.log, current.txn_id, current.commit_ts, current.last_lsn, current.pending_pages, current.pending_keys_hex, current.pending_rows_hex, true)
+
+    let index_values_result: Result[List[YazaSqlValueV1], Text] = list_try_new()
+    if not result_is_ok(index_values_result):
+        yaza_db_sql_create_index_close_v1(current.storage, current.wal)
+        return err("YDBv1 CREATE INDEX catalog row could not allocate values")
+    let index_values: List[YazaSqlValueV1] = result_unwrap(index_values_result)
+    let index_id_value: Result[YazaSqlValueV1, Text] = yaza_sql_value_integer_v1(4, index_id)
+    let table_id_value: Result[YazaSqlValueV1, Text] = yaza_sql_value_integer_v1(4, plan.table_id)
+    let root_id_value: Result[YazaSqlValueV1, Text] = yaza_sql_value_integer_v1(4, root_allocation.page_id)
+    let kind_value: Result[YazaSqlValueV1, Text] = yaza_sql_value_integer_v1(2, yaza_db_catalog_index_kind_secondary_building_v1())
+    if not result_is_ok(index_id_value) or not result_is_ok(table_id_value) or not result_is_ok(root_id_value) or not result_is_ok(kind_value):
+        yaza_db_sql_create_index_close_v1(current.storage, current.wal)
+        return err("YDBv1 CREATE INDEX catalog integer fields are outside their types")
+    if not list_try_push(index_values, result_unwrap(index_id_value)) or not list_try_push(index_values, result_unwrap(table_id_value)) or not list_try_push(index_values, yaza_sql_value_text_v1(plan.index_name)) or not list_try_push(index_values, result_unwrap(root_id_value)) or not list_try_push(index_values, result_unwrap(kind_value)) or not list_try_push(index_values, yaza_sql_value_boolean_v1(plan.is_unique)) or not list_try_push(index_values, yaza_sql_value_text_v1(key_columns_text)):
+        yaza_db_sql_create_index_close_v1(current.storage, current.wal)
+        return err("YDBv1 CREATE INDEX catalog row could not append its fields")
+    let index_nulls: List[Boolean] = [false, false, false, false, false, false, false]
+    let index_schema: List[YazaSqlColumnSchemaV1] = yaza_db_catalog_table_schema_v1(3)?
+    let inserted_result: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_insert_committed_row_v1(current, catalog.sys_indexes_root, index_values, index_nulls, index_schema, [0])
+    if not result_is_ok(inserted_result):
+        yaza_db_sql_create_index_close_v1(current.storage, current.wal)
+        return err("YDBv1 CREATE INDEX BUILDING catalog row write failed; reopen through recovery: " + result_unwrap_error(inserted_result))
+    set current = result_unwrap(inserted_result)
+    let commit_result: Result[YazaDbWriteCommitV1, Text] = yaza_db_write_transaction_commit_v1(current)
+    if not result_is_ok(commit_result):
+        yaza_db_sql_create_index_close_v1(current.storage, current.wal)
+        return err("YDBv1 CREATE INDEX BUILDING publication requires recovery: " + result_unwrap_error(commit_result))
+    let committed: YazaDbWriteCommitV1 = result_unwrap(commit_result)
+    return ok(YazaDbSqlCreateIndexStateV1(committed.storage, committed.wal, index_id, root_allocation.page_id, yaza_db_catalog_index_kind_secondary_building_v1(), 0))
+
+fn yaza_db_sql_create_index_prepare_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, plan: YazaSqlCreateIndexPlanV1, loaded: YazaDbCatalogSnapshotWithRootsV1) -> Result[YazaDbSqlCreateIndexStateV1, Text]:
+    if not yaza_sql_create_index_plan_valid_v1(plan) or storage.root != wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid): return err("YDBv1 CREATE INDEX received an invalid plan or database identity")
+    if loaded.sql_snapshot.version != plan.catalog_version: return err("YDBv1 CREATE INDEX plan was bound against a stale catalog snapshot")
+    var table_index: Number = 0
+    while table_index < list_count(loaded.sql_snapshot.tables) and list_get(loaded.sql_snapshot.tables, table_index).table_id != plan.table_id:
+        set table_index = table_index + 1
+    if table_index >= list_count(loaded.sql_snapshot.tables) or table_index >= list_count(loaded.root_page_ids) or table_index >= list_count(loaded.table_schema_versions): return err("YDBv1 CREATE INDEX table is missing its current root or schema epoch")
+    let table_root_page_id: Number = list_get(loaded.root_page_ids, table_index)
+    let schema_version: Number = list_get(loaded.table_schema_versions, table_index)
+    let catalog: YazaDbCatalogRootV1 = yaza_db_catalog_storage_read_root_v1(storage.file, storage.header)?
+    let primary_key_ordinals: List[Number] = yaza_db_query_clustered_key_ordinals_v1(storage.file, storage.header, catalog, plan.table_id, table_root_page_id, loaded.sql_snapshot.version, list_count(plan.table_columns))?
+    let entry_columns: List[YazaSqlColumnSchemaV1] = yaza_db_sql_create_index_entry_schema_v1(plan, primary_key_ordinals)?
+    let entry_key_ordinals: List[Number] = yaza_db_sql_create_index_entry_key_ordinals_v1(entry_columns)?
+    let cursor_result: Result[Bytes, Text] = bytes_try_new_zeroed(2048)
+    if not result_is_ok(cursor_result): return err("YDBv1 CREATE INDEX could not allocate its bounded streaming cursor")
+    let cursor_buffer: Bytes = result_unwrap(cursor_result)
+    let unique_buckets_result: Result[List[Number], Text] = list_try_new()
+    let unique_hashes_result: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(unique_buckets_result) or not result_is_ok(unique_hashes_result): return err("YDBv1 CREATE INDEX could not allocate its bounded uniqueness state")
+    let unique_bucket_heads: List[Number] = result_unwrap(unique_buckets_result)
+    let unique_hashes: List[Number] = result_unwrap(unique_hashes_result)
+    var unique_scan_cursor_buffer: Bytes = bytes_from_text("")
+    if plan.is_unique:
+        let unique_cursor_result: Result[Bytes, Text] = bytes_try_new_zeroed(2048)
+        if not result_is_ok(unique_cursor_result): return err("YDBv1 UNIQUE INDEX could not allocate its bounded collision-scan cursor: " + result_unwrap_error(unique_cursor_result))
+        set unique_scan_cursor_buffer = result_unwrap(unique_cursor_result)
+        if not list_try_reserve(unique_bucket_heads, 131072) or not list_try_reserve(unique_hashes, 65536):
+            return err("YDBv1 UNIQUE INDEX could not reserve its bounded hash state")
+        var bucket_index: Number = 0
+        while bucket_index < 131072:
+            if not list_try_push(unique_bucket_heads, 0): return err("YDBv1 UNIQUE INDEX could not initialize its hash table")
+            set bucket_index = bucket_index + 1
+    var cursor_length: Number = 0
+    var total_rows: Number = 0
+    var total_cells: Number = 0
+    var total_payload_bytes: Number = 0
+    var total_unique_probe_work: Number = 0
+    var total_unique_collision_scan_rows: Number = 0
+    let visible_ts: Number = loaded.sql_snapshot.version
+    var scanning: Boolean = true
+    while scanning:
+        let batch: YazaDbSqlCreateIndexPreflightBatchV1 = yaza_db_sql_create_index_preflight_batch_v1(storage.file, storage.header, table_root_page_id, plan, schema_version, primary_key_ordinals, entry_columns, entry_key_ordinals, visible_ts, cursor_buffer, cursor_length, unique_bucket_heads, unique_hashes, unique_scan_cursor_buffer, total_unique_probe_work, total_unique_collision_scan_rows)?
+        if batch.row_count == 0:
+            set scanning = false
+        else:
+            if total_rows > 65536 - batch.row_count: return err("YDBv1 CREATE INDEX source exceeds its 65,536-row preflight bound")
+            if total_cells > 1048576 - batch.cell_count: return err("YDBv1 CREATE INDEX source exceeds its 1,048,576-cell preflight bound")
+            if total_payload_bytes > 67108864 - batch.source_payload_bytes: return err("YDBv1 CREATE INDEX source exceeds its 64 MiB payload preflight bound")
+            set total_rows = total_rows + batch.row_count
+            set total_cells = total_cells + batch.cell_count
+            set total_payload_bytes = total_payload_bytes + batch.source_payload_bytes
+            set total_unique_probe_work = batch.unique_probe_work
+            set total_unique_collision_scan_rows = batch.unique_collision_scan_rows
+            set cursor_length = batch.cursor_length
+    let index_rows: List[YazaDbRowV1] = yaza_db_index_catalog_rows_v1(storage.file, storage.header, visible_ts)?
+    let key_columns_text: Text = number_text(plan.index_column_ordinal)
+    var existing_index: Number = 0
+    while existing_index < list_count(index_rows):
+        let existing: YazaDbRowV1 = list_get(index_rows, existing_index)
+        if list_get(existing.values, 2).text_value == plan.index_name:
+            if list_get(existing.values, 1).integer_value != plan.table_id or list_get(existing.values, 5).boolean_value != plan.is_unique or list_get(existing.values, 6).text_value != key_columns_text:
+                return err("YDBv1 CREATE INDEX name already exists with a different definition")
+            let existing_kind: Number = list_get(existing.values, 4).integer_value
+            if existing_kind == yaza_db_catalog_index_kind_secondary_active_v1(): return err("YDBv1 CREATE INDEX name already exists")
+            if existing_kind != yaza_db_catalog_index_kind_secondary_building_v1(): return err("YDBv1 CREATE INDEX name conflicts with a primary index")
+            return ok(YazaDbSqlCreateIndexStateV1(storage, wal, list_get(existing.values, 0).integer_value, list_get(existing.values, 3).integer_value, existing_kind, total_rows))
+        set existing_index = existing_index + 1
+    let published: YazaDbSqlCreateIndexStateV1 = yaza_db_sql_create_index_publish_building_v1(storage, wal, plan, key_columns_text)?
+    return ok(YazaDbSqlCreateIndexStateV1(published.storage, published.wal, published.index_id, published.root_page_id, published.index_kind, total_rows))
+
+fn yaza_db_sql_create_index_activate_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, plan: YazaSqlCreateIndexPlanV1, state: YazaDbSqlCreateIndexStateV1) -> Result[YazaDbWriteCommitV1, Text]:
+    if storage.root != wal.root or state.storage.root != state.wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid) or not bytes_equal(state.storage.header.db_uuid, state.wal.db_uuid): return err("YDBv1 CREATE INDEX activation database identity is invalid")
+    if state.index_kind != yaza_db_catalog_index_kind_secondary_building_v1() or state.index_id < 1 or state.root_page_id < 2: return err("YDBv1 CREATE INDEX activation state is invalid")
+    let visible_ts: Number = storage.header.next_commit_ts - 1
+    let rows: List[YazaDbRowV1] = yaza_db_index_catalog_rows_v1(storage.file, storage.header, visible_ts)?
+    var catalog_row_index: Number = 0
+    var found: Boolean = false
+    while catalog_row_index < list_count(rows) and not found:
+        let candidate: YazaDbRowV1 = list_get(rows, catalog_row_index)
+        if list_get(candidate.values, 0).integer_value == state.index_id: set found = true
+        else: set catalog_row_index = catalog_row_index + 1
+    if not found: return err("YDBv1 CREATE INDEX activation could not find its BUILDING catalog row")
+    let catalog_row: YazaDbRowV1 = list_get(rows, catalog_row_index)
+    if catalog_row.deleted or list_get(catalog_row.values, 1).integer_value != plan.table_id or list_get(catalog_row.values, 2).text_value != plan.index_name or list_get(catalog_row.values, 3).integer_value != state.root_page_id or list_get(catalog_row.values, 4).integer_value != yaza_db_catalog_index_kind_secondary_building_v1() or list_get(catalog_row.values, 5).boolean_value != plan.is_unique or list_get(catalog_row.values, 6).text_value != number_text(plan.index_column_ordinal):
+        return err("YDBv1 CREATE INDEX BUILDING catalog definition changed before activation")
+    if not list_try_set(catalog_row.values, 4, yaza_sql_executor_value_v1(2, yaza_db_catalog_index_kind_secondary_active_v1(), 0.0, false, "")): return err("YDBv1 CREATE INDEX ACTIVE catalog row could not be materialized")
+    let catalog: YazaDbCatalogRootV1 = yaza_db_catalog_storage_read_root_v1(storage.file, storage.header)?
+    let catalog_columns: List[YazaSqlColumnSchemaV1] = yaza_db_catalog_table_schema_v1(3)?
+    let catalog_key_ordinals: List[Number] = [0]
+    let catalog_key: Bytes = yaza_db_key_encode_composite_v1(catalog_row.values, catalog_row.nulls, catalog_columns, catalog_key_ordinals)?
+    let catalog_payload: Bytes = yaza_db_row_encode_for_schema_v1(catalog_row.values, catalog_row.nulls, catalog_columns, storage.header.next_commit_ts, 1)?
+    let seek: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(storage.file, storage.header, catalog.sys_indexes_root, catalog_key)?
+    let page_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(seek.leaf_page, seek.leaf_page_id)?
+    let slot_index: Number = yaza_db_page_lower_bound_v1(seek.leaf_page, catalog_key, seek.leaf_page_id)?
+    if slot_index >= page_header.count: return err("YDBv1 CREATE INDEX activation catalog key is absent from its B+Tree")
+    let stored_catalog_key: Bytes = yaza_db_page_slot_key_v1(seek.leaf_page, slot_index, seek.leaf_page_id)?
+    if not bytes_equal(stored_catalog_key, catalog_key): return err("YDBv1 CREATE INDEX activation catalog key changed before commit")
+    let begun: YazaDbWriteTransactionV1 = yaza_db_write_transaction_begin_with_reserve_v1(storage, wal, yaza_db_write_transaction_default_free_page_reserve_v1())?
+    if begun.commit_ts != storage.header.next_commit_ts:
+        yaza_db_sql_create_index_close_v1(begun.storage, begun.wal)
+        return err("YDBv1 CREATE INDEX activation timestamp changed; reopen through recovery")
+    let changed: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_mutate_leaf_v1(begun, yaza_db_wal_type_leaf_update_v1(), seek.leaf_page_id, catalog_key, catalog_payload)
+    if not result_is_ok(changed):
+        let message: Text = result_unwrap_error(changed)
+        yaza_db_sql_create_index_close_v1(begun.storage, begun.wal)
+        return err("YDBv1 CREATE INDEX activation catalog update failed; reopen through recovery: " + message)
+    let committed: Result[YazaDbWriteCommitV1, Text] = yaza_db_write_transaction_commit_v1(result_unwrap(changed))
+    if not result_is_ok(committed):
+        let message: Text = result_unwrap_error(committed)
+        yaza_db_sql_create_index_close_v1(begun.storage, begun.wal)
+        return err("YDBv1 CREATE INDEX activation commit requires recovery: " + message)
+    return ok(result_unwrap(committed))
+
+fn yaza_db_sql_create_index_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, plan: YazaSqlCreateIndexPlanV1, loaded: YazaDbCatalogSnapshotWithRootsV1) -> Result[YazaDbWriteCommitV1, Text]:
+    let initial: YazaDbSqlCreateIndexStateV1 = yaza_db_sql_create_index_prepare_v1(storage, wal, plan, loaded)?
+    let current_catalog: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(initial.storage.file, initial.storage.header)?
+    if current_catalog.sql_snapshot.version < plan.catalog_version: return err("YDBv1 CREATE INDEX catalog version regressed during build initialization")
+    let table_index: Number = yaza_db_catalog_snapshot_table_index_v1(current_catalog.sql_snapshot.tables, plan.table_id)
+    if table_index < 0 or table_index >= list_count(current_catalog.root_page_ids) or table_index >= list_count(current_catalog.table_schema_versions): return err("YDBv1 CREATE INDEX table root disappeared during build initialization")
+    let table_root_page_id: Number = list_get(current_catalog.root_page_ids, table_index)
+    let schema_version: Number = list_get(current_catalog.table_schema_versions, table_index)
+    let catalog: YazaDbCatalogRootV1 = yaza_db_catalog_storage_read_root_v1(initial.storage.file, initial.storage.header)?
+    let primary_key_ordinals: List[Number] = yaza_db_query_clustered_key_ordinals_v1(initial.storage.file, initial.storage.header, catalog, plan.table_id, table_root_page_id, current_catalog.sql_snapshot.version, list_count(plan.table_columns))?
+    let entry_columns: List[YazaSqlColumnSchemaV1] = yaza_db_sql_create_index_entry_schema_v1(plan, primary_key_ordinals)?
+    let entry_key_ordinals: List[Number] = yaza_db_sql_create_index_entry_key_ordinals_v1(entry_columns)?
+    let cursor_created: Result[Bytes, Text] = bytes_try_new_zeroed(2048)
+    if not result_is_ok(cursor_created): return err("YDBv1 CREATE INDEX could not allocate its bounded build cursor")
+    let cursor: Bytes = result_unwrap(cursor_created)
+    var cursor_length: Number = 0
+    var total_rows: Number = 0
+    var batch_number: Number = 0
+    var complete: Boolean = false
+    var current: YazaDbSqlCreateIndexStateV1 = initial
+    while not complete and batch_number < 130:
+        let visible_ts: Number = current.storage.header.next_commit_ts - 1
+        let batch: YazaDbSqlCreateIndexBatchV1 = yaza_db_sql_create_index_build_batch_v1(current.storage, current.wal, plan, table_root_page_id, schema_version, primary_key_ordinals, entry_columns, entry_key_ordinals, current.root_page_id, visible_ts, cursor, cursor_length)?
+        if batch.row_count == 0:
+            set complete = true
+        else:
+            if total_rows > 65536 - batch.row_count: return err("YDBv1 CREATE INDEX source changed or exceeded its build-row bound")
+            set total_rows = total_rows + batch.row_count
+            set cursor_length = batch.cursor_length
+            set current = YazaDbSqlCreateIndexStateV1(batch.storage, batch.wal, current.index_id, current.root_page_id, current.index_kind, current.source_row_count)
+        set batch_number = batch_number + 1
+    if not complete: return err("YDBv1 CREATE INDEX exceeded its bounded batch count")
+    if total_rows != current.source_row_count: return err("YDBv1 CREATE INDEX source row count changed between preflight and build")
+    let verify_ts: Number = current.storage.header.next_commit_ts - 1
+    let verified_rows: List[YazaDbRowV1] = yaza_db_btree_read_rows_for_schema_v1(current.storage.file, current.storage.header, current.root_page_id, entry_columns, 1, entry_key_ordinals, verify_ts, 65536)?
+    if list_count(verified_rows) != current.source_row_count: return err("YDBv1 CREATE INDEX verification found a missing or extra index entry")
+    return yaza_db_sql_create_index_activate_v1(current.storage, current.wal, plan, current)

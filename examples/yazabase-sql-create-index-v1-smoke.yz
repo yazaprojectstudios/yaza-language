@@ -1,0 +1,214 @@
+use "std/fs"
+use "../yazabase/allocator_v1"
+use "../yazabase/btree_scan_v1"
+use "../yazabase/btree_reclaim_v1"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/catalog_schema_v1"
+use "../yazabase/catalog_snapshot_v1"
+use "../yazabase/index_catalog_v1"
+use "../yazabase/key_codec_v1"
+use "../yazabase/query_v1"
+use "../yazabase/sql_create_index_write_v1"
+use "../yazabase/sql_drop_index_v1"
+use "../yazabase/sql_dispatch_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/wal_v1"
+
+fn yazabase_sql_create_index_has_entry_v1(file: Number, header: YazaDbFileHeaderV1, root_page_id: Number, entry_columns: List[YazaSqlColumnSchemaV1], entry_key_ordinals: List[Number], visible_ts: Number, text_value: Text, is_null: Boolean, row_id: Number) -> Result[Boolean, Text]:
+    var indexed_value: YazaSqlValueV1 = yaza_sql_value_text_v1(text_value)
+    if is_null: set indexed_value = yaza_sql_value_null_v1(9)?
+    let id_value: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, row_id)?
+    let values: List[YazaSqlValueV1] = [indexed_value, id_value]
+    let nulls: List[Boolean] = [is_null, false]
+    let key: Bytes = yaza_db_key_encode_composite_v1(values, nulls, entry_columns, entry_key_ordinals)?
+    let rows: List[YazaDbRowV1] = yaza_db_btree_read_rows_by_key_for_schema_v1(file, header, root_page_id, entry_columns, 1, entry_key_ordinals, visible_ts, key)?
+    return ok(list_count(rows) == 1)
+
+fn yazabase_sql_create_index_v1_check(root_path: Text) -> Result[Boolean, Text]:
+    let parsed_drop: Result[Text, Text] = yaza_sql_parse_drop_index_v1("DROP INDEX indexed_rows_category_idx;")
+    if not result_is_ok(parsed_drop) or result_unwrap(parsed_drop) != "indexed_rows_category_idx": return err("YDBv1 DROP INDEX parser did not normalize a valid index name")
+    let parsed_drop_if_exists: Result[Text, Text] = yaza_sql_parse_drop_index_v1("DROP INDEX IF EXISTS indexed_rows_category_idx;")
+    if not result_is_ok(parsed_drop_if_exists) or result_unwrap(parsed_drop_if_exists) != "indexed_rows_category_idx": return err("YDBv1 DROP INDEX IF EXISTS parser did not normalize a valid index name")
+    if result_is_ok(yaza_sql_parse_drop_index_v1("DROP INDEX IF indexed_rows_category_idx")):
+        return err("YDBv1 DROP INDEX parser accepted IF without EXISTS")
+    if result_is_ok(yaza_sql_parse_drop_index_v1("DROP INDEX indexed_rows_category_idx; SELECT 1")) or result_is_ok(yaza_sql_parse_drop_index_v1("DROP INDEX schema.indexed_rows_category_idx")):
+        return err("YDBv1 DROP INDEX parser accepted a multi-statement or qualified name")
+    let root: Number = root_open(root_path)?
+    let db_name: Text = "create-index-smoke.ydb"
+    let header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_from_text("create-idx-uuid1"), 0, 1, 1, 0, 2, 1)
+    let empty: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, db_name, header)?
+    let empty_closed: Boolean = yaza_db_storage_close_v1(empty)?
+    if not empty_closed: return err("YDBv1 CREATE INDEX fixture could not close its empty database")
+    let initialized: YazaDbCatalogBootstrapV1 = yaza_db_catalog_initialize_v1(root, db_name)?
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let created: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(initialized.storage, initialized.wal, "CREATE TABLE indexed_rows (id BIGINT PRIMARY KEY, category TEXT)", no_parameters)?
+    let bulk_parts_result: Result[TextList, Text] = text_list_try_new()
+    if not result_is_ok(bulk_parts_result): return err("YDBv1 CREATE INDEX fixture could not allocate source SQL")
+    let bulk_parts: TextList = result_unwrap(bulk_parts_result)
+    if not list_try_reserve(bulk_parts, 1030) or not list_try_push(bulk_parts, "INSERT INTO indexed_rows (id, category) VALUES "): return err("YDBv1 CREATE INDEX fixture could not reserve its source SQL")
+    var row_id: Number = 0
+    while row_id < 16:
+        if row_id > 0 and not list_try_push(bulk_parts, ", "): return err("YDBv1 CREATE INDEX fixture could not add its row delimiter")
+        var category: Text = "NULL"
+        if row_id % 7 != 0: set category = "'group-" + number_text(row_id % 5) + "'"
+        if not list_try_push(bulk_parts, "(" + number_text(row_id) + ", " + category + ")"): return err("YDBv1 CREATE INDEX fixture could not add a source row")
+        set row_id = row_id + 1
+    let insert_source: Text = text_try_join(bulk_parts, "")?
+    let inserted: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(created.storage, created.wal, insert_source, no_parameters)?
+    let built: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(inserted.storage, inserted.wal, "CREATE INDEX indexed_rows_category_idx ON indexed_rows(category)", no_parameters)?
+    if built.statement_kind != yaza_db_sql_statement_kind_create_index_v1() or not option_is_some(built.write_commit): return err("YDBv1 SQL dispatcher did not return a CREATE INDEX commit")
+    let committed: YazaDbWriteCommitV1 = option_unwrap(built.write_commit)
+    let explain_index: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(committed.storage, committed.wal, "EXPLAIN SELECT id FROM indexed_rows WHERE category = 'group-2'", no_parameters)?
+    if not option_is_some(explain_index.explain_text) or text_find(option_unwrap(explain_index.explain_text), "Physical: SecondaryIndexRangeScan(index=indexed_rows_category_idx") < 0:
+        return err("YDBv1 EXPLAIN did not report its selected secondary-index range scan")
+    let visible_ts: Number = committed.storage.header.next_commit_ts - 1
+    let index_rows: List[YazaDbRowV1] = yaza_db_index_catalog_rows_v1(committed.storage.file, committed.storage.header, visible_ts)?
+    var found_index: Boolean = false
+    var index_root_page_id: Number = 0
+    var index_id: Number = 0
+    var index_row_index: Number = 0
+    while index_row_index < list_count(index_rows) and not found_index:
+        let index_row: YazaDbRowV1 = list_get(index_rows, index_row_index)
+        if list_get(index_row.values, 2).text_value == "indexed_rows_category_idx":
+            set found_index = true
+            set index_id = list_get(index_row.values, 0).integer_value
+            set index_root_page_id = list_get(index_row.values, 3).integer_value
+            if list_get(index_row.values, 4).integer_value != yaza_db_catalog_index_kind_secondary_active_v1(): return err("YDBv1 CREATE INDEX left a completed index in BUILDING state")
+            if list_get(index_row.values, 5).boolean_value or list_get(index_row.values, 6).text_value != "1": return err("YDBv1 CREATE INDEX catalog definition is incorrect")
+        set index_row_index = index_row_index + 1
+    if not found_index or index_root_page_id < 2 or index_id < 1: return err("YDBv1 CREATE INDEX did not publish its index catalog row")
+    let index_reclaim_plan: YazaDbBtreeReclaimPlanV1 = yaza_db_btree_reclaim_plan_v1(committed.storage.file, committed.storage.header, index_root_page_id)?
+    let expected_reclaimed_index_pages: Number = list_count(index_reclaim_plan.page_ids)
+    let loaded: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(committed.storage.file, committed.storage.header)?
+    let table_index: Number = yaza_db_catalog_snapshot_table_index_v1(loaded.sql_snapshot.tables, 13)
+    if table_index < 0: return err("YDBv1 CREATE INDEX fixture could not find its source table")
+    let table: YazaSqlTableSchemaV1 = list_get(loaded.sql_snapshot.tables, table_index)
+    let catalog: YazaDbCatalogRootV1 = yaza_db_catalog_storage_read_root_v1(committed.storage.file, committed.storage.header)?
+    let primary_key_ordinals: List[Number] = yaza_db_query_clustered_key_ordinals_v1(committed.storage.file, committed.storage.header, catalog, table.table_id, list_get(loaded.root_page_ids, table_index), loaded.sql_snapshot.version, list_count(table.columns))?
+    let plan: YazaSqlCreateIndexPlanV1 = YazaSqlCreateIndexPlanV1(1, loaded.sql_snapshot.version, "indexed_rows_category_idx", table.table_id, table.name, false, 1, table.columns)
+    let entry_columns: List[YazaSqlColumnSchemaV1] = yaza_db_sql_create_index_entry_schema_v1(plan, primary_key_ordinals)?
+    let entry_key_ordinals: List[Number] = yaza_db_sql_create_index_entry_key_ordinals_v1(entry_columns)?
+    let entries: List[YazaDbRowV1] = yaza_db_btree_read_rows_for_schema_v1(committed.storage.file, committed.storage.header, index_root_page_id, entry_columns, 1, entry_key_ordinals, visible_ts, 65536)?
+    if list_count(entries) != 16: return err("YDBv1 CREATE INDEX did not materialize exactly one entry per source row")
+    if result_is_ok(yaza_db_execute_statement_v1(committed.storage, committed.wal, "CREATE INDEX indexed_rows_category_idx ON indexed_rows(category)", no_parameters)):
+        return err("YDBv1 CREATE INDEX accepted a duplicate name")
+    let idempotent_create: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(committed.storage, committed.wal, "CREATE INDEX IF NOT EXISTS indexed_rows_category_idx ON indexed_rows(category)", no_parameters)?
+    if idempotent_create.statement_kind != yaza_db_sql_statement_kind_create_index_v1() or option_is_some(idempotent_create.write_commit) or idempotent_create.storage.header.next_commit_ts != committed.storage.header.next_commit_ts or idempotent_create.wal.next_lsn != committed.wal.next_lsn:
+        return err("YDBv1 CREATE INDEX IF NOT EXISTS mutated state for an existing matching index")
+    if result_is_ok(yaza_db_execute_statement_v1(committed.storage, committed.wal, "CREATE UNIQUE INDEX IF NOT EXISTS indexed_rows_category_idx ON indexed_rows(category)", no_parameters)):
+        return err("YDBv1 CREATE UNIQUE INDEX IF NOT EXISTS accepted an existing non-unique index with the same name")
+    if result_is_ok(yaza_db_execute_statement_v1(committed.storage, committed.wal, "CREATE INDEX IF NOT EXISTS indexed_rows_category_idx ON indexed_rows(id)", no_parameters)):
+        return err("YDBv1 CREATE INDEX IF NOT EXISTS accepted an existing index name with a different column definition")
+    let inserted_after_build: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(committed.storage, committed.wal, "INSERT INTO indexed_rows (id, category) VALUES (16, 'group-2')", no_parameters)?
+    let insert_commit: YazaDbWriteCommitV1 = option_unwrap(inserted_after_build.write_commit)
+    let after_insert_count: List[YazaDbRowV1] = yaza_db_btree_read_rows_for_schema_v1(insert_commit.storage.file, insert_commit.storage.header, index_root_page_id, entry_columns, 1, entry_key_ordinals, insert_commit.storage.header.next_commit_ts - 1, 65536)?
+    if list_count(after_insert_count) != 17: return err("YDBv1 INSERT did not add its active secondary-index entry")
+    if not result_unwrap(yazabase_sql_create_index_has_entry_v1(insert_commit.storage.file, insert_commit.storage.header, index_root_page_id, entry_columns, entry_key_ordinals, insert_commit.storage.header.next_commit_ts - 1, "group-2", false, 16)):
+        return err("YDBv1 INSERT secondary-index entry is not seekable by its composite key")
+    let grouped_insert: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(insert_commit.storage, insert_commit.wal, "INSERT INTO indexed_rows (id, category) VALUES (17, 'group-2'), (18, 'group-3'), (19, 'group-4'), (20, 'group-0'), (21, NULL), (22, 'group-2'), (23, 'group-3'), (24, 'group-4')", no_parameters)?
+    let grouped_insert_commit: YazaDbWriteCommitV1 = option_unwrap(grouped_insert.write_commit)
+    let after_grouped_insert_count: List[YazaDbRowV1] = yaza_db_btree_read_rows_for_schema_v1(grouped_insert_commit.storage.file, grouped_insert_commit.storage.header, index_root_page_id, entry_columns, 1, entry_key_ordinals, grouped_insert_commit.storage.header.next_commit_ts - 1, 65536)?
+    if list_count(after_grouped_insert_count) != 25: return err("YDBv1 multi-row INSERT did not add every active secondary-index entry")
+    if not result_unwrap(yazabase_sql_create_index_has_entry_v1(grouped_insert_commit.storage.file, grouped_insert_commit.storage.header, index_root_page_id, entry_columns, entry_key_ordinals, grouped_insert_commit.storage.header.next_commit_ts - 1, "group-2", false, 22)):
+        return err("YDBv1 multi-row INSERT secondary-index entry is not seekable by its composite key")
+    let indexed_query: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(grouped_insert_commit.storage, grouped_insert_commit.wal, "SELECT id FROM indexed_rows WHERE category = 'group-2'", no_parameters)?
+    if not option_is_some(indexed_query.query_result) or list_count(option_unwrap(indexed_query.query_result).rows) != 5:
+        return err("YDBv1 equality SELECT did not use the secondary-index prefix range correctly")
+    let indexed_miss: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(indexed_query.storage, indexed_query.wal, "SELECT id FROM indexed_rows WHERE category = 'missing'", no_parameters)?
+    if not option_is_some(indexed_miss.query_result) or list_count(option_unwrap(indexed_miss.query_result).rows) != 0:
+        return err("YDBv1 secondary-index equality range returned rows for a missing value")
+    let range_explain: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(indexed_miss.storage, indexed_miss.wal, "EXPLAIN SELECT id FROM indexed_rows WHERE category >= 'group-2'", no_parameters)?
+    if not option_is_some(range_explain.explain_text) or text_find(option_unwrap(range_explain.explain_text), "Physical: SecondaryIndexRangeScan(index=indexed_rows_category_idx") < 0:
+        return err("YDBv1 EXPLAIN did not report a secondary-index range scan for an inequality predicate")
+    let range_ge: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(range_explain.storage, range_explain.wal, "SELECT id FROM indexed_rows WHERE category >= 'group-2'", no_parameters)?
+    if not option_is_some(range_ge.query_result) or list_count(option_unwrap(range_ge.query_result).rows) != 14:
+        return err("YDBv1 secondary-index >= range did not include its boundary and exclude NULL values")
+    let range_gt: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(range_ge.storage, range_ge.wal, "SELECT id FROM indexed_rows WHERE category > 'group-2'", no_parameters)?
+    if not option_is_some(range_gt.query_result) or list_count(option_unwrap(range_gt.query_result).rows) != 9:
+        return err("YDBv1 secondary-index > range included its boundary or returned NULL values")
+    let range_le: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(range_gt.storage, range_gt.wal, "SELECT id FROM indexed_rows WHERE category <= 'group-2'", no_parameters)?
+    if not option_is_some(range_le.query_result) or list_count(option_unwrap(range_le.query_result).rows) != 12:
+        return err("YDBv1 secondary-index <= range did not include its boundary and exclude NULL values")
+    let range_lt: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(range_le.storage, range_le.wal, "SELECT id FROM indexed_rows WHERE category < 'group-2'", no_parameters)?
+    if not option_is_some(range_lt.query_result) or list_count(option_unwrap(range_lt.query_result).rows) != 7:
+        return err("YDBv1 secondary-index < range included its boundary or returned NULL values")
+    let updated_after_build: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(indexed_miss.storage, indexed_miss.wal, "UPDATE indexed_rows SET category = 'group-9' WHERE id = 0", no_parameters)?
+    let update_commit: YazaDbWriteCommitV1 = option_unwrap(updated_after_build.write_commit)
+    let after_update_count: List[YazaDbRowV1] = yaza_db_btree_read_rows_for_schema_v1(update_commit.storage.file, update_commit.storage.header, index_root_page_id, entry_columns, 1, entry_key_ordinals, update_commit.storage.header.next_commit_ts - 1, 65536)?
+    if list_count(after_update_count) != 25: return err("YDBv1 UPDATE changed the secondary-index entry count")
+    if result_unwrap(yazabase_sql_create_index_has_entry_v1(update_commit.storage.file, update_commit.storage.header, index_root_page_id, entry_columns, entry_key_ordinals, update_commit.storage.header.next_commit_ts - 1, "", true, 0)):
+        return err("YDBv1 UPDATE left its old NULL secondary-index entry visible")
+    if not result_unwrap(yazabase_sql_create_index_has_entry_v1(update_commit.storage.file, update_commit.storage.header, index_root_page_id, entry_columns, entry_key_ordinals, update_commit.storage.header.next_commit_ts - 1, "group-9", false, 0)):
+        return err("YDBv1 UPDATE did not add its replacement secondary-index entry")
+    let indexed_updated_query: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(update_commit.storage, update_commit.wal, "SELECT id FROM indexed_rows WHERE category = 'group-9'", no_parameters)?
+    if not option_is_some(indexed_updated_query.query_result) or list_count(option_unwrap(indexed_updated_query.query_result).rows) != 1:
+        return err("YDBv1 equality SELECT did not see the updated secondary-index key")
+    let updated_back_to_null: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(indexed_updated_query.storage, indexed_updated_query.wal, "UPDATE indexed_rows SET category = NULL WHERE id = 0", no_parameters)?
+    let null_resurrect_commit: YazaDbWriteCommitV1 = option_unwrap(updated_back_to_null.write_commit)
+    let updated_back_to_group9: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(null_resurrect_commit.storage, null_resurrect_commit.wal, "UPDATE indexed_rows SET category = 'group-9' WHERE id = 0", no_parameters)?
+    let group9_resurrect_commit: YazaDbWriteCommitV1 = option_unwrap(updated_back_to_group9.write_commit)
+    let indexed_resurrected_query: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(group9_resurrect_commit.storage, group9_resurrect_commit.wal, "SELECT id FROM indexed_rows WHERE category = 'group-9'", no_parameters)?
+    if not option_is_some(indexed_resurrected_query.query_result) or list_count(option_unwrap(indexed_resurrected_query.query_result).rows) != 1:
+        return err("YDBv1 secondary-index UPDATE did not resurrect the tombstoned key")
+    let deleted_after_build: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(indexed_resurrected_query.storage, indexed_resurrected_query.wal, "DELETE FROM indexed_rows WHERE id = 16", no_parameters)?
+    let delete_commit: YazaDbWriteCommitV1 = option_unwrap(deleted_after_build.write_commit)
+    let after_delete_count: List[YazaDbRowV1] = yaza_db_btree_read_rows_for_schema_v1(delete_commit.storage.file, delete_commit.storage.header, index_root_page_id, entry_columns, 1, entry_key_ordinals, delete_commit.storage.header.next_commit_ts - 1, 65536)?
+    if list_count(after_delete_count) != 24: return err("YDBv1 DELETE did not tombstone its secondary-index entry")
+    if result_unwrap(yazabase_sql_create_index_has_entry_v1(delete_commit.storage.file, delete_commit.storage.header, index_root_page_id, entry_columns, entry_key_ordinals, delete_commit.storage.header.next_commit_ts - 1, "group-2", false, 16)):
+        return err("YDBv1 DELETE left its secondary-index row visible")
+    let wal_closed: Boolean = yaza_db_wal_log_close_v1(delete_commit.wal)?
+    let storage_closed: Boolean = yaza_db_storage_close_v1(delete_commit.storage)?
+    if not wal_closed or not storage_closed: return err("YDBv1 CREATE INDEX fixture could not close committed handles")
+    let recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, db_name)?
+    let recovered_indexes: List[YazaDbRowV1] = yaza_db_index_catalog_rows_v1(recovered.storage.file, recovered.storage.header, recovered.storage.header.next_commit_ts - 1)?
+    var survived: Boolean = false
+    var recovered_index: Number = 0
+    while recovered_index < list_count(recovered_indexes):
+        let index_row: YazaDbRowV1 = list_get(recovered_indexes, recovered_index)
+        if list_get(index_row.values, 0).integer_value == index_id and list_get(index_row.values, 4).integer_value == yaza_db_catalog_index_kind_secondary_active_v1(): set survived = true
+        set recovered_index = recovered_index + 1
+    if not survived: return err("YDBv1 CREATE INDEX ACTIVE state did not survive close/reopen recovery")
+    let free_before_drop: Number = yaza_db_allocator_count_free_pages_v1(recovered.storage, yaza_db_storage_preallocated_page_count_v1())?
+    let dropped: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(recovered.storage, recovered.wal, "DROP INDEX indexed_rows_category_idx", no_parameters)?
+    if dropped.statement_kind != yaza_db_sql_statement_kind_drop_index_v1() or not option_is_some(dropped.write_commit): return err("YDBv1 SQL dispatcher did not return a DROP INDEX commit")
+    let drop_commit: YazaDbWriteCommitV1 = option_unwrap(dropped.write_commit)
+    let after_drop: List[YazaDbRowV1] = yaza_db_index_catalog_rows_v1(drop_commit.storage.file, drop_commit.storage.header, drop_commit.storage.header.next_commit_ts - 1)?
+    var name_still_visible: Boolean = false
+    var after_drop_index: Number = 0
+    while after_drop_index < list_count(after_drop):
+        if list_get(list_get(after_drop, after_drop_index).values, 2).text_value == "indexed_rows_category_idx": set name_still_visible = true
+        set after_drop_index = after_drop_index + 1
+    if name_still_visible: return err("YDBv1 DROP INDEX left the dropped name visible in sys_indexes")
+    let free_after_drop: Number = yaza_db_allocator_count_free_pages_v1(drop_commit.storage, yaza_db_storage_preallocated_page_count_v1())?
+    if free_after_drop != free_before_drop + expected_reclaimed_index_pages: return err("YDBv1 DROP INDEX did not reclaim its validated B+Tree pages")
+    let preserved_query: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(drop_commit.storage, drop_commit.wal, "SELECT category FROM indexed_rows WHERE id = 0", no_parameters)?
+    if not option_is_some(preserved_query.query_result) or list_count(option_unwrap(preserved_query.query_result).rows) != 1:
+        return err("YDBv1 DROP INDEX changed the base table's committed rows")
+    if result_is_ok(yaza_db_execute_statement_v1(preserved_query.storage, preserved_query.wal, "DROP INDEX indexed_rows_category_idx", no_parameters)):
+        return err("YDBv1 DROP INDEX accepted a missing index")
+    let idempotent_drop: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(preserved_query.storage, preserved_query.wal, "DROP INDEX IF EXISTS indexed_rows_category_idx", no_parameters)?
+    if idempotent_drop.statement_kind != yaza_db_sql_statement_kind_drop_index_v1() or option_is_some(idempotent_drop.write_commit) or idempotent_drop.storage.header.next_commit_ts != preserved_query.storage.header.next_commit_ts or idempotent_drop.wal.next_lsn != preserved_query.wal.next_lsn:
+        return err("YDBv1 DROP INDEX IF EXISTS mutated state for a missing index")
+    let drop_wal_closed: Boolean = yaza_db_wal_log_close_v1(preserved_query.wal)?
+    let drop_storage_closed: Boolean = yaza_db_storage_close_v1(preserved_query.storage)?
+    if not drop_wal_closed or not drop_storage_closed: return err("YDBv1 DROP INDEX handles could not close")
+    let after_reopen: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, db_name)?
+    let recovered_after_drop: List[YazaDbRowV1] = yaza_db_index_catalog_rows_v1(after_reopen.storage.file, after_reopen.storage.header, after_reopen.storage.header.next_commit_ts - 1)?
+    var name_survived_drop: Boolean = false
+    var reopened_index: Number = 0
+    while reopened_index < list_count(recovered_after_drop):
+        if list_get(list_get(recovered_after_drop, reopened_index).values, 2).text_value == "indexed_rows_category_idx": set name_survived_drop = true
+        set reopened_index = reopened_index + 1
+    if name_survived_drop: return err("YDBv1 DROP INDEX tombstone did not survive recovery")
+    let free_after_reopen: Number = yaza_db_allocator_count_free_pages_v1(after_reopen.storage, yaza_db_storage_preallocated_page_count_v1())?
+    if free_after_reopen != free_before_drop + expected_reclaimed_index_pages: return err("YDBv1 DROP INDEX page reclamation did not survive recovery")
+    let recovered_wal_closed: Boolean = yaza_db_wal_log_close_v1(after_reopen.wal)?
+    let recovered_storage_closed: Boolean = yaza_db_storage_close_v1(after_reopen.storage)?
+    let root_closed: Boolean = close(root)?
+    if not recovered_wal_closed or not recovered_storage_closed or not root_closed: return err("YDBv1 CREATE/DROP INDEX fixture could not close final handles")
+    return ok(true)
+
+start:
+    let outcome: Result[Boolean, Text] = yazabase_sql_create_index_v1_check(arg(1))
+    if not result_is_ok(outcome): say result_unwrap_error(outcome)
+    else: say "yazabase-sql-create-index-v1-ok"

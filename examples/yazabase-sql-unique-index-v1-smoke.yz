@@ -1,0 +1,98 @@
+use "std/fs"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/key_codec_v1"
+use "../yazabase/index_catalog_v1"
+use "../yazabase/query_v1"
+use "../yazabase/sql_dispatch_v1"
+use "../yazabase/sql_executor_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/wal_v1"
+
+fn yazabase_sql_unique_index_v1_check(root_path: Text) -> Result[Boolean, Text]:
+    let root: Number = root_open(root_path)?
+    let db_name: Text = "unique-index-smoke.ydb"
+    let header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_from_text("unique-idx-uuid1"), 0, 1, 1, 0, 2, 1)
+    let empty: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, db_name, header)?
+    let empty_closed: Boolean = yaza_db_storage_close_v1(empty)?
+    if not empty_closed: return err("YDBv1 UNIQUE INDEX fixture could not close its empty database")
+    let initialized: YazaDbCatalogBootstrapV1 = yaza_db_catalog_initialize_v1(root, db_name)?
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    if bytes_crc32c(bytes_from_text("123456789")) != 3808858755: return err("YAZA CRC32C does not match the standard check vector")
+    let collision_columns: List[YazaSqlColumnSchemaV1] = [YazaSqlColumnSchemaV1("email", 9, true, 0, 0, 0, "")]
+    let collision_left: Bytes = yaza_db_key_encode_composite_v1([yaza_sql_value_text_v1("c4TZelLlVQ")], [false], collision_columns, [0])?
+    let collision_right: Bytes = yaza_db_key_encode_composite_v1([yaza_sql_value_text_v1("qVpBwT6JCP")], [false], collision_columns, [0])?
+    let collision_left_crc: Number = bytes_crc32c(collision_left)
+    let collision_right_crc: Number = bytes_crc32c(collision_right)
+    if collision_left_crc != collision_right_crc or bytes_equal(collision_left, collision_right): return err("YDBv1 UNIQUE INDEX collision fixture CRC32C mismatch " + number_text(collision_left_crc) + "/" + number_text(collision_right_crc))
+    let created: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(initialized.storage, initialized.wal, "CREATE TABLE unique_rows (id BIGINT PRIMARY KEY, email TEXT)", no_parameters)?
+    # These distinct keys intentionally collide under CRC32C after YDBv1 TEXT key encoding.
+    let inserted: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(created.storage, created.wal, "INSERT INTO unique_rows (id, email) VALUES (1, 'alpha'), (2, 'beta'), (3, NULL), (4, NULL), (5, 'c4TZelLlVQ'), (6, 'qVpBwT6JCP')", no_parameters)?
+    let built: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(inserted.storage, inserted.wal, "CREATE UNIQUE INDEX unique_rows_email_idx ON unique_rows(email)", no_parameters)?
+    if built.statement_kind != yaza_db_sql_statement_kind_create_index_v1() or not option_is_some(built.write_commit): return err("YDBv1 SQL dispatcher did not return a UNIQUE INDEX commit")
+    let committed: YazaDbWriteCommitV1 = option_unwrap(built.write_commit)
+    let index_rows: List[YazaDbRowV1] = yaza_db_index_catalog_rows_v1(committed.storage.file, committed.storage.header, committed.storage.header.next_commit_ts - 1)?
+    var found_unique: Boolean = false
+    var index_row_index: Number = 0
+    while index_row_index < list_count(index_rows) and not found_unique:
+        let index_row: YazaDbRowV1 = list_get(index_rows, index_row_index)
+        if list_get(index_row.values, 2).text_value == "unique_rows_email_idx":
+            set found_unique = true
+            if not list_get(index_row.values, 5).boolean_value or list_get(index_row.values, 4).integer_value != yaza_db_catalog_index_kind_secondary_active_v1(): return err("YDBv1 UNIQUE INDEX did not publish an ACTIVE unique catalog row")
+        set index_row_index = index_row_index + 1
+    if not found_unique: return err("YDBv1 CREATE UNIQUE INDEX did not publish its catalog row")
+    let idempotent_unique: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(committed.storage, committed.wal, "CREATE UNIQUE INDEX IF NOT EXISTS unique_rows_email_idx ON unique_rows(email)", no_parameters)?
+    if idempotent_unique.statement_kind != yaza_db_sql_statement_kind_create_index_v1() or option_is_some(idempotent_unique.write_commit) or idempotent_unique.storage.header.next_commit_ts != committed.storage.header.next_commit_ts or idempotent_unique.wal.next_lsn != committed.wal.next_lsn:
+        return err("YDBv1 CREATE UNIQUE INDEX IF NOT EXISTS mutated state for an existing matching unique index")
+    if result_is_ok(yaza_db_execute_statement_v1(committed.storage, committed.wal, "CREATE INDEX IF NOT EXISTS unique_rows_email_idx ON unique_rows(email)", no_parameters)):
+        return err("YDBv1 CREATE INDEX IF NOT EXISTS accepted an existing UNIQUE index with a non-unique definition")
+    if result_is_ok(yaza_db_execute_statement_v1(committed.storage, committed.wal, "INSERT INTO unique_rows (id, email) VALUES (5, 'alpha')", no_parameters)):
+        return err("YDBv1 UNIQUE INDEX accepted a value already stored in another row")
+    if result_is_ok(yaza_db_execute_statement_v1(committed.storage, committed.wal, "INSERT INTO unique_rows (id, email) VALUES (5, 'gamma'), (6, 'gamma')", no_parameters)):
+        return err("YDBv1 UNIQUE INDEX accepted duplicate values within one INSERT")
+    let nulls_inserted: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(committed.storage, committed.wal, "INSERT INTO unique_rows (id, email) VALUES (7, NULL), (8, NULL)", no_parameters)?
+    if result_is_ok(yaza_db_execute_statement_v1(nulls_inserted.storage, nulls_inserted.wal, "UPDATE unique_rows SET email = 'alpha' WHERE id = 2", no_parameters)):
+        return err("YDBv1 UNIQUE INDEX accepted an UPDATE to another row's value")
+    if result_is_ok(yaza_db_execute_statement_v1(nulls_inserted.storage, nulls_inserted.wal, "UPDATE unique_rows SET email = 'batch' WHERE id >= 7", no_parameters)):
+        return err("YDBv1 UNIQUE INDEX accepted duplicate values produced by one multi-row UPDATE")
+    let updated: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(nulls_inserted.storage, nulls_inserted.wal, "UPDATE unique_rows SET email = 'beta2' WHERE id = 2", no_parameters)?
+    let old_value_reused: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(updated.storage, updated.wal, "INSERT INTO unique_rows (id, email) VALUES (9, 'beta')", no_parameters)?
+    let updated_to_beta3: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(old_value_reused.storage, old_value_reused.wal, "UPDATE unique_rows SET email = 'beta3' WHERE id = 2", no_parameters)?
+    let updated_back_to_beta2: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(updated_to_beta3.storage, updated_to_beta3.wal, "UPDATE unique_rows SET email = 'beta2' WHERE id = 2", no_parameters)?
+    let resurrected_lookup: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(updated_back_to_beta2.storage, updated_back_to_beta2.wal, "SELECT id FROM unique_rows WHERE email = 'beta2'", no_parameters)?
+    if not option_is_some(resurrected_lookup.query_result) or list_count(option_unwrap(resurrected_lookup.query_result).rows) != 1 or list_get(list_get(option_unwrap(resurrected_lookup.query_result).rows, 0), 0).integer_value != 2:
+        return err("YDBv1 UNIQUE INDEX UPDATE did not resurrect tombstoned key")
+    let duplicate_table: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(resurrected_lookup.storage, resurrected_lookup.wal, "CREATE TABLE duplicate_rows (id BIGINT PRIMARY KEY, email TEXT, amount DECIMAL(10, 2))", no_parameters)?
+    let duplicate_data: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(duplicate_table.storage, duplicate_table.wal, "INSERT INTO duplicate_rows (id, email, amount) VALUES (1, 'same', 1.20), (2, 'same', 1.20)", no_parameters)?
+    if result_is_ok(yaza_db_execute_statement_v1(duplicate_data.storage, duplicate_data.wal, "CREATE UNIQUE INDEX duplicate_rows_email_idx ON duplicate_rows(email)", no_parameters)):
+        return err("YDBv1 UNIQUE INDEX build accepted duplicate source rows")
+    if result_is_ok(yaza_db_execute_statement_v1(duplicate_data.storage, duplicate_data.wal, "CREATE UNIQUE INDEX duplicate_rows_amount_idx ON duplicate_rows(amount)", no_parameters)):
+        return err("YDBv1 DECIMAL UNIQUE INDEX build accepted exact duplicate source rows")
+    let after_rejected_build: List[YazaDbRowV1] = yaza_db_index_catalog_rows_v1(duplicate_data.storage.file, duplicate_data.storage.header, duplicate_data.storage.header.next_commit_ts - 1)?
+    var rejected_build_published: Boolean = false
+    var rejected_index_index: Number = 0
+    while rejected_index_index < list_count(after_rejected_build):
+        let rejected_name: Text = list_get(list_get(after_rejected_build, rejected_index_index).values, 2).text_value
+        if rejected_name == "duplicate_rows_email_idx" or rejected_name == "duplicate_rows_amount_idx": set rejected_build_published = true
+        set rejected_index_index = rejected_index_index + 1
+    if rejected_build_published: return err("YDBv1 failed UNIQUE INDEX preflight published catalog state")
+    let wal_closed: Boolean = yaza_db_wal_log_close_v1(duplicate_data.wal)?
+    let storage_closed: Boolean = yaza_db_storage_close_v1(duplicate_data.storage)?
+    if not wal_closed or not storage_closed: return err("YDBv1 UNIQUE INDEX fixture could not close handles before recovery")
+    let recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, db_name)?
+    if result_is_ok(yaza_db_execute_statement_v1(recovered.storage, recovered.wal, "INSERT INTO unique_rows (id, email) VALUES (10, 'alpha')", no_parameters)):
+        return err("YDBv1 recovered UNIQUE INDEX did not reject a duplicate")
+    let dropped: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(recovered.storage, recovered.wal, "DROP INDEX unique_rows_email_idx", no_parameters)?
+    if dropped.statement_kind != yaza_db_sql_statement_kind_drop_index_v1() or not option_is_some(dropped.write_commit): return err("YDBv1 DROP INDEX did not remove an ACTIVE unique secondary index")
+    let drop_commit: YazaDbWriteCommitV1 = option_unwrap(dropped.write_commit)
+    let preserved: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(drop_commit.storage, drop_commit.wal, "SELECT id FROM unique_rows", no_parameters)?
+    if not option_is_some(preserved.query_result) or list_count(option_unwrap(preserved.query_result).rows) != 9: return err("YDBv1 DROP INDEX changed base table rows")
+    let final_wal_closed: Boolean = yaza_db_wal_log_close_v1(preserved.wal)?
+    let final_storage_closed: Boolean = yaza_db_storage_close_v1(preserved.storage)?
+    let root_closed: Boolean = close(root)?
+    if not final_wal_closed or not final_storage_closed or not root_closed: return err("YDBv1 UNIQUE INDEX fixture could not close final handles")
+    return ok(true)
+
+start:
+    let outcome: Result[Boolean, Text] = yazabase_sql_unique_index_v1_check(arg(1))
+    if not result_is_ok(outcome): say result_unwrap_error(outcome)
+    else: say "yazabase-sql-unique-index-v1-ok"

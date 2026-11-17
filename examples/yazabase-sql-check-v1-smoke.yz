@@ -1,0 +1,88 @@
+use "std/fs"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/sql_dispatch_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/wal_v1"
+use "../yazabase/checkpoint_v1"
+
+fn yazabase_sql_check_v1(root_path: Text) -> Result[Boolean, Text]:
+    let root: Number = root_open(root_path)?
+    let database_name: Text = "check-v1-smoke.ydb"
+    let header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_from_text("ck-v1-smoke-uuid"), 0, 1, 1, 0, 2, 1)
+    let empty: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, database_name, header)?
+    let empty_closed: Boolean = yaza_db_storage_close_v1(empty)?
+    if not empty_closed: return err("YDBv1 CHECK smoke could not close the empty database")
+    let initialized: YazaDbCatalogBootstrapV1 = yaza_db_catalog_initialize_v1(root, database_name)?
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+
+    let rejected_or_check: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(initialized.storage, initialized.wal, "CREATE TABLE rejected_check (id BIGINT PRIMARY KEY, age SMALLINT, CHECK (age >= 18 OR age <= 150))", no_parameters)
+    if result_is_ok(rejected_or_check): return err("YDBv1 CHECK parser accepted OR semantics that are outside its declared profile")
+    let created_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(initialized.storage, initialized.wal, "CREATE TABLE check_rows (id BIGINT, age SMALLINT, label TEXT, PRIMARY KEY (id), UNIQUE (label), CHECK (age >= 18 AND age <= 150 AND label <> 'bad:label'))", no_parameters)?
+    if not option_is_some(created_result.write_commit): return err("YDBv1 CHECK smoke could not create its constrained table")
+    let created: YazaDbWriteCommitV1 = option_unwrap(created_result.write_commit)
+    let create_wal_closed: Boolean = yaza_db_wal_log_close_v1(created.wal)?
+    let create_storage_closed: Boolean = yaza_db_storage_close_v1(created.storage)?
+    if not create_wal_closed or not create_storage_closed: return err("YDBv1 CHECK smoke could not close handles before recovery")
+
+    let recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, database_name)?
+    let valid_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(recovered.storage, recovered.wal, "INSERT INTO check_rows (id, age, label) VALUES (1, 18, 'ok')", no_parameters)?
+    if not option_is_some(valid_result.write_commit): return err("YDBv1 CHECK rejected a row satisfying its constraints")
+    let valid: YazaDbWriteCommitV1 = option_unwrap(valid_result.write_commit)
+
+    let low_age: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(valid.storage, valid.wal, "INSERT INTO check_rows (id, age, label) VALUES (2, 17, 'ok')", no_parameters)
+    if result_is_ok(low_age): return err("YDBv1 CHECK accepted a row below its lower bound")
+    let upper_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(valid.storage, valid.wal, "INSERT INTO check_rows (id, age, label) VALUES (3, 150, 'upper-bound')", no_parameters)?
+    if not option_is_some(upper_result.write_commit): return err("YDBv1 CHECK did not persist the inclusive upper bound")
+    let upper: YazaDbWriteCommitV1 = option_unwrap(upper_result.write_commit)
+    let too_high: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(upper.storage, upper.wal, "INSERT INTO check_rows (id, age, label) VALUES (4, 151, 'too-high')", no_parameters)
+    if result_is_ok(too_high): return err("YDBv1 CHECK accepted a row above its upper bound")
+    let bad_label: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(upper.storage, upper.wal, "INSERT INTO check_rows (id, age, label) VALUES (4, 18, 'bad:label')", no_parameters)
+    if result_is_ok(bad_label): return err("YDBv1 CHECK accepted a disallowed text literal containing a colon")
+
+    let duplicate_label: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(upper.storage, upper.wal, "INSERT INTO check_rows (id, age, label) VALUES (2, NULL, 'ok')", no_parameters)
+    if result_is_ok(duplicate_label): return err("YDBv1 UNIQUE index did not reject an existing label")
+    let null_age_valid_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(upper.storage, upper.wal, "INSERT INTO check_rows (id, age, label) VALUES (2, NULL, 'second')", no_parameters)?
+    if not option_is_some(null_age_valid_result.write_commit): return err("YDBv1 CHECK did not preserve SQL UNKNOWN semantics for NULL")
+    let null_age: YazaDbWriteCommitV1 = option_unwrap(null_age_valid_result.write_commit)
+    let invalid_update: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(null_age.storage, null_age.wal, "UPDATE check_rows SET age = 17 WHERE id = 1", no_parameters)
+    if result_is_ok(invalid_update): return err("YDBv1 UPDATE bypassed the persisted CHECK constraint")
+    let invalid_upper_update: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(null_age.storage, null_age.wal, "UPDATE check_rows SET age = 151 WHERE id = 1", no_parameters)
+    if result_is_ok(invalid_upper_update): return err("YDBv1 UPDATE bypassed the persisted upper CHECK constraint")
+    let invalid_text_update: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(null_age.storage, null_age.wal, "UPDATE check_rows SET label = 'bad:label' WHERE id = 1", no_parameters)
+    if result_is_ok(invalid_text_update): return err("YDBv1 UPDATE bypassed the persisted text CHECK constraint")
+
+    let rejected_add: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(null_age.storage, null_age.wal, "ALTER TABLE check_rows ADD CHECK (age > 20)", no_parameters)
+    if result_is_ok(rejected_add): return err("YDBv1 ALTER TABLE CHECK accepted a constraint violated by an existing row")
+    let after_rejected_add_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(null_age.storage, null_age.wal, "INSERT INTO check_rows (id, age, label) VALUES (4, 18, 'after-rejected-alter')", no_parameters)?
+    if not option_is_some(after_rejected_add_result.write_commit): return err("YDBv1 failed ALTER TABLE CHECK published partial constraint metadata")
+    let after_rejected_add: YazaDbWriteCommitV1 = option_unwrap(after_rejected_add_result.write_commit)
+
+    let add_check_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(after_rejected_add.storage, after_rejected_add.wal, "ALTER TABLE check_rows ADD CHECK (age <> 999 AND label <> 'no-alter')", no_parameters)?
+    if not option_is_some(add_check_result.write_commit): return err("YDBv1 ALTER TABLE CHECK did not publish its valid constraint")
+    let added_check: YazaDbWriteCommitV1 = option_unwrap(add_check_result.write_commit)
+    let alter_wal_closed: Boolean = yaza_db_wal_log_close_v1(added_check.wal)?
+    let alter_storage_closed: Boolean = yaza_db_storage_close_v1(added_check.storage)?
+    if not alter_wal_closed or not alter_storage_closed: return err("YDBv1 ALTER TABLE CHECK smoke could not close handles before recovery")
+
+    let reopened: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, database_name)?
+    let invalid_alter_insert: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(reopened.storage, reopened.wal, "INSERT INTO check_rows (id, age, label) VALUES (5, 999, 'invalid-after-reopen')", no_parameters)
+    if result_is_ok(invalid_alter_insert): return err("YDBv1 ALTER TABLE CHECK did not persist through database reopen")
+    let invalid_alter_text: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(reopened.storage, reopened.wal, "INSERT INTO check_rows (id, age, label) VALUES (5, 18, 'no-alter')", no_parameters)
+    if result_is_ok(invalid_alter_text): return err("YDBv1 ALTER TABLE CHECK did not persist its second conjunct")
+
+    let final_wal_closed: Boolean = yaza_db_wal_log_close_v1(reopened.wal)?
+    let final_storage_closed: Boolean = yaza_db_storage_close_v1(reopened.storage)?
+    if not final_wal_closed or not final_storage_closed: return err("YDBv1 CHECK smoke could not close its final database handles")
+    let removed: Boolean = remove(root, database_name)?
+    if not removed: return err("YDBv1 CHECK smoke could not remove its temporary database")
+    let directory_synced: Boolean = sync_directory(root)?
+    let root_closed: Boolean = close(root)?
+    if not directory_synced or not root_closed: return err("YDBv1 CHECK smoke could not close and sync its temporary root")
+    return ok(true)
+
+start:
+    let outcome: Result[Boolean, Text] = yazabase_sql_check_v1(arg(1))
+    if result_is_ok(outcome):
+        say "yazabase-sql-check-v1-ok"
+    else:
+        say result_unwrap_error(outcome)

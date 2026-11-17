@@ -1,0 +1,63 @@
+# Scheduler-driven PostgreSQL pool acquisition.
+# Each step is nonblocking. When the per-database limit is full, the caller
+# registers a pool-release readiness notification and returns WAIT from its
+# task-step callback; idle-slot expiry remains timer-driven.
+use "pool"
+use "std/task"
+
+shape PgPoolCheckoutAsyncState:
+    identity: Bytes
+    maximum: Number
+    acquire_deadline_ms: Number
+    idle_timeout_ms: Number
+
+variant PgPoolCheckoutAsyncStep:
+    Ready(connection_or_reservation: Number)
+    Wait(state: PgPoolCheckoutAsyncState)
+
+fn pg_pool_checkout_async_begin(identity: Bytes, maximum: Number, acquire_timeout_ms: Number, idle_timeout_ms: Number) -> Result[PgPoolCheckoutAsyncState, Text]:
+    if bytes_length(identity) != 32:
+        return err("postgres pool: identity must be a 32-byte SHA-256 digest")
+    if maximum < 1 or maximum > 64:
+        return err("postgres pool: per-database size must be between 1 and 64")
+    if acquire_timeout_ms < 1 or acquire_timeout_ms > 300000:
+        return err("postgres pool: acquisition timeout must be between 1 and 300000 milliseconds")
+    if idle_timeout_ms < 1 or idle_timeout_ms > 86400000:
+        return err("postgres pool: idle timeout must be between 1 and 86400000 milliseconds")
+    let now: Number = monotonic_ms()
+    if now < 0 or now > 9223372036854775 * 1000 + 807 - acquire_timeout_ms:
+        return err("postgres pool: monotonic deadline is outside the supported range")
+    return ok(PgPoolCheckoutAsyncState(identity, maximum, now + acquire_timeout_ms, idle_timeout_ms))
+
+fn pg_pool_checkout_async_step(state: PgPoolCheckoutAsyncState) -> Result[PgPoolCheckoutAsyncStep, Text]:
+    if task_or_request_cancelled():
+        return err("postgres pool: asynchronous acquisition was cancelled")
+    if bytes_length(state.identity) != 32 or state.maximum < 1 or state.maximum > 64 or state.idle_timeout_ms < 1 or state.idle_timeout_ms > 86400000 or state.acquire_deadline_ms <= 0:
+        return err("postgres pool: asynchronous acquisition state is malformed")
+    let now: Number = monotonic_ms()
+    if now < 0:
+        return err("postgres pool: monotonic clock is unavailable")
+    if now >= state.acquire_deadline_ms:
+        return err("postgres pool: asynchronous acquisition timed out at the configured size limit")
+    let polled: Result[Option[Number], Text] = pg_pool_checkout_poll_native(state.identity, state.maximum, state.idle_timeout_ms)
+    if not result_is_ok(polled):
+        return err(result_unwrap_error(polled))
+    let available: Option[Number] = result_unwrap(polled)
+    if option_is_some(available):
+        return ok(PgPoolCheckoutAsyncStep::Ready(option_unwrap(available)))
+    return ok(PgPoolCheckoutAsyncStep::Wait(state))
+
+# Invoke this only after a Wait result, then return YAZA_TASK_STEP_WAIT from
+# the task-step callback. Pool release wakes the task through the native I/O
+# driver instead of periodically polling the pool.
+fn pg_pool_checkout_async_wait(state: PgPoolCheckoutAsyncState) -> Result[Boolean, Text]:
+    if task_or_request_cancelled():
+        return err("postgres pool: asynchronous acquisition was cancelled")
+    let now: Number = monotonic_ms()
+    if now < 0 or now >= state.acquire_deadline_ms:
+        return err("postgres pool: asynchronous acquisition timed out at the configured size limit")
+    if not task_deadline_cap_until(state.acquire_deadline_ms):
+        return err("postgres pool: cannot bind acquisition to the active scheduler deadline")
+    if not pg_pool_wait_current_task_native(state.identity, state.maximum):
+        return err("postgres pool: cannot register scheduler readiness wait")
+    return ok(true)

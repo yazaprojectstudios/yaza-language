@@ -1,0 +1,248 @@
+# Read the bounded committed catalog snapshot used by persistent SELECT.
+# Catalog writes and transactional visibility remain outside this v1 slice.
+use "./catalog_schema_v1"
+use "./catalog_storage_v1"
+use "./btree_scan_v1"
+use "./row_v1"
+use "./sql_binder_v1"
+use "./sql_parser_v3"
+
+shape YazaDbCatalogSnapshotWithRootsV1:
+    catalog: YazaDbCatalogRootV1
+    sql_snapshot: YazaSqlCatalogSnapshotV1
+    root_page_ids: List[Number]
+    table_schema_versions: List[Number]
+    views: List[YazaDbCatalogViewV1]
+
+shape YazaDbCatalogViewV1:
+    view_id: Number
+    name: Text
+    definition: Text
+    dependency_table_id: Number
+    output_columns: List[YazaSqlColumnSchemaV1]
+
+fn yaza_db_catalog_snapshot_type_supported_v1(type_id: Number) -> Boolean:
+    return type_id == 1 or type_id == 2 or type_id == 3 or type_id == 4 or type_id == 6 or type_id == 9 or type_id == 10 or type_id == 11 or type_id == 12 or type_id == 13 or type_id == 14 or type_id == 15 or type_id == 16
+
+fn yaza_db_catalog_snapshot_read_tree_v1(file: Number, file_header: YazaDbFileHeaderV1, page_id: Number, columns: List[YazaSqlColumnSchemaV1], key_ordinals: List[Number], visible_ts: Number, row_limit: Number) -> Result[List[YazaDbRowV1], Text]:
+    let rows: Result[List[YazaDbRowV1], Text] = yaza_db_btree_read_rows_v1(file, file_header, page_id, columns, key_ordinals, visible_ts, row_limit)
+    if not result_is_ok(rows): return err("YDBv1 catalog root " + number_text(page_id) + " scan failed: " + result_unwrap_error(rows))
+    return ok(result_unwrap(rows))
+
+fn yaza_db_catalog_snapshot_table_index_v1(tables: List[YazaSqlTableSchemaV1], table_id: Number) -> Number:
+    var index: Number = 0
+    while index < list_count(tables):
+        if list_get(tables, index).table_id == table_id: return index
+        set index = index + 1
+    return -1
+
+fn yaza_db_catalog_snapshot_view_index_v1(views: List[YazaDbCatalogViewV1], view_id: Number) -> Number:
+    var index: Number = 0
+    while index < list_count(views):
+        if list_get(views, index).view_id == view_id: return index
+        set index = index + 1
+    return -1
+
+fn yaza_db_catalog_snapshot_load_with_roots_v1(file: Number, file_header: YazaDbFileHeaderV1) -> Result[YazaDbCatalogSnapshotWithRootsV1, Text]:
+    if file_header.catalog_root == 0 or file_header.next_commit_ts < 2: return err("YDBv1 catalog snapshot requires an initialized and committed catalog")
+    let catalog: YazaDbCatalogRootV1 = yaza_db_catalog_storage_read_root_v1(file, file_header)?
+    let visible_ts: Number = file_header.next_commit_ts - 1
+
+    let tables_schema: List[YazaSqlColumnSchemaV1] = yaza_db_catalog_table_schema_v1(1)?
+    let table_key_ordinals: List[Number] = [0]
+    let stored_tables: List[YazaDbRowV1] = yaza_db_catalog_snapshot_read_tree_v1(file, file_header, catalog.sys_tables_root, tables_schema, table_key_ordinals, visible_ts, yaza_db_catalog_max_table_records_v1())?
+    if list_count(stored_tables) < 4: return err("YDBv1 catalog snapshot is missing one or more required system tables")
+    let tables_created: Result[List[YazaSqlTableSchemaV1], Text] = list_try_new()
+    if not result_is_ok(tables_created): return err(result_unwrap_error(tables_created))
+    let tables: List[YazaSqlTableSchemaV1] = result_unwrap(tables_created)
+    if not list_try_reserve(tables, list_count(stored_tables)): return err("YDBv1 catalog snapshot could not reserve its bounded table list")
+    let roots_created: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(roots_created): return err(result_unwrap_error(roots_created))
+    let root_page_ids: List[Number] = result_unwrap(roots_created)
+    if not list_try_reserve(root_page_ids, list_count(stored_tables)): return err("YDBv1 catalog snapshot could not reserve its bounded root list")
+    let schema_versions_result: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(schema_versions_result): return err(result_unwrap_error(schema_versions_result))
+    let table_schema_versions: List[Number] = result_unwrap(schema_versions_result)
+    if not list_try_reserve(table_schema_versions, list_count(stored_tables)): return err("YDBv1 catalog snapshot could not reserve table schema versions")
+    let views_created: Result[List[YazaDbCatalogViewV1], Text] = list_try_new()
+    if not result_is_ok(views_created): return err(result_unwrap_error(views_created))
+    let views: List[YazaDbCatalogViewV1] = result_unwrap(views_created)
+    if not list_try_reserve(views, list_count(stored_tables)): return err("YDBv1 catalog snapshot could not reserve its bounded view list")
+
+    var table_row_index: Number = 0
+    while table_row_index < list_count(stored_tables):
+        let row: YazaDbRowV1 = list_get(stored_tables, table_row_index)
+        if list_count(row.values) != 7 or list_count(row.nulls) != 7: return err("YDBv1 sys_tables row width is invalid")
+        if row.version_ts < 1 or row.version_ts > visible_ts: return err("YDBv1 sys_tables row has an invalid committed version timestamp")
+        var field_index: Number = 0
+        while field_index < 7:
+            if list_get(row.nulls, field_index): return err("YDBv1 sys_tables contains NULL in a required field")
+            set field_index = field_index + 1
+        let table_id: Number = list_get(row.values, 0).integer_value
+        let schema_name: Text = list_get(row.values, 1).text_value
+        let table_name: Text = list_get(row.values, 2).text_value
+        let root_page_id: Number = list_get(row.values, 3).integer_value
+        let table_kind: Number = list_get(row.values, 4).integer_value
+        let flags: Number = list_get(row.values, 5).integer_value
+        let schema_version: Number = list_get(row.values, 6).integer_value
+        if table_id < 1 or table_id > yaza_db_catalog_max_object_id_v1() or text_length(schema_name) == 0 or text_length(table_name) == 0: return err("YDBv1 sys_tables contains an invalid table identity")
+        if flags < 0 or schema_version < 1 or schema_version > yaza_db_row_max_schema_epoch_v1(): return err("YDBv1 sys_tables contains unsupported table metadata")
+        if yaza_db_catalog_snapshot_table_index_v1(tables, table_id) >= 0 or yaza_db_catalog_snapshot_view_index_v1(views, table_id) >= 0: return err("YDBv1 sys_tables contains a duplicate table or view ID")
+        var existing_index: Number = 0
+        while existing_index < list_count(tables):
+            if list_get(tables, existing_index).name == table_name: return err("YDBv1 catalog has duplicate unqualified table names unsupported by this binder")
+            set existing_index = existing_index + 1
+        var duplicate_view_name_index: Number = 0
+        while duplicate_view_name_index < list_count(views):
+            if list_get(views, duplicate_view_name_index).name == table_name: return err("YDBv1 catalog has duplicate unqualified table/view names unsupported by this binder")
+            set duplicate_view_name_index = duplicate_view_name_index + 1
+        if table_kind == 1:
+            if root_page_id < 2 or root_page_id >= file_header.page_count: return err("YDBv1 sys_tables root page is outside the logical database")
+            if catalog.sys_views_root != 0 and root_page_id == catalog.sys_views_root: return err("YDBv1 sys_tables aliases the private sys_views root")
+            let root_address: YazaDbBitmapAddressV1 = yaza_db_bitmap_address_v1(root_page_id)?
+            if root_address.is_bitmap_page: return err("YDBv1 sys_tables root page points to a BITMAP page")
+            let table_root_page: Bytes = yaza_db_storage_read_page_validated_file_v1(file, file_header, root_page_id)?
+            let table_root_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(table_root_page, root_page_id)?
+            if table_root_header.page_type != 1 and table_root_header.page_type != 2: return err("YDBv1 sys_tables root page is not a B+Tree page")
+            if table_id == 1 and (root_page_id != catalog.sys_tables_root or schema_name != "sys" or table_name != "sys_tables"): return err("YDBv1 sys_tables does not describe its own root consistently")
+            if table_id == 2 and (root_page_id != catalog.sys_columns_root or schema_name != "sys" or table_name != "sys_columns"): return err("YDBv1 sys_tables does not describe sys_columns consistently")
+            if table_id == 3 and (root_page_id != catalog.sys_indexes_root or schema_name != "sys" or table_name != "sys_indexes"): return err("YDBv1 sys_tables does not describe sys_indexes consistently")
+            if table_id == 4 and (root_page_id != catalog.sys_constraints_root or schema_name != "sys" or table_name != "sys_constraints"): return err("YDBv1 sys_tables does not describe sys_constraints consistently")
+            if table_id <= 4 and schema_name != "sys": return err("YDBv1 system catalog table has an invalid schema name")
+            let empty_columns_result: Result[List[YazaSqlColumnSchemaV1], Text] = list_try_new()
+            if not result_is_ok(empty_columns_result): return err(result_unwrap_error(empty_columns_result))
+            let empty_columns: List[YazaSqlColumnSchemaV1] = result_unwrap(empty_columns_result)
+            if not list_try_push(tables, YazaSqlTableSchemaV1(table_id, table_name, empty_columns)): return err("YDBv1 catalog snapshot table-list growth failed")
+            if not list_try_push(root_page_ids, root_page_id): return err("YDBv1 catalog snapshot root-list growth failed")
+            if not list_try_push(table_schema_versions, schema_version): return err("YDBv1 catalog snapshot could not retain a table schema version")
+        elif table_kind == 2:
+            if catalog.sys_views_root == 0 or table_id <= 4 or root_page_id != 0 or flags != 0 or schema_name != "public": return err("YDBv1 sys_tables view metadata is invalid or lacks a v2 sys_views root")
+            let empty_view_columns_result: Result[List[YazaSqlColumnSchemaV1], Text] = list_try_new()
+            if not result_is_ok(empty_view_columns_result): return err(result_unwrap_error(empty_view_columns_result))
+            let empty_view_columns: List[YazaSqlColumnSchemaV1] = result_unwrap(empty_view_columns_result)
+            if not list_try_push(views, YazaDbCatalogViewV1(table_id, table_name, "", 0, empty_view_columns)): return err("YDBv1 catalog snapshot view-list growth failed")
+        else:
+            return err("YDBv1 sys_tables contains an unsupported table_kind")
+        set table_row_index = table_row_index + 1
+
+    if yaza_db_catalog_snapshot_table_index_v1(tables, 1) < 0 or yaza_db_catalog_snapshot_table_index_v1(tables, 2) < 0 or yaza_db_catalog_snapshot_table_index_v1(tables, 3) < 0 or yaza_db_catalog_snapshot_table_index_v1(tables, 4) < 0: return err("YDBv1 catalog snapshot is missing one or more required system tables")
+
+    let columns_schema: List[YazaSqlColumnSchemaV1] = yaza_db_catalog_table_schema_v1(2)?
+    let column_key_ordinals: List[Number] = [0, 1]
+    let stored_columns: List[YazaDbRowV1] = yaza_db_catalog_snapshot_read_tree_v1(file, file_header, catalog.sys_columns_root, columns_schema, column_key_ordinals, visible_ts, yaza_db_catalog_max_column_rows_v1())?
+    let defaults_created: Result[List[YazaSqlColumnDefaultV1], Text] = list_try_new()
+    if not result_is_ok(defaults_created): return err(result_unwrap_error(defaults_created))
+    let column_defaults: List[YazaSqlColumnDefaultV1] = result_unwrap(defaults_created)
+    if not list_try_reserve(column_defaults, list_count(stored_columns)): return err("YDBv1 catalog snapshot could not reserve default metadata")
+    var column_row_index: Number = 0
+    var catalog_table_index: Number = 0
+    var catalog_view_index: Number = 0
+    var previous_column_table_id: Number = 0
+    while column_row_index < list_count(stored_columns):
+        let row: YazaDbRowV1 = list_get(stored_columns, column_row_index)
+        if list_count(row.values) != 8 or list_count(row.nulls) != 8: return err("YDBv1 sys_columns row width is invalid")
+        if list_get(row.nulls, 0) or list_get(row.nulls, 1) or list_get(row.nulls, 2) or list_get(row.nulls, 3) or list_get(row.nulls, 4) or list_get(row.nulls, 6): return err("YDBv1 sys_columns contains NULL in a required field")
+        let table_id: Number = list_get(row.values, 0).integer_value
+        let ordinal: Number = list_get(row.values, 1).integer_value
+        let column_name: Text = list_get(row.values, 2).text_value
+        let type_id: Number = list_get(row.values, 3).integer_value
+        let nullable: Boolean = list_get(row.values, 4).boolean_value
+        let type_flags: Number = list_get(row.values, 6).integer_value
+        var default_expression: Text = ""
+        if not list_get(row.nulls, 7):
+            let default_value: YazaSqlValueV1 = list_get(row.values, 7)
+            if default_value.type_id != 9 or text_length(default_value.text_value) < 1 or text_length(default_value.text_value) > 4096: return err("YDBv1 sys_columns contains an invalid bounded default literal")
+            set default_expression = default_value.text_value
+        if table_id < 1 or table_id > yaza_db_catalog_max_object_id_v1() or ordinal < 0 or text_length(column_name) == 0 or not yaza_db_catalog_snapshot_type_supported_v1(type_id) or not yaza_db_catalog_column_type_flags_valid_v1(type_id, type_flags): return err("YDBv1 sys_columns contains unsupported column metadata")
+        if table_id < previous_column_table_id: return err("YDBv1 sys_columns rows are not ordered by their clustered table key")
+        set previous_column_table_id = table_id
+        while catalog_table_index < list_count(tables) and list_get(tables, catalog_table_index).table_id < table_id:
+            set catalog_table_index = catalog_table_index + 1
+        while catalog_view_index < list_count(views) and list_get(views, catalog_view_index).view_id < table_id:
+            set catalog_view_index = catalog_view_index + 1
+        let column: YazaSqlColumnSchemaV1 = YazaSqlColumnSchemaV1(column_name, type_id, nullable, ordinal, yaza_db_catalog_column_type_precision_v1(type_id, type_flags), yaza_db_catalog_column_type_scale_v1(type_id, type_flags), default_expression)
+        if text_length(default_expression) > 0:
+            let parsed_default: YazaSqlValueV1 = yaza_sql_insert_materialize_column_default_v1(default_expression, column)?
+            if parsed_default.is_null and not nullable: return err("YDBv1 sys_columns contains a NULL DEFAULT for a NOT NULL column")
+        if catalog_table_index < list_count(tables) and list_get(tables, catalog_table_index).table_id == table_id:
+            let table: YazaSqlTableSchemaV1 = list_get(tables, catalog_table_index)
+            if ordinal != list_count(table.columns) or ordinal >= 1024: return err("YDBv1 sys_columns ordinals are not contiguous from zero")
+            var existing_column_index: Number = 0
+            while existing_column_index < list_count(table.columns):
+                if list_get(table.columns, existing_column_index).name == column_name: return err("YDBv1 sys_columns contains a duplicate column name")
+                set existing_column_index = existing_column_index + 1
+            if not list_try_push(table.columns, column): return err("YDBv1 catalog snapshot column-list growth failed")
+            if text_length(default_expression) > 0 and not list_try_push(column_defaults, YazaSqlColumnDefaultV1(table_id, ordinal, default_expression)): return err("YDBv1 catalog snapshot could not retain a column DEFAULT literal")
+            if not list_try_set(tables, catalog_table_index, table): return err("YDBv1 catalog snapshot could not publish a table's columns")
+        elif catalog_view_index < list_count(views) and list_get(views, catalog_view_index).view_id == table_id:
+            if not list_get(row.nulls, 7): return err("YDBv1 view output columns cannot have DEFAULT expressions")
+            let view: YazaDbCatalogViewV1 = list_get(views, catalog_view_index)
+            if ordinal != list_count(view.output_columns) or ordinal >= 1024: return err("YDBv1 view output columns are not contiguous from zero")
+            var existing_view_column_index: Number = 0
+            while existing_view_column_index < list_count(view.output_columns):
+                if list_get(view.output_columns, existing_view_column_index).name == column_name: return err("YDBv1 view output column names are duplicated")
+                set existing_view_column_index = existing_view_column_index + 1
+            if not list_try_push(view.output_columns, column) or not list_try_set(views, catalog_view_index, view): return err("YDBv1 catalog snapshot could not publish view output columns")
+        else:
+            return err("YDBv1 sys_columns references a missing table or view")
+        set column_row_index = column_row_index + 1
+
+    set table_row_index = 0
+    while table_row_index < list_count(tables):
+        let table: YazaSqlTableSchemaV1 = list_get(tables, table_row_index)
+        let schema_version: Number = list_get(table_schema_versions, table_row_index)
+        let column_count: Number = list_count(table.columns)
+        if column_count == 0 or schema_version > column_count: return err("YDBv1 sys_tables schema version exceeds its persisted table schema")
+        var suffix_index: Number = column_count - (schema_version - 1)
+        while suffix_index < column_count:
+            let suffix_column: YazaSqlColumnSchemaV1 = list_get(table.columns, suffix_index)
+            if not suffix_column.nullable and text_length(suffix_column.default_expression) == 0: return err("YDBv1 table schema-version suffix contains a non-nullable column without a DEFAULT")
+            set suffix_index = suffix_index + 1
+        set table_row_index = table_row_index + 1
+    var view_row_index: Number = 0
+    while view_row_index < list_count(views):
+        if list_count(list_get(views, view_row_index).output_columns) == 0: return err("YDBv1 view catalog row has no persisted output columns")
+        set view_row_index = view_row_index + 1
+
+    if catalog.sys_views_root == 0:
+        if list_count(views) != 0: return err("YDBv1 legacy catalog contains view rows without a sys_views root")
+    else:
+        let views_schema: List[YazaSqlColumnSchemaV1] = yaza_db_catalog_table_schema_v1(5)?
+        let view_key_ordinals: List[Number] = [0]
+        let stored_views: List[YazaDbRowV1] = yaza_db_catalog_snapshot_read_tree_v1(file, file_header, catalog.sys_views_root, views_schema, view_key_ordinals, visible_ts, yaza_db_catalog_max_table_records_v1())?
+        if list_count(stored_views) != list_count(views): return err("YDBv1 sys_views row count does not match the table_kind=2 catalog entries")
+        var stored_view_index: Number = 0
+        var previous_view_id: Number = 0
+        while stored_view_index < list_count(stored_views):
+            let row: YazaDbRowV1 = list_get(stored_views, stored_view_index)
+            if list_count(row.values) != 3 or list_count(row.nulls) != 3 or list_get(row.nulls, 0) or list_get(row.nulls, 1) or list_get(row.nulls, 2): return err("YDBv1 sys_views row is malformed or contains NULL")
+            if row.version_ts < 1 or row.version_ts > visible_ts: return err("YDBv1 sys_views row has an invalid committed version timestamp")
+            let view_id: Number = list_get(row.values, 0).integer_value
+            let definition: Text = list_get(row.values, 1).text_value
+            let dependency_table_id: Number = list_get(row.values, 2).integer_value
+            if view_id <= previous_view_id or view_id <= 4 or text_length(definition) < 1 or text_length(definition) > 65536 or dependency_table_id <= 4: return err("YDBv1 sys_views contains invalid identity, definition, or dependency metadata")
+            set previous_view_id = view_id
+            let view_index: Number = yaza_db_catalog_snapshot_view_index_v1(views, view_id)
+            if view_index < 0: return err("YDBv1 sys_views references an absent view table row")
+            var view: YazaDbCatalogViewV1 = list_get(views, view_index)
+            let select_result: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(definition)
+            if not result_is_ok(select_result): return err("YDBv1 stored view definition no longer parses: " + result_unwrap_error(select_result))
+            let bound_result: Result[YazaSqlBoundPlanV1, Text] = yaza_sql_bind_select_v1(definition, result_unwrap(select_result), YazaSqlCatalogSnapshotV1(visible_ts, tables, column_defaults))
+            if not result_is_ok(bound_result): return err("YDBv1 stored view definition no longer binds: " + result_unwrap_error(bound_result))
+            let bound: YazaSqlBoundPlanV1 = result_unwrap(bound_result)
+            if bound.table_id != dependency_table_id or bound.table_id <= 4 or bound.right_table_id != 0 or list_count(bound.join_stages) != 0 or list_count(bound.subqueries) != 0 or list_count(bound.parameters) != 0 or bound.parameter_style != 0: return err("YDBv1 stored view dependency does not match its validated SELECT")
+            if list_count(bound.projections) != list_count(view.output_columns): return err("YDBv1 stored view output schema no longer matches its validated SELECT")
+            var output_index: Number = 0
+            while output_index < list_count(bound.projections):
+                let projection: YazaSqlBoundProjectionV1 = list_get(bound.projections, output_index)
+                let output_column: YazaSqlColumnSchemaV1 = list_get(view.output_columns, output_index)
+                if projection.output_name != output_column.name or projection.type_id != output_column.type_id or projection.nullable != output_column.nullable or projection.precision != output_column.precision or projection.scale != output_column.scale: return err("YDBv1 stored view output column metadata is inconsistent with its validated SELECT")
+                set output_index = output_index + 1
+            set view = YazaDbCatalogViewV1(view.view_id, view.name, definition, dependency_table_id, view.output_columns)
+            if not list_try_set(views, view_index, view): return err("YDBv1 catalog snapshot could not publish a validated view")
+            set stored_view_index = stored_view_index + 1
+    return ok(YazaDbCatalogSnapshotWithRootsV1(catalog, YazaSqlCatalogSnapshotV1(visible_ts, tables, column_defaults), root_page_ids, table_schema_versions, views))
+
+fn yaza_db_catalog_snapshot_load_v1(file: Number, file_header: YazaDbFileHeaderV1) -> Result[YazaSqlCatalogSnapshotV1, Text]:
+    let loaded: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(file, file_header)?
+    return ok(loaded.sql_snapshot)

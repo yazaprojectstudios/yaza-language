@@ -1,0 +1,183 @@
+use "../yazabase/sql_create_table_v1"
+use "../yazabase/sql_create_table_write_v1"
+
+fn yazabase_sql_create_table_v1_empty_catalog() -> YazaSqlCatalogSnapshotV1:
+    let tables: List[YazaSqlTableSchemaV1] = List[YazaSqlTableSchemaV1]()
+    return YazaSqlCatalogSnapshotV1(3, tables, List[YazaSqlColumnDefaultV1]())
+
+fn yazabase_sql_create_table_v1_parse_and_bind() -> Boolean:
+    let source: Text = "CREATE TABLE Users (id BIGINT PRIMARY KEY, name TEXT NOT NULL DEFAULT 'n', active BOOL DEFAULT TRUE, score DOUBLE DEFAULT 1.25, age INT DEFAULT -2, small SMALLINT DEFAULT NULL);"
+    let parsed: Result[YazaSqlCreateTableAstV1, Text] = yaza_sql_parse_create_table_v1(source)
+    if not result_is_ok(parsed): return false
+    let ast: YazaSqlCreateTableAstV1 = result_unwrap(parsed)
+    if ast.version != 1 or ast.start_byte != 0 or ast.end_byte != text_length(source): return false
+    if ast.table_name.part_count != 1 or list_count(ast.columns) != 6 or list_count(ast.primary_key_columns) != 1: return false
+    if text_slice(source, ast.table_name.start_byte, ast.table_name.end_byte - ast.table_name.start_byte) != "Users": return false
+    let bound: Result[YazaSqlCreateTablePlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_create_table_v1(source, ast, yazabase_sql_create_table_v1_empty_catalog())
+    if not result_is_ok(bound): return false
+    let plan: YazaSqlCreateTablePlanV1 = result_unwrap(bound)
+    if plan.version != 1 or plan.catalog_version != 3 or plan.table_name != "users": return false
+    if list_count(plan.columns) != 6 or list_count(plan.key_ordinals) != 1 or list_get(plan.key_ordinals, 0) != 0: return false
+    if list_get(plan.columns, 0).type_id != 4 or list_get(plan.columns, 0).nullable: return false
+    if list_get(plan.columns, 1).type_id != 9 or list_get(plan.columns, 1).nullable: return false
+    if list_get(plan.columns, 2).type_id != 1 or not list_get(plan.columns, 2).nullable: return false
+    if list_get(plan.columns, 3).type_id != 6 or list_get(plan.columns, 4).type_id != 3 or list_get(plan.columns, 5).type_id != 2: return false
+    if list_count(plan.default_expressions) != 6 or list_get(plan.default_expressions, 1) != "'n'" or list_get(plan.default_expressions, 2) != "TRUE" or list_get(plan.default_expressions, 3) != "1.25" or list_get(plan.default_expressions, 4) != "-2" or list_get(plan.default_expressions, 5) != "NULL": return false
+    return true
+
+fn yazabase_sql_create_table_v1_composite_key() -> Boolean:
+    let source: Text = "CREATE TABLE orders (tenant INT NOT NULL, id BIGINT, note TEXT, PRIMARY KEY (tenant, id))"
+    let parsed: Result[YazaSqlCreateTableAstV1, Text] = yaza_sql_parse_create_table_v1(source)
+    if not result_is_ok(parsed): return false
+    let bound: Result[YazaSqlCreateTablePlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_create_table_v1(source, result_unwrap(parsed), yazabase_sql_create_table_v1_empty_catalog())
+    if not result_is_ok(bound): return false
+    let plan: YazaSqlCreateTablePlanV1 = result_unwrap(bound)
+    if plan.table_name != "orders" or list_count(plan.key_ordinals) != 2: return false
+    if list_get(plan.key_ordinals, 0) != 0 or list_get(plan.key_ordinals, 1) != 1: return false
+    if list_get(plan.columns, 0).nullable or list_get(plan.columns, 1).nullable: return false
+    return true
+
+fn yazabase_sql_create_table_v1_rejections() -> Boolean:
+    let no_key: Result[YazaSqlCreateTableAstV1, Text] = yaza_sql_parse_create_table_v1("CREATE TABLE no_key (id BIGINT, title TEXT)")
+    if result_is_ok(no_key): return false
+    let unsupported: Result[YazaSqlCreateTableAstV1, Text] = yaza_sql_parse_create_table_v1("CREATE TABLE bad (id JSON PRIMARY KEY)")
+    if result_is_ok(unsupported): return false
+    let duplicate_key: Result[YazaSqlCreateTableAstV1, Text] = yaza_sql_parse_create_table_v1("CREATE TABLE bad (id BIGINT PRIMARY KEY, PRIMARY KEY (id))")
+    if result_is_ok(duplicate_key): return false
+    let expression_default: Result[YazaSqlCreateTableAstV1, Text] = yaza_sql_parse_create_table_v1("CREATE TABLE bad (id BIGINT PRIMARY KEY, created TEXT DEFAULT CURRENT_TIMESTAMP)")
+    if result_is_ok(expression_default): return false
+    let extra_statement: Result[YazaSqlCreateTableAstV1, Text] = yaza_sql_parse_create_table_v1("CREATE TABLE good (id BIGINT PRIMARY KEY); DROP TABLE good")
+    if result_is_ok(extra_statement): return false
+    let quoted_source: Text = "CREATE TABLE \"MixedName\" (id BIGINT PRIMARY KEY)"
+    let quoted_ast: Result[YazaSqlCreateTableAstV1, Text] = yaza_sql_parse_create_table_v1(quoted_source)
+    if not result_is_ok(quoted_ast): return false
+    let quoted_bound: Result[YazaSqlCreateTablePlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_create_table_v1(quoted_source, result_unwrap(quoted_ast), yazabase_sql_create_table_v1_empty_catalog())
+    if result_is_ok(quoted_bound): return false
+
+    let duplicate_columns_source: Text = "CREATE TABLE duplicate_columns (id BIGINT PRIMARY KEY, ID TEXT)"
+    let duplicate_columns_ast: Result[YazaSqlCreateTableAstV1, Text] = yaza_sql_parse_create_table_v1(duplicate_columns_source)
+    if not result_is_ok(duplicate_columns_ast): return false
+    let duplicate_columns: Result[YazaSqlCreateTablePlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_create_table_v1(duplicate_columns_source, result_unwrap(duplicate_columns_ast), yazabase_sql_create_table_v1_empty_catalog())
+    if result_is_ok(duplicate_columns) or result_unwrap_error(duplicate_columns).code != 3002: return false
+
+    let existing_columns: List[YazaSqlColumnSchemaV1] = [YazaSqlColumnSchemaV1("id", 4, false, 0, 0, 0, "")]
+    let existing_tables: List[YazaSqlTableSchemaV1] = [YazaSqlTableSchemaV1(1, "users", existing_columns)]
+    let existing_catalog: YazaSqlCatalogSnapshotV1 = YazaSqlCatalogSnapshotV1(3, existing_tables, List[YazaSqlColumnDefaultV1]())
+    let duplicate_table_source: Text = "CREATE TABLE USERS (id BIGINT PRIMARY KEY)"
+    let duplicate_table_ast: Result[YazaSqlCreateTableAstV1, Text] = yaza_sql_parse_create_table_v1(duplicate_table_source)
+    if not result_is_ok(duplicate_table_ast): return false
+    let duplicate_table: Result[YazaSqlCreateTablePlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_create_table_v1(duplicate_table_source, result_unwrap(duplicate_table_ast), existing_catalog)
+    if result_is_ok(duplicate_table) or result_unwrap_error(duplicate_table).code != 3002: return false
+
+    let wrong_default_source: Text = "CREATE TABLE wrong_default (id BIGINT PRIMARY KEY, age INTEGER DEFAULT 'old')"
+    let wrong_default_ast: Result[YazaSqlCreateTableAstV1, Text] = yaza_sql_parse_create_table_v1(wrong_default_source)
+    if not result_is_ok(wrong_default_ast): return false
+    let wrong_default: Result[YazaSqlCreateTablePlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_create_table_v1(wrong_default_source, result_unwrap(wrong_default_ast), yazabase_sql_create_table_v1_empty_catalog())
+    if result_is_ok(wrong_default) or result_unwrap_error(wrong_default).code != 3003: return false
+
+    let not_null_default_source: Text = "CREATE TABLE null_default (id BIGINT PRIMARY KEY, age INTEGER NOT NULL DEFAULT NULL)"
+    let not_null_default_ast: Result[YazaSqlCreateTableAstV1, Text] = yaza_sql_parse_create_table_v1(not_null_default_source)
+    if not result_is_ok(not_null_default_ast): return false
+    let not_null_default: Result[YazaSqlCreateTablePlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_create_table_v1(not_null_default_source, result_unwrap(not_null_default_ast), yazabase_sql_create_table_v1_empty_catalog())
+    if result_is_ok(not_null_default) or result_unwrap_error(not_null_default).code != 3003: return false
+    return true
+
+fn yazabase_sql_create_table_v1_decimal_type_syntax() -> Boolean:
+    let source: Text = "CREATE TABLE amounts (id BIGINT PRIMARY KEY, amount DECIMAL(18, 4))"
+    let parsed: Result[YazaSqlCreateTableAstV1, Text] = yaza_sql_parse_create_table_v1(source)
+    if not result_is_ok(parsed): return false
+    let columns: List[YazaSqlCreateColumnAstV1] = result_unwrap(parsed).columns
+    if list_count(columns) != 2: return false
+    let amount: YazaSqlCreateColumnAstV1 = list_get(columns, 1)
+    if amount.type_id != 10 or amount.precision != 18 or amount.scale != 4: return false
+    let bound: Result[YazaSqlCreateTablePlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_create_table_v1(source, result_unwrap(parsed), yazabase_sql_create_table_v1_empty_catalog())
+    if not result_is_ok(bound): return false
+    let plan: YazaSqlCreateTablePlanV1 = result_unwrap(bound)
+    let bound_amount: YazaSqlColumnSchemaV1 = list_get(plan.columns, 1)
+    if bound_amount.type_id != 10 or bound_amount.precision != 18 or bound_amount.scale != 4: return false
+    let bad_precision: Result[YazaSqlCreateTableAstV1, Text] = yaza_sql_parse_create_table_v1("CREATE TABLE bad (id BIGINT PRIMARY KEY, amount DECIMAL(39, 2))")
+    if result_is_ok(bad_precision): return false
+    let bad_scale: Result[YazaSqlCreateTableAstV1, Text] = yaza_sql_parse_create_table_v1("CREATE TABLE bad (id BIGINT PRIMARY KEY, amount NUMERIC(4, 5))")
+    if result_is_ok(bad_scale): return false
+    let missing_precision: Result[YazaSqlCreateTableAstV1, Text] = yaza_sql_parse_create_table_v1("CREATE TABLE bad (id BIGINT PRIMARY KEY, amount DECIMAL)")
+    if result_is_ok(missing_precision): return false
+    return true
+
+fn yazabase_sql_create_table_v1_unique_constraints() -> Boolean:
+    let source: Text = "CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT UNIQUE, handle TEXT, UNIQUE (handle))"
+    let parsed: Result[YazaSqlCreateTableAstV1, Text] = yaza_sql_parse_create_table_v1(source)
+    if not result_is_ok(parsed): return false
+    let ast: YazaSqlCreateTableAstV1 = result_unwrap(parsed)
+    if list_count(ast.unique_columns) != 2: return false
+    let bound: Result[YazaSqlCreateTablePlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_create_table_v1(source, ast, yazabase_sql_create_table_v1_empty_catalog())
+    if not result_is_ok(bound): return false
+    let plan: YazaSqlCreateTablePlanV1 = result_unwrap(bound)
+    if list_count(plan.unique_ordinals) != 2 or list_get(plan.unique_ordinals, 0) != 1 or list_get(plan.unique_ordinals, 1) != 2: return false
+    let non_unique_null_source: Text = "CREATE TABLE optional_names (id BIGINT PRIMARY KEY, email TEXT NULL UNIQUE)"
+    let non_unique_null_ast: Result[YazaSqlCreateTableAstV1, Text] = yaza_sql_parse_create_table_v1(non_unique_null_source)
+    if not result_is_ok(non_unique_null_ast): return false
+    let non_unique_null_plan: Result[YazaSqlCreateTablePlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_create_table_v1(non_unique_null_source, result_unwrap(non_unique_null_ast), yazabase_sql_create_table_v1_empty_catalog())
+    if not result_is_ok(non_unique_null_plan) or list_get(result_unwrap(non_unique_null_plan).columns, 1).nullable == false: return false
+    let composite_unique: Result[YazaSqlCreateTableAstV1, Text] = yaza_sql_parse_create_table_v1("CREATE TABLE bad_unique (id BIGINT PRIMARY KEY, tenant INT, UNIQUE (tenant, id))")
+    if result_is_ok(composite_unique): return false
+    let unknown_unique_source: Text = "CREATE TABLE bad_unique (id BIGINT PRIMARY KEY, UNIQUE (missing))"
+    let unknown_unique_ast: Result[YazaSqlCreateTableAstV1, Text] = yaza_sql_parse_create_table_v1(unknown_unique_source)
+    if not result_is_ok(unknown_unique_ast): return false
+    let unknown_unique: Result[YazaSqlCreateTablePlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_create_table_v1(unknown_unique_source, result_unwrap(unknown_unique_ast), yazabase_sql_create_table_v1_empty_catalog())
+    if result_is_ok(unknown_unique): return false
+    let repeated_unique_source: Text = "CREATE TABLE bad_unique (id BIGINT PRIMARY KEY, email TEXT UNIQUE, UNIQUE (email))"
+    let repeated_unique_ast: Result[YazaSqlCreateTableAstV1, Text] = yaza_sql_parse_create_table_v1(repeated_unique_source)
+    if not result_is_ok(repeated_unique_ast): return false
+    let repeated_unique: Result[YazaSqlCreateTablePlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_create_table_v1(repeated_unique_source, result_unwrap(repeated_unique_ast), yazabase_sql_create_table_v1_empty_catalog())
+    if result_is_ok(repeated_unique): return false
+    return true
+
+fn yazabase_sql_create_table_v1_decimal_catalog_flags() -> Boolean:
+    let encoded: Result[Number, Text] = yaza_db_catalog_column_type_flags_encode_v1(10, 18, 4)
+    if not result_is_ok(encoded): return false
+    let flags: Number = result_unwrap(encoded)
+    if flags != 70144 or not yaza_db_catalog_column_type_flags_valid_v1(10, flags): return false
+    if yaza_db_catalog_column_type_precision_v1(10, flags) != 18 or yaza_db_catalog_column_type_scale_v1(10, flags) != 4: return false
+    if not yaza_db_catalog_column_type_flags_valid_v1(9, 0) or yaza_db_catalog_column_type_flags_valid_v1(9, flags): return false
+    if yaza_db_catalog_column_type_flags_valid_v1(10, flags + 1) or yaza_db_catalog_column_type_flags_valid_v1(10, flags + 1048576): return false
+    if result_is_ok(yaza_db_catalog_column_type_flags_encode_v1(10, 0, 0)) or result_is_ok(yaza_db_catalog_column_type_flags_encode_v1(10, 7, 8)): return false
+    if result_is_ok(yaza_db_catalog_column_type_flags_encode_v1(9, 18, 4)): return false
+    return true
+
+fn yazabase_sql_create_table_v1_check_constraints() -> Boolean:
+    let source: Text = "CREATE TABLE people (id BIGINT, age SMALLINT, PRIMARY KEY (id), CHECK (age >= 18))"
+    let parsed: Result[YazaSqlCreateTableAstV1, Text] = yaza_sql_parse_create_table_v1(source)
+    if not result_is_ok(parsed): return false
+    let ast: YazaSqlCreateTableAstV1 = result_unwrap(parsed)
+    if list_count(ast.check_constraints) != 1: return false
+    let ast_check: YazaSqlCreateCheckAstV1 = list_get(ast.check_constraints, 0)
+    if ast_check.comparison_operator != 6 or ast_check.literal_kind != 3 or text_slice(source, ast_check.literal_start_byte, ast_check.literal_end_byte - ast_check.literal_start_byte) != "18": return false
+    let bound: Result[YazaSqlCreateTablePlanV1, YazaSqlDiagnosticV1] = yaza_sql_bind_create_table_v1(source, ast, yazabase_sql_create_table_v1_empty_catalog())
+    if not result_is_ok(bound): return false
+    let plan: YazaSqlCreateTablePlanV1 = result_unwrap(bound)
+    if list_count(plan.check_constraints) != 1: return false
+    if list_get(plan.check_constraints, 0).column_ordinal != 1 or list_get(plan.check_constraints, 0).comparison_operator != 6 or list_get(plan.check_constraints, 0).literal != "18": return false
+
+    let bad_column_source: Text = "CREATE TABLE bad_check (id BIGINT PRIMARY KEY, age SMALLINT, CHECK (missing >= 18))"
+    let bad_column_ast: Result[YazaSqlCreateTableAstV1, Text] = yaza_sql_parse_create_table_v1(bad_column_source)
+    if not result_is_ok(bad_column_ast): return false
+    if result_is_ok(yaza_sql_bind_create_table_v1(bad_column_source, result_unwrap(bad_column_ast), yazabase_sql_create_table_v1_empty_catalog())): return false
+
+    let type_mismatch_source: Text = "CREATE TABLE bad_check_type (id BIGINT PRIMARY KEY, age TEXT, CHECK (age >= 18))"
+    let type_mismatch_ast: Result[YazaSqlCreateTableAstV1, Text] = yaza_sql_parse_create_table_v1(type_mismatch_source)
+    if not result_is_ok(type_mismatch_ast): return false
+    if result_is_ok(yaza_sql_bind_create_table_v1(type_mismatch_source, result_unwrap(type_mismatch_ast), yazabase_sql_create_table_v1_empty_catalog())): return false
+    return true
+
+start:
+    let initial_used: Number = arena_used()
+    arena_scope 262144:
+        assert yazabase_sql_create_table_v1_parse_and_bind()
+        assert yazabase_sql_create_table_v1_composite_key()
+        assert yazabase_sql_create_table_v1_rejections()
+        assert yazabase_sql_create_table_v1_decimal_type_syntax()
+        assert yazabase_sql_create_table_v1_unique_constraints()
+        assert yazabase_sql_create_table_v1_decimal_catalog_flags()
+        assert yazabase_sql_create_table_v1_check_constraints()
+    assert arena_used() == initial_used
+    say "yazabase-sql-create-table-v1-ok"

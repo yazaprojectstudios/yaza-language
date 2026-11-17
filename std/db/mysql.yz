@@ -1,0 +1,78 @@
+# Provider adapter from MySQL result packets and column definitions to DbValue and DbRow.
+use "core"
+use "query"
+use "../mysql/protocol"
+
+shape DbMysqlQueryResult:
+    columns: List[MysqlColumnDefinition]
+    rows: List[MysqlRow]
+    affected_rows: Number
+    last_insert_id: Number
+
+fn db_mysql_error(kind: DbErrorKind, message: Text) -> DbError:
+    let code: Option[Text] = none
+    return db_error(kind, message, code, false)
+
+fn db_mysql_decode_cell(col_def: MysqlColumnDefinition, cell_text: Text, is_null: Boolean) -> Result[DbValue, DbError]:
+    if is_null:
+        return ok(DbValue::Null)
+    let t: Number = col_def.column_type
+    if t == 1 or t == 2 or t == 3 or t == 9:
+        let parsed: Result[Number, Text] = number_try_parse(cell_text)
+        if not result_is_ok(parsed):
+            return err(db_mysql_error(DbErrorKind::Protocol, "MySQL integer conversion failed"))
+        let n: Number = result_unwrap(parsed)
+        if n < -2147483648 or n > 2147483647:
+            return err(db_mysql_error(DbErrorKind::Protocol, "MySQL integer outside 32-bit range"))
+        return ok(DbValue::Int32Value(int32_from_number(n)))
+    if t == 8:
+        let parsed64: Result[Number, Text] = number_try_parse(cell_text)
+        if not result_is_ok(parsed64):
+            return err(db_mysql_error(DbErrorKind::Protocol, "MySQL bigint conversion failed"))
+        return ok(DbValue::Int64Value(result_unwrap(parsed64)))
+    if t == 4 or t == 5:
+        let parsed_f: Result[Float64, Text] = float64_try_parse(cell_text)
+        if not result_is_ok(parsed_f):
+            return err(db_mysql_error(DbErrorKind::Protocol, "MySQL float/double conversion failed"))
+        return ok(DbValue::Float64Value(result_unwrap(parsed_f)))
+    if t == 0 or t == 246:
+        if not db_decimal_text_valid(cell_text):
+            return err(db_mysql_error(DbErrorKind::Protocol, "MySQL decimal format invalid"))
+        return ok(DbValue::DecimalValue(cell_text))
+    if t == 10 or t == 14:
+        if not db_date_text_valid(cell_text):
+            return err(db_mysql_error(DbErrorKind::Protocol, "MySQL date format invalid"))
+        return ok(DbValue::DateValue(cell_text))
+    if t == 11 or t == 19:
+        if not db_time_text_valid(cell_text):
+            return err(db_mysql_error(DbErrorKind::Protocol, "MySQL time format invalid"))
+        return ok(DbValue::TimeValue(cell_text))
+    if t == 7 or t == 12 or t == 17 or t == 18:
+        if not db_timestamp_text_valid(cell_text):
+            return err(db_mysql_error(DbErrorKind::Protocol, "MySQL timestamp format invalid"))
+        return ok(DbValue::TimestampValue(cell_text))
+    if t == 245:
+        if not json_is_valid(cell_text):
+            return err(db_mysql_error(DbErrorKind::Protocol, "MySQL JSON format invalid"))
+        return ok(DbValue::JsonValue(cell_text))
+    if t == 252:
+        return ok(DbValue::BytesValue(bytes_from_text(cell_text)))
+    return ok(DbValue::TextValue(cell_text))
+
+fn db_mysql_row_to_dbrow(columns: List[MysqlColumnDefinition], row: MysqlRow) -> Result[DbRow, DbError]:
+    let col_count: Number = list_count(columns)
+    if list_count(row.cell_values) != col_count or list_count(row.cell_is_null) != col_count:
+        return err(db_mysql_error(DbErrorKind::Protocol, "MySQL row column count mismatch"))
+    let db_cols: List[DbColumn] = List[DbColumn]()
+    var idx: Number = 0
+    while idx < col_count:
+        let cdef: MysqlColumnDefinition = list_get(columns, idx)
+        let raw_val: Text = list_get(row.cell_values, idx)
+        let is_null_str: Text = list_get(row.cell_is_null, idx)
+        let is_null: Boolean = is_null_str == "true"
+        let val_res: Result[DbValue, DbError] = db_mysql_decode_cell(cdef, raw_val, is_null)
+        if not result_is_ok(val_res):
+            return err(result_unwrap_error(val_res))
+        list_push(db_cols, DbColumn(cdef.name, result_unwrap(val_res)))
+        set idx = idx + 1
+    return ok(DbRow(db_cols))

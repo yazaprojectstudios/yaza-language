@@ -1,0 +1,150 @@
+# Key-Value NoSQL wire protocol: REdis Serialization Protocol (RESP2/RESP3).
+# Pure YAZA codec decoupled from relational SQL semantics.
+
+shape KvParsedItem:
+    value_text: Text
+    value_int: Number
+    is_null: Boolean
+    is_error: Boolean
+    bytes_consumed: Number
+
+fn kv_crlf() -> Bytes:
+    return bytes_concat(bytes_from_number(13), bytes_from_number(10))
+
+fn kv_encode_simple_string(str: Text) -> Bytes:
+    var b: Bytes = bytes_concat(bytes_from_number(43), bytes_from_text(str)) # '+'
+    return bytes_concat(b, kv_crlf())
+
+fn kv_encode_error(err_msg: Text) -> Bytes:
+    var b: Bytes = bytes_concat(bytes_from_number(45), bytes_from_text(err_msg)) # '-'
+    return bytes_concat(b, kv_crlf())
+
+fn kv_encode_integer(val: Number) -> Bytes:
+    var b: Bytes = bytes_concat(bytes_from_number(58), bytes_from_text(number_text(val))) # ':'
+    return bytes_concat(b, kv_crlf())
+
+fn kv_encode_bulk_string(str: Text) -> Bytes:
+    let raw: Bytes = bytes_from_text(str)
+    let len_text: Text = number_text(bytes_length(raw))
+    var b: Bytes = bytes_concat(bytes_from_number(36), bytes_from_text(len_text)) # '$'
+    set b = bytes_concat(b, kv_crlf())
+    set b = bytes_concat(b, raw)
+    return bytes_concat(b, kv_crlf())
+
+fn kv_encode_null() -> Bytes:
+    var b: Bytes = bytes_concat(bytes_from_number(36), bytes_from_text("-1"))
+    return bytes_concat(b, kv_crlf())
+
+fn kv_encode_command(cmd: Text, args: TextList) -> Bytes:
+    let count: Number = 1 + list_count(args)
+    var b: Bytes = bytes_concat(bytes_from_number(42), bytes_from_text(number_text(count))) # '*'
+    set b = bytes_concat(b, kv_crlf())
+    set b = bytes_concat(b, kv_encode_bulk_string(cmd))
+    var idx: Number = 0
+    while idx < list_count(args):
+        set b = bytes_concat(b, kv_encode_bulk_string(list_get(args, idx)))
+        set idx = idx + 1
+    return b
+
+fn kv_find_crlf(payload: Bytes, offset: Number) -> Number:
+    let total: Number = bytes_length(payload)
+    var idx: Number = offset
+    while idx + 1 < total:
+        if bytes_get(payload, idx) == 13 and bytes_get(payload, idx + 1) == 10:
+            return idx
+        set idx = idx + 1
+    return -1
+
+fn kv_parse_response(payload: Bytes, offset: Number) -> Result[KvParsedItem, Text]:
+    let total: Number = bytes_length(payload)
+    if offset < 0 or offset >= total:
+        return err("RESP buffer underflow")
+    let prefix: Number = bytes_get(payload, offset)
+    # Simple String '+'
+    if prefix == 43:
+        let end_idx: Number = kv_find_crlf(payload, offset + 1)
+        if end_idx < 0: return err("RESP incomplete simple string")
+        let str_bytes: Bytes = bytes_slice(payload, offset + 1, end_idx - offset - 1)
+        let opt: Option[Text] = bytes_to_text_checked(str_bytes)
+        if not option_is_some(opt): return err("RESP invalid UTF-8 string")
+        let consumed: Number = end_idx - offset + 2
+        return ok(KvParsedItem(option_unwrap(opt), 0, false, false, consumed))
+    # Simple Error '-'
+    if prefix == 45:
+        let end_idx: Number = kv_find_crlf(payload, offset + 1)
+        if end_idx < 0: return err("RESP incomplete error string")
+        let str_bytes: Bytes = bytes_slice(payload, offset + 1, end_idx - offset - 1)
+        let opt: Option[Text] = bytes_to_text_checked(str_bytes)
+        if not option_is_some(opt): return err("RESP invalid UTF-8 error")
+        let consumed: Number = end_idx - offset + 2
+        return ok(KvParsedItem(option_unwrap(opt), 0, false, true, consumed))
+    # Integer ':'
+    if prefix == 58:
+        let end_idx: Number = kv_find_crlf(payload, offset + 1)
+        if end_idx < 0: return err("RESP incomplete integer")
+        let int_str: Option[Text] = bytes_to_text_checked(bytes_slice(payload, offset + 1, end_idx - offset - 1))
+        if not option_is_some(int_str): return err("RESP invalid integer encoding")
+        let parsed: Result[Number, Text] = number_try_parse(option_unwrap(int_str))
+        if not result_is_ok(parsed): return err("RESP non-numeric integer text")
+        let consumed: Number = end_idx - offset + 2
+        return ok(KvParsedItem(option_unwrap(int_str), result_unwrap(parsed), false, false, consumed))
+    # Bulk String '$'
+    if prefix == 36:
+        let end_len_idx: Number = kv_find_crlf(payload, offset + 1)
+        if end_len_idx < 0: return err("RESP incomplete bulk length")
+        let len_str: Option[Text] = bytes_to_text_checked(bytes_slice(payload, offset + 1, end_len_idx - offset - 1))
+        if not option_is_some(len_str): return err("RESP invalid length encoding")
+        let parsed_len: Result[Number, Text] = number_try_parse(option_unwrap(len_str))
+        if not result_is_ok(parsed_len): return err("RESP non-numeric bulk length")
+        let len_val: Number = result_unwrap(parsed_len)
+        if len_val < 0:
+            # Null bulk string ($-1\r\n)
+            let consumed: Number = end_len_idx - offset + 2
+            return ok(KvParsedItem("", 0, true, false, consumed))
+        let data_start: Number = end_len_idx + 2
+        if data_start + len_val + 2 > total: return err("RESP bulk string truncated")
+        let str_bytes: Bytes = bytes_slice(payload, data_start, len_val)
+        let opt: Option[Text] = bytes_to_text_checked(str_bytes)
+        if not option_is_some(opt): return err("RESP bulk string invalid UTF-8")
+        let consumed: Number = data_start + len_val + 2 - offset
+        return ok(KvParsedItem(option_unwrap(opt), 0, false, false, consumed))
+    return err("RESP unsupported type prefix")
+
+# High-level Key-Value commands
+fn kv_ping() -> Bytes:
+    let args: TextList = text_list()
+    return kv_encode_command("PING", args)
+
+fn kv_get(key: Text) -> Bytes:
+    let args: TextList = text_list()
+    list_push(args, key)
+    return kv_encode_command("GET", args)
+
+fn kv_set(key: Text, value: Text) -> Bytes:
+    let args: TextList = text_list()
+    list_push(args, key)
+    list_push(args, value)
+    return kv_encode_command("SET", args)
+
+fn kv_set_ex(key: Text, value: Text, seconds: Number) -> Bytes:
+    let args: TextList = text_list()
+    list_push(args, key)
+    list_push(args, value)
+    list_push(args, "EX")
+    list_push(args, number_text(seconds))
+    return kv_encode_command("SET", args)
+
+fn kv_del(key: Text) -> Bytes:
+    let args: TextList = text_list()
+    list_push(args, key)
+    return kv_encode_command("DEL", args)
+
+fn kv_exists(key: Text) -> Bytes:
+    let args: TextList = text_list()
+    list_push(args, key)
+    return kv_encode_command("EXISTS", args)
+
+fn kv_incr(key: Text) -> Bytes:
+    let args: TextList = text_list()
+    list_push(args, key)
+    return kv_encode_command("INCR", args)

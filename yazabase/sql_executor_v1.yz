@@ -1,0 +1,1658 @@
+# Bounded in-memory execution profile, including pre-materialized INNER/LEFT/normalized RIGHT JOIN rows, for Phase 3.
+# Supported scalar types: BOOLEAN, SMALLINT, INTEGER, BIGINT, DOUBLE, TEXT, DECIMAL, DATE, UUID, TIME, TIMESTAMP, TIMESTAMPTZ, BLOB.
+# SQL NULL uses an explicit tagged value and three-valued predicate semantics.
+# REAL remains unsupported pending an exact storage and conversion contract.
+use "sql_binder_v1"
+use "./sql_decimal_v1"
+use "./sql_date_v1"
+use "./sql_uuid_v1"
+use "./sql_temporal_v1"
+use "./sql_literal_v1"
+
+shape YazaSqlValueV1:
+    type_id: Number
+    # For DECIMAL, integer_value packs precision*64 + scale. Other tags use it
+    # as their ordinary integer payload, keeping the common value shape small.
+    integer_value: Number
+    float_value: Float64
+    boolean_value: Boolean
+    text_value: Text
+    bytes_value: Bytes
+    source_literal: Boolean
+    source_start_byte: Number
+    source_end_byte: Number
+    is_null: Boolean
+
+shape YazaSqlMemoryTableV1:
+    table_id: Number
+    catalog_version: Number
+    column_type_ids: List[Number]
+    rows: List[List[YazaSqlValueV1]]
+    join_work_units: Number
+
+shape YazaSqlQueryResultV1:
+    columns: List[YazaSqlBoundProjectionV1]
+    rows: List[List[YazaSqlValueV1]]
+    work_units: Number
+    auxiliary_rows: Number
+    auxiliary_cells: Number
+    auxiliary_text_bytes: Number
+
+shape YazaSqlSubqueryValuesV1:
+    values: List[YazaSqlValueV1]
+    pairs: List[List[YazaSqlValueV1]]
+    has_rows: Boolean
+    work_units: Number
+    retained_rows: Number
+    retained_cells: Number
+    retained_text_bytes: Number
+
+shape YazaSqlRowsHandleV1:
+    rows: List[List[YazaSqlValueV1]]
+
+shape YazaSqlSubquerySearchRangeV1:
+    start: Number
+    end: Number
+
+shape YazaSqlExecutorInputProfileV1:
+    cell_count: Number
+    text_byte_count: Number
+    max_text_bytes: Number
+
+fn yaza_sql_executor_value_v1(type_id: Number, integer_value: Number, float_value: Float64, boolean_value: Boolean, text_value: Text) -> YazaSqlValueV1:
+    return YazaSqlValueV1(type_id, integer_value, float_value, boolean_value, text_value, bytes_empty(), false, -1, -1, false)
+
+fn yaza_sql_value_null_v1(type_id: Number) -> Result[YazaSqlValueV1, Text]:
+    if not yaza_sql_executor_type_supported_v1(type_id): return err("SQL NULL constructor requires a supported scalar type ID")
+    return ok(YazaSqlValueV1(type_id, 0, 0.0, false, "", bytes_empty(), false, -1, -1, true))
+
+fn yaza_sql_value_blob_v1(value: Bytes) -> Result[YazaSqlValueV1, Text]:
+    if bytes_length(value) > 67108864: return err("SQL BLOB exceeds its 64 MiB value limit")
+    return ok(YazaSqlValueV1(16, 0, 0.0, false, "", value, false, -1, -1, false))
+
+fn yaza_sql_value_variable_length_v1(value: YazaSqlValueV1) -> Result[Number, Text]:
+    if value.type_id == 9: return ok(text_length(value.text_value))
+    if value.type_id == 16:
+        let length: Number = bytes_length(value.bytes_value)
+        if length > 67108864: return err("SQL BLOB exceeds its 64 MiB value limit")
+        return ok(length)
+    return err("SQL variable-length value requires TEXT or BLOB")
+
+fn yaza_sql_value_integer_v1(type_id: Number, value: Number) -> Result[YazaSqlValueV1, Text]:
+    if type_id == 11:
+        let date_text: Text = yaza_sql_date_to_text_v1(value)?
+        return ok(yaza_sql_executor_value_v1(11, value, 0.0, false, date_text))
+    if type_id == 13:
+        let time_text: Text = yaza_sql_time_to_text_v1(value)?
+        return ok(yaza_sql_executor_value_v1(13, value, 0.0, false, time_text))
+    if type_id == 14:
+        let timestamp_text: Text = yaza_sql_timestamp_to_text_v1(value)?
+        return ok(yaza_sql_executor_value_v1(14, value, 0.0, false, timestamp_text))
+    if type_id == 15:
+        let timestamp_text: Text = yaza_sql_timestamptz_to_text_v1(value)?
+        return ok(yaza_sql_executor_value_v1(15, value, 0.0, false, timestamp_text))
+    if type_id == 2:
+        if value < -32768 or value > 32767: return err("SQL SMALLINT value is out of range")
+    elif type_id == 3:
+        if value < -2147483648 or value > 2147483647: return err("SQL INTEGER value is out of range")
+    elif type_id != 4:
+        return err("SQL integer constructor requires SMALLINT, INTEGER, or BIGINT type ID")
+    return ok(yaza_sql_executor_value_v1(type_id, value, 0.0, false, ""))
+
+fn yaza_sql_value_uuid_v1(value: Text) -> Result[YazaSqlValueV1, Text]:
+    let canonical: Text = yaza_sql_uuid_canonical_v1(value)?
+    return ok(yaza_sql_executor_value_v1(12, 0, 0.0, false, canonical))
+
+fn yaza_sql_value_double_v1(value: Float64) -> YazaSqlValueV1:
+    return yaza_sql_executor_value_v1(6, 0, value, false, "")
+
+fn yaza_sql_value_boolean_v1(value: Boolean) -> YazaSqlValueV1:
+    return yaza_sql_executor_value_v1(1, 0, 0.0, value, "")
+
+fn yaza_sql_value_text_v1(value: Text) -> YazaSqlValueV1:
+    return yaza_sql_executor_value_v1(9, 0, 0.0, false, value)
+
+fn yaza_sql_value_decimal_precision_v1(value: YazaSqlValueV1) -> Number:
+    return value.integer_value / 64
+
+fn yaza_sql_value_decimal_scale_v1(value: YazaSqlValueV1) -> Number:
+    return value.integer_value % 64
+
+fn yaza_sql_value_decimal_v1(value: YazaSqlDecimalV1) -> Result[YazaSqlValueV1, Text]:
+    let valid: Boolean = yaza_sql_decimal_validate_v1(value)?
+    let text_value: Text = yaza_sql_decimal_to_text_v1(value)?
+    return ok(YazaSqlValueV1(10, value.precision * 64 + value.scale, 0.0, false, text_value, bytes_empty(), false, -1, -1, false))
+
+fn yaza_sql_executor_type_supported_v1(type_id: Number) -> Boolean:
+    return type_id == 1 or type_id == 2 or type_id == 3 or type_id == 4 or type_id == 6 or type_id == 9 or type_id == 10 or type_id == 11 or type_id == 12 or type_id == 13 or type_id == 14 or type_id == 15 or type_id == 16
+
+fn yaza_sql_executor_max_input_cells_v1() -> Number:
+    return 1048576
+
+fn yaza_sql_executor_max_input_text_bytes_v1() -> Number:
+    return 67108864
+
+fn yaza_sql_executor_max_text_value_bytes_v1() -> Number:
+    return 65536
+
+fn yaza_sql_executor_max_work_units_v1() -> Number:
+    return 100000000
+
+fn yaza_sql_executor_value_matches_v1(value: YazaSqlValueV1, type_id: Number) -> Boolean:
+    if value.source_literal or value.type_id != type_id: return false
+    if value.is_null: return true
+    if type_id == 1: return true
+    if type_id == 2: return value.integer_value >= -32768 and value.integer_value <= 32767
+    if type_id == 3: return value.integer_value >= -2147483648 and value.integer_value <= 2147483647
+    if type_id == 4 or type_id == 6 or type_id == 9: return true
+    if type_id == 16: return bytes_length(value.bytes_value) <= 67108864
+    if type_id == 11:
+        if not yaza_sql_date_valid_days_v1(value.integer_value): return false
+        let canonical_date: Result[Text, Text] = yaza_sql_date_to_text_v1(value.integer_value)
+        return result_is_ok(canonical_date) and result_unwrap(canonical_date) == value.text_value
+    if type_id == 13:
+        let canonical_time: Result[Text, Text] = yaza_sql_time_to_text_v1(value.integer_value)
+        return result_is_ok(canonical_time) and result_unwrap(canonical_time) == value.text_value
+    if type_id == 14:
+        let canonical_timestamp: Result[Text, Text] = yaza_sql_timestamp_to_text_v1(value.integer_value)
+        return result_is_ok(canonical_timestamp) and result_unwrap(canonical_timestamp) == value.text_value
+    if type_id == 15:
+        let canonical_timestamptz: Result[Text, Text] = yaza_sql_timestamptz_to_text_v1(value.integer_value)
+        return result_is_ok(canonical_timestamptz) and result_unwrap(canonical_timestamptz) == value.text_value
+    if type_id == 12:
+        let canonical_uuid: Result[Text, Text] = yaza_sql_uuid_canonical_v1(value.text_value)
+        return result_is_ok(canonical_uuid) and result_unwrap(canonical_uuid) == value.text_value
+    if type_id == 10:
+        let precision: Number = yaza_sql_value_decimal_precision_v1(value)
+        let scale: Number = yaza_sql_value_decimal_scale_v1(value)
+        if not yaza_sql_decimal_parameters_valid_v1(precision, scale): return false
+        let parsed: Result[YazaSqlDecimalV1, Text] = yaza_sql_decimal_parse_v1(value.text_value, precision, scale)
+        if not result_is_ok(parsed): return false
+        let canonical: Result[Text, Text] = yaza_sql_decimal_to_text_v1(result_unwrap(parsed))
+        return result_is_ok(canonical) and result_unwrap(canonical) == value.text_value
+    return false
+
+fn yaza_sql_executor_keyword_v1(source: Text, start_byte: Number, end_byte: Number, keyword: Text) -> Boolean:
+    if start_byte < 0 or end_byte < start_byte or end_byte > text_length(source) or end_byte - start_byte != text_length(keyword): return false
+    var index: Number = 0
+    while index < text_length(keyword):
+        var actual: Number = text_byte(source, start_byte + index)
+        let expected: Number = text_byte(keyword, index)
+        if actual >= 65 and actual <= 90: set actual = actual + 32
+        if actual != expected: return false
+        set index = index + 1
+    return true
+
+fn yaza_sql_executor_validate_plan_v1(plan: YazaSqlBoundPlanV1, table: YazaSqlMemoryTableV1) -> Result[YazaSqlExecutorInputProfileV1, Text]:
+    if plan.version != 1 or plan.table_id != table.table_id or plan.catalog_version != table.catalog_version:
+        return err("SQL executor plan does not match this table snapshot")
+    if text_length(plan.source) > 65536: return err("SQL executor SQL source exceeds the 65536-byte profile limit")
+    if table.table_id <= 0 or table.catalog_version <= 0 or list_count(table.column_type_ids) == 0 or list_count(table.column_type_ids) > 1024:
+        return err("SQL executor received invalid table metadata")
+    if plan.left_column_count <= 0 or plan.left_column_count > list_count(table.column_type_ids) or list_count(plan.join_stages) > 6:
+        return err("SQL executor plan has an invalid left-table column boundary")
+    if plan.right_table_id == 0:
+        if plan.right_column_count != 0 or plan.join_left_column_ordinal != -1 or plan.join_right_column_ordinal != -1 or plan.join_comparison_operator != 0 or list_count(plan.join_stages) != 0 or plan.left_column_count != list_count(table.column_type_ids) or table.join_work_units != 0:
+            return err("SQL executor non-join plan contains joined-table metadata")
+    else:
+        if plan.right_table_id <= 0 or plan.right_column_count <= 0 or plan.left_column_count + plan.right_column_count > list_count(table.column_type_ids):
+            return err("SQL executor plan does not match the joined row schema")
+        if list_count(plan.operators) < 3: return err("SQL executor joined plan is missing its JOIN operator")
+        let joined_kind: Number = list_get(plan.operators, 2).kind
+        if joined_kind == yaza_sql_operator_cross_join_v1():
+            if plan.join_left_column_ordinal != -1 or plan.join_right_column_ordinal != -1 or plan.join_comparison_operator != 0:
+                return err("SQL executor CROSS JOIN plan unexpectedly contains equality metadata")
+        elif joined_kind == yaza_sql_operator_theta_join_v1():
+            if plan.join_comparison_operator < 2 or plan.join_comparison_operator > 6 or plan.join_left_column_ordinal < 0 or plan.join_left_column_ordinal >= plan.left_column_count or plan.join_right_column_ordinal < 0 or plan.join_right_column_ordinal >= plan.right_column_count:
+                return err("SQL executor theta JOIN plan has an invalid comparison or key ordinal")
+        elif plan.join_comparison_operator != 1 or plan.join_left_column_ordinal < 0 or plan.join_left_column_ordinal >= plan.left_column_count or plan.join_right_column_ordinal < 0 or plan.join_right_column_ordinal >= plan.right_column_count:
+            return err("SQL executor equality JOIN plan has invalid comparison metadata or key ordinal")
+        if table.join_work_units < 0 or table.join_work_units > yaza_sql_executor_max_work_units_v1():
+            return err("SQL executor JOIN work units are outside the bounded work profile")
+        if joined_kind != yaza_sql_operator_cross_join_v1() and list_get(table.column_type_ids, plan.join_left_column_ordinal) != list_get(table.column_type_ids, plan.left_column_count + plan.join_right_column_ordinal):
+            return err("SQL executor JOIN key types do not match")
+        var accumulated_column_count: Number = plan.left_column_count + plan.right_column_count
+        var stage_index: Number = 0
+        while stage_index < list_count(plan.join_stages):
+            let stage: YazaSqlBoundJoinStageV1 = list_get(plan.join_stages, stage_index)
+            let equality_stage: Boolean = stage.join_kind == yaza_sql_operator_inner_join_v1() or stage.join_kind == yaza_sql_operator_left_join_v1() or stage.join_kind == yaza_sql_operator_right_join_v1() or stage.join_kind == yaza_sql_operator_full_join_v1()
+            let theta_stage: Boolean = stage.join_kind == yaza_sql_operator_theta_join_v1()
+            let cross_stage: Boolean = stage.join_kind == yaza_sql_operator_cross_join_v1()
+            let valid_comparison: Boolean = (equality_stage and stage.comparison_operator == 1) or (theta_stage and stage.comparison_operator >= 2 and stage.comparison_operator <= 6) or (cross_stage and stage.comparison_operator == 0)
+            if stage.table_id <= 0 or stage.column_count <= 0 or stage.column_count > 1024 or not valid_comparison:
+                return err("SQL executor additional JOIN stage is outside the supported plan profile")
+            if cross_stage:
+                if stage.left_key_ordinal != -1 or stage.right_key_ordinal != -1:
+                    return err("SQL executor additional CROSS JOIN stage unexpectedly contains key ordinals")
+            elif stage.left_key_ordinal < 0 or stage.left_key_ordinal >= accumulated_column_count or stage.right_key_ordinal < 0 or stage.right_key_ordinal >= stage.column_count:
+                return err("SQL executor additional JOIN key ordinal is outside its input schema")
+            if accumulated_column_count + stage.column_count > list_count(table.column_type_ids):
+                return err("SQL executor additional JOIN stage exceeds the flattened schema")
+            if not cross_stage and list_get(table.column_type_ids, stage.left_key_ordinal) != list_get(table.column_type_ids, accumulated_column_count + stage.right_key_ordinal):
+                return err("SQL executor additional JOIN key types do not match")
+            set accumulated_column_count = accumulated_column_count + stage.column_count
+            set stage_index = stage_index + 1
+        if accumulated_column_count != list_count(table.column_type_ids):
+            return err("SQL executor additional JOIN stages do not cover the flattened row schema")
+    if list_count(table.rows) > 65536:
+        return err("SQL executor in-memory profile is limited to 65536 input rows")
+    if list_count(plan.projections) == 0 or list_count(plan.projections) > 1024 or list_count(plan.group_by_columns) > 64 or list_count(plan.order_by) > 1024 or list_count(plan.expressions) > 4095 or list_count(plan.subqueries) > 16 or list_count(plan.subquery_parameter_ordinals) != list_count(plan.subqueries):
+        return err("SQL executor plan exceeds its structural limits")
+    if plan.has_limit and (plan.limit < 0 or plan.limit > 1000000): return err("SQL executor LIMIT is outside the bounded profile")
+    var input_cell_count: Number = 0
+    var input_text_byte_count: Number = 0
+    var max_text_bytes: Number = 0
+
+    var column_index: Number = 0
+    while column_index < list_count(table.column_type_ids):
+        let type_id: Number = list_get(table.column_type_ids, column_index)
+        if not yaza_sql_executor_type_supported_v1(type_id): return err("SQL executor table contains a scalar type outside the current exact-value profile")
+        set column_index = column_index + 1
+
+    var row_index: Number = 0
+    while row_index < list_count(table.rows):
+        let row: List[YazaSqlValueV1] = list_get(table.rows, row_index)
+        if list_count(row) != list_count(table.column_type_ids): return err("SQL executor row width does not match table schema")
+        set input_cell_count = input_cell_count + list_count(row)
+        if input_cell_count > yaza_sql_executor_max_input_cells_v1(): return err("SQL executor exceeds the bounded input-cell budget")
+        var cell_index: Number = 0
+        while cell_index < list_count(row):
+            let cell: YazaSqlValueV1 = list_get(row, cell_index)
+            let expected_type: Number = list_get(table.column_type_ids, cell_index)
+            if not yaza_sql_executor_value_matches_v1(cell, expected_type): return err("SQL executor row contains a value that does not match its declared column type")
+            if expected_type == 9 and not cell.is_null:
+                let value_text_bytes: Number = text_length(cell.text_value)
+                if value_text_bytes > yaza_sql_executor_max_text_value_bytes_v1(): return err("SQL executor text value exceeds the bounded value-size limit")
+                set input_text_byte_count = input_text_byte_count + value_text_bytes
+                if input_text_byte_count > yaza_sql_executor_max_input_text_bytes_v1(): return err("SQL executor exceeds the bounded input-text byte budget")
+                if value_text_bytes > max_text_bytes: set max_text_bytes = value_text_bytes
+            elif expected_type == 16 and not cell.is_null:
+                let value_blob_bytes: Number = bytes_length(cell.bytes_value)
+                if value_blob_bytes > 67108864: return err("SQL executor BLOB value exceeds the 64 MiB bound")
+                set input_text_byte_count = input_text_byte_count + value_blob_bytes
+                if input_text_byte_count > yaza_sql_executor_max_input_text_bytes_v1(): return err("SQL executor exceeds the bounded variable-width input byte budget")
+                if value_blob_bytes > max_text_bytes: set max_text_bytes = value_blob_bytes
+            set cell_index = cell_index + 1
+        set row_index = row_index + 1
+
+    var saw_aggregate_projection: Boolean = false
+    var saw_plain_projection: Boolean = false
+    var projection_index: Number = 0
+    while projection_index < list_count(plan.projections):
+        let projection: YazaSqlBoundProjectionV1 = list_get(plan.projections, projection_index)
+        if text_length(projection.output_name) == 0: return err("SQL executor projection metadata does not match the table")
+        if projection.aggregate_kind == 1:
+            set saw_aggregate_projection = true
+            if projection.column_ordinal != -1 or projection.type_id != 4 or projection.nullable:
+                return err("SQL executor aggregate projection metadata is malformed")
+        elif projection.aggregate_kind == 2:
+            set saw_aggregate_projection = true
+            if projection.column_ordinal < 0 or projection.column_ordinal >= list_count(table.column_type_ids):
+                return err("SQL executor SUM projection references a column outside the table")
+            let input_type_id: Number = list_get(table.column_type_ids, projection.column_ordinal)
+            var expected_sum_type: Number = 4
+            if input_type_id == 6: set expected_sum_type = 6
+            var sum_metadata_valid: Boolean = input_type_id == 2 or input_type_id == 3 or input_type_id == 4 or input_type_id == 6
+            if input_type_id == 10:
+                set sum_metadata_valid = projection.type_id == 10 and projection.precision == 38 and yaza_sql_decimal_parameters_valid_v1(projection.precision, projection.scale)
+            elif projection.precision != 0 or projection.scale != 0:
+                set sum_metadata_valid = false
+            if not sum_metadata_valid or (input_type_id != 10 and projection.type_id != expected_sum_type) or not projection.nullable:
+                return err("SQL executor SUM projection metadata is malformed")
+        elif projection.aggregate_kind == 3 or projection.aggregate_kind == 4:
+            set saw_aggregate_projection = true
+            if projection.column_ordinal < 0 or projection.column_ordinal >= list_count(table.column_type_ids):
+                return err("SQL executor MIN/MAX projection references a column outside the table")
+            let input_type_id: Number = list_get(table.column_type_ids, projection.column_ordinal)
+            if (input_type_id != 1 and input_type_id != 2 and input_type_id != 3 and input_type_id != 4 and input_type_id != 6 and input_type_id != 9 and input_type_id != 10 and input_type_id != 11 and input_type_id != 12 and input_type_id != 13 and input_type_id != 14 and input_type_id != 15 and input_type_id != 16) or projection.type_id != input_type_id or not projection.nullable:
+                return err("SQL executor MIN/MAX projection metadata is malformed")
+        elif projection.aggregate_kind == 5:
+            set saw_aggregate_projection = true
+            if projection.column_ordinal < 0 or projection.column_ordinal >= list_count(table.column_type_ids):
+                return err("SQL executor AVG projection references a column outside the table")
+            let input_type_id: Number = list_get(table.column_type_ids, projection.column_ordinal)
+            if (input_type_id != 2 and input_type_id != 3 and input_type_id != 4 and input_type_id != 6) or projection.type_id != 6 or not projection.nullable:
+                return err("SQL executor AVG projection metadata is malformed")
+        elif projection.aggregate_kind == 0:
+            set saw_plain_projection = true
+            if projection.column_ordinal < 0 or projection.column_ordinal >= list_count(table.column_type_ids): return err("SQL executor projection references a column outside the table")
+            if projection.type_id != list_get(table.column_type_ids, projection.column_ordinal):
+                return err("SQL executor projection metadata does not match the table")
+        else:
+            return err("SQL executor projection metadata has an unknown aggregate kind")
+        if projection.type_id == 10:
+            if not yaza_sql_decimal_parameters_valid_v1(projection.precision, projection.scale): return err("SQL executor DECIMAL projection metadata is invalid")
+        elif projection.precision != 0 or projection.scale != 0:
+            return err("SQL executor non-DECIMAL projection carries precision metadata")
+        set projection_index = projection_index + 1
+    if saw_aggregate_projection and list_count(plan.group_by_columns) == 0 and saw_plain_projection: return err("SQL executor plan mixes aggregate and non-aggregate projections")
+    var group_column_index: Number = 0
+    while group_column_index < list_count(plan.group_by_columns):
+        let group_column_ordinal: Number = list_get(plan.group_by_columns, group_column_index)
+        if group_column_ordinal < 0 or group_column_ordinal >= list_count(table.column_type_ids): return err("SQL executor GROUP BY references a column outside the table")
+        let group_type_id: Number = list_get(table.column_type_ids, group_column_ordinal)
+        if group_type_id != 1 and group_type_id != 2 and group_type_id != 3 and group_type_id != 4 and group_type_id != 6 and group_type_id != 9 and group_type_id != 10 and group_type_id != 11 and group_type_id != 12 and group_type_id != 13 and group_type_id != 14 and group_type_id != 15 and group_type_id != 16:
+            return err("SQL executor GROUP BY references a non-groupable type")
+        var prior_group_index: Number = 0
+        while prior_group_index < group_column_index:
+            if list_get(plan.group_by_columns, prior_group_index) == group_column_ordinal: return err("SQL executor GROUP BY column list contains a duplicate")
+            set prior_group_index = prior_group_index + 1
+        set group_column_index = group_column_index + 1
+    if list_count(plan.group_by_columns) == 0 and saw_aggregate_projection and list_count(plan.order_by) > 0: return err("SQL executor ungrouped aggregate plan cannot contain ORDER BY in v1")
+    if list_count(plan.group_by_columns) > 0 and saw_plain_projection:
+        var group_projection_index: Number = 0
+        while group_projection_index < list_count(plan.projections):
+            let group_projection: YazaSqlBoundProjectionV1 = list_get(plan.projections, group_projection_index)
+            if group_projection.aggregate_kind == 0:
+                var is_group_key: Boolean = false
+                var group_key_index: Number = 0
+                while group_key_index < list_count(plan.group_by_columns):
+                    if list_get(plan.group_by_columns, group_key_index) == group_projection.column_ordinal: set is_group_key = true
+                    set group_key_index = group_key_index + 1
+                if not is_group_key: return err("SQL executor non-aggregate projection is not a GROUP BY column")
+            set group_projection_index = group_projection_index + 1
+    let uses_aggregate_operator: Boolean = saw_aggregate_projection or list_count(plan.group_by_columns) > 0
+    var intermediate_cell_count: Number = list_count(table.rows) * list_count(plan.projections)
+    if saw_aggregate_projection and list_count(plan.group_by_columns) == 0: set intermediate_cell_count = list_count(plan.projections)
+    if intermediate_cell_count > yaza_sql_executor_max_input_cells_v1():
+        return err("SQL executor exceeds the bounded intermediate-result cell budget")
+
+    var order_index: Number = 0
+    while order_index < list_count(plan.order_by):
+        let order_term: YazaSqlBoundOrderTermV1 = list_get(plan.order_by, order_index)
+        if order_term.projection_ordinal < 0 or order_term.projection_ordinal >= list_count(plan.projections):
+            return err("SQL executor ORDER BY references a column outside the projection")
+        set order_index = order_index + 1
+
+    var parameter_index: Number = 0
+    while parameter_index < list_count(plan.parameters):
+        let parameter: YazaSqlBoundParameterV1 = list_get(plan.parameters, parameter_index)
+        if parameter.ordinal != parameter_index or not yaza_sql_executor_type_supported_v1(parameter.type_id):
+            return err("SQL executor parameter metadata is malformed or uses an unsupported type")
+        set parameter_index = parameter_index + 1
+
+    if plan.having_start_index < 0 or plan.having_start_index > list_count(plan.expressions):
+        return err("SQL executor plan has an invalid HAVING expression boundary")
+    if plan.where_root < -1 or (plan.where_root >= 0 and plan.where_root >= plan.having_start_index):
+        return err("SQL executor WHERE root is outside its expression range")
+    if plan.having_root < -1 or (plan.having_root >= 0 and (plan.having_root < plan.having_start_index or plan.having_root >= list_count(plan.expressions))):
+        return err("SQL executor HAVING root is outside its expression range")
+    if plan.having_root < 0 and plan.having_start_index != list_count(plan.expressions):
+        return err("SQL executor plan has HAVING expressions without a HAVING root")
+    if plan.where_root < 0 and plan.having_start_index != 0:
+        return err("SQL executor plan has WHERE expressions without a WHERE root")
+    if plan.where_root >= 0 and plan.having_start_index == 0:
+        return err("SQL executor WHERE root is outside the expression list")
+
+    let parent_counts_result: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(parent_counts_result): return err("SQL executor could not allocate expression-tree validation state")
+    var parent_counts: List[Number] = result_unwrap(parent_counts_result)
+    if not list_try_reserve(parent_counts, list_count(plan.expressions)): return err("SQL executor could not reserve expression-tree validation state")
+    var parent_init_index: Number = 0
+    while parent_init_index < list_count(plan.expressions):
+        if not list_try_push(parent_counts, 0): return err("SQL executor could not initialize expression-tree validation state")
+        set parent_init_index = parent_init_index + 1
+    let subquery_ref_counts_result: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(subquery_ref_counts_result): return err("SQL executor could not allocate subquery-reference validation state")
+    let subquery_ref_counts: List[Number] = result_unwrap(subquery_ref_counts_result)
+    if not list_try_reserve(subquery_ref_counts, list_count(plan.subqueries)): return err("SQL executor could not reserve subquery-reference validation state")
+    var subquery_ref_init_index: Number = 0
+    while subquery_ref_init_index < list_count(plan.subqueries):
+        if not list_try_push(subquery_ref_counts, 0): return err("SQL executor could not initialize subquery-reference validation state")
+        let parameter_ordinals: List[Number] = list_get(plan.subquery_parameter_ordinals, subquery_ref_init_index)
+        if list_count(parameter_ordinals) > 4096: return err("SQL executor subquery parameter map exceeds its bound")
+        var parameter_map_index: Number = 0
+        while parameter_map_index < list_count(parameter_ordinals):
+            let parameter_ordinal: Number = list_get(parameter_ordinals, parameter_map_index)
+            if parameter_ordinal < 0 or parameter_ordinal >= list_count(plan.parameters): return err("SQL executor subquery parameter map references an absent statement parameter")
+            var prior_map_index: Number = 0
+            while prior_map_index < parameter_map_index:
+                if list_get(parameter_ordinals, prior_map_index) == parameter_ordinal: return err("SQL executor subquery parameter map contains a duplicate global ordinal")
+                set prior_map_index = prior_map_index + 1
+            set parameter_map_index = parameter_map_index + 1
+        set subquery_ref_init_index = subquery_ref_init_index + 1
+
+    var expression_index: Number = 0
+    while expression_index < list_count(plan.expressions):
+        let node: YazaSqlBoundExpressionNodeV1 = list_get(plan.expressions, expression_index)
+        let is_having_expression: Boolean = expression_index >= plan.having_start_index
+        var expression_column_count: Number = list_count(table.column_type_ids)
+        if is_having_expression: set expression_column_count = list_count(plan.projections)
+        if node.kind == 1:
+            if node.column_ordinal < 0 or node.column_ordinal >= expression_column_count or node.operator < 1 or node.operator > 10:
+                return err("SQL executor received an invalid comparison node")
+            var expected_comparison_type: Number = 0
+            if is_having_expression: set expected_comparison_type = list_get(plan.projections, node.column_ordinal).type_id
+            else: set expected_comparison_type = list_get(table.column_type_ids, node.column_ordinal)
+            if node.type_id != expected_comparison_type or not yaza_sql_executor_type_supported_v1(node.type_id):
+                return err("SQL executor comparison type does not match its input schema")
+            if node.type_id == 10:
+                if not yaza_sql_decimal_parameters_valid_v1(node.precision, node.scale): return err("SQL executor DECIMAL comparison metadata is invalid")
+            elif node.precision != 0 or node.scale != 0:
+                return err("SQL executor non-DECIMAL comparison carries precision metadata")
+            if node.type_id == 1 and node.operator > 2: return err("SQL executor Boolean comparisons support only equality and inequality")
+            if node.operator >= 7 and node.operator <= 10 and node.type_id != 9: return err("SQL executor LIKE pattern comparisons support only TEXT columns")
+            if node.value_kind != 3 and node.value_kind != 4 and node.value_kind != 5 and node.value_kind != 8 and node.value_kind != 1:
+                return err("SQL executor received an unsupported comparison value")
+            if node.value_start_byte < 0 or node.value_end_byte < node.value_start_byte or node.value_end_byte > text_length(plan.source):
+                return err("SQL executor comparison source span is invalid")
+            if node.value_kind == 5:
+                if node.parameter_ordinal < 0 or node.parameter_ordinal >= list_count(plan.parameters):
+                    return err("SQL executor comparison parameter ordinal is invalid")
+                if list_get(plan.parameters, node.parameter_ordinal).type_id != node.type_id:
+                    return err("SQL executor plan parameter type does not match its comparison")
+        elif node.kind == 6 or node.kind == 7:
+            if is_having_expression:
+                return err("SQL executor does not allow subqueries in HAVING")
+            if node.kind == 6:
+                if node.value_kind != 0 and node.value_kind != 1: return err("SQL executor IN subquery has an unsupported correlation mode")
+                if node.column_ordinal < 0 or node.column_ordinal >= expression_column_count or (node.operator != 1 and node.operator != 2):
+                    return err("SQL executor received an invalid IN subquery expression")
+                if node.type_id != list_get(table.column_type_ids, node.column_ordinal):
+                    return err("SQL executor IN subquery metadata does not match its input column")
+                if node.type_id == 10:
+                    if not yaza_sql_decimal_parameters_valid_v1(node.precision, node.scale): return err("SQL executor DECIMAL IN-subquery metadata is invalid")
+                elif node.precision != 0 or node.scale != 0:
+                    return err("SQL executor non-DECIMAL IN-subquery node carries precision metadata")
+                if node.value_kind == 0:
+                    if node.correlation_column_ordinal != -1 or node.correlation_type_id != 0 or node.correlation_precision != 0 or node.correlation_scale != 0:
+                        return err("SQL executor uncorrelated IN node carries correlation metadata")
+                elif node.correlation_column_ordinal < 0 or node.correlation_column_ordinal >= expression_column_count or node.correlation_type_id != list_get(table.column_type_ids, node.correlation_column_ordinal) or not yaza_sql_executor_type_supported_v1(node.correlation_type_id):
+                    return err("SQL executor correlated IN key metadata does not match its outer column")
+                elif node.correlation_type_id == 10:
+                    if not yaza_sql_decimal_parameters_valid_v1(node.correlation_precision, node.correlation_scale): return err("SQL executor correlated IN key DECIMAL metadata is invalid")
+                elif node.correlation_precision != 0 or node.correlation_scale != 0:
+                    return err("SQL executor correlated IN non-DECIMAL key carries precision metadata")
+            else:
+                if node.operator != 1:
+                    return err("SQL executor received an invalid EXISTS operator")
+                if node.value_kind == 0:
+                    if node.column_ordinal != -1 or node.type_id != 1 or node.precision != 0 or node.scale != 0:
+                        return err("SQL executor received malformed uncorrelated EXISTS metadata")
+                elif node.value_kind == 1:
+                    if node.column_ordinal < 0 or node.column_ordinal >= expression_column_count or node.type_id != list_get(table.column_type_ids, node.column_ordinal) or not yaza_sql_executor_type_supported_v1(node.type_id):
+                        return err("SQL executor correlated EXISTS metadata does not match its outer column")
+                    if node.type_id == 10:
+                        if not yaza_sql_decimal_parameters_valid_v1(node.precision, node.scale): return err("SQL executor correlated EXISTS DECIMAL metadata is invalid")
+                    elif node.precision != 0 or node.scale != 0:
+                        return err("SQL executor correlated EXISTS non-DECIMAL metadata carries precision")
+                else:
+                    return err("SQL executor received an unsupported EXISTS correlation mode")
+            if node.parameter_ordinal < 0 or node.parameter_ordinal >= list_count(plan.subqueries):
+                return err("SQL executor subquery descriptor ordinal is invalid")
+            if node.left_index != -1 or node.right_index != -1 or (node.value_kind != 0 and node.value_kind != 1) or text_length(list_get(plan.subqueries, node.parameter_ordinal)) == 0:
+                return err("SQL executor subquery node contains malformed child or source metadata")
+            let subquery_ref_count: Number = list_get(subquery_ref_counts, node.parameter_ordinal) + 1
+            if subquery_ref_count > 1: return err("SQL executor plan reuses a subquery result descriptor")
+            list_set(subquery_ref_counts, node.parameter_ordinal, subquery_ref_count)
+        elif node.kind == 5:
+            if node.column_ordinal < 0 or node.column_ordinal >= expression_column_count or (node.operator != 1 and node.operator != 2):
+                return err("SQL executor received an invalid IS NULL node")
+            var expected_null_type: Number = 0
+            if is_having_expression: set expected_null_type = list_get(plan.projections, node.column_ordinal).type_id
+            else: set expected_null_type = list_get(table.column_type_ids, node.column_ordinal)
+            if node.type_id != expected_null_type or not yaza_sql_executor_type_supported_v1(node.type_id):
+                return err("SQL executor IS NULL type does not match its input schema")
+            if node.type_id == 10:
+                if not yaza_sql_decimal_parameters_valid_v1(node.precision, node.scale): return err("SQL executor DECIMAL IS NULL metadata is invalid")
+            elif node.precision != 0 or node.scale != 0:
+                return err("SQL executor non-DECIMAL IS NULL node carries precision metadata")
+            if node.left_index != -1 or node.right_index != -1 or node.value_kind != 0 or node.parameter_ordinal != -1:
+                return err("SQL executor IS NULL node contains comparison or child fields")
+        elif node.kind == 2 or node.kind == 3:
+            if node.left_index < 0 or node.left_index >= expression_index or node.right_index < 0 or node.right_index >= expression_index:
+                return err("SQL executor Boolean node references an invalid child")
+            if node.precision != 0 or node.scale != 0: return err("SQL executor Boolean expression carries DECIMAL metadata")
+            if is_having_expression and (node.left_index < plan.having_start_index or node.right_index < plan.having_start_index):
+                return err("SQL executor HAVING Boolean node references a WHERE child")
+            if not is_having_expression and (node.left_index >= plan.having_start_index or node.right_index >= plan.having_start_index):
+                return err("SQL executor WHERE Boolean node references a HAVING child")
+            let left_parent_count: Number = list_get(parent_counts, node.left_index) + 1
+            var right_parent_count: Number = list_get(parent_counts, node.right_index) + 1
+            if node.right_index == node.left_index: set right_parent_count = left_parent_count + 1
+            if left_parent_count > 1 or right_parent_count > 1: return err("SQL executor expression plan reuses a child and exceeds the tree evaluation bound")
+            list_set(parent_counts, node.left_index, left_parent_count)
+            list_set(parent_counts, node.right_index, right_parent_count)
+        elif node.kind == 4:
+            if node.left_index < 0 or node.left_index >= expression_index or node.right_index != -1:
+                return err("SQL executor NOT node references an invalid child")
+            if is_having_expression and node.left_index < plan.having_start_index:
+                return err("SQL executor HAVING NOT node references a WHERE child")
+            if not is_having_expression and node.left_index >= plan.having_start_index:
+                return err("SQL executor WHERE NOT node references a HAVING child")
+            let left_parent_count: Number = list_get(parent_counts, node.left_index) + 1
+            if left_parent_count > 1: return err("SQL executor expression plan reuses a child and exceeds the tree evaluation bound")
+            list_set(parent_counts, node.left_index, left_parent_count)
+        else:
+            return err("SQL executor received an unknown expression node")
+        set expression_index = expression_index + 1
+
+    var subquery_ref_index: Number = 0
+    while subquery_ref_index < list_count(subquery_ref_counts):
+        if list_get(subquery_ref_counts, subquery_ref_index) != 1: return err("SQL executor plan contains an unused subquery descriptor")
+        set subquery_ref_index = subquery_ref_index + 1
+
+    var tree_node_index: Number = 0
+    while tree_node_index < list_count(plan.expressions):
+        var expected_parent_count: Number = 1
+        if tree_node_index == plan.where_root or tree_node_index == plan.having_root: set expected_parent_count = 0
+        if list_get(parent_counts, tree_node_index) != expected_parent_count: return err("SQL executor expression plan is not a single bounded tree")
+        set tree_node_index = tree_node_index + 1
+
+    if plan.having_root >= 0 and plan.having_root == plan.where_root:
+        return err("SQL executor WHERE and HAVING cannot share an expression root")
+    if plan.having_root >= 0 and not uses_aggregate_operator:
+        return err("SQL executor HAVING requires grouping or aggregate output")
+
+    var expected_operator_count: Number = 2
+    if plan.right_table_id > 0: set expected_operator_count = expected_operator_count + 2
+    set expected_operator_count = expected_operator_count + list_count(plan.join_stages) * 2
+    if plan.where_root >= 0: set expected_operator_count = expected_operator_count + 1
+    if plan.having_root >= 0: set expected_operator_count = expected_operator_count + 1
+    if plan.distinct: set expected_operator_count = expected_operator_count + 1
+    if list_count(plan.order_by) > 0: set expected_operator_count = expected_operator_count + 1
+    if plan.has_limit: set expected_operator_count = expected_operator_count + 1
+    if list_count(plan.operators) != expected_operator_count or plan.root_operator != expected_operator_count - 1:
+        return err("SQL executor logical operator chain is malformed")
+
+    var operator_index: Number = 0
+    var prior_operator: Number = -1
+    let scan: YazaSqlLogicalOperatorV1 = list_get(plan.operators, operator_index)
+    if scan.kind != 1 or scan.input_index != -1 or scan.table_id != table.table_id: return err("SQL executor scan operator is malformed")
+    set prior_operator = operator_index
+    set operator_index = operator_index + 1
+    if plan.right_table_id > 0:
+        let right_scan: YazaSqlLogicalOperatorV1 = list_get(plan.operators, operator_index)
+        if right_scan.kind != 1 or right_scan.input_index != -1 or right_scan.table_id != plan.right_table_id:
+            return err("SQL executor joined scan operator is malformed")
+        set operator_index = operator_index + 1
+        let join_operator: YazaSqlLogicalOperatorV1 = list_get(plan.operators, operator_index)
+        if (join_operator.kind != yaza_sql_operator_inner_join_v1() and join_operator.kind != yaza_sql_operator_left_join_v1() and join_operator.kind != yaza_sql_operator_right_join_v1() and join_operator.kind != yaza_sql_operator_full_join_v1() and join_operator.kind != yaza_sql_operator_cross_join_v1() and join_operator.kind != yaza_sql_operator_theta_join_v1()) or join_operator.input_index != prior_operator or join_operator.expression_root != operator_index - 1 or join_operator.table_id != plan.right_table_id or join_operator.item_start != plan.join_left_column_ordinal or join_operator.item_count != plan.join_right_column_ordinal or join_operator.limit != plan.join_comparison_operator:
+            return err("SQL executor JOIN operator is malformed")
+        set prior_operator = operator_index
+        set operator_index = operator_index + 1
+        var stage_index: Number = 0
+        while stage_index < list_count(plan.join_stages):
+            let stage: YazaSqlBoundJoinStageV1 = list_get(plan.join_stages, stage_index)
+            let stage_scan: YazaSqlLogicalOperatorV1 = list_get(plan.operators, operator_index)
+            if stage_scan.kind != 1 or stage_scan.input_index != -1 or stage_scan.table_id != stage.table_id:
+                return err("SQL executor additional JOIN scan operator is malformed")
+            set operator_index = operator_index + 1
+            let stage_join: YazaSqlLogicalOperatorV1 = list_get(plan.operators, operator_index)
+            if stage_join.kind != stage.join_kind or stage_join.input_index != prior_operator or stage_join.expression_root != operator_index - 1 or stage_join.table_id != stage.table_id or stage_join.item_start != stage.left_key_ordinal or stage_join.item_count != stage.right_key_ordinal or stage_join.limit != stage.comparison_operator:
+                return err("SQL executor additional JOIN operator is malformed")
+            set prior_operator = operator_index
+            set operator_index = operator_index + 1
+            set stage_index = stage_index + 1
+    if plan.where_root >= 0:
+        let filter: YazaSqlLogicalOperatorV1 = list_get(plan.operators, operator_index)
+        if filter.kind != 2 or filter.input_index != prior_operator or filter.expression_root != plan.where_root or filter.table_id != table.table_id:
+            return err("SQL executor filter operator is malformed")
+        set prior_operator = operator_index
+        set operator_index = operator_index + 1
+    let projection_operator: YazaSqlLogicalOperatorV1 = list_get(plan.operators, operator_index)
+    if uses_aggregate_operator:
+        if projection_operator.kind != yaza_sql_operator_aggregate_v1() or projection_operator.input_index != prior_operator or projection_operator.item_start != list_count(plan.group_by_columns) or projection_operator.item_count != list_count(plan.projections) or projection_operator.table_id != table.table_id:
+            return err("SQL executor aggregate operator is malformed")
+    else:
+        if projection_operator.kind != 3 or projection_operator.input_index != prior_operator or projection_operator.item_count != list_count(plan.projections) or projection_operator.table_id != table.table_id:
+            return err("SQL executor projection operator is malformed")
+    set prior_operator = operator_index
+    set operator_index = operator_index + 1
+    if plan.having_root >= 0:
+        let having_filter: YazaSqlLogicalOperatorV1 = list_get(plan.operators, operator_index)
+        if having_filter.kind != 8 or having_filter.input_index != prior_operator or having_filter.expression_root != plan.having_root or having_filter.table_id != table.table_id:
+            return err("SQL executor HAVING operator is malformed")
+        set prior_operator = operator_index
+        set operator_index = operator_index + 1
+    if plan.distinct:
+        let distinct: YazaSqlLogicalOperatorV1 = list_get(plan.operators, operator_index)
+        if distinct.kind != 4 or distinct.input_index != prior_operator or distinct.item_count != list_count(plan.projections) or distinct.table_id != table.table_id:
+            return err("SQL executor DISTINCT operator is malformed")
+        set prior_operator = operator_index
+        set operator_index = operator_index + 1
+    if list_count(plan.order_by) > 0:
+        let sort: YazaSqlLogicalOperatorV1 = list_get(plan.operators, operator_index)
+        if sort.kind != 5 or sort.input_index != prior_operator or sort.item_count != list_count(plan.order_by) or sort.table_id != table.table_id:
+            return err("SQL executor sort operator is malformed")
+        set prior_operator = operator_index
+        set operator_index = operator_index + 1
+    if plan.has_limit:
+        let limit: YazaSqlLogicalOperatorV1 = list_get(plan.operators, operator_index)
+        if limit.kind != 6 or limit.input_index != prior_operator or limit.limit != plan.limit or limit.table_id != table.table_id:
+            return err("SQL executor LIMIT operator is malformed")
+        set prior_operator = operator_index
+    if prior_operator != plan.root_operator: return err("SQL executor plan root is malformed")
+    return ok(YazaSqlExecutorInputProfileV1(input_cell_count, input_text_byte_count, max_text_bytes))
+
+fn yaza_sql_executor_validate_work_budget_with_prior_v1(plan: YazaSqlBoundPlanV1, table: YazaSqlMemoryTableV1, prepared: List[YazaSqlValueV1], parameters: List[YazaSqlValueV1], input_profile: YazaSqlExecutorInputProfileV1, prior_work_units: Number, where_preapplied: Boolean) -> Result[Number, Text]:
+    if prior_work_units < 0 or prior_work_units > yaza_sql_executor_max_work_units_v1(): return err("SQL executor prior scan work exceeds the bounded per-query work budget")
+    var expressions_per_row: Number = list_count(plan.expressions)
+    if where_preapplied: set expressions_per_row = list_count(plan.expressions) - plan.having_start_index
+    var input_cell_work: Number = input_profile.cell_count
+    if where_preapplied: set input_cell_work = 0
+    var work_units: Number = prior_work_units + input_cell_work + table.join_work_units + list_count(table.rows) * (expressions_per_row + 1)
+    if list_get(plan.projections, 0).aggregate_kind != 0:
+        set work_units = work_units + list_count(plan.projections) + list_count(table.rows) * list_count(plan.projections)
+    else:
+        set work_units = work_units + list_count(table.rows) * list_count(plan.projections)
+    var max_text_bytes: Number = input_profile.max_text_bytes
+    var text_filter_count: Number = 0
+    var having_text_filter_count: Number = 0
+    var expression_index: Number = 0
+    while expression_index < list_count(plan.expressions):
+        let node: YazaSqlBoundExpressionNodeV1 = list_get(plan.expressions, expression_index)
+        if node.kind == 1 and (node.type_id == 9 or node.type_id == 16):
+            if expression_index >= plan.having_start_index: set having_text_filter_count = having_text_filter_count + 1
+            elif not where_preapplied: set text_filter_count = text_filter_count + 1
+            let value: YazaSqlValueV1 = list_get(prepared, expression_index)
+            var compared_text_bytes: Number = 0
+            if value.source_literal:
+                set compared_text_bytes = node.value_end_byte - node.value_start_byte
+            elif node.type_id == 9:
+                set compared_text_bytes = text_length(value.text_value)
+            else:
+                set compared_text_bytes = bytes_length(value.bytes_value)
+            if node.type_id == 9 and compared_text_bytes > yaza_sql_executor_max_text_value_bytes_v1(): return err("SQL executor text comparison exceeds the bounded value-size limit")
+            if node.type_id == 16 and compared_text_bytes > 67108864: return err("SQL executor BLOB comparison exceeds the 64 MiB value-size limit")
+            if compared_text_bytes > max_text_bytes: set max_text_bytes = compared_text_bytes
+        set expression_index = expression_index + 1
+
+    var parameter_text_byte_count: Number = 0
+    var parameter_index: Number = 0
+    while parameter_index < list_count(parameters):
+        let parameter: YazaSqlValueV1 = list_get(parameters, parameter_index)
+        if (parameter.type_id == 9 or parameter.type_id == 16) and not parameter.is_null:
+            var parameter_bytes: Number = 0
+            if parameter.type_id == 9: set parameter_bytes = text_length(parameter.text_value)
+            else: set parameter_bytes = bytes_length(parameter.bytes_value)
+            if parameter.type_id == 9 and parameter_bytes > yaza_sql_executor_max_text_value_bytes_v1(): return err("SQL executor text bind value exceeds the bounded value-size limit")
+            if parameter.type_id == 16 and parameter_bytes > 67108864: return err("SQL executor BLOB bind value exceeds the 64 MiB value-size limit")
+            set parameter_text_byte_count = parameter_text_byte_count + parameter_bytes
+            if parameter_text_byte_count > yaza_sql_executor_max_input_text_bytes_v1(): return err("SQL executor exceeds the bounded bind-text byte budget")
+            if parameter_bytes > max_text_bytes: set max_text_bytes = parameter_bytes
+        set parameter_index = parameter_index + 1
+
+    set work_units = work_units + list_count(table.rows) * text_filter_count * (2 * max_text_bytes + 1)
+    var having_row_bound: Number = 1
+    if list_count(plan.group_by_columns) > 0: set having_row_bound = list_count(table.rows)
+    set work_units = work_units + having_row_bound * having_text_filter_count * (2 * max_text_bytes + 1)
+
+    var sort_text_terms: Number = 0
+    var sort_scalar_terms: Number = 0
+    var order_index: Number = 0
+    while order_index < list_count(plan.order_by):
+        let order_term: YazaSqlBoundOrderTermV1 = list_get(plan.order_by, order_index)
+        let projection: YazaSqlBoundProjectionV1 = list_get(plan.projections, order_term.projection_ordinal)
+        set sort_scalar_terms = sort_scalar_terms + 1
+        if projection.type_id == 9 or projection.type_id == 16: set sort_text_terms = sort_text_terms + 1
+        set order_index = order_index + 1
+
+    if list_count(plan.group_by_columns) > 0:
+        var group_sort_text_terms: Number = 0
+        var group_column_index: Number = 0
+        while group_column_index < list_count(plan.group_by_columns):
+            let group_type_id: Number = list_get(table.column_type_ids, list_get(plan.group_by_columns, group_column_index))
+            if group_type_id == 9 or group_type_id == 16: set group_sort_text_terms = group_sort_text_terms + 1
+            set group_column_index = group_column_index + 1
+        var group_sort_levels: Number = 0
+        var group_sort_rows: Number = list_count(table.rows)
+        while group_sort_rows > 1:
+            set group_sort_rows = (group_sort_rows + 1) / 2
+            set group_sort_levels = group_sort_levels + 1
+        let group_comparison_bound: Number = 4 * list_count(table.rows) * (group_sort_levels + 1)
+        set work_units = work_units + group_comparison_bound * list_count(plan.group_by_columns)
+        set work_units = work_units + group_comparison_bound * group_sort_text_terms * (2 * max_text_bytes + 1)
+
+    var distinct_text_terms: Number = 0
+    if plan.distinct:
+        var projection_index: Number = 0
+        while projection_index < list_count(plan.projections):
+            let projection: YazaSqlBoundProjectionV1 = list_get(plan.projections, projection_index)
+            set sort_scalar_terms = sort_scalar_terms + 1
+            if projection.type_id == 9 or projection.type_id == 16: set sort_text_terms = sort_text_terms + 1
+            if projection.type_id == 9 or projection.type_id == 16: set distinct_text_terms = distinct_text_terms + 1
+            set projection_index = projection_index + 1
+
+    if plan.distinct or list_count(plan.order_by) > 0:
+        var sort_levels: Number = 0
+        var sort_input_count: Number = list_count(table.rows)
+        if list_count(plan.group_by_columns) == 0 and list_get(plan.projections, 0).aggregate_kind != 0: set sort_input_count = 1
+        var sort_rows: Number = sort_input_count
+        while sort_rows > 1:
+            set sort_rows = (sort_rows + 1) / 2
+            set sort_levels = sort_levels + 1
+        let sort_comparison_bound: Number = 4 * sort_input_count * (sort_levels + 1)
+        set work_units = work_units + sort_comparison_bound * sort_scalar_terms
+        set work_units = work_units + sort_comparison_bound * sort_text_terms * (2 * max_text_bytes + 1)
+        if plan.distinct:
+            set work_units = work_units + sort_input_count * list_count(plan.projections)
+            set work_units = work_units + sort_input_count * distinct_text_terms * (2 * max_text_bytes + 1)
+
+    if work_units > yaza_sql_executor_max_work_units_v1(): return err("SQL executor exceeds the bounded per-query work budget")
+    return ok(work_units)
+
+fn yaza_sql_executor_validate_work_budget_v1(plan: YazaSqlBoundPlanV1, table: YazaSqlMemoryTableV1, prepared: List[YazaSqlValueV1], parameters: List[YazaSqlValueV1], input_profile: YazaSqlExecutorInputProfileV1) -> Result[Number, Text]:
+    return yaza_sql_executor_validate_work_budget_with_prior_v1(plan, table, prepared, parameters, input_profile, 0, false)
+
+fn yaza_sql_executor_prepare_values_v1(plan: YazaSqlBoundPlanV1, table: YazaSqlMemoryTableV1, parameters: List[YazaSqlValueV1]) -> Result[List[YazaSqlValueV1], Text]:
+    if list_count(parameters) != list_count(plan.parameters): return err("SQL executor bind value count does not match the prepared plan")
+    let prepared_result: Result[List[YazaSqlValueV1], Text] = list_try_new()
+    if not result_is_ok(prepared_result): return err("SQL executor could not allocate prepared expression values")
+    var prepared: List[YazaSqlValueV1] = result_unwrap(prepared_result)
+    if not list_try_reserve(prepared, list_count(plan.expressions)): return err("SQL executor could not reserve prepared expression values")
+    var expression_index: Number = 0
+    while expression_index < list_count(plan.expressions):
+        let node: YazaSqlBoundExpressionNodeV1 = list_get(plan.expressions, expression_index)
+        if node.kind != 1:
+            if not list_try_push(prepared, yaza_sql_executor_value_v1(0, 0, 0.0, false, "")): return err("SQL executor could not store prepared expression values")
+        else:
+            let column_type: Number = node.type_id
+            if not yaza_sql_executor_type_supported_v1(column_type): return err("SQL executor comparison type is outside the supported profile")
+            var value: YazaSqlValueV1 = yaza_sql_executor_value_v1(column_type, 0, 0.0, false, "")
+            if node.value_kind == 5:
+                let parameter: YazaSqlValueV1 = list_get(parameters, node.parameter_ordinal)
+                if not yaza_sql_executor_value_matches_v1(parameter, column_type): return err("SQL executor bind value type does not match the inferred parameter type")
+                if column_type == 10 and not parameter.is_null:
+                    let parameter_decimal: YazaSqlDecimalV1 = yaza_sql_decimal_parse_v1(parameter.text_value, yaza_sql_value_decimal_precision_v1(parameter), yaza_sql_value_decimal_scale_v1(parameter))?
+                    let target_decimal: YazaSqlDecimalV1 = yaza_sql_decimal_rescale_v1(parameter_decimal, node.precision, node.scale)?
+                    set value = yaza_sql_value_decimal_v1(target_decimal)?
+                else:
+                    set value = parameter
+            elif node.value_kind == 3:
+                let literal_result: Result[Text, Text] = text_try_slice(plan.source, node.value_start_byte, node.value_end_byte - node.value_start_byte)
+                if not result_is_ok(literal_result): return err("SQL executor could not read a numeric literal")
+                if column_type == 2 or column_type == 3 or column_type == 4:
+                    let parsed_result: Result[Number, Text] = number_try_parse(result_unwrap(literal_result))
+                    if not result_is_ok(parsed_result): return err("SQL executor integer literal is invalid or out of range")
+                    set value = yaza_sql_executor_value_v1(column_type, result_unwrap(parsed_result), 0.0, false, "")
+                    if not yaza_sql_executor_value_matches_v1(value, column_type): return err("SQL executor integer literal is out of range")
+                elif column_type == 6:
+                    let parsed_float: Result[Float64, Text] = float64_try_parse(result_unwrap(literal_result))
+                    if not result_is_ok(parsed_float): return err("SQL executor DOUBLE literal is invalid or non-finite")
+                    set value = yaza_sql_executor_value_v1(6, 0, result_unwrap(parsed_float), false, "")
+                elif column_type == 10:
+                    let parsed_decimal: YazaSqlDecimalV1 = yaza_sql_decimal_parse_v1(result_unwrap(literal_result), node.precision, node.scale)?
+                    set value = yaza_sql_value_decimal_v1(parsed_decimal)?
+                else:
+                    return err("SQL executor numeric literal type is unsupported for this column")
+            elif node.value_kind == 8:
+                if column_type != 16: return err("SQL executor BLOB literal does not match its column type")
+                let literal_blob: Bytes = yaza_sql_decode_blob_literal_v1(plan.source, node.value_start_byte, node.value_end_byte)?
+                set value = yaza_sql_value_blob_v1(literal_blob)?
+            elif node.value_kind == 4:
+                if (column_type != 9 and column_type != 11 and column_type != 12 and column_type != 13 and column_type != 14 and column_type != 15) or node.value_end_byte - node.value_start_byte < 2 or text_byte(plan.source, node.value_start_byte) != 39 or text_byte(plan.source, node.value_end_byte - 1) != 39:
+                    return err("SQL executor text literal does not match its column type")
+                if column_type == 11:
+                    let date_literal: Text = text_slice(plan.source, node.value_start_byte + 1, node.value_end_byte - node.value_start_byte - 2)
+                    let date_days: Number = yaza_sql_date_parse_v1(date_literal)?
+                    set value = yaza_sql_value_integer_v1(11, date_days)?
+                elif column_type == 12:
+                    let uuid_literal: Text = text_slice(plan.source, node.value_start_byte + 1, node.value_end_byte - node.value_start_byte - 2)
+                    set value = yaza_sql_value_uuid_v1(uuid_literal)?
+                elif column_type == 13:
+                    let time_literal: Text = yaza_sql_decode_text_literal_v1(plan.source, node.value_start_byte, node.value_end_byte)?
+                    let time_micros: Number = yaza_sql_time_parse_v1(time_literal)?
+                    set value = yaza_sql_value_integer_v1(13, time_micros)?
+                elif column_type == 14:
+                    let timestamp_literal: Text = yaza_sql_decode_text_literal_v1(plan.source, node.value_start_byte, node.value_end_byte)?
+                    let timestamp_micros: Number = yaza_sql_timestamp_parse_v1(timestamp_literal)?
+                    set value = yaza_sql_value_integer_v1(14, timestamp_micros)?
+                elif column_type == 15:
+                    let timestamp_literal: Text = yaza_sql_decode_text_literal_v1(plan.source, node.value_start_byte, node.value_end_byte)?
+                    let timestamptz_micros: Number = yaza_sql_timestamptz_parse_v1(timestamp_literal)?
+                    set value = yaza_sql_value_integer_v1(15, timestamptz_micros)?
+                else:
+                    if node.operator >= 7 and node.operator <= 10:
+                        let pattern_literal: Text = yaza_sql_decode_text_literal_v1(plan.source, node.value_start_byte, node.value_end_byte)?
+                        set value = yaza_sql_executor_value_v1(9, 0, 0.0, false, pattern_literal)
+                    else:
+                        set value = YazaSqlValueV1(9, 0, 0.0, false, "", bytes_empty(), true, node.value_start_byte, node.value_end_byte, false)
+            elif node.value_kind == 1:
+                if yaza_sql_executor_keyword_v1(plan.source, node.value_start_byte, node.value_end_byte, "null"):
+                    set value = yaza_sql_value_null_v1(column_type)?
+                elif column_type != 1:
+                    return err("SQL executor Boolean literal does not match its column type")
+                elif yaza_sql_executor_keyword_v1(plan.source, node.value_start_byte, node.value_end_byte, "true"):
+                    set value = yaza_sql_executor_value_v1(1, 0, 0.0, true, "")
+                elif yaza_sql_executor_keyword_v1(plan.source, node.value_start_byte, node.value_end_byte, "false"):
+                    set value = yaza_sql_executor_value_v1(1, 0, 0.0, false, "")
+                else:
+                    return err("SQL executor received an invalid Boolean literal")
+            if not list_try_push(prepared, value): return err("SQL executor could not store prepared expression values")
+        set expression_index = expression_index + 1
+    return ok(prepared)
+
+fn yaza_sql_like_char_match_v1(t_byte: Number, p_byte: Number, case_insensitive: Boolean) -> Boolean:
+    if p_byte == 95: return true
+    if t_byte == p_byte: return true
+    if case_insensitive:
+        var b1: Number = t_byte
+        var b2: Number = p_byte
+        if b1 >= 65 and b1 <= 90: set b1 = b1 + 32
+        if b2 >= 65 and b2 <= 90: set b2 = b2 + 32
+        return b1 == b2
+    return false
+
+fn yaza_sql_like_match_v1(text_val: Text, pattern: Text, case_insensitive: Boolean) -> Boolean:
+    let t_len: Number = text_length(text_val)
+    let p_len: Number = text_length(pattern)
+    var t_idx: Number = 0
+    var p_idx: Number = 0
+    var star_idx: Number = -1
+    var match_idx: Number = 0
+    while t_idx < t_len:
+        if p_idx < p_len and (text_byte(pattern, p_idx) == 95 or yaza_sql_like_char_match_v1(text_byte(text_val, t_idx), text_byte(pattern, p_idx), case_insensitive)):
+            set t_idx = t_idx + 1
+            set p_idx = p_idx + 1
+        elif p_idx < p_len and text_byte(pattern, p_idx) == 37:
+            set star_idx = p_idx
+            set match_idx = t_idx
+            set p_idx = p_idx + 1
+        elif star_idx != -1:
+            set p_idx = star_idx + 1
+            set match_idx = match_idx + 1
+            set t_idx = match_idx
+        else:
+            return false
+    while p_idx < p_len and text_byte(pattern, p_idx) == 37:
+        set p_idx = p_idx + 1
+    return p_idx == p_len
+
+fn yaza_sql_executor_text_literal_compare_v1(source: Text, start_byte: Number, end_byte: Number, value: Text) -> Number:
+    var source_index: Number = start_byte + 1
+    let source_end: Number = end_byte - 1
+    var value_index: Number = 0
+    var comparison: Number = 0
+    while comparison == 0 and source_index < source_end and value_index < text_length(value):
+        var source_byte: Number = text_byte(source, source_index)
+        if source_byte == 39 and source_index + 1 < source_end and text_byte(source, source_index + 1) == 39:
+            set source_index = source_index + 1
+        let value_byte: Number = text_byte(value, value_index)
+        if source_byte < value_byte: set comparison = -1
+        elif source_byte > value_byte: set comparison = 1
+        set source_index = source_index + 1
+        set value_index = value_index + 1
+    if comparison == 0:
+        if source_index < source_end: return 1
+        if value_index < text_length(value): return -1
+    return comparison
+
+fn yaza_sql_executor_compare_bytes_v1(left: Bytes, right: Bytes) -> Number:
+    let left_length: Number = bytes_length(left)
+    let right_length: Number = bytes_length(right)
+    var index: Number = 0
+    var common_length: Number = left_length
+    if right_length < common_length: set common_length = right_length
+    while index < common_length:
+        let left_byte: Number = bytes_get(left, index)
+        let right_byte: Number = bytes_get(right, index)
+        if left_byte < right_byte: return -1
+        if left_byte > right_byte: return 1
+        set index = index + 1
+    if left_length < right_length: return -1
+    if left_length > right_length: return 1
+    return 0
+
+fn yaza_sql_executor_compare_values_v1(source: Text, left: YazaSqlValueV1, right: YazaSqlValueV1) -> Number:
+    if left.is_null:
+        if right.is_null: return 0
+        return -1
+    if right.is_null: return 1
+    if left.type_id == 1:
+        if left.boolean_value == right.boolean_value: return 0
+        if left.boolean_value: return 1
+        return -1
+    if left.type_id == 2 or left.type_id == 3 or left.type_id == 4 or left.type_id == 11 or left.type_id == 13 or left.type_id == 14 or left.type_id == 15:
+        if left.integer_value < right.integer_value: return -1
+        if left.integer_value > right.integer_value: return 1
+        return 0
+    if left.type_id == 6:
+        let left_is_nan: Boolean = yaza_sql_executor_float_is_nan_v1(left.float_value)
+        let right_is_nan: Boolean = yaza_sql_executor_float_is_nan_v1(right.float_value)
+        if left_is_nan:
+            if right_is_nan: return 0
+            return 1
+        if right_is_nan: return -1
+        if left.float_value < right.float_value: return -1
+        if left.float_value > right.float_value: return 1
+        return 0
+    if left.type_id == 10:
+        return yaza_sql_decimal_compare_text_v1(left.text_value, right.text_value)
+    if left.type_id == 12:
+        let uuid_compared: Number = text_compare(left.text_value, right.text_value)
+        if uuid_compared < 0: return -1
+        if uuid_compared > 0: return 1
+        return 0
+    if left.type_id == 9:
+        if right.source_literal: return -yaza_sql_executor_text_literal_compare_v1(source, right.source_start_byte, right.source_end_byte, left.text_value)
+        let compared: Number = text_compare(left.text_value, right.text_value)
+        if compared < 0: return -1
+        if compared > 0: return 1
+        return 0
+    if left.type_id == 16:
+        return yaza_sql_executor_compare_bytes_v1(left.bytes_value, right.bytes_value)
+    return 0
+
+fn yaza_sql_executor_float_is_nan_v1(value: Float64) -> Boolean:
+    let bits: Number = float64_bits(value)
+    let min_integer: Number = -9223372036854775807 - 1
+    var magnitude_bits: Number = bits
+    if bits < 0: set magnitude_bits = bits - min_integer
+    let exponent: Number = magnitude_bits / 4503599627370496
+    let fraction: Number = magnitude_bits % 4503599627370496
+    return exponent == 2047 and fraction != 0
+
+fn yaza_sql_executor_apply_comparison_v1(comparison: Number, operator: Number) -> Boolean:
+    if operator == 1: return comparison == 0
+    if operator == 2: return comparison != 0
+    if operator == 3: return comparison < 0
+    if operator == 4: return comparison <= 0
+    if operator == 5: return comparison > 0
+    return comparison >= 0
+
+fn yaza_sql_executor_sorted_values_contains_v1(source: Text, values: List[YazaSqlValueV1], target: YazaSqlValueV1) -> Boolean:
+    var lower: Number = 0
+    var upper: Number = list_count(values)
+    while lower < upper:
+        let middle: Number = lower + (upper - lower) / 2
+        let candidate: YazaSqlValueV1 = list_get(values, middle)
+        let compared: Number = yaza_sql_executor_compare_values_v1(source, candidate, target)
+        if compared < 0: set lower = middle + 1
+        else: set upper = middle
+    if lower >= list_count(values): return false
+    return yaza_sql_executor_compare_values_v1(source, list_get(values, lower), target) == 0
+
+fn yaza_sql_executor_correlated_pair_compare_v1(source: Text, left: List[YazaSqlValueV1], right: List[YazaSqlValueV1]) -> Number:
+    let key_comparison: Number = yaza_sql_executor_compare_values_v1(source, list_get(left, 0), list_get(right, 0))
+    if key_comparison != 0: return key_comparison
+    return yaza_sql_executor_compare_values_v1(source, list_get(left, 1), list_get(right, 1))
+
+fn yaza_sql_executor_correlated_pair_key_range_v1(source: Text, pairs: List[List[YazaSqlValueV1]], key: YazaSqlValueV1) -> YazaSqlSubquerySearchRangeV1:
+    var lower: Number = 0
+    var upper: Number = list_count(pairs)
+    while lower < upper:
+        let middle: Number = lower + (upper - lower) / 2
+        let candidate: List[YazaSqlValueV1] = list_get(pairs, middle)
+        if yaza_sql_executor_compare_values_v1(source, list_get(candidate, 0), key) < 0: set lower = middle + 1
+        else: set upper = middle
+    let first: Number = lower
+    set upper = list_count(pairs)
+    while lower < upper:
+        let middle: Number = lower + (upper - lower) / 2
+        let candidate: List[YazaSqlValueV1] = list_get(pairs, middle)
+        if yaza_sql_executor_compare_values_v1(source, list_get(candidate, 0), key) <= 0: set lower = middle + 1
+        else: set upper = middle
+    return YazaSqlSubquerySearchRangeV1(first, lower)
+
+fn yaza_sql_executor_correlated_pair_value_contains_v1(source: Text, pairs: List[List[YazaSqlValueV1]], range: YazaSqlSubquerySearchRangeV1, target: YazaSqlValueV1) -> Boolean:
+    var lower: Number = range.start
+    var upper: Number = range.end
+    while lower < upper:
+        let middle: Number = lower + (upper - lower) / 2
+        let candidate: List[YazaSqlValueV1] = list_get(pairs, middle)
+        if yaza_sql_executor_compare_values_v1(source, list_get(candidate, 1), target) < 0: set lower = middle + 1
+        else: set upper = middle
+    if lower >= range.end: return false
+    let candidate_value: YazaSqlValueV1 = list_get(list_get(pairs, lower), 1)
+    return not candidate_value.is_null and yaza_sql_executor_compare_values_v1(source, candidate_value, target) == 0
+
+fn yaza_sql_executor_eval_expression_v1(plan: YazaSqlBoundPlanV1, prepared: List[YazaSqlValueV1], subquery_values: List[YazaSqlSubqueryValuesV1], row: List[YazaSqlValueV1], node_index: Number, depth: Number) -> Result[Number, Text]:
+    if depth > 64 or node_index < 0 or node_index >= list_count(plan.expressions): return err("SQL executor expression evaluation exceeded a verified bound")
+    let node: YazaSqlBoundExpressionNodeV1 = list_get(plan.expressions, node_index)
+    if node.kind == 1:
+        let left: YazaSqlValueV1 = list_get(row, node.column_ordinal)
+        let right: YazaSqlValueV1 = list_get(prepared, node_index)
+        if left.is_null or right.is_null: return ok(2)
+        var truth: Number = 0
+        if node.operator >= 7 and node.operator <= 10:
+            var pattern_str: Text = right.text_value
+            if right.source_literal:
+                let decoded_pattern: Result[Text, Text] = yaza_sql_decode_text_literal_v1(plan.source, right.source_start_byte, right.source_end_byte)
+                if result_is_ok(decoded_pattern): set pattern_str = result_unwrap(decoded_pattern)
+            let is_case_insensitive: Boolean = node.operator == 9 or node.operator == 10
+            var matched: Boolean = yaza_sql_like_match_v1(left.text_value, pattern_str, is_case_insensitive)
+            if node.operator == 8 or node.operator == 10:
+                set matched = not matched
+            if matched: set truth = 1
+        elif yaza_sql_executor_apply_comparison_v1(yaza_sql_executor_compare_values_v1(plan.source, left, right), node.operator):
+            set truth = 1
+        return ok(truth)
+    if node.kind == 5:
+        let tested: YazaSqlValueV1 = list_get(row, node.column_ordinal)
+        var matches: Boolean = tested.is_null
+        if node.operator == 2: set matches = not matches
+        if matches: return ok(1)
+        return ok(0)
+    if node.kind == 7:
+        if node.parameter_ordinal < 0 or node.parameter_ordinal >= list_count(subquery_values): return err("SQL executor EXISTS subquery has no materialized result")
+        if node.value_kind == 1:
+            if node.column_ordinal < 0 or node.column_ordinal >= list_count(row): return err("SQL executor correlated EXISTS references an invalid outer row column")
+            let tested: YazaSqlValueV1 = list_get(row, node.column_ordinal)
+            if tested.is_null: return ok(0)
+            let matching_values: List[YazaSqlValueV1] = list_get(subquery_values, node.parameter_ordinal).values
+            if yaza_sql_executor_sorted_values_contains_v1(plan.source, matching_values, tested): return ok(1)
+            return ok(0)
+        if list_get(subquery_values, node.parameter_ordinal).has_rows: return ok(1)
+        return ok(0)
+    if node.kind == 6:
+        if node.parameter_ordinal < 0 or node.parameter_ordinal >= list_count(subquery_values): return err("SQL executor IN subquery has no materialized result")
+        if node.column_ordinal < 0 or node.column_ordinal >= list_count(row): return err("SQL executor IN subquery references an invalid row column")
+        let tested_value: YazaSqlValueV1 = list_get(row, node.column_ordinal)
+        if node.value_kind == 1:
+            if node.correlation_column_ordinal < 0 or node.correlation_column_ordinal >= list_count(row): return err("SQL executor correlated IN references an invalid outer key column")
+            let correlation_key: YazaSqlValueV1 = list_get(row, node.correlation_column_ordinal)
+            let pairs: List[List[YazaSqlValueV1]] = list_get(subquery_values, node.parameter_ordinal).pairs
+            if list_count(pairs) > 65536: return err("SQL executor correlated IN pair result exceeds its 65536-row bound")
+            var correlated_truth: Number = 0
+            if not correlation_key.is_null and list_count(pairs) > 0:
+                let key_range: YazaSqlSubquerySearchRangeV1 = yaza_sql_executor_correlated_pair_key_range_v1(plan.source, pairs, correlation_key)
+                if key_range.start < key_range.end:
+                    let first_pair: List[YazaSqlValueV1] = list_get(pairs, key_range.start)
+                    let has_null_candidate: Boolean = list_get(first_pair, 1).is_null
+                    if tested_value.is_null: set correlated_truth = 2
+                    elif yaza_sql_executor_correlated_pair_value_contains_v1(plan.source, pairs, key_range, tested_value): set correlated_truth = 1
+                    elif has_null_candidate: set correlated_truth = 2
+            if node.operator == 2:
+                if correlated_truth == 1: set correlated_truth = 0
+                elif correlated_truth == 0: set correlated_truth = 1
+            return ok(correlated_truth)
+        let values: List[YazaSqlValueV1] = list_get(subquery_values, node.parameter_ordinal).values
+        if list_count(values) > 65536: return err("SQL executor IN subquery result exceeds its 65536-row bound")
+        var found_match: Boolean = false
+        var saw_null: Boolean = false
+        var subquery_index: Number = 0
+        while subquery_index < list_count(values) and not found_match:
+            let candidate: YazaSqlValueV1 = list_get(values, subquery_index)
+            if candidate.type_id != node.type_id: return err("SQL executor IN subquery result type changed after binding")
+            if candidate.is_null or tested_value.is_null:
+                set saw_null = true
+            elif yaza_sql_executor_compare_values_v1(plan.source, tested_value, candidate) == 0:
+                set found_match = true
+            set subquery_index = subquery_index + 1
+        var truth: Number = 0
+        if found_match: set truth = 1
+        elif list_count(values) > 0 and (tested_value.is_null or saw_null): set truth = 2
+        if node.operator == 2:
+            if truth == 1: set truth = 0
+            elif truth == 0: set truth = 1
+        return ok(truth)
+    let left_result: Result[Number, Text] = yaza_sql_executor_eval_expression_v1(plan, prepared, subquery_values, row, node.left_index, depth + 1)
+    if not result_is_ok(left_result): return err(result_unwrap_error(left_result))
+    let left_value: Number = result_unwrap(left_result)
+    if node.kind == 2:
+        if left_value == 0: return ok(0)
+        let right_and_result: Result[Number, Text] = yaza_sql_executor_eval_expression_v1(plan, prepared, subquery_values, row, node.right_index, depth + 1)
+        if not result_is_ok(right_and_result): return err(result_unwrap_error(right_and_result))
+        let right_and: Number = result_unwrap(right_and_result)
+        if left_value == 1: return ok(right_and)
+        if right_and == 0: return ok(0)
+        return ok(2)
+    if node.kind == 3:
+        if left_value == 1: return ok(1)
+        let right_or_result: Result[Number, Text] = yaza_sql_executor_eval_expression_v1(plan, prepared, subquery_values, row, node.right_index, depth + 1)
+        if not result_is_ok(right_or_result): return err(result_unwrap_error(right_or_result))
+        let right_or: Number = result_unwrap(right_or_result)
+        if left_value == 0: return ok(right_or)
+        if right_or == 1: return ok(1)
+        return ok(2)
+    if left_value == 0: return ok(1)
+    if left_value == 1: return ok(0)
+    return ok(2)
+
+fn yaza_sql_executor_project_row_v1(plan: YazaSqlBoundPlanV1, source_row: List[YazaSqlValueV1]) -> Result[List[YazaSqlValueV1], Text]:
+    let projected_result: Result[List[YazaSqlValueV1], Text] = list_try_new()
+    if not result_is_ok(projected_result): return err("SQL executor could not allocate an output row")
+    var projected: List[YazaSqlValueV1] = result_unwrap(projected_result)
+    if not list_try_reserve(projected, list_count(plan.projections)): return err("SQL executor could not reserve an output row")
+    var projection_index: Number = 0
+    while projection_index < list_count(plan.projections):
+        let projection: YazaSqlBoundProjectionV1 = list_get(plan.projections, projection_index)
+        if not list_try_push(projected, list_get(source_row, projection.column_ordinal)): return err("SQL executor could not build an output row")
+        set projection_index = projection_index + 1
+    return ok(projected)
+
+fn yaza_sql_executor_compare_rows_v1(plan: YazaSqlBoundPlanV1, left: List[YazaSqlValueV1], right: List[YazaSqlValueV1]) -> Number:
+    var comparison: Number = 0
+    var group_index: Number = 0
+    while group_index < list_count(plan.group_by_columns) and comparison == 0:
+        let group_column: Number = list_get(plan.group_by_columns, group_index)
+        set comparison = yaza_sql_executor_compare_values_v1(plan.source, list_get(left, group_column), list_get(right, group_column))
+        set group_index = group_index + 1
+    var order_index: Number = 0
+    while order_index < list_count(plan.order_by) and comparison == 0:
+        let order_term: YazaSqlBoundOrderTermV1 = list_get(plan.order_by, order_index)
+        set comparison = yaza_sql_executor_compare_values_v1(plan.source, list_get(left, order_term.projection_ordinal), list_get(right, order_term.projection_ordinal))
+        if order_term.descending: set comparison = -comparison
+        set order_index = order_index + 1
+    if comparison != 0 or not plan.distinct: return comparison
+    var projection_index: Number = 0
+    while projection_index < list_count(plan.projections):
+        set comparison = yaza_sql_executor_compare_values_v1(plan.source, list_get(left, projection_index), list_get(right, projection_index))
+        if comparison != 0: return comparison
+        set projection_index = projection_index + 1
+    return 0
+
+fn yaza_sql_executor_sift_down_v1(plan: YazaSqlBoundPlanV1, state: YazaSqlRowsHandleV1, start: Number, end: Number) -> Unit:
+    var root: Number = start
+    var active: Boolean = root * 2 + 1 <= end
+    while active:
+        var child: Number = root * 2 + 1
+        if child + 1 <= end and yaza_sql_executor_compare_rows_v1(plan, list_get(state.rows, child), list_get(state.rows, child + 1)) < 0:
+            set child = child + 1
+        if yaza_sql_executor_compare_rows_v1(plan, list_get(state.rows, root), list_get(state.rows, child)) < 0:
+            let saved: List[YazaSqlValueV1] = list_get(state.rows, root)
+            list_set(state.rows, root, list_get(state.rows, child))
+            list_set(state.rows, child, saved)
+            set root = child
+            set active = root * 2 + 1 <= end
+        else:
+            set active = false
+
+fn yaza_sql_executor_sort_rows_v1(plan: YazaSqlBoundPlanV1, state: YazaSqlRowsHandleV1) -> Unit:
+    let count: Number = list_count(state.rows)
+    var start: Number = count / 2 - 1
+    while start >= 0:
+        yaza_sql_executor_sift_down_v1(plan, state, start, count - 1)
+        set start = start - 1
+    var end: Number = count - 1
+    while end > 0:
+        let saved: List[YazaSqlValueV1] = list_get(state.rows, 0)
+        list_set(state.rows, 0, list_get(state.rows, end))
+        list_set(state.rows, end, saved)
+        yaza_sql_executor_sift_down_v1(plan, state, 0, end - 1)
+        set end = end - 1
+
+fn yaza_sql_executor_rows_equal_v1(source: Text, left: List[YazaSqlValueV1], right: List[YazaSqlValueV1]) -> Boolean:
+    if list_count(left) != list_count(right): return false
+    var index: Number = 0
+    while index < list_count(left):
+        if yaza_sql_executor_compare_values_v1(source, list_get(left, index), list_get(right, index)) != 0: return false
+        set index = index + 1
+    return true
+
+fn yaza_sql_executor_distinct_v1(plan: YazaSqlBoundPlanV1, rows: List[List[YazaSqlValueV1]]) -> Result[List[List[YazaSqlValueV1]], Text]:
+    let unique_result: Result[List[List[YazaSqlValueV1]], Text] = list_try_new()
+    if not result_is_ok(unique_result): return err("SQL executor could not allocate DISTINCT output")
+    var unique: List[List[YazaSqlValueV1]] = result_unwrap(unique_result)
+    if not list_try_reserve(unique, list_count(rows)): return err("SQL executor could not reserve DISTINCT output")
+    var has_last: Boolean = false
+    var last_row: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    var index: Number = 0
+    while index < list_count(rows):
+        let row: List[YazaSqlValueV1] = list_get(rows, index)
+        if not has_last or not yaza_sql_executor_rows_equal_v1(plan.source, last_row, row):
+            if not list_try_push(unique, row): return err("SQL executor could not append DISTINCT output")
+            set last_row = row
+            set has_last = true
+        set index = index + 1
+    return ok(unique)
+
+fn yaza_sql_executor_accumulate_sum_v1(projection: YazaSqlBoundProjectionV1, projection_index: Number, source_row: List[YazaSqlValueV1], integer_sums: List[Number], double_sums: List[Float64], aggregate_values: List[YazaSqlValueV1], sum_has_values: List[Boolean]) -> Result[Boolean, Text]:
+    let value: YazaSqlValueV1 = list_get(source_row, projection.column_ordinal)
+    if value.is_null: return ok(true)
+    if projection.type_id == 6:
+        let next_sum: Float64 = list_get(double_sums, projection_index) + value.float_value
+        if not list_try_set(double_sums, projection_index, next_sum): return err("SQL executor could not update a DOUBLE SUM accumulator")
+    elif projection.type_id == 10:
+        let parsed: YazaSqlDecimalV1 = yaza_sql_decimal_parse_v1(value.text_value, projection.precision, projection.scale)?
+        var next_decimal: YazaSqlDecimalV1 = parsed
+        if list_get(sum_has_values, projection_index):
+            let current_value: YazaSqlValueV1 = list_get(aggregate_values, projection_index)
+            let current_decimal: YazaSqlDecimalV1 = yaza_sql_decimal_parse_v1(current_value.text_value, projection.precision, projection.scale)?
+            set next_decimal = yaza_sql_decimal_add_v1(current_decimal, parsed, projection.precision)?
+        let decimal_value: YazaSqlValueV1 = yaza_sql_value_decimal_v1(next_decimal)?
+        if not list_try_set(aggregate_values, projection_index, decimal_value): return err("SQL executor could not update a DECIMAL SUM accumulator")
+    else:
+        let current_sum: Number = list_get(integer_sums, projection_index)
+        let next_value: Number = value.integer_value
+        let maximum: Number = 9223372036854775807
+        let minimum: Number = -9223372036854775807 - 1
+        if next_value > 0 and current_sum > maximum - next_value:
+            return err("SQL executor SUM overflowed signed BIGINT result")
+        if next_value < 0 and current_sum < minimum - next_value:
+            return err("SQL executor SUM underflowed signed BIGINT result")
+        if not list_try_set(integer_sums, projection_index, current_sum + next_value):
+            return err("SQL executor could not update an integer SUM accumulator")
+    if not list_try_set(sum_has_values, projection_index, true): return err("SQL executor could not update SUM null state")
+    return ok(true)
+
+fn yaza_sql_executor_accumulate_extreme_v1(source: Text, projection: YazaSqlBoundProjectionV1, projection_index: Number, source_row: List[YazaSqlValueV1], aggregate_values: List[YazaSqlValueV1], aggregate_has_values: List[Boolean]) -> Result[Boolean, Text]:
+    let value: YazaSqlValueV1 = list_get(source_row, projection.column_ordinal)
+    if value.is_null: return ok(true)
+    var replace: Boolean = not list_get(aggregate_has_values, projection_index)
+    if not replace:
+        let current: YazaSqlValueV1 = list_get(aggregate_values, projection_index)
+        let comparison: Number = yaza_sql_executor_compare_values_v1(source, current, value)
+        if projection.aggregate_kind == 3 and comparison > 0: set replace = true
+        if projection.aggregate_kind == 4 and comparison < 0: set replace = true
+    if replace and not list_try_set(aggregate_values, projection_index, value):
+        return err("SQL executor could not update a MIN/MAX accumulator")
+    if not list_get(aggregate_has_values, projection_index) and not list_try_set(aggregate_has_values, projection_index, true):
+        return err("SQL executor could not update MIN/MAX null state")
+    return ok(true)
+
+fn yaza_sql_executor_accumulate_average_v1(projection: YazaSqlBoundProjectionV1, projection_index: Number, source_row: List[YazaSqlValueV1], average_sums: List[Float64], average_compensations: List[Float64], average_counts: List[Number], aggregate_has_values: List[Boolean]) -> Result[Boolean, Text]:
+    let value: YazaSqlValueV1 = list_get(source_row, projection.column_ordinal)
+    if value.is_null: return ok(true)
+    var addend: Float64 = value.float_value
+    if value.type_id != 6: set addend = float64_from_number(value.integer_value)
+    let current_sum: Float64 = list_get(average_sums, projection_index)
+    let next_sum: Float64 = current_sum + addend
+    var current_magnitude: Float64 = current_sum
+    var addend_magnitude: Float64 = addend
+    if current_magnitude < 0.0: set current_magnitude = -current_magnitude
+    if addend_magnitude < 0.0: set addend_magnitude = -addend_magnitude
+    var correction: Float64 = (current_sum - next_sum) + addend
+    if current_magnitude < addend_magnitude: set correction = (addend - next_sum) + current_sum
+    let next_compensation: Float64 = list_get(average_compensations, projection_index) + correction
+    if not list_try_set(average_sums, projection_index, next_sum) or not list_try_set(average_compensations, projection_index, next_compensation):
+        return err("SQL executor could not update AVG accumulator")
+    if not list_try_set(average_counts, projection_index, list_get(average_counts, projection_index) + 1):
+        return err("SQL executor could not update AVG count")
+    if not list_get(aggregate_has_values, projection_index) and not list_try_set(aggregate_has_values, projection_index, true):
+        return err("SQL executor could not update AVG null state")
+    return ok(true)
+
+fn yaza_sql_executor_reset_aggregate_state_v1(plan: YazaSqlBoundPlanV1, integer_sums: List[Number], double_sums: List[Float64], aggregate_values: List[YazaSqlValueV1], aggregate_has_values: List[Boolean], average_compensations: List[Float64], average_counts: List[Number]) -> Result[Boolean, Text]:
+    var index: Number = 0
+    while index < list_count(plan.projections):
+        let projection: YazaSqlBoundProjectionV1 = list_get(plan.projections, index)
+        if projection.aggregate_kind == 2 or projection.aggregate_kind == 5:
+            if not list_try_set(integer_sums, index, 0) or not list_try_set(double_sums, index, 0.0): return err("SQL executor could not reset numeric aggregate state")
+        if projection.aggregate_kind == 3 or projection.aggregate_kind == 4 or (projection.aggregate_kind == 2 and projection.type_id == 10):
+            let null_value: Result[YazaSqlValueV1, Text] = yaza_sql_value_null_v1(projection.type_id)
+            if not result_is_ok(null_value): return err(result_unwrap_error(null_value))
+            if not list_try_set(aggregate_values, index, result_unwrap(null_value)): return err("SQL executor could not reset aggregate value state")
+        if projection.aggregate_kind == 5:
+            if not list_try_set(average_compensations, index, 0.0) or not list_try_set(average_counts, index, 0): return err("SQL executor could not reset AVG state")
+        if projection.aggregate_kind >= 2 and projection.aggregate_kind <= 5 and not list_try_set(aggregate_has_values, index, false): return err("SQL executor could not reset aggregate NULL state")
+        set index = index + 1
+    return ok(true)
+
+fn yaza_sql_executor_accumulate_row_v1(plan: YazaSqlBoundPlanV1, source_row: List[YazaSqlValueV1], integer_sums: List[Number], double_sums: List[Float64], aggregate_values: List[YazaSqlValueV1], aggregate_has_values: List[Boolean], average_compensations: List[Float64], average_counts: List[Number], prior_count: Number) -> Result[Number, Text]:
+    var count: Number = prior_count + 1
+    var projection_index: Number = 0
+    while projection_index < list_count(plan.projections):
+        let projection: YazaSqlBoundProjectionV1 = list_get(plan.projections, projection_index)
+        if projection.aggregate_kind == 2:
+            let accumulated: Result[Boolean, Text] = yaza_sql_executor_accumulate_sum_v1(projection, projection_index, source_row, integer_sums, double_sums, aggregate_values, aggregate_has_values)
+            if not result_is_ok(accumulated): return err(result_unwrap_error(accumulated))
+        elif projection.aggregate_kind == 3 or projection.aggregate_kind == 4:
+            let accumulated: Result[Boolean, Text] = yaza_sql_executor_accumulate_extreme_v1(plan.source, projection, projection_index, source_row, aggregate_values, aggregate_has_values)
+            if not result_is_ok(accumulated): return err(result_unwrap_error(accumulated))
+        elif projection.aggregate_kind == 5:
+            let accumulated: Result[Boolean, Text] = yaza_sql_executor_accumulate_average_v1(projection, projection_index, source_row, double_sums, average_compensations, average_counts, aggregate_has_values)
+            if not result_is_ok(accumulated): return err(result_unwrap_error(accumulated))
+        set projection_index = projection_index + 1
+    return ok(count)
+
+fn yaza_sql_executor_build_aggregate_row_v1(plan: YazaSqlBoundPlanV1, has_source_row: Boolean, source_row: List[YazaSqlValueV1], aggregate_count: Number, integer_sums: List[Number], double_sums: List[Float64], aggregate_values: List[YazaSqlValueV1], aggregate_has_values: List[Boolean], average_compensations: List[Float64], average_counts: List[Number]) -> Result[List[YazaSqlValueV1], Text]:
+    let row_result: Result[List[YazaSqlValueV1], Text] = list_try_new()
+    if not result_is_ok(row_result): return err("SQL executor could not allocate aggregate result row")
+    var row: List[YazaSqlValueV1] = result_unwrap(row_result)
+    if not list_try_reserve(row, list_count(plan.projections)): return err("SQL executor could not reserve aggregate result row")
+    var index: Number = 0
+    while index < list_count(plan.projections):
+        let projection: YazaSqlBoundProjectionV1 = list_get(plan.projections, index)
+        var value: YazaSqlValueV1 = yaza_sql_executor_value_v1(4, aggregate_count, 0.0, false, "")
+        if projection.aggregate_kind == 0:
+            if not has_source_row or projection.column_ordinal < 0 or projection.column_ordinal >= list_count(source_row): return err("SQL executor grouped projection has no source key row")
+            set value = list_get(source_row, projection.column_ordinal)
+        elif projection.aggregate_kind == 2:
+            if list_get(aggregate_has_values, index):
+                if projection.type_id == 10: set value = list_get(aggregate_values, index)
+                elif projection.type_id == 6: set value = yaza_sql_value_double_v1(list_get(double_sums, index))
+                else: set value = yaza_sql_executor_value_v1(4, list_get(integer_sums, index), 0.0, false, "")
+            else:
+                let null_result: Result[YazaSqlValueV1, Text] = yaza_sql_value_null_v1(projection.type_id)
+                if not result_is_ok(null_result): return err(result_unwrap_error(null_result))
+                set value = result_unwrap(null_result)
+        elif projection.aggregate_kind == 3 or projection.aggregate_kind == 4:
+            if list_get(aggregate_has_values, index): set value = list_get(aggregate_values, index)
+            else:
+                let null_result: Result[YazaSqlValueV1, Text] = yaza_sql_value_null_v1(projection.type_id)
+                if not result_is_ok(null_result): return err(result_unwrap_error(null_result))
+                set value = result_unwrap(null_result)
+        elif projection.aggregate_kind == 5:
+            if list_get(aggregate_has_values, index):
+                let compensated_sum: Float64 = list_get(double_sums, index) + list_get(average_compensations, index)
+                set value = yaza_sql_value_double_v1(compensated_sum / float64_from_number(list_get(average_counts, index)))
+            else:
+                let null_result: Result[YazaSqlValueV1, Text] = yaza_sql_value_null_v1(6)
+                if not result_is_ok(null_result): return err(result_unwrap_error(null_result))
+                set value = result_unwrap(null_result)
+        if not list_try_push(row, value): return err("SQL executor could not build aggregate result row")
+        set index = index + 1
+    return ok(row)
+
+fn yaza_sql_executor_group_keys_equal_v1(plan: YazaSqlBoundPlanV1, left: List[YazaSqlValueV1], right: List[YazaSqlValueV1]) -> Boolean:
+    var index: Number = 0
+    while index < list_count(plan.group_by_columns):
+        let column: Number = list_get(plan.group_by_columns, index)
+        if yaza_sql_executor_compare_values_v1(plan.source, list_get(left, column), list_get(right, column)) != 0: return false
+        set index = index + 1
+    return true
+
+fn yaza_sql_executor_apply_having_v1(plan: YazaSqlBoundPlanV1, prepared: List[YazaSqlValueV1], subquery_values: List[YazaSqlSubqueryValuesV1], rows: List[List[YazaSqlValueV1]]) -> Result[List[List[YazaSqlValueV1]], Text]:
+    if plan.having_root < 0: return ok(rows)
+    let filtered_result: Result[List[List[YazaSqlValueV1]], Text] = list_try_new()
+    if not result_is_ok(filtered_result): return err("SQL executor could not allocate HAVING output")
+    var filtered: List[List[YazaSqlValueV1]] = result_unwrap(filtered_result)
+    if not list_try_reserve(filtered, list_count(rows)): return err("SQL executor could not reserve HAVING output")
+    var row_index: Number = 0
+    while row_index < list_count(rows):
+        let row: List[YazaSqlValueV1] = list_get(rows, row_index)
+        let selected_result: Result[Number, Text] = yaza_sql_executor_eval_expression_v1(plan, prepared, subquery_values, row, plan.having_root, 0)
+        if not result_is_ok(selected_result): return err(result_unwrap_error(selected_result))
+        if result_unwrap(selected_result) == 1 and not list_try_push(filtered, row): return err("SQL executor could not append HAVING output")
+        set row_index = row_index + 1
+    return ok(filtered)
+
+fn yaza_sql_execute_memory_with_scan_v1(plan: YazaSqlBoundPlanV1, table: YazaSqlMemoryTableV1, parameters: List[YazaSqlValueV1], subquery_values: List[YazaSqlSubqueryValuesV1], prior_work_units: Number, statement_prior_work_units: Number, where_preapplied: Boolean) -> Result[YazaSqlQueryResultV1, Text]:
+    if where_preapplied and plan.where_root < 0: return err("SQL executor cannot skip a WHERE predicate that is absent from the plan")
+    if statement_prior_work_units < 0 or statement_prior_work_units > yaza_sql_executor_max_work_units_v1() or prior_work_units < 0 or prior_work_units > yaza_sql_executor_max_work_units_v1() - statement_prior_work_units:
+        return err("SQL executor prior statement/scan work exceeds the bounded work profile")
+    if list_count(subquery_values) != list_count(plan.subqueries): return err("SQL executor received an incomplete IN subquery materialization set")
+    let verified: Result[YazaSqlExecutorInputProfileV1, Text] = yaza_sql_executor_validate_plan_v1(plan, table)
+    if not result_is_ok(verified): return err(result_unwrap_error(verified))
+    var subquery_total_rows: Number = 0
+    var subquery_total_text_bytes: Number = 0
+    var subquery_retained_rows: Number = 0
+    var subquery_retained_cells: Number = 0
+    var subquery_retained_text_bytes: Number = 0
+    var subquery_work_units: Number = 0
+    var subquery_index: Number = 0
+    while subquery_index < list_count(subquery_values):
+        let materialized: YazaSqlSubqueryValuesV1 = list_get(subquery_values, subquery_index)
+        let materialized_values: List[YazaSqlValueV1] = materialized.values
+        let materialized_row_count: Number = list_count(materialized_values) + list_count(materialized.pairs)
+        if materialized_row_count > 65536 - subquery_total_rows: return err("SQL executor IN subquery results exceed the 65536-row aggregate bound")
+        set subquery_total_rows = subquery_total_rows + materialized_row_count
+        if materialized.retained_rows < 0 or materialized.retained_rows > 65536 - subquery_retained_rows:
+            return err("SQL executor nested subquery materialization exceeds the statement row budget")
+        if materialized.retained_cells < 0 or materialized.retained_cells > yaza_sql_executor_max_input_cells_v1() - subquery_retained_cells:
+            return err("SQL executor nested subquery materialization exceeds the statement cell budget")
+        if materialized.retained_text_bytes < 0 or materialized.retained_text_bytes > yaza_sql_executor_max_input_text_bytes_v1() - subquery_retained_text_bytes:
+            return err("SQL executor nested subquery materialization exceeds the statement Text budget")
+        if materialized.work_units < 0 or materialized.work_units > yaza_sql_executor_max_work_units_v1() - subquery_work_units:
+            return err("SQL executor nested subqueries exceed the statement work budget")
+        set subquery_retained_rows = subquery_retained_rows + materialized.retained_rows
+        set subquery_retained_cells = subquery_retained_cells + materialized.retained_cells
+        set subquery_retained_text_bytes = subquery_retained_text_bytes + materialized.retained_text_bytes
+        set subquery_work_units = subquery_work_units + materialized.work_units
+        set subquery_index = subquery_index + 1
+
+    var expression_index: Number = 0
+    while expression_index < list_count(plan.expressions):
+        let node: YazaSqlBoundExpressionNodeV1 = list_get(plan.expressions, expression_index)
+        if node.kind == 6 and node.value_kind == 1:
+            let materialized: YazaSqlSubqueryValuesV1 = list_get(subquery_values, node.parameter_ordinal)
+            if list_count(materialized.values) != 0: return err("SQL executor correlated IN unexpectedly contains a flat value vector")
+            let pairs: List[List[YazaSqlValueV1]] = materialized.pairs
+            var pair_index: Number = 0
+            while pair_index < list_count(pairs):
+                let pair: List[YazaSqlValueV1] = list_get(pairs, pair_index)
+                if list_count(pair) != 2: return err("SQL executor correlated IN materialization contains a malformed pair")
+                let key_value: YazaSqlValueV1 = list_get(pair, 0)
+                let projected_value: YazaSqlValueV1 = list_get(pair, 1)
+                if not yaza_sql_executor_value_matches_v1(key_value, node.correlation_type_id): return err("SQL executor correlated IN key does not match its bound type")
+                if not yaza_sql_executor_value_matches_v1(projected_value, node.type_id): return err("SQL executor correlated IN value does not match its bound type")
+                if key_value.type_id == 10 and (yaza_sql_value_decimal_precision_v1(key_value) != node.correlation_precision or yaza_sql_value_decimal_scale_v1(key_value) != node.correlation_scale): return err("SQL executor correlated IN key DECIMAL metadata changed after binding")
+                if projected_value.type_id == 10 and (yaza_sql_value_decimal_precision_v1(projected_value) != node.precision or yaza_sql_value_decimal_scale_v1(projected_value) != node.scale): return err("SQL executor correlated IN value DECIMAL metadata changed after binding")
+                if pair_index > 0 and yaza_sql_executor_correlated_pair_compare_v1(plan.source, list_get(pairs, pair_index - 1), pair) > 0:
+                    return err("SQL executor correlated IN materialization is not sorted by key and value")
+                var pair_value_index: Number = 0
+                while pair_value_index < 2:
+                    let pair_member: YazaSqlValueV1 = list_get(pair, pair_value_index)
+                    if (pair_member.type_id == 9 or pair_member.type_id == 16) and not pair_member.is_null:
+                        let pair_byte_count: Number = yaza_sql_value_variable_length_v1(pair_member)?
+                        if pair_member.type_id == 9 and pair_byte_count > yaza_sql_executor_max_text_value_bytes_v1(): return err("SQL executor correlated IN text value exceeds the bounded value-size limit")
+                        if pair_byte_count > yaza_sql_executor_max_input_text_bytes_v1() - subquery_total_text_bytes: return err("SQL executor correlated IN pairs exceed the 64 MiB variable-width byte budget")
+                        set subquery_total_text_bytes = subquery_total_text_bytes + pair_byte_count
+                    set pair_value_index = pair_value_index + 1
+                set pair_index = pair_index + 1
+        elif node.kind == 6 or (node.kind == 7 and node.value_kind == 1):
+            let materialized_values: List[YazaSqlValueV1] = list_get(subquery_values, node.parameter_ordinal).values
+            if list_count(list_get(subquery_values, node.parameter_ordinal).pairs) != 0: return err("SQL executor uncorrelated subquery unexpectedly contains pair values")
+            var value_index: Number = 0
+            while value_index < list_count(materialized_values):
+                let value: YazaSqlValueV1 = list_get(materialized_values, value_index)
+                if not yaza_sql_executor_value_matches_v1(value, node.type_id): return err("SQL executor subquery value does not match the bound comparison type")
+                if node.type_id == 10 and (yaza_sql_value_decimal_precision_v1(value) != node.precision or yaza_sql_value_decimal_scale_v1(value) != node.scale):
+                    return err("SQL executor DECIMAL subquery value does not match its bound precision and scale")
+                if node.kind == 7 and node.value_kind == 1 and value_index > 0:
+                    let previous: YazaSqlValueV1 = list_get(materialized_values, value_index - 1)
+                    if yaza_sql_executor_compare_values_v1(plan.source, previous, value) > 0: return err("SQL executor correlated EXISTS key materialization is not sorted")
+                if (value.type_id == 9 or value.type_id == 16) and not value.is_null:
+                    let byte_count: Number = yaza_sql_value_variable_length_v1(value)?
+                    if value.type_id == 9 and byte_count > yaza_sql_executor_max_text_value_bytes_v1(): return err("SQL executor subquery text value exceeds the bounded value-size limit")
+                    if byte_count > yaza_sql_executor_max_input_text_bytes_v1() - subquery_total_text_bytes: return err("SQL executor subquery values exceed the 64 MiB variable-width byte budget")
+                    set subquery_total_text_bytes = subquery_total_text_bytes + byte_count
+                set value_index = value_index + 1
+        set expression_index = expression_index + 1
+
+    let prepared_result: Result[List[YazaSqlValueV1], Text] = yaza_sql_executor_prepare_values_v1(plan, table, parameters)
+    if not result_is_ok(prepared_result): return err(result_unwrap_error(prepared_result))
+    if subquery_work_units > yaza_sql_executor_max_work_units_v1() - statement_prior_work_units:
+        return err("SQL executor subqueries exceed the remaining statement work budget")
+    let query_statement_prior_work_units: Number = statement_prior_work_units + subquery_work_units
+    if prior_work_units > yaza_sql_executor_max_work_units_v1() - query_statement_prior_work_units:
+        return err("SQL executor scan exceeds the remaining statement work budget")
+    let validator_prior_work_units: Number = query_statement_prior_work_units + prior_work_units
+    let budget_result: Result[Number, Text] = yaza_sql_executor_validate_work_budget_with_prior_v1(plan, table, result_unwrap(prepared_result), parameters, result_unwrap(verified), validator_prior_work_units, where_preapplied)
+    if not result_is_ok(budget_result): return err(result_unwrap_error(budget_result))
+    var query_work_units: Number = result_unwrap(budget_result) - statement_prior_work_units
+    if query_work_units < 0 or query_work_units > yaza_sql_executor_max_work_units_v1() - statement_prior_work_units:
+        return err("SQL executor query work exceeds the remaining statement budget")
+    var subquery_comparison_work: Number = 0
+    var subquery_work_index: Number = 0
+    while subquery_work_index < list_count(subquery_values) and not where_preapplied:
+        var is_correlated_exists: Boolean = false
+        var is_correlated_in: Boolean = false
+        var expression_probe: Number = 0
+        while expression_probe < list_count(plan.expressions):
+            let node: YazaSqlBoundExpressionNodeV1 = list_get(plan.expressions, expression_probe)
+            if node.kind == 7 and node.value_kind == 1 and node.parameter_ordinal == subquery_work_index:
+                set is_correlated_exists = true
+            elif node.kind == 6 and node.value_kind == 1 and node.parameter_ordinal == subquery_work_index:
+                set is_correlated_in = true
+            set expression_probe = expression_probe + 1
+        var comparison_units: Number = list_count(table.rows) * list_count(list_get(subquery_values, subquery_work_index).values)
+        if is_correlated_in:
+            var search_levels: Number = 0
+            var search_remaining: Number = list_count(list_get(subquery_values, subquery_work_index).pairs)
+            while search_remaining > 0:
+                set search_remaining = search_remaining / 2
+                set search_levels = search_levels + 1
+            set comparison_units = list_count(table.rows) * search_levels * 3
+        elif is_correlated_exists:
+            var search_levels: Number = 0
+            var search_remaining: Number = list_count(list_get(subquery_values, subquery_work_index).values)
+            while search_remaining > 0:
+                set search_remaining = search_remaining / 2
+                set search_levels = search_levels + 1
+            set comparison_units = list_count(table.rows) * search_levels
+        if comparison_units > yaza_sql_executor_max_work_units_v1() - subquery_comparison_work:
+            return err("SQL executor subquery comparisons exceed the 100000000 comparison work-unit bound")
+        set subquery_comparison_work = subquery_comparison_work + comparison_units
+        set subquery_work_index = subquery_work_index + 1
+    if subquery_comparison_work > yaza_sql_executor_max_work_units_v1() - statement_prior_work_units - query_work_units:
+        return err("SQL executor outer comparisons exceed the statement work budget")
+    set query_work_units = query_work_units + subquery_comparison_work
+    let output_result: Result[List[List[YazaSqlValueV1]], Text] = list_try_new()
+    if not result_is_ok(output_result): return err("SQL executor could not allocate query rows")
+    var output_rows: List[List[YazaSqlValueV1]] = result_unwrap(output_result)
+    var has_aggregate_projection: Boolean = false
+    var projection_scan_index: Number = 0
+    while projection_scan_index < list_count(plan.projections):
+        if list_get(plan.projections, projection_scan_index).aggregate_kind != 0: set has_aggregate_projection = true
+        set projection_scan_index = projection_scan_index + 1
+    let has_grouping: Boolean = list_count(plan.group_by_columns) > 0
+    var initial_output_capacity: Number = list_count(table.rows)
+    if has_aggregate_projection and not has_grouping: set initial_output_capacity = 1
+    if not list_try_reserve(output_rows, initial_output_capacity): return err("SQL executor could not reserve query rows")
+    var aggregate_count: Number = 0
+    var integer_sums: List[Number] = List[Number]()
+    var double_sums: List[Float64] = List[Float64]()
+    var aggregate_values: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    var aggregate_has_values: List[Boolean] = List[Boolean]()
+    var average_compensations: List[Float64] = List[Float64]()
+    var average_counts: List[Number] = List[Number]()
+    var has_sum_projection: Boolean = false
+    var has_aggregate_value_projection: Boolean = false
+    var has_average_projection: Boolean = false
+    var sum_scan_index: Number = 0
+    while sum_scan_index < list_count(plan.projections):
+        if list_get(plan.projections, sum_scan_index).aggregate_kind == 2: set has_sum_projection = true
+        if list_get(plan.projections, sum_scan_index).aggregate_kind == 3 or list_get(plan.projections, sum_scan_index).aggregate_kind == 4 or (list_get(plan.projections, sum_scan_index).aggregate_kind == 2 and list_get(plan.projections, sum_scan_index).type_id == 10): set has_aggregate_value_projection = true
+        if list_get(plan.projections, sum_scan_index).aggregate_kind == 5: set has_average_projection = true
+        set sum_scan_index = sum_scan_index + 1
+    if has_sum_projection or has_aggregate_value_projection or has_average_projection:
+        if not list_try_reserve(aggregate_has_values, list_count(plan.projections)):
+            return err("SQL executor could not reserve aggregate NULL state")
+        if (has_sum_projection or has_average_projection) and (not list_try_reserve(integer_sums, list_count(plan.projections)) or not list_try_reserve(double_sums, list_count(plan.projections))):
+            return err("SQL executor could not reserve numeric aggregate state")
+        if has_average_projection and (not list_try_reserve(average_compensations, list_count(plan.projections)) or not list_try_reserve(average_counts, list_count(plan.projections))):
+            return err("SQL executor could not reserve AVG state")
+        if has_aggregate_value_projection and not list_try_reserve(aggregate_values, list_count(plan.projections)):
+            return err("SQL executor could not reserve aggregate value state")
+        var initialize_aggregate_index: Number = 0
+        while initialize_aggregate_index < list_count(plan.projections):
+            if not list_try_push(aggregate_has_values, false): return err("SQL executor could not initialize aggregate NULL state")
+            if (has_sum_projection or has_average_projection) and (not list_try_push(integer_sums, 0) or not list_try_push(double_sums, 0.0)):
+                return err("SQL executor could not initialize numeric aggregate state")
+            if has_average_projection and (not list_try_push(average_compensations, 0.0) or not list_try_push(average_counts, 0)):
+                return err("SQL executor could not initialize AVG state")
+            if has_aggregate_value_projection:
+                let projection: YazaSqlBoundProjectionV1 = list_get(plan.projections, initialize_aggregate_index)
+                let null_value: YazaSqlValueV1 = yaza_sql_value_null_v1(projection.type_id)?
+                if not list_try_push(aggregate_values, null_value): return err("SQL executor could not initialize aggregate value state")
+            set initialize_aggregate_index = initialize_aggregate_index + 1
+    if has_grouping:
+        let group_rows_result: Result[List[List[YazaSqlValueV1]], Text] = list_try_new()
+        if not result_is_ok(group_rows_result): return err("SQL executor could not allocate GROUP BY input rows")
+        var group_rows: List[List[YazaSqlValueV1]] = result_unwrap(group_rows_result)
+        if not list_try_reserve(group_rows, list_count(table.rows)): return err("SQL executor could not reserve GROUP BY input rows")
+        var scan_index: Number = 0
+        while scan_index < list_count(table.rows):
+            let source_row: List[YazaSqlValueV1] = list_get(table.rows, scan_index)
+            var selected: Boolean = true
+            if plan.where_root >= 0 and not where_preapplied:
+                let selected_result: Result[Number, Text] = yaza_sql_executor_eval_expression_v1(plan, result_unwrap(prepared_result), subquery_values, source_row, plan.where_root, 0)
+                if not result_is_ok(selected_result): return err(result_unwrap_error(selected_result))
+                set selected = result_unwrap(selected_result) == 1
+            if selected and not list_try_push(group_rows, source_row): return err("SQL executor could not collect GROUP BY input rows")
+            set scan_index = scan_index + 1
+
+        var group_sort_plan: YazaSqlBoundPlanV1 = plan
+        set group_sort_plan.order_by = List[YazaSqlBoundOrderTermV1]()
+        set group_sort_plan.distinct = false
+        yaza_sql_executor_sort_rows_v1(group_sort_plan, YazaSqlRowsHandleV1(group_rows))
+        var has_group: Boolean = false
+        var group_source_row: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+        var row_index: Number = 0
+        while row_index < list_count(group_rows):
+            let source_row: List[YazaSqlValueV1] = list_get(group_rows, row_index)
+            if not has_group or not yaza_sql_executor_group_keys_equal_v1(plan, group_source_row, source_row):
+                if has_group:
+                    let completed_row: Result[List[YazaSqlValueV1], Text] = yaza_sql_executor_build_aggregate_row_v1(plan, true, group_source_row, aggregate_count, integer_sums, double_sums, aggregate_values, aggregate_has_values, average_compensations, average_counts)
+                    if not result_is_ok(completed_row): return err(result_unwrap_error(completed_row))
+                    if not list_try_push(output_rows, result_unwrap(completed_row)): return err("SQL executor could not append grouped result row")
+                let reset: Result[Boolean, Text] = yaza_sql_executor_reset_aggregate_state_v1(plan, integer_sums, double_sums, aggregate_values, aggregate_has_values, average_compensations, average_counts)
+                if not result_is_ok(reset): return err(result_unwrap_error(reset))
+                set aggregate_count = 0
+                set group_source_row = source_row
+                set has_group = true
+            let next_count: Result[Number, Text] = yaza_sql_executor_accumulate_row_v1(plan, source_row, integer_sums, double_sums, aggregate_values, aggregate_has_values, average_compensations, average_counts, aggregate_count)
+            if not result_is_ok(next_count): return err(result_unwrap_error(next_count))
+            set aggregate_count = result_unwrap(next_count)
+            set row_index = row_index + 1
+        if has_group:
+            let completed_row: Result[List[YazaSqlValueV1], Text] = yaza_sql_executor_build_aggregate_row_v1(plan, true, group_source_row, aggregate_count, integer_sums, double_sums, aggregate_values, aggregate_has_values, average_compensations, average_counts)
+            if not result_is_ok(completed_row): return err(result_unwrap_error(completed_row))
+            if not list_try_push(output_rows, result_unwrap(completed_row)): return err("SQL executor could not append grouped result row")
+    elif has_aggregate_projection:
+        var scan_index: Number = 0
+        while scan_index < list_count(table.rows):
+            let source_row: List[YazaSqlValueV1] = list_get(table.rows, scan_index)
+            var selected: Boolean = true
+            if plan.where_root >= 0 and not where_preapplied:
+                let selected_result: Result[Number, Text] = yaza_sql_executor_eval_expression_v1(plan, result_unwrap(prepared_result), subquery_values, source_row, plan.where_root, 0)
+                if not result_is_ok(selected_result): return err(result_unwrap_error(selected_result))
+                set selected = result_unwrap(selected_result) == 1
+            if selected:
+                let next_count: Result[Number, Text] = yaza_sql_executor_accumulate_row_v1(plan, source_row, integer_sums, double_sums, aggregate_values, aggregate_has_values, average_compensations, average_counts, aggregate_count)
+                if not result_is_ok(next_count): return err(result_unwrap_error(next_count))
+                set aggregate_count = result_unwrap(next_count)
+            set scan_index = scan_index + 1
+        let aggregate_row: Result[List[YazaSqlValueV1], Text] = yaza_sql_executor_build_aggregate_row_v1(plan, false, List[YazaSqlValueV1](), aggregate_count, integer_sums, double_sums, aggregate_values, aggregate_has_values, average_compensations, average_counts)
+        if not result_is_ok(aggregate_row): return err(result_unwrap_error(aggregate_row))
+        if not list_try_push(output_rows, result_unwrap(aggregate_row)): return err("SQL executor could not append aggregate result row")
+    else:
+        var scan_index: Number = 0
+        while scan_index < list_count(table.rows):
+            let source_row: List[YazaSqlValueV1] = list_get(table.rows, scan_index)
+            var selected: Boolean = true
+            if plan.where_root >= 0 and not where_preapplied:
+                let selected_result: Result[Number, Text] = yaza_sql_executor_eval_expression_v1(plan, result_unwrap(prepared_result), subquery_values, source_row, plan.where_root, 0)
+                if not result_is_ok(selected_result): return err(result_unwrap_error(selected_result))
+                set selected = result_unwrap(selected_result) == 1
+            if selected:
+                let projected_result: Result[List[YazaSqlValueV1], Text] = yaza_sql_executor_project_row_v1(plan, source_row)
+                if not result_is_ok(projected_result): return err(result_unwrap_error(projected_result))
+                if not list_try_push(output_rows, result_unwrap(projected_result)): return err("SQL executor could not append a query row")
+            set scan_index = scan_index + 1
+
+    if plan.distinct or list_count(plan.order_by) > 0:
+        var output_sort_plan: YazaSqlBoundPlanV1 = plan
+        set output_sort_plan.group_by_columns = List[Number]()
+        yaza_sql_executor_sort_rows_v1(output_sort_plan, YazaSqlRowsHandleV1(output_rows))
+    if plan.having_root >= 0:
+        let having_result: Result[List[List[YazaSqlValueV1]], Text] = yaza_sql_executor_apply_having_v1(plan, result_unwrap(prepared_result), subquery_values, output_rows)
+        if not result_is_ok(having_result): return err(result_unwrap_error(having_result))
+        set output_rows = result_unwrap(having_result)
+    if plan.distinct:
+        let distinct_result: Result[List[List[YazaSqlValueV1]], Text] = yaza_sql_executor_distinct_v1(plan, output_rows)
+        if not result_is_ok(distinct_result): return err(result_unwrap_error(distinct_result))
+        set output_rows = result_unwrap(distinct_result)
+    if plan.has_limit and list_count(output_rows) > plan.limit:
+        let limited_result: Result[List[List[YazaSqlValueV1]], Text] = list_try_new()
+        if not result_is_ok(limited_result): return err("SQL executor could not allocate LIMIT output")
+        var limited: List[List[YazaSqlValueV1]] = result_unwrap(limited_result)
+        if not list_try_reserve(limited, plan.limit): return err("SQL executor could not reserve LIMIT output")
+        var limit_index: Number = 0
+        while limit_index < plan.limit:
+            if not list_try_push(limited, list_get(output_rows, limit_index)): return err("SQL executor could not append LIMIT output")
+            set limit_index = limit_index + 1
+        set output_rows = limited
+    return ok(YazaSqlQueryResultV1(plan.projections, output_rows, query_work_units, subquery_retained_rows, subquery_retained_cells, subquery_retained_text_bytes))
+
+fn yaza_sql_execute_memory_with_subqueries_and_prior_v1(plan: YazaSqlBoundPlanV1, table: YazaSqlMemoryTableV1, parameters: List[YazaSqlValueV1], subquery_values: List[YazaSqlSubqueryValuesV1], statement_prior_work_units: Number) -> Result[YazaSqlQueryResultV1, Text]:
+    return yaza_sql_execute_memory_with_scan_v1(plan, table, parameters, subquery_values, 0, statement_prior_work_units, false)
+
+fn yaza_sql_execute_memory_with_subqueries_v1(plan: YazaSqlBoundPlanV1, table: YazaSqlMemoryTableV1, parameters: List[YazaSqlValueV1], subquery_values: List[YazaSqlSubqueryValuesV1]) -> Result[YazaSqlQueryResultV1, Text]:
+    return yaza_sql_execute_memory_with_subqueries_and_prior_v1(plan, table, parameters, subquery_values, 0)
+
+fn yaza_sql_execute_memory_v1(plan: YazaSqlBoundPlanV1, table: YazaSqlMemoryTableV1, parameters: List[YazaSqlValueV1]) -> Result[YazaSqlQueryResultV1, Text]:
+    let empty_subqueries: List[YazaSqlSubqueryValuesV1] = List[YazaSqlSubqueryValuesV1]()
+    return yaza_sql_execute_memory_with_subqueries_v1(plan, table, parameters, empty_subqueries)
+
+fn yaza_sql_executor_diagnostic_code_v1(message: Text) -> Number:
+    if text_starts_with(message, "SQL executor could not allocate") or text_starts_with(message, "SQL executor could not reserve") or text_starts_with(message, "SQL executor could not append") or text_starts_with(message, "SQL executor could not build"): return 4005
+    if text_starts_with(message, "SQL executor SUM overflowed") or text_starts_with(message, "SQL executor SUM underflowed"): return 4008
+    if text_starts_with(message, "SQL executor in-memory profile") or text_starts_with(message, "SQL executor exceeds") or text_starts_with(message, "SQL executor SQL source exceeds") or text_starts_with(message, "SQL executor text value exceeds") or text_starts_with(message, "SQL executor text comparison exceeds") or text_starts_with(message, "SQL executor text bind value exceeds") or text_starts_with(message, "SQL executor LIMIT is outside") or text_starts_with(message, "SQL executor plan exceeds"): return 4007
+    if text_starts_with(message, "SQL executor table contains a scalar type") or text_starts_with(message, "SQL executor scalar type") or text_starts_with(message, "SQL executor comparison type") or text_starts_with(message, "SQL executor numeric literal type") or text_starts_with(message, "SQL executor received an unsupported comparison value"): return 4006
+    if text_starts_with(message, "SQL executor bind") or text_starts_with(message, "SQL executor integer literal") or text_starts_with(message, "SQL executor DOUBLE literal") or text_starts_with(message, "SQL executor text literal") or text_starts_with(message, "SQL executor Boolean literal"): return 4003
+    if text_starts_with(message, "SQL executor table") or text_starts_with(message, "SQL executor row") or text_starts_with(message, "SQL executor projection metadata") or text_starts_with(message, "SQL executor ORDER BY") or text_starts_with(message, "SQL executor parameter metadata") or text_starts_with(message, "SQL executor received invalid table metadata"): return 4004
+    if text_starts_with(message, "SQL executor plan") or text_starts_with(message, "SQL executor scan") or text_starts_with(message, "SQL executor filter") or text_starts_with(message, "SQL executor DISTINCT") or text_starts_with(message, "SQL executor sort") or text_starts_with(message, "SQL executor LIMIT operator") or text_starts_with(message, "SQL executor projection operator") or text_starts_with(message, "SQL executor aggregate operator"): return 4001
+    if text_starts_with(message, "SQL executor projection") or text_starts_with(message, "SQL executor aggregate projection") or text_starts_with(message, "SQL executor plan mixes") or text_starts_with(message, "SQL executor aggregate plan"): return 4001
+    if text_starts_with(message, "SQL executor expression") or text_starts_with(message, "SQL executor WHERE") or text_starts_with(message, "SQL executor comparison") or text_starts_with(message, "SQL executor Boolean node") or text_starts_with(message, "SQL executor NOT node"): return 4002
+    return 4099
+
+fn yaza_sql_execute_memory_structured_v1(plan: YazaSqlBoundPlanV1, table: YazaSqlMemoryTableV1, parameters: List[YazaSqlValueV1]) -> Result[YazaSqlQueryResultV1, YazaSqlDiagnosticV1]:
+    let executed: Result[YazaSqlQueryResultV1, Text] = yaza_sql_execute_memory_v1(plan, table, parameters)
+    if result_is_ok(executed): return ok(result_unwrap(executed))
+    let message: Text = result_unwrap_error(executed)
+    let diagnostic: YazaSqlDiagnosticV1 = yaza_sql_v1_diagnostic(plan.source, message, 4, yaza_sql_executor_diagnostic_code_v1(message))
+    return err(diagnostic)

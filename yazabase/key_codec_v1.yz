@@ -1,0 +1,275 @@
+# YDBv1 memcomparable composite-key codec for the current SQL scalar profile.
+# Composite keys are compared bytewise by the B+Tree page codec.
+use "./sql_executor_v1"
+use "./sql_decimal_v1"
+use "./sql_uuid_v1"
+use "./page_v1"
+
+fn yaza_db_key_integer_width_v1(type_id: Number) -> Number:
+    if type_id == 2: return 2
+    if type_id == 3: return 4
+    if type_id == 4: return 8
+    if type_id == 11: return 4
+    if type_id == 13 or type_id == 14 or type_id == 15: return 8
+    return 0
+
+fn yaza_db_key_encode_integer_component_v1(type_id: Number, value: Number) -> Result[Bytes, Text]:
+    let validated_value: YazaSqlValueV1 = yaza_sql_value_integer_v1(type_id, value)?
+    let width: Number = yaza_db_key_integer_width_v1(type_id)
+    if width == 0: return err("YDBv1 integer key encoder requires an integer scalar type")
+    let raw_result: Result[Bytes, Text] = bytes_try_new_zeroed(width)
+    let encoded_result: Result[Bytes, Text] = bytes_try_new_zeroed(width + 2)
+    if not result_is_ok(raw_result) or not result_is_ok(encoded_result): return err("YDBv1 integer key encoder could not allocate bounded bytes")
+    let raw: Bytes = result_unwrap(raw_result)
+    let encoded: Bytes = result_unwrap(encoded_result)
+    if not yaza_db_write_int_le_v1(raw, 0, value, width): return err("YDBv1 signed integer key bits could not be encoded")
+    if not bytes_try_set(encoded, 0, 1) or not bytes_try_set(encoded, 1, type_id): return err("YDBv1 integer key component header could not be encoded")
+    var byte_index: Number = 0
+    while byte_index < width:
+        let source_byte: Number = bytes_get(raw, width - byte_index - 1)
+        var sortable_byte: Number = source_byte
+        if byte_index == 0:
+            if source_byte >= 128: set sortable_byte = source_byte - 128
+            else: set sortable_byte = source_byte + 128
+        if not bytes_try_set(encoded, byte_index + 2, sortable_byte): return err("YDBv1 signed integer sort-key byte could not be written")
+        set byte_index = byte_index + 1
+    return ok(encoded)
+
+fn yaza_db_key_matches_single_integer_v1(encoded_key: Bytes, value: YazaSqlValueV1, is_null: Boolean, type_id: Number, scratch: Bytes) -> Result[Boolean, Text]:
+    let width: Number = yaza_db_key_integer_width_v1(type_id)
+    if width == 0 or bytes_length(scratch) < width: return err("YDBv1 single-integer key check received an unsupported type or scratch buffer")
+    if value.type_id != type_id or value.source_literal: return err("YDBv1 single-integer key value tag does not match its column")
+    if is_null:
+        return ok(bytes_length(encoded_key) == 2 and bytes_get(encoded_key, 0) == 0 and bytes_get(encoded_key, 1) == type_id)
+    if not yaza_sql_executor_value_matches_v1(value, type_id): return err("YDBv1 single-integer key value is outside its declared SQL type")
+    if bytes_length(encoded_key) != width + 2 or bytes_get(encoded_key, 0) != 1 or bytes_get(encoded_key, 1) != type_id: return ok(false)
+    if not yaza_db_write_int_le_v1(scratch, 0, value.integer_value, width): return err("YDBv1 single-integer key scratch encoding failed")
+    var byte_index: Number = 0
+    while byte_index < width:
+        let source_byte: Number = bytes_get(scratch, width - byte_index - 1)
+        var sortable_byte: Number = source_byte
+        if byte_index == 0:
+            if source_byte >= 128: set sortable_byte = source_byte - 128
+            else: set sortable_byte = source_byte + 128
+        if bytes_get(encoded_key, byte_index + 2) != sortable_byte: return ok(false)
+        set byte_index = byte_index + 1
+    return ok(true)
+
+# Validate an integer primary key directly against a page slot's shared-prefix
+# representation. This avoids allocating the reconstructed key Bytes per row.
+fn yaza_db_key_matches_single_integer_number_span_v1(page: Bytes, header: YazaDbPageHeaderV1, slot: YazaDbPageSlotSpanV1, integer_value: Number, is_null: Boolean, type_id: Number, scratch: Bytes) -> Result[Boolean, Text]:
+    let width: Number = yaza_db_key_integer_width_v1(type_id)
+    let page_length: Number = bytes_length(page)
+    if width == 0 or bytes_length(scratch) < width or page_length != yaza_db_page_size_v1() or header.page_type != 1 or header.prefix_len < 0 or header.prefix_len > 2048 or slot.offset < header.data_start or slot.offset > page_length or slot.key_len < 0 or slot.key_len > page_length - slot.offset:
+        return err("YDBv1 single-integer key span check received an invalid page, type, or scratch buffer")
+    if not is_null and ((type_id == 2 and (integer_value < -32768 or integer_value > 32767)) or (type_id == 3 and (integer_value < -2147483648 or integer_value > 2147483647))):
+        return err("YDBv1 single-integer key value is outside its declared SQL type")
+    let full_key_length: Number = header.prefix_len + slot.key_len
+    var expected_length: Number = width + 2
+    if is_null: set expected_length = 2
+    if full_key_length != expected_length: return ok(false)
+    let prefix_offset: Number = page_length - header.prefix_len
+    var index: Number = 0
+    while index < expected_length:
+        var stored_byte: Number = 0
+        if index < header.prefix_len:
+            set stored_byte = bytes_get(page, prefix_offset + index)
+        else:
+            set stored_byte = bytes_get(page, slot.offset + index - header.prefix_len)
+        var expected_byte: Number = 0
+        if index == 0 and not is_null: set expected_byte = 1
+        elif index == 1: set expected_byte = type_id
+        elif not is_null:
+            if index == 2 and not yaza_db_write_int_le_v1(scratch, 0, integer_value, width): return err("YDBv1 single-integer key scratch encoding failed")
+            let byte_index: Number = index - 2
+            let source_byte: Number = bytes_get(scratch, width - byte_index - 1)
+            set expected_byte = source_byte
+            if byte_index == 0:
+                if source_byte >= 128: set expected_byte = source_byte - 128
+                else: set expected_byte = source_byte + 128
+        if stored_byte != expected_byte: return ok(false)
+        set index = index + 1
+    return ok(true)
+
+fn yaza_db_key_matches_single_integer_span_v1(page: Bytes, header: YazaDbPageHeaderV1, slot: YazaDbPageSlotSpanV1, value: YazaSqlValueV1, is_null: Boolean, type_id: Number, scratch: Bytes) -> Result[Boolean, Text]:
+    if value.type_id != type_id or value.source_literal: return err("YDBv1 single-integer key value tag does not match its column")
+    if not is_null and not yaza_sql_executor_value_matches_v1(value, type_id): return err("YDBv1 single-integer key value is outside its declared SQL type")
+    return yaza_db_key_matches_single_integer_number_span_v1(page, header, slot, value.integer_value, is_null, type_id, scratch)
+
+fn yaza_db_key_float64_sortable_v1(value: Float64) -> Result[Bytes, Text]:
+    let raw_created: Result[Bytes, Text] = bytes_try_new_zeroed(8)
+    if not result_is_ok(raw_created): return err(result_unwrap_error(raw_created))
+    let raw: Bytes = result_unwrap(raw_created)
+    if not yaza_db_write_int_le_v1(raw, 0, float64_bits(value), 8): return err("YDBv1 DOUBLE key bits could not be encoded")
+    let high_byte: Number = bytes_get(raw, 7)
+    let exponent_high: Number = high_byte % 128
+    let exponent_low: Number = bytes_get(raw, 6) / 16
+    if exponent_high == 127 and exponent_low == 15: return err("YDBv1 DOUBLE index keys reject NaN and infinity")
+    var negative: Boolean = high_byte >= 128
+    var zero_value: Boolean = exponent_high == 0
+    var scan: Number = 0
+    while scan < 7:
+        if bytes_get(raw, scan) != 0: set zero_value = false
+        set scan = scan + 1
+    if zero_value:
+        set negative = false
+        set scan = 0
+        while scan < 8:
+            if not bytes_try_set(raw, scan, 0): return err("YDBv1 DOUBLE zero normalization failed")
+            set scan = scan + 1
+    let encoded_created: Result[Bytes, Text] = bytes_try_new_zeroed(8)
+    if not result_is_ok(encoded_created): return err(result_unwrap_error(encoded_created))
+    let encoded: Bytes = result_unwrap(encoded_created)
+    var index: Number = 0
+    while index < 8:
+        let source_byte: Number = bytes_get(raw, 7 - index)
+        var output_byte: Number = source_byte
+        if negative:
+            set output_byte = 255 - source_byte
+        elif index == 0:
+            if source_byte >= 128: set output_byte = source_byte - 128
+            else: set output_byte = source_byte + 128
+        if not bytes_try_set(encoded, index, output_byte): return err("YDBv1 sortable DOUBLE key byte could not be written")
+        set index = index + 1
+    return ok(encoded)
+
+fn yaza_db_key_encode_composite_v1(values: List[YazaSqlValueV1], nulls: List[Boolean], columns: List[YazaSqlColumnSchemaV1], key_ordinals: List[Number]) -> Result[Bytes, Text]:
+    let column_count: Number = list_count(columns)
+    let key_count: Number = list_count(key_ordinals)
+    if column_count < 1 or column_count > 1024 or list_count(values) != column_count or list_count(nulls) != column_count: return err("YDBv1 key row width does not match its column schema")
+    if key_count < 1 or key_count > column_count: return err("YDBv1 composite key requires 1 to 1024 key columns")
+    let seen_created: Result[List[Boolean], Text] = list_try_new()
+    if not result_is_ok(seen_created): return err(result_unwrap_error(seen_created))
+    let seen: List[Boolean] = result_unwrap(seen_created)
+    if not list_try_reserve(seen, column_count): return err("YDBv1 composite key could not reserve its ordinal validation table")
+    var init_index: Number = 0
+    while init_index < column_count:
+        if not list_try_push(seen, false): return err("YDBv1 composite key could not initialize its ordinal validation table")
+        set init_index = init_index + 1
+    var total_size: Number = 0
+    var key_index: Number = 0
+    while key_index < key_count:
+        let ordinal: Number = list_get(key_ordinals, key_index)
+        if ordinal < 0 or ordinal >= column_count: return err("YDBv1 composite key ordinal is outside the row schema")
+        if list_get(seen, ordinal): return err("YDBv1 composite key contains a duplicate column ordinal")
+        if not list_try_set(seen, ordinal, true): return err("YDBv1 composite key ordinal validation failed")
+        let column: YazaSqlColumnSchemaV1 = list_get(columns, ordinal)
+        let value: YazaSqlValueV1 = list_get(values, ordinal)
+        let is_null: Boolean = list_get(nulls, ordinal)
+        let type_id: Number = column.type_id
+        if column.ordinal != ordinal: return err("YDBv1 key column ordinal does not match schema position")
+        if type_id != 1 and type_id != 2 and type_id != 3 and type_id != 4 and type_id != 6 and type_id != 9 and type_id != 10 and type_id != 11 and type_id != 12 and type_id != 13 and type_id != 14 and type_id != 15 and type_id != 16: return err("YDBv1 index key type is not supported by this scalar profile")
+        if value.type_id != type_id or value.source_literal: return err("YDBv1 index key value tag does not match its column")
+        if is_null and not column.nullable: return err("YDBv1 index key contains NULL for a NOT NULL column")
+        if not is_null and not yaza_sql_executor_value_matches_v1(value, type_id): return err("YDBv1 index key value is outside its declared SQL type")
+        var component_size: Number = 2
+        if not is_null:
+            if type_id == 1: set component_size = 3
+            elif type_id == 2 or type_id == 3 or type_id == 4 or type_id == 11 or type_id == 13 or type_id == 14 or type_id == 15: set component_size = 2 + yaza_db_key_integer_width_v1(type_id)
+            elif type_id == 12: set component_size = 18
+            elif type_id == 6: set component_size = 10
+            elif type_id == 10:
+                if yaza_sql_value_decimal_precision_v1(value) != column.precision or yaza_sql_value_decimal_scale_v1(value) != column.scale: return err("YDBv1 DECIMAL key precision/scale does not match its column")
+                let decimal: YazaSqlDecimalV1 = yaza_sql_decimal_parse_v1(value.text_value, column.precision, column.scale)?
+                let decimal_key: Bytes = yaza_sql_decimal_order_key_v1(decimal)?
+                set component_size = 2 + bytes_length(decimal_key)
+            elif type_id == 9:
+                let text_length_bytes: Number = text_length(value.text_value)
+                if text_length_bytes > 2048: return err("YDBv1 TEXT index-key value exceeds the encoded key limit")
+                set component_size = 4 + text_length_bytes
+                var text_index: Number = 0
+                while text_index < text_length_bytes:
+                    if text_byte(value.text_value, text_index) == 0: set component_size = component_size + 1
+                    set text_index = text_index + 1
+            elif type_id == 16:
+                let blob_length: Number = bytes_length(value.bytes_value)
+                if blob_length > 2048: return err("YDBv1 BLOB index-key value exceeds the encoded key limit")
+                set component_size = 4 + blob_length
+                var blob_index: Number = 0
+                while blob_index < blob_length:
+                    if bytes_get(value.bytes_value, blob_index) == 0: set component_size = component_size + 1
+                    set blob_index = blob_index + 1
+        if component_size > 2048 - total_size: return err("YDBv1 composite index key exceeds the 2048-byte page-key limit")
+        set total_size = total_size + component_size
+        set key_index = key_index + 1
+    let output_created: Result[Bytes, Text] = bytes_try_new_zeroed(total_size)
+    if not result_is_ok(output_created): return err(result_unwrap_error(output_created))
+    let output: Bytes = result_unwrap(output_created)
+    let scratch_created: Result[Bytes, Text] = bytes_try_new_zeroed(8)
+    if not result_is_ok(scratch_created): return err(result_unwrap_error(scratch_created))
+    let scratch: Bytes = result_unwrap(scratch_created)
+    var output_offset: Number = 0
+    set key_index = 0
+    while key_index < key_count:
+        let ordinal: Number = list_get(key_ordinals, key_index)
+        let column: YazaSqlColumnSchemaV1 = list_get(columns, ordinal)
+        let value: YazaSqlValueV1 = list_get(values, ordinal)
+        let is_null: Boolean = list_get(nulls, ordinal)
+        let type_id: Number = column.type_id
+        var null_marker: Number = 1
+        if is_null: set null_marker = 0
+        if not bytes_try_set(output, output_offset, null_marker) or not bytes_try_set(output, output_offset + 1, type_id): return err("YDBv1 composite key component header could not be written")
+        set output_offset = output_offset + 2
+        if not is_null:
+            if type_id == 1:
+                var boolean_byte: Number = 0
+                if value.boolean_value: set boolean_byte = 1
+                if not bytes_try_set(output, output_offset, boolean_byte): return err("YDBv1 Boolean index key could not be written")
+                set output_offset = output_offset + 1
+            elif type_id == 2 or type_id == 3 or type_id == 4 or type_id == 11 or type_id == 13 or type_id == 14 or type_id == 15:
+                let width: Number = yaza_db_key_integer_width_v1(type_id)
+                if not yaza_db_write_int_le_v1(scratch, 0, value.integer_value, width): return err("YDBv1 signed integer index key could not be encoded")
+                var byte_index: Number = 0
+                while byte_index < width:
+                    let source_byte: Number = bytes_get(scratch, width - byte_index - 1)
+                    var sortable_byte: Number = source_byte
+                    if byte_index == 0:
+                        if source_byte >= 128: set sortable_byte = source_byte - 128
+                        else: set sortable_byte = source_byte + 128
+                    if not bytes_try_set(output, output_offset + byte_index, sortable_byte): return err("YDBv1 signed integer sort key could not be written")
+                    set byte_index = byte_index + 1
+                set output_offset = output_offset + width
+            elif type_id == 6:
+                let sortable_float: Bytes = yaza_db_key_float64_sortable_v1(value.float_value)?
+                if not yaza_db_write_bytes_v1(output, output_offset, sortable_float): return err("YDBv1 DOUBLE sort key could not be copied")
+                set output_offset = output_offset + 8
+            elif type_id == 12:
+                let uuid_bytes: Bytes = yaza_sql_uuid_parse_v1(value.text_value)?
+                if not yaza_db_write_bytes_v1(output, output_offset, uuid_bytes): return err("YDBv1 UUID sort key could not be copied")
+                set output_offset = output_offset + 16
+            elif type_id == 10:
+                let decimal: YazaSqlDecimalV1 = yaza_sql_decimal_parse_v1(value.text_value, column.precision, column.scale)?
+                let decimal_key: Bytes = yaza_sql_decimal_order_key_v1(decimal)?
+                if not yaza_db_write_bytes_v1(output, output_offset, decimal_key): return err("YDBv1 DECIMAL sort key could not be copied")
+                set output_offset = output_offset + bytes_length(decimal_key)
+            elif type_id == 9:
+                let text_length_bytes: Number = text_length(value.text_value)
+                var text_index: Number = 0
+                while text_index < text_length_bytes:
+                    let text_byte_value: Number = text_byte(value.text_value, text_index)
+                    if text_byte_value == 0:
+                        if not bytes_try_set(output, output_offset, 0) or not bytes_try_set(output, output_offset + 1, 255): return err("YDBv1 TEXT zero-byte escape could not be written")
+                        set output_offset = output_offset + 2
+                    else:
+                        if not bytes_try_set(output, output_offset, text_byte_value): return err("YDBv1 TEXT index key could not be written")
+                        set output_offset = output_offset + 1
+                    set text_index = text_index + 1
+                if not bytes_try_set(output, output_offset, 0) or not bytes_try_set(output, output_offset + 1, 0): return err("YDBv1 TEXT index-key terminator could not be written")
+                set output_offset = output_offset + 2
+            elif type_id == 16:
+                let blob_length: Number = bytes_length(value.bytes_value)
+                var blob_index: Number = 0
+                while blob_index < blob_length:
+                    let blob_byte: Number = bytes_get(value.bytes_value, blob_index)
+                    if blob_byte == 0:
+                        if not bytes_try_set(output, output_offset, 0) or not bytes_try_set(output, output_offset + 1, 255): return err("YDBv1 BLOB zero-byte escape could not be written")
+                        set output_offset = output_offset + 2
+                    else:
+                        if not bytes_try_set(output, output_offset, blob_byte): return err("YDBv1 BLOB index key could not be written")
+                        set output_offset = output_offset + 1
+                    set blob_index = blob_index + 1
+                if not bytes_try_set(output, output_offset, 0) or not bytes_try_set(output, output_offset + 1, 0): return err("YDBv1 BLOB index-key terminator could not be written")
+                set output_offset = output_offset + 2
+        set key_index = key_index + 1
+    if output_offset != total_size: return err("YDBv1 composite key size accounting is inconsistent")
+    return ok(output)

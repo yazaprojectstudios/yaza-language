@@ -1,0 +1,680 @@
+# YDBv1 inline row codec for the current SQL scalar profile.
+# TEXT and BLOB values may use external OVERFLOW references; this module encodes
+# references but does not allocate or hydrate their persistent pages.
+use "./sql_executor_v1"
+use "./sql_insert_exec_v1"
+use "./sql_decimal_v1"
+use "./sql_uuid_v1"
+use "./page_v1"
+use "./overflow_v1"
+
+shape YazaDbRowV1:
+    version_ts: Number
+    undo_ref: Number
+    deleted: Boolean
+    values: List[YazaSqlValueV1]
+    nulls: List[Boolean]
+    schema_epoch: Number
+    schema_version: Number
+    physical_column_count: Number
+    text_input_bytes: Number
+    max_text_input_bytes: Number
+    overflow_refs: List[YazaDbOverflowRefV1]
+
+shape YazaDbRowScanDecodeV1:
+    row: YazaDbRowV1
+    has_integer_key: Boolean
+    integer_key: Number
+
+shape YazaDbRowByteViewV1:
+    source: Bytes
+    start: Number
+    length: Number
+
+fn yaza_db_row_header_size_v1() -> Number:
+    return 24
+
+fn yaza_db_row_max_inline_size_v1() -> Number:
+    return 4096
+
+fn yaza_db_row_overflow_length_marker_v1() -> Number:
+    return 4294967295
+
+fn yaza_db_row_empty_overflow_ref_v1() -> YazaDbOverflowRefV1:
+    return YazaDbOverflowRefV1(0, 0, 0, 0)
+
+fn yaza_db_row_overflow_ref_is_empty_v1(reference: YazaDbOverflowRefV1) -> Boolean:
+    return reference.first_page_id == 0 and reference.total_length == 0 and reference.checksum == 0 and reference.reserved == 0
+
+fn yaza_db_row_overflow_ref_at_v1(overflow_refs: List[YazaDbOverflowRefV1], index: Number) -> YazaDbOverflowRefV1:
+    if list_count(overflow_refs) == 0: return yaza_db_row_empty_overflow_ref_v1()
+    return list_get(overflow_refs, index)
+
+fn yaza_db_row_max_undo_ref_v1() -> Number:
+    return 1099511627775
+
+fn yaza_db_row_max_schema_epoch_v1() -> Number:
+    return 32767
+
+fn yaza_db_row_schema_epoch_from_tag_v1(tag: Number) -> Result[Number, Text]:
+    if tag == 0: return ok(1)
+    if tag < 32768 or tag > 65535: return err("YDBv1 row schema tag is non-canonical")
+    let epoch: Number = tag - 32768
+    if epoch < 2 or epoch > yaza_db_row_max_schema_epoch_v1(): return err("YDBv1 row schema epoch is outside its versioned-tag bound")
+    return ok(epoch)
+
+fn yaza_db_row_schema_tag_from_epoch_v1(epoch: Number) -> Result[Number, Text]:
+    if epoch == 1: return ok(0)
+    if epoch < 2 or epoch > yaza_db_row_max_schema_epoch_v1(): return err("YDBv1 row schema epoch is outside its versioned-tag bound")
+    return ok(32768 + epoch)
+
+fn yaza_db_row_schema_physical_count_v1(columns: List[YazaSqlColumnSchemaV1], schema_version: Number, schema_epoch: Number) -> Result[Number, Text]:
+    let count: Number = list_count(columns)
+    if schema_version < 1 or schema_version > yaza_db_row_max_schema_epoch_v1() or schema_epoch < 1 or schema_epoch > schema_version:
+        return err("YDBv1 row schema epoch is newer than its catalog schema")
+    let schema_delta: Number = schema_version - schema_epoch
+    if schema_delta >= count: return err("YDBv1 row schema epoch implies an empty or invalid physical schema")
+    let physical_count: Number = count - schema_delta
+    var index: Number = physical_count
+    while index < count:
+        let column: YazaSqlColumnSchemaV1 = list_get(columns, index)
+        if not column.nullable and text_length(column.default_expression) == 0: return err("YDBv1 row schema suffix contains a non-nullable added column without a DEFAULT")
+        set index = index + 1
+    return ok(physical_count)
+
+fn yaza_db_row_set_undo_ref_v1(encoded: Bytes, undo_ref: Number) -> Result[Bytes, Text]:
+    let size: Number = bytes_length(encoded)
+    if size < yaza_db_row_header_size_v1() or size > yaza_db_row_max_inline_size_v1() or undo_ref < 1 or undo_ref > yaza_db_row_max_undo_ref_v1(): return err("YDBv1 row undo reference is outside its WAL bound")
+    let version_ts: Number = yaza_db_read_int_le_v1(encoded, 0, 8)?
+    let old_undo_ref: Number = yaza_db_read_uint_le_v1(encoded, 8, 8)?
+    let infomask: Number = yaza_db_read_uint_le_v1(encoded, 16, 2)?
+    let count: Number = yaza_db_read_uint_le_v1(encoded, 18, 2)?
+    let schema_tag: Number = yaza_db_read_uint_le_v1(encoded, 22, 2)?
+    let schema_epoch: Number = yaza_db_row_schema_epoch_from_tag_v1(schema_tag)?
+    if not yaza_db_row_version_valid_v1(version_ts) or old_undo_ref != 0 or count < 1 or count > 1024 or schema_epoch < 1 or (infomask != 0 and infomask != 1 and infomask != 4 and infomask != 5): return err("YDBv1 row header cannot accept a first undo reference")
+    let stamped: Bytes = bytes_try_slice(encoded, 0, size)?
+    if not yaza_db_write_uint_le_v1(stamped, 8, undo_ref, 8): return err("YDBv1 row undo reference could not be stamped")
+    return ok(stamped)
+
+fn yaza_db_row_set_deleted_v1(encoded: Bytes, is_deleted: Boolean) -> Result[Bytes, Text]:
+    let size: Number = bytes_length(encoded)
+    if size < yaza_db_row_header_size_v1() or size > yaza_db_row_max_inline_size_v1(): return err("YDBv1 row tombstone payload size is invalid")
+    let version_ts: Number = yaza_db_read_int_le_v1(encoded, 0, 8)?
+    let undo_ref: Number = yaza_db_read_uint_le_v1(encoded, 8, 8)?
+    let infomask: Number = yaza_db_read_uint_le_v1(encoded, 16, 2)?
+    let count: Number = yaza_db_read_uint_le_v1(encoded, 18, 2)?
+    let schema_tag: Number = yaza_db_read_uint_le_v1(encoded, 22, 2)?
+    let schema_epoch: Number = yaza_db_row_schema_epoch_from_tag_v1(schema_tag)?
+    if not yaza_db_row_version_valid_v1(version_ts) or undo_ref > yaza_db_row_max_undo_ref_v1() or count < 1 or count > 1024 or schema_epoch < 1 or (infomask != 0 and infomask != 1 and infomask != 4 and infomask != 5): return err("YDBv1 row header cannot accept a tombstone flag")
+    let currently_deleted: Boolean = infomask == 1 or infomask == 5
+    if currently_deleted == is_deleted:
+        let unchanged: Bytes = bytes_try_slice(encoded, 0, size)?
+        return ok(unchanged)
+    var next_infomask: Number = infomask + 1
+    if currently_deleted: set next_infomask = infomask - 1
+    let updated: Bytes = bytes_try_slice(encoded, 0, size)?
+    if not yaza_db_write_uint_le_v1(updated, 16, next_infomask, 2): return err("YDBv1 row tombstone flag could not be written")
+    return ok(updated)
+
+fn yaza_db_row_version_min_signed_v1() -> Number:
+    return -9223372036854775807 - 1
+
+fn yaza_db_row_version_txn_encode_v1(txn_id: Number) -> Result[Number, Text]:
+    if txn_id < 1: return err("YDBv1 row transaction ID must be a positive u63")
+    return ok(yaza_db_row_version_min_signed_v1() + txn_id)
+
+fn yaza_db_row_version_txn_decode_v1(version_ts: Number) -> Result[Number, Text]:
+    if version_ts >= 0: return err("YDBv1 row version tag is a committed timestamp, not a transaction ID")
+    let txn_id: Number = version_ts - yaza_db_row_version_min_signed_v1()
+    if txn_id < 1: return err("YDBv1 row version tag contains reserved transaction ID zero")
+    return ok(txn_id)
+
+fn yaza_db_row_version_valid_v1(version_ts: Number) -> Boolean:
+    if version_ts >= 0: return true
+    return version_ts != yaza_db_row_version_min_signed_v1()
+
+fn yaza_db_row_fixed_width_v1(type_id: Number) -> Number:
+    if type_id == 1: return 1
+    if type_id == 2: return 2
+    if type_id == 3: return 4
+    if type_id == 4 or type_id == 6: return 8
+    if type_id == 10: return 16
+    if type_id == 11: return 4
+    if type_id == 13 or type_id == 14 or type_id == 15: return 8
+    if type_id == 12: return 16
+    if type_id == 9 or type_id == 16: return 0
+    return -1
+
+fn yaza_db_row_schema_valid_v1(columns: List[YazaSqlColumnSchemaV1]) -> Boolean:
+    let count: Number = list_count(columns)
+    if count < 1 or count > 1024: return false
+    var index: Number = 0
+    while index < count:
+        let column: YazaSqlColumnSchemaV1 = list_get(columns, index)
+        if column.ordinal != index or yaza_db_row_fixed_width_v1(column.type_id) < 0: return false
+        if column.type_id == 10:
+            if not yaza_sql_decimal_parameters_valid_v1(column.precision, column.scale): return false
+        elif column.precision != 0 or column.scale != 0:
+            return false
+        set index = index + 1
+    return true
+
+fn yaza_db_row_bit_mask_v1(bit_index: Number) -> Number:
+    var mask: Number = 1
+    var shift: Number = 0
+    while shift < bit_index:
+        set mask = mask * 2
+        set shift = shift + 1
+    return mask
+
+fn yaza_db_row_byte_view_new_v1(source: Bytes, start: Number, length: Number) -> Result[YazaDbRowByteViewV1, Text]:
+    let source_length: Number = bytes_length(source)
+    if start < 0 or length < 0 or start > source_length or length > source_length - start:
+        return err("YDBv1 row byte view exceeds its source buffer")
+    return ok(YazaDbRowByteViewV1(source, start, length))
+
+fn yaza_db_row_view_byte_v1(view: YazaDbRowByteViewV1, offset: Number) -> Number:
+    return bytes_get(view.source, view.start + offset)
+
+fn yaza_db_row_view_read_uint_le_v1(view: YazaDbRowByteViewV1, offset: Number, width: Number) -> Result[Number, Text]:
+    if width < 1 or width > 8 or offset < 0 or offset > view.length - width:
+        return err("YDBv1 row unsigned integer is outside its byte view")
+    return yaza_db_read_uint_le_v1(view.source, view.start + offset, width)
+
+fn yaza_db_row_view_read_int_le_v1(view: YazaDbRowByteViewV1, offset: Number, width: Number) -> Result[Number, Text]:
+    if (width != 2 and width != 4 and width != 8) or offset < 0 or offset > view.length - width:
+        return err("YDBv1 row signed integer is outside its byte view")
+    return yaza_db_read_int_le_v1(view.source, view.start + offset, width)
+
+fn yaza_db_row_null_bit_v1(row: YazaDbRowByteViewV1, bit_index: Number) -> Boolean:
+    let byte_offset: Number = yaza_db_row_header_size_v1() + bit_index / 8
+    let mask: Number = yaza_db_row_bit_mask_v1(bit_index % 8)
+    return yaza_db_row_view_byte_v1(row, byte_offset) / mask % 2 == 1
+
+fn yaza_db_row_set_null_bit_v1(row: Bytes, bit_index: Number) -> Boolean:
+    let byte_offset: Number = yaza_db_row_header_size_v1() + bit_index / 8
+    let mask: Number = yaza_db_row_bit_mask_v1(bit_index % 8)
+    return bytes_try_set(row, byte_offset, bytes_get(row, byte_offset) + mask)
+
+fn yaza_db_row_null_placeholder_v1(type_id: Number) -> YazaSqlValueV1:
+    return YazaSqlValueV1(type_id, 0, 0.0, false, "", bytes_empty(), false, -1, -1, true)
+
+fn yaza_db_row_range_is_zero_v1(row: YazaDbRowByteViewV1, offset: Number, length: Number) -> Boolean:
+    if offset < 0 or length < 0 or offset > row.length or length > row.length - offset: return false
+    var index: Number = 0
+    while index < length:
+        if yaza_db_row_view_byte_v1(row, offset + index) != 0: return false
+        set index = index + 1
+    return true
+
+fn yaza_db_row_encode_physical_schema_with_overflow_v1(values: List[YazaSqlValueV1], nulls: List[Boolean], overflow_refs: List[YazaDbOverflowRefV1], columns: List[YazaSqlColumnSchemaV1], version_ts: Number, current_schema_version: Number, row_schema_epoch: Number, physical_count: Number) -> Result[Bytes, Text]:
+    let count: Number = list_count(columns)
+    if not yaza_db_row_version_valid_v1(version_ts) or not yaza_db_row_schema_valid_v1(columns): return err("YDBv1 row version tag or schema is invalid")
+    if list_count(values) != count or list_count(nulls) != count: return err("YDBv1 row values and null bitmap do not match the schema width")
+    if list_count(overflow_refs) != 0 and list_count(overflow_refs) != count: return err("YDBv1 row overflow references do not match the schema width")
+    let expected_physical_count: Number = yaza_db_row_schema_physical_count_v1(columns, current_schema_version, row_schema_epoch)?
+    if physical_count != expected_physical_count: return err("YDBv1 row physical width does not match its schema epoch")
+    let schema_tag: Number = yaza_db_row_schema_tag_from_epoch_v1(row_schema_epoch)?
+    var suffix_index: Number = physical_count
+    while suffix_index < count:
+        let suffix_column: YazaSqlColumnSchemaV1 = list_get(columns, suffix_index)
+        let suffix_value: YazaSqlValueV1 = list_get(values, suffix_index)
+        let suffix_overflow_ref: YazaDbOverflowRefV1 = yaza_db_row_overflow_ref_at_v1(overflow_refs, suffix_index)
+        if suffix_value.type_id != suffix_column.type_id or suffix_value.source_literal:
+            return err("YDBv1 row schema suffix value does not match its declared type")
+        if text_length(suffix_column.default_expression) == 0:
+            if not suffix_column.nullable or not list_get(nulls, suffix_index) or not suffix_value.is_null: return err("YDBv1 row schema suffix without DEFAULT must contain canonical NULL placeholders")
+        else:
+            let expected_suffix_value: YazaSqlValueV1 = yaza_sql_insert_materialize_column_default_v1(suffix_column.default_expression, suffix_column)?
+            if list_get(nulls, suffix_index) != expected_suffix_value.is_null or yaza_sql_executor_compare_values_v1("", suffix_value, expected_suffix_value) != 0: return err("YDBv1 row schema suffix does not match its virtual DEFAULT value")
+        if not yaza_db_row_overflow_ref_is_empty_v1(suffix_overflow_ref): return err("YDBv1 nullable schema suffix cannot contain an overflow reference")
+        set suffix_index = suffix_index + 1
+
+    let null_bytes: Number = (physical_count + 7) / 8
+    var fixed_len: Number = 0
+    var variable_count: Number = 0
+    var variable_data_len: Number = 0
+    var has_null: Boolean = false
+    var index: Number = 0
+    while index < physical_count:
+        let column: YazaSqlColumnSchemaV1 = list_get(columns, index)
+        let value: YazaSqlValueV1 = list_get(values, index)
+        let is_null: Boolean = list_get(nulls, index)
+        let width: Number = yaza_db_row_fixed_width_v1(column.type_id)
+        let overflow_ref: YazaDbOverflowRefV1 = yaza_db_row_overflow_ref_at_v1(overflow_refs, index)
+        if is_null and not column.nullable: return err("YDBv1 row contains NULL in a NOT NULL column")
+        if is_null: set has_null = true
+        if value.type_id != column.type_id or value.source_literal: return err("YDBv1 row value type does not match its column")
+        if not is_null and not yaza_sql_executor_value_matches_v1(value, column.type_id): return err("YDBv1 row value is outside its declared scalar type")
+        if column.type_id == 10 and not is_null and (yaza_sql_value_decimal_precision_v1(value) != column.precision or yaza_sql_value_decimal_scale_v1(value) != column.scale): return err("YDBv1 DECIMAL value precision/scale does not match its column")
+        if ((column.type_id != 9 and column.type_id != 16) or is_null) and not yaza_db_row_overflow_ref_is_empty_v1(overflow_ref): return err("YDBv1 overflow references are valid only for non-NULL TEXT or BLOB columns")
+        if width > 0: set fixed_len = fixed_len + width
+        if width == 0:
+            set variable_count = variable_count + 1
+            if not is_null:
+                if overflow_ref.first_page_id > 0:
+                    let checked_ref: Bytes = yaza_db_overflow_ref_encode_v1(overflow_ref)?
+                    if overflow_ref.total_length <= yaza_db_overflow_threshold_v1() or overflow_ref.total_length > 67108864: return err("YDBv1 external TEXT reference length is outside its supported bound")
+                    # A decoded external variable-width row carries an empty
+                    # placeholder plus its authoritative reference.
+                    var source_value_len: Number = 0
+                    if column.type_id == 9: set source_value_len = text_length(value.text_value)
+                    else: set source_value_len = bytes_length(value.bytes_value)
+                    if source_value_len > 0 and source_value_len != overflow_ref.total_length: return err("YDBv1 external value reference length does not match the row value")
+                    set variable_data_len = variable_data_len + 4 + bytes_length(checked_ref)
+                else:
+                    if not yaza_db_row_overflow_ref_is_empty_v1(overflow_ref): return err("YDBv1 inline TEXT has a non-canonical empty overflow reference")
+                    var value_len: Number = 0
+                    if column.type_id == 9: set value_len = text_length(value.text_value)
+                    else: set value_len = bytes_length(value.bytes_value)
+                    if value_len > 67108864: return err("YDBv1 variable-width value exceeds its 64 MiB limit")
+                    if value_len > yaza_db_row_max_inline_size_v1() - yaza_db_row_header_size_v1() - 4: return err("YDBv1 variable-width value requires overflow storage")
+                    set variable_data_len = variable_data_len + 4 + value_len
+        set index = index + 1
+
+    let variable_table_start: Number = yaza_db_row_header_size_v1() + null_bytes + fixed_len
+    let variable_data_start: Number = variable_table_start + variable_count * 2
+    let total_size: Number = variable_data_start + variable_data_len
+    if fixed_len > 65535 or total_size > yaza_db_row_max_inline_size_v1(): return err("YDBv1 inline row exceeds the 4 KiB tuple limit")
+    let created: Result[Bytes, Text] = bytes_try_new_zeroed(total_size)
+    if not result_is_ok(created): return err(result_unwrap_error(created))
+    let encoded: Bytes = result_unwrap(created)
+    var infomask: Number = 0
+    if has_null: set infomask = 4
+    if not yaza_db_write_int_le_v1(encoded, 0, version_ts, 8) or not yaza_db_write_uint_le_v1(encoded, 8, 0, 8): return err("YDBv1 row version header could not be written")
+    if not yaza_db_write_uint_le_v1(encoded, 16, infomask, 2) or not yaza_db_write_uint_le_v1(encoded, 18, physical_count, 2) or not yaza_db_write_uint_le_v1(encoded, 20, fixed_len, 2) or not yaza_db_write_uint_le_v1(encoded, 22, schema_tag, 2): return err("YDBv1 row header fields could not be written")
+
+    set index = 0
+    while index < physical_count:
+        if list_get(nulls, index) and not yaza_db_row_set_null_bit_v1(encoded, index): return err("YDBv1 row NULL bitmap could not be written")
+        set index = index + 1
+
+    var fixed_offset: Number = yaza_db_row_header_size_v1() + null_bytes
+    set index = 0
+    while index < physical_count:
+        let column: YazaSqlColumnSchemaV1 = list_get(columns, index)
+        let value: YazaSqlValueV1 = list_get(values, index)
+        let is_null: Boolean = list_get(nulls, index)
+        let width: Number = yaza_db_row_fixed_width_v1(column.type_id)
+        if width > 0:
+            if not is_null:
+                if column.type_id == 1:
+                    var boolean_byte: Number = 0
+                    if value.boolean_value: set boolean_byte = 1
+                    if not bytes_try_set(encoded, fixed_offset, boolean_byte): return err("YDBv1 BOOLEAN column could not be written")
+                elif column.type_id == 6:
+                    if not yaza_db_write_int_le_v1(encoded, fixed_offset, float64_bits(value.float_value), 8): return err("YDBv1 DOUBLE column could not be written")
+                elif column.type_id == 10:
+                    let decimal: YazaSqlDecimalV1 = yaza_sql_decimal_parse_v1(value.text_value, column.precision, column.scale)?
+                    if not yaza_db_write_bytes_v1(encoded, fixed_offset, decimal.coefficient): return err("YDBv1 DECIMAL coefficient could not be written")
+                elif column.type_id == 12:
+                    let uuid_bytes: Bytes = yaza_sql_uuid_parse_v1(value.text_value)?
+                    if not yaza_db_write_bytes_v1(encoded, fixed_offset, uuid_bytes): return err("YDBv1 UUID bytes could not be written")
+                else:
+                    if not yaza_db_write_int_le_v1(encoded, fixed_offset, value.integer_value, width): return err("YDBv1 signed integer column could not be written")
+            set fixed_offset = fixed_offset + width
+        set index = index + 1
+
+    var variable_index: Number = 0
+    var variable_offset: Number = variable_data_start
+    set index = 0
+    while index < physical_count:
+        let column: YazaSqlColumnSchemaV1 = list_get(columns, index)
+        if column.type_id == 9 or column.type_id == 16:
+            let is_null: Boolean = list_get(nulls, index)
+            let entry_offset: Number = variable_table_start + variable_index * 2
+            if not is_null:
+                let value: YazaSqlValueV1 = list_get(values, index)
+                let overflow_ref: YazaDbOverflowRefV1 = yaza_db_row_overflow_ref_at_v1(overflow_refs, index)
+                if not yaza_db_write_uint_le_v1(encoded, entry_offset, variable_offset, 2): return err("YDBv1 variable-width offset could not be written")
+                if overflow_ref.first_page_id > 0:
+                    let reference_bytes: Bytes = yaza_db_overflow_ref_encode_v1(overflow_ref)?
+                    if not yaza_db_write_uint_le_v1(encoded, variable_offset, yaza_db_row_overflow_length_marker_v1(), 4) or not yaza_db_write_bytes_v1(encoded, variable_offset + 4, reference_bytes): return err("YDBv1 overflow reference could not be written into the row")
+                    set variable_offset = variable_offset + 4 + bytes_length(reference_bytes)
+                else:
+                    var value_len: Number = 0
+                    if column.type_id == 9: set value_len = text_length(value.text_value)
+                    else: set value_len = bytes_length(value.bytes_value)
+                    if not yaza_db_write_uint_le_v1(encoded, variable_offset, value_len, 4): return err("YDBv1 variable-width length could not be written")
+                    var byte_index: Number = 0
+                    while byte_index < value_len:
+                        var output_byte: Number = 0
+                        if column.type_id == 9: set output_byte = text_byte(value.text_value, byte_index)
+                        else: set output_byte = bytes_get(value.bytes_value, byte_index)
+                        if not bytes_try_set(encoded, variable_offset + 4 + byte_index, output_byte): return err("YDBv1 variable-width bytes could not be written")
+                        set byte_index = byte_index + 1
+                    set variable_offset = variable_offset + 4 + value_len
+            set variable_index = variable_index + 1
+        set index = index + 1
+    if variable_offset != total_size: return err("YDBv1 row variable data accounting is inconsistent")
+    return ok(encoded)
+
+fn yaza_db_row_encode_v1(values: List[YazaSqlValueV1], nulls: List[Boolean], columns: List[YazaSqlColumnSchemaV1], version_ts: Number) -> Result[Bytes, Text]:
+    let count: Number = list_count(columns)
+    return yaza_db_row_encode_physical_schema_with_overflow_v1(values, nulls, List[YazaDbOverflowRefV1](), columns, version_ts, 1, 1, count)
+
+fn yaza_db_row_encode_for_schema_v1(values: List[YazaSqlValueV1], nulls: List[Boolean], columns: List[YazaSqlColumnSchemaV1], version_ts: Number, schema_version: Number) -> Result[Bytes, Text]:
+    let count: Number = list_count(columns)
+    return yaza_db_row_encode_physical_schema_with_overflow_v1(values, nulls, List[YazaDbOverflowRefV1](), columns, version_ts, schema_version, schema_version, count)
+
+fn yaza_db_row_encode_for_schema_with_overflow_v1(values: List[YazaSqlValueV1], nulls: List[Boolean], overflow_refs: List[YazaDbOverflowRefV1], columns: List[YazaSqlColumnSchemaV1], version_ts: Number, schema_version: Number) -> Result[Bytes, Text]:
+    let count: Number = list_count(columns)
+    return yaza_db_row_encode_physical_schema_with_overflow_v1(values, nulls, overflow_refs, columns, version_ts, schema_version, schema_version, count)
+
+fn yaza_db_row_preflight_for_schema_v1(values: List[YazaSqlValueV1], nulls: List[Boolean], columns: List[YazaSqlColumnSchemaV1], version_ts: Number, schema_version: Number) -> Result[Bytes, Text]:
+    let count: Number = list_count(columns)
+    if list_count(values) != count or list_count(nulls) != count: return err("YDBv1 row preflight values and null bitmap do not match the schema width")
+    let refs_created: Result[List[YazaDbOverflowRefV1], Text] = list_try_new()
+    if not result_is_ok(refs_created): return err(result_unwrap_error(refs_created))
+    let refs: List[YazaDbOverflowRefV1] = result_unwrap(refs_created)
+    if not list_try_reserve(refs, count): return err("YDBv1 row preflight could not reserve overflow-reference metadata")
+    var index: Number = 0
+    while index < count:
+        let column: YazaSqlColumnSchemaV1 = list_get(columns, index)
+        let value: YazaSqlValueV1 = list_get(values, index)
+        let is_null: Boolean = list_get(nulls, index)
+        var reference: YazaDbOverflowRefV1 = yaza_db_row_empty_overflow_ref_v1()
+        if (column.type_id == 9 or column.type_id == 16) and not is_null:
+            var value_length: Number = 0
+            if column.type_id == 9: set value_length = text_length(value.text_value)
+            else: set value_length = bytes_length(value.bytes_value)
+            if value_length > yaza_db_overflow_threshold_v1(): set reference = YazaDbOverflowRefV1(2, value_length, 0, 0)
+        if not list_try_push(refs, reference): return err("YDBv1 row preflight could not retain overflow-reference metadata")
+        set index = index + 1
+    return yaza_db_row_encode_for_schema_with_overflow_v1(values, nulls, refs, columns, version_ts, schema_version)
+
+fn yaza_db_row_encode_physical_schema_v1(values: List[YazaSqlValueV1], nulls: List[Boolean], columns: List[YazaSqlColumnSchemaV1], version_ts: Number, current_schema_version: Number, row_schema_epoch: Number, physical_count: Number) -> Result[Bytes, Text]:
+    return yaza_db_row_encode_physical_schema_with_overflow_v1(values, nulls, List[YazaDbOverflowRefV1](), columns, version_ts, current_schema_version, row_schema_epoch, physical_count)
+
+fn yaza_db_row_utf8_continuation_v1(byte: Number) -> Boolean:
+    return byte >= 128 and byte <= 191
+
+fn yaza_db_row_utf8_width_v1(encoded: YazaDbRowByteViewV1, offset: Number, remaining: Number) -> Number:
+    if remaining < 1: return 0
+    if offset < 0 or offset >= encoded.length or remaining > encoded.length - offset: return 0
+    let first: Number = yaza_db_row_view_byte_v1(encoded, offset)
+    if first == 0: return 0
+    if first < 128: return 1
+    if first >= 194 and first <= 223:
+        if remaining < 2 or not yaza_db_row_utf8_continuation_v1(yaza_db_row_view_byte_v1(encoded, offset + 1)): return 0
+        return 2
+    if first == 224:
+        if remaining < 3: return 0
+        let second: Number = yaza_db_row_view_byte_v1(encoded, offset + 1)
+        if second < 160 or second > 191 or not yaza_db_row_utf8_continuation_v1(yaza_db_row_view_byte_v1(encoded, offset + 2)): return 0
+        return 3
+    if (first >= 225 and first <= 236) or (first >= 238 and first <= 239):
+        if remaining < 3 or not yaza_db_row_utf8_continuation_v1(yaza_db_row_view_byte_v1(encoded, offset + 1)) or not yaza_db_row_utf8_continuation_v1(yaza_db_row_view_byte_v1(encoded, offset + 2)): return 0
+        return 3
+    if first == 237:
+        if remaining < 3: return 0
+        let second: Number = yaza_db_row_view_byte_v1(encoded, offset + 1)
+        if second < 128 or second > 159 or not yaza_db_row_utf8_continuation_v1(yaza_db_row_view_byte_v1(encoded, offset + 2)): return 0
+        return 3
+    if first == 240:
+        if remaining < 4: return 0
+        let second: Number = yaza_db_row_view_byte_v1(encoded, offset + 1)
+        if second < 144 or second > 191 or not yaza_db_row_utf8_continuation_v1(yaza_db_row_view_byte_v1(encoded, offset + 2)) or not yaza_db_row_utf8_continuation_v1(yaza_db_row_view_byte_v1(encoded, offset + 3)): return 0
+        return 4
+    if first >= 241 and first <= 243:
+        if remaining < 4 or not yaza_db_row_utf8_continuation_v1(yaza_db_row_view_byte_v1(encoded, offset + 1)) or not yaza_db_row_utf8_continuation_v1(yaza_db_row_view_byte_v1(encoded, offset + 2)) or not yaza_db_row_utf8_continuation_v1(yaza_db_row_view_byte_v1(encoded, offset + 3)): return 0
+        return 4
+    if first == 244:
+        if remaining < 4: return 0
+        let second: Number = yaza_db_row_view_byte_v1(encoded, offset + 1)
+        if second < 128 or second > 143 or not yaza_db_row_utf8_continuation_v1(yaza_db_row_view_byte_v1(encoded, offset + 2)) or not yaza_db_row_utf8_continuation_v1(yaza_db_row_view_byte_v1(encoded, offset + 3)): return 0
+        return 4
+    return 0
+
+fn yaza_db_row_utf8_range_valid_v1(encoded: YazaDbRowByteViewV1, offset: Number, length: Number) -> Boolean:
+    if offset < 0 or length < 0 or offset > encoded.length or length > encoded.length - offset: return false
+    var byte_index: Number = 0
+    while byte_index < length:
+        let first: Number = yaza_db_row_view_byte_v1(encoded, offset + byte_index)
+        if first == 0: return false
+        if first < 128:
+            set byte_index = byte_index + 1
+        else:
+            let width: Number = yaza_db_row_utf8_width_v1(encoded, offset + byte_index, length - byte_index)
+            if width == 0: return false
+            set byte_index = byte_index + width
+    return true
+
+fn yaza_db_row_decode_view_with_buffers_v1(encoded: YazaDbRowByteViewV1, columns: List[YazaSqlColumnSchemaV1], current_schema_version: Number, reuse_output_buffers: Boolean, materialize_text: Boolean, schema_prevalidated: Boolean, skip_unmaterialized_text_values: Boolean, reusable_values: List[YazaSqlValueV1], reusable_nulls: List[Boolean], reusable_overflow_refs: List[YazaDbOverflowRefV1], output_columns: List[Boolean], capture_integer_key_ordinal: Number) -> Result[YazaDbRowScanDecodeV1, Text]:
+    let total_size: Number = encoded.length
+    let count: Number = list_count(columns)
+    if total_size < yaza_db_row_header_size_v1() or total_size > yaza_db_row_max_inline_size_v1() or (not schema_prevalidated and not yaza_db_row_schema_valid_v1(columns)): return err("YDBv1 row size or schema is invalid")
+    if skip_unmaterialized_text_values and (not reuse_output_buffers or materialize_text): return err("YDBv1 scan may skip TEXT output only with reusable buffers and unmaterialized text")
+    let has_output_column_mask: Boolean = list_count(output_columns) > 0
+    if has_output_column_mask and (list_count(output_columns) != count or not reuse_output_buffers): return err("YDBv1 projected row decode requires a schema-width mask and reusable buffers")
+    let version_ts: Number = yaza_db_row_view_read_int_le_v1(encoded, 0, 8)?
+    let undo_ref: Number = yaza_db_row_view_read_uint_le_v1(encoded, 8, 8)?
+    let infomask: Number = yaza_db_row_view_read_uint_le_v1(encoded, 16, 2)?
+    let stored_count: Number = yaza_db_row_view_read_uint_le_v1(encoded, 18, 2)?
+    let stored_fixed_len: Number = yaza_db_row_view_read_uint_le_v1(encoded, 20, 2)?
+    let schema_tag: Number = yaza_db_row_view_read_uint_le_v1(encoded, 22, 2)?
+    let schema_epoch: Number = yaza_db_row_schema_epoch_from_tag_v1(schema_tag)?
+    let expected_physical_count: Number = yaza_db_row_schema_physical_count_v1(columns, current_schema_version, schema_epoch)?
+    if not yaza_db_row_version_valid_v1(version_ts) or undo_ref > yaza_db_row_max_undo_ref_v1() or stored_count != expected_physical_count or stored_count > count: return err("YDBv1 row header version, undo reference, width, or schema epoch is invalid")
+    if capture_integer_key_ordinal < -1 or capture_integer_key_ordinal >= count: return err("YDBv1 scan integer-key capture ordinal is outside its schema")
+    if capture_integer_key_ordinal >= 0:
+        if capture_integer_key_ordinal >= stored_count: return err("YDBv1 scan integer-key capture is absent from the row schema epoch")
+        let capture_type_id: Number = list_get(columns, capture_integer_key_ordinal).type_id
+        if capture_type_id != 2 and capture_type_id != 3 and capture_type_id != 4: return err("YDBv1 scan integer-key capture requires a signed integer column")
+    var fixed_len: Number = 0
+    var variable_count: Number = 0
+    var index: Number = 0
+    while index < stored_count:
+        let width: Number = yaza_db_row_fixed_width_v1(list_get(columns, index).type_id)
+        if width > 0: set fixed_len = fixed_len + width
+        if width == 0: set variable_count = variable_count + 1
+        set index = index + 1
+    if stored_fixed_len != fixed_len: return err("YDBv1 row fixed-column length does not match its schema")
+    let null_bytes: Number = (stored_count + 7) / 8
+    let variable_table_start: Number = yaza_db_row_header_size_v1() + null_bytes + fixed_len
+    let variable_data_start: Number = variable_table_start + variable_count * 2
+    if variable_data_start > total_size: return err("YDBv1 row column areas exceed the record length")
+    if stored_count % 8 != 0:
+        let last_null_byte: Number = yaza_db_row_view_byte_v1(encoded, yaza_db_row_header_size_v1() + null_bytes - 1)
+        let allowed_mask: Number = yaza_db_row_bit_mask_v1(stored_count % 8) - 1
+        if last_null_byte > allowed_mask: return err("YDBv1 row NULL bitmap has non-zero unused bits")
+
+    var nulls: List[Boolean] = reusable_nulls
+    var values: List[YazaSqlValueV1] = reusable_values
+    var overflow_refs: List[YazaDbOverflowRefV1] = reusable_overflow_refs
+    if reuse_output_buffers:
+        if list_count(nulls) != count or list_count(values) != count or list_count(overflow_refs) != count:
+            return err("YDBv1 reusable row decode buffers do not match the schema width")
+    else:
+        let nulls_created: Result[List[Boolean], Text] = list_try_new()
+        let values_created: Result[List[YazaSqlValueV1], Text] = list_try_new()
+        let overflow_refs_created: Result[List[YazaDbOverflowRefV1], Text] = list_try_new()
+        if not result_is_ok(nulls_created) or not result_is_ok(values_created) or not result_is_ok(overflow_refs_created): return err("YDBv1 row decode could not allocate result lists")
+        set nulls = result_unwrap(nulls_created)
+        set values = result_unwrap(values_created)
+        set overflow_refs = result_unwrap(overflow_refs_created)
+        if not list_try_reserve(nulls, count) or not list_try_reserve(values, count) or not list_try_reserve(overflow_refs, count): return err("YDBv1 row decode could not reserve result lists")
+    let has_null_flag: Boolean = infomask == 4 or infomask == 5
+    let deleted: Boolean = infomask == 1 or infomask == 5
+    if infomask != 0 and infomask != 1 and infomask != 4 and infomask != 5: return err("YDBv1 row infomask contains unsupported flags")
+    let no_null_bitmap: Boolean = infomask == 0 or infomask == 1
+    var has_null: Boolean = false
+    set index = 0
+    if no_null_bitmap:
+        # The common non-NULL row checks each bitmap byte once. NULL vector
+        # writes are fused with the value-decode pass below.
+        while index < null_bytes:
+            if yaza_db_row_view_byte_v1(encoded, yaza_db_row_header_size_v1() + index) != 0:
+                return err("YDBv1 row NULL bitmap does not match its infomask")
+            set index = index + 1
+
+    var fixed_offset: Number = yaza_db_row_header_size_v1() + null_bytes
+    var variable_index: Number = 0
+    var expected_variable_offset: Number = variable_data_start
+    var text_input_bytes: Number = 0
+    var max_text_input_bytes: Number = 0
+    var captured_integer_key: Number = 0
+    var has_captured_integer_key: Boolean = false
+    set index = 0
+    while index < stored_count:
+        let column: YazaSqlColumnSchemaV1 = list_get(columns, index)
+        let type_id: Number = column.type_id
+        let width: Number = yaza_db_row_fixed_width_v1(type_id)
+        var output_column_selected: Boolean = true
+        if has_output_column_mask: set output_column_selected = list_get(output_columns, index)
+        var is_null: Boolean = false
+        if not no_null_bitmap: set is_null = yaza_db_row_null_bit_v1(encoded, index)
+        if is_null and not column.nullable: return err("YDBv1 row NULL bitmap marks a NOT NULL column")
+        if index == capture_integer_key_ordinal and is_null: return err("YDBv1 scan integer key is NULL")
+        if is_null: set has_null = true
+        if reuse_output_buffers:
+            if output_column_selected and not list_try_set(nulls, index, is_null): return err("YDBv1 reusable row NULL bitmap update failed")
+        elif not list_try_push(nulls, is_null): return err("YDBv1 row NULL bitmap result growth failed")
+        var value: YazaSqlValueV1 = YazaSqlValueV1(0, 0, 0.0, false, "", bytes_empty(), false, -1, -1, true)
+        if output_column_selected: set value = yaza_db_row_null_placeholder_v1(type_id)
+        var overflow_ref: YazaDbOverflowRefV1 = YazaDbOverflowRefV1(0, 0, 0, 0)
+        var decoded_text_bytes: Number = 0
+        if width > 0:
+            if is_null and not yaza_db_row_range_is_zero_v1(encoded, fixed_offset, width): return err("YDBv1 NULL fixed column contains non-zero bytes")
+            if not is_null:
+                if type_id == 1:
+                    let boolean_byte: Number = yaza_db_row_view_byte_v1(encoded, fixed_offset)
+                    if boolean_byte > 1: return err("YDBv1 BOOLEAN column is not encoded as zero or one")
+                    if output_column_selected: set value = yaza_sql_value_boolean_v1(boolean_byte == 1)
+                elif type_id == 6:
+                    let float_bits: Number = yaza_db_row_view_read_int_le_v1(encoded, fixed_offset, 8)?
+                    if output_column_selected: set value = yaza_sql_value_double_v1(float64_from_bits(float_bits))
+                elif type_id == 10:
+                    if output_column_selected:
+                        let coefficient: Bytes = bytes_try_slice(encoded.source, encoded.start + fixed_offset, 16)?
+                        let decimal: YazaSqlDecimalV1 = YazaSqlDecimalV1(coefficient, column.precision, column.scale)
+                        let validated: Boolean = yaza_sql_decimal_validate_v1(decimal)?
+                        set value = yaza_sql_value_decimal_v1(decimal)?
+                elif type_id == 12:
+                    if output_column_selected:
+                        let uuid_bytes: Bytes = bytes_try_slice(encoded.source, encoded.start + fixed_offset, 16)?
+                        let uuid_text: Text = yaza_sql_uuid_to_text_v1(uuid_bytes)?
+                        set value = yaza_sql_value_uuid_v1(uuid_text)?
+                else:
+                    let integer_value: Number = yaza_db_row_view_read_int_le_v1(encoded, fixed_offset, width)?
+                    if index == capture_integer_key_ordinal:
+                        set captured_integer_key = integer_value
+                        set has_captured_integer_key = true
+                    if not output_column_selected:
+                        set value = YazaSqlValueV1(0, 0, 0.0, false, "", bytes_empty(), false, -1, -1, true)
+                    elif type_id == 4:
+                        # BIGINT is already decoded from its canonical signed
+                        # 64-bit storage width; no narrowing-range constructor
+                        # is needed on this hot scan path.
+                        set value = yaza_sql_executor_value_v1(4, integer_value, 0.0, false, "")
+                    elif type_id == 11:
+                        let decoded_date: Result[YazaSqlValueV1, Text] = yaza_sql_value_integer_v1(11, integer_value)
+                        if not result_is_ok(decoded_date): return err(result_unwrap_error(decoded_date))
+                        if output_column_selected: set value = result_unwrap(decoded_date)
+                    else:
+                        let decoded_integer: Result[YazaSqlValueV1, Text] = yaza_sql_value_integer_v1(type_id, integer_value)
+                        if not result_is_ok(decoded_integer): return err(result_unwrap_error(decoded_integer))
+                        set value = result_unwrap(decoded_integer)
+            set fixed_offset = fixed_offset + width
+        else:
+            let entry_offset: Number = variable_table_start + variable_index * 2
+            let stored_offset: Number = yaza_db_row_view_read_uint_le_v1(encoded, entry_offset, 2)?
+            if is_null:
+                if stored_offset != 0: return err("YDBv1 NULL variable-width column has a non-zero data offset")
+            else:
+                if stored_offset != expected_variable_offset or stored_offset > total_size - 4: return err("YDBv1 variable-width offset is non-canonical or outside the row")
+                let text_len: Number = yaza_db_row_view_read_uint_le_v1(encoded, stored_offset, 4)?
+                if text_len == yaza_db_row_overflow_length_marker_v1():
+                    if total_size - stored_offset - 4 < 24: return err("YDBv1 external variable-width reference is truncated")
+                    let reference_bytes: Bytes = bytes_try_slice(encoded.source, encoded.start + stored_offset + 4, 24)?
+                    let decoded_overflow_ref: YazaDbOverflowRefV1 = yaza_db_overflow_ref_decode_v1(reference_bytes)?
+                    if decoded_overflow_ref.total_length <= yaza_db_overflow_threshold_v1() or decoded_overflow_ref.total_length > 67108864: return err("YDBv1 external variable-width length is outside its supported bound")
+                    if type_id == 9: set decoded_text_bytes = decoded_overflow_ref.total_length
+                    if output_column_selected:
+                        set overflow_ref = decoded_overflow_ref
+                        if type_id == 9:
+                            if not skip_unmaterialized_text_values: set value = yaza_sql_value_text_v1("")
+                        else:
+                            set value = yaza_sql_value_blob_v1(bytes_empty())?
+                    set expected_variable_offset = stored_offset + 4 + 24
+                else:
+                    if text_len > 67108864 or text_len > total_size - stored_offset - 4: return err("YDBv1 variable-width field length exceeds its row or value limit")
+                    if type_id == 9:
+                        set decoded_text_bytes = text_len
+                        if materialize_text and output_column_selected:
+                            let text_bytes: Bytes = bytes_try_slice(encoded.source, encoded.start + stored_offset + 4, text_len)?
+                            let decoded_text: Result[Text, Text] = bytes_try_to_text(text_bytes)
+                            if not result_is_ok(decoded_text): return err("YDBv1 TEXT field contains invalid UTF-8")
+                            set value = yaza_sql_value_text_v1(result_unwrap(decoded_text))
+                        else:
+                            if not yaza_db_row_utf8_range_valid_v1(encoded, stored_offset + 4, text_len): return err("YDBv1 TEXT field contains invalid UTF-8")
+                            if output_column_selected and not skip_unmaterialized_text_values: set value = yaza_sql_value_text_v1("")
+                    else:
+                        if output_column_selected:
+                            let blob_bytes: Bytes = bytes_try_slice(encoded.source, encoded.start + stored_offset + 4, text_len)?
+                            set value = yaza_sql_value_blob_v1(blob_bytes)?
+                    set expected_variable_offset = stored_offset + 4 + text_len
+            set variable_index = variable_index + 1
+        if decoded_text_bytes > 0:
+            set text_input_bytes = text_input_bytes + decoded_text_bytes
+            if decoded_text_bytes > max_text_input_bytes: set max_text_input_bytes = decoded_text_bytes
+        if output_column_selected and not (skip_unmaterialized_text_values and type_id == 9):
+            if reuse_output_buffers:
+                if not list_try_set(values, index, value) or not list_try_set(overflow_refs, index, overflow_ref): return err("YDBv1 reusable decoded row value update failed")
+            elif not list_try_push(values, value) or not list_try_push(overflow_refs, overflow_ref): return err("YDBv1 decoded row value or overflow-reference list growth failed")
+        set index = index + 1
+    if has_null != has_null_flag: return err("YDBv1 row infomask does not match its NULL bitmap")
+    if expected_variable_offset != total_size: return err("YDBv1 row has trailing, overlapping, or unreferenced variable bytes")
+    while index < count:
+        let column: YazaSqlColumnSchemaV1 = list_get(columns, index)
+        let has_default: Boolean = text_length(column.default_expression) > 0
+        if not column.nullable and not has_default: return err("YDBv1 row schema suffix cannot be synthesized without a DEFAULT")
+        var output_column_selected: Boolean = true
+        if has_output_column_mask: set output_column_selected = list_get(output_columns, index)
+        var value: YazaSqlValueV1 = yaza_db_row_null_placeholder_v1(column.type_id)
+        var is_null: Boolean = true
+        if has_default:
+            set value = yaza_sql_insert_materialize_column_default_v1(column.default_expression, column)?
+            set is_null = value.is_null
+            if is_null and not column.nullable: return err("YDBv1 row schema suffix DEFAULT produced NULL for a NOT NULL column")
+            if output_column_selected and not is_null and column.type_id == 9:
+                let default_text_bytes: Number = text_length(value.text_value)
+                set text_input_bytes = text_input_bytes + default_text_bytes
+                if default_text_bytes > max_text_input_bytes: set max_text_input_bytes = default_text_bytes
+            if skip_unmaterialized_text_values and column.type_id == 9: set value = yaza_db_row_null_placeholder_v1(column.type_id)
+        if reuse_output_buffers and output_column_selected:
+            if not list_try_set(nulls, index, is_null): return err("YDBv1 decoded schema suffix NULL marker could not update")
+            if not (skip_unmaterialized_text_values and column.type_id == 9):
+                if not list_try_set(values, index, value) or not list_try_set(overflow_refs, index, yaza_db_row_empty_overflow_ref_v1()): return err("YDBv1 decoded schema suffix value could not update")
+        elif not reuse_output_buffers and (not list_try_push(nulls, is_null) or not list_try_push(values, value) or not list_try_push(overflow_refs, yaza_db_row_empty_overflow_ref_v1())): return err("YDBv1 decoded schema suffix could not grow")
+        set index = index + 1
+    if capture_integer_key_ordinal >= 0 and not has_captured_integer_key: return err("YDBv1 row decoder did not capture the requested integer key")
+    return ok(YazaDbRowScanDecodeV1(YazaDbRowV1(version_ts, undo_ref, deleted, values, nulls, schema_epoch, current_schema_version, stored_count, text_input_bytes, max_text_input_bytes, overflow_refs), has_captured_integer_key, captured_integer_key))
+
+fn yaza_db_row_decode_for_schema_with_buffers_v1(encoded: Bytes, columns: List[YazaSqlColumnSchemaV1], current_schema_version: Number, reuse_output_buffers: Boolean, materialize_text: Boolean, reusable_values: List[YazaSqlValueV1], reusable_nulls: List[Boolean], reusable_overflow_refs: List[YazaDbOverflowRefV1]) -> Result[YazaDbRowV1, Text]:
+    let view: YazaDbRowByteViewV1 = yaza_db_row_byte_view_new_v1(encoded, 0, bytes_length(encoded))?
+    let decoded: YazaDbRowScanDecodeV1 = yaza_db_row_decode_view_with_buffers_v1(view, columns, current_schema_version, reuse_output_buffers, materialize_text, false, false, reusable_values, reusable_nulls, reusable_overflow_refs, List[Boolean](), -1)?
+    return ok(decoded.row)
+
+fn yaza_db_row_decode_for_scan_span_v1(source: Bytes, start: Number, length: Number, columns: List[YazaSqlColumnSchemaV1], current_schema_version: Number, reuse_output_buffers: Boolean, materialize_text: Boolean, schema_prevalidated: Boolean, reusable_values: List[YazaSqlValueV1], reusable_nulls: List[Boolean], reusable_overflow_refs: List[YazaDbOverflowRefV1]) -> Result[YazaDbRowV1, Text]:
+    let view: YazaDbRowByteViewV1 = yaza_db_row_byte_view_new_v1(source, start, length)?
+    let decoded: YazaDbRowScanDecodeV1 = yaza_db_row_decode_view_with_buffers_v1(view, columns, current_schema_version, reuse_output_buffers, materialize_text, schema_prevalidated, false, reusable_values, reusable_nulls, reusable_overflow_refs, List[Boolean](), -1)?
+    return ok(decoded.row)
+
+fn yaza_db_row_decode_for_stream_scan_span_v1(source: Bytes, start: Number, length: Number, columns: List[YazaSqlColumnSchemaV1], current_schema_version: Number, reuse_output_buffers: Boolean, materialize_text: Boolean, schema_prevalidated: Boolean, skip_unmaterialized_text_values: Boolean, reusable_values: List[YazaSqlValueV1], reusable_nulls: List[Boolean], reusable_overflow_refs: List[YazaDbOverflowRefV1], output_columns: List[Boolean]) -> Result[YazaDbRowV1, Text]:
+    let decoded: YazaDbRowScanDecodeV1 = yaza_db_row_decode_for_stream_scan_span_with_integer_key_v1(source, start, length, columns, current_schema_version, reuse_output_buffers, materialize_text, schema_prevalidated, skip_unmaterialized_text_values, reusable_values, reusable_nulls, reusable_overflow_refs, output_columns, -1)?
+    return ok(decoded.row)
+
+fn yaza_db_row_decode_for_stream_scan_span_with_integer_key_v1(source: Bytes, start: Number, length: Number, columns: List[YazaSqlColumnSchemaV1], current_schema_version: Number, reuse_output_buffers: Boolean, materialize_text: Boolean, schema_prevalidated: Boolean, skip_unmaterialized_text_values: Boolean, reusable_values: List[YazaSqlValueV1], reusable_nulls: List[Boolean], reusable_overflow_refs: List[YazaDbOverflowRefV1], output_columns: List[Boolean], capture_integer_key_ordinal: Number) -> Result[YazaDbRowScanDecodeV1, Text]:
+    let view: YazaDbRowByteViewV1 = yaza_db_row_byte_view_new_v1(source, start, length)?
+    return yaza_db_row_decode_view_with_buffers_v1(view, columns, current_schema_version, reuse_output_buffers, materialize_text, schema_prevalidated, skip_unmaterialized_text_values, reusable_values, reusable_nulls, reusable_overflow_refs, output_columns, capture_integer_key_ordinal)
+
+fn yaza_db_row_decode_for_schema_v1(encoded: Bytes, columns: List[YazaSqlColumnSchemaV1], current_schema_version: Number) -> Result[YazaDbRowV1, Text]:
+    return yaza_db_row_decode_for_schema_with_buffers_v1(encoded, columns, current_schema_version, false, true, List[YazaSqlValueV1](), List[Boolean](), List[YazaDbOverflowRefV1]())
+
+fn yaza_db_row_decode_for_scan_v1(encoded: Bytes, columns: List[YazaSqlColumnSchemaV1], current_schema_version: Number, reuse_output_buffers: Boolean, materialize_text: Boolean, reusable_values: List[YazaSqlValueV1], reusable_nulls: List[Boolean], reusable_overflow_refs: List[YazaDbOverflowRefV1]) -> Result[YazaDbRowV1, Text]:
+    if not reuse_output_buffers: return yaza_db_row_decode_for_schema_v1(encoded, columns, current_schema_version)
+    return yaza_db_row_decode_for_schema_with_buffers_v1(encoded, columns, current_schema_version, true, materialize_text, reusable_values, reusable_nulls, reusable_overflow_refs)
+
+fn yaza_db_row_decode_v1(encoded: Bytes, columns: List[YazaSqlColumnSchemaV1]) -> Result[YazaDbRowV1, Text]:
+    return yaza_db_row_decode_for_schema_v1(encoded, columns, 1)

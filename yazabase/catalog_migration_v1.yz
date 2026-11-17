@@ -1,0 +1,79 @@
+# Crash-safe v1-to-v2 catalog-root migration for the persistent-view feature.
+use "std/fs"
+use "./allocator_v1"
+use "./catalog_storage_v1"
+use "./catalog_v1"
+use "./page_image_v1"
+use "./page_v1"
+use "./storage_v1"
+use "./transaction_v1"
+use "./wal_v1"
+
+shape YazaDbCatalogMigrationV1:
+    storage: YazaDbStorageHandleV1
+    wal: YazaDbWalLogV1
+    catalog: YazaDbCatalogRootV1
+    migrated: Boolean
+
+fn yaza_db_catalog_migration_append_page_image_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, page_id: Number, page_type: Number, catalog: YazaDbCatalogRootV1) -> Result[YazaDbWalAppendV1, Text]:
+    if page_type != 1 and page_type != 4: return err("YDBv1 catalog migration page type is invalid")
+    var current_wal: YazaDbWalLogV1 = wal
+    if current_wal.next_lsn == 0:
+        let seed: Result[YazaDbWalAppendV1, Text] = yaza_db_wal_log_append_v1(current_wal, YazaDbWalRecordV1(0, 0, 0, yaza_db_wal_type_skip_v1(), 0, bytes_from_text("")))
+        if not result_is_ok(seed): return err(result_unwrap_error(seed))
+        set current_wal = result_unwrap(seed).log
+    let record_length: Number = yaza_db_wal_header_size_v1() + yaza_db_wal_page_image_payload_size_v1()
+    let expected_lsn: Number = yaza_db_wal_record_lsn_for_append_v1(current_wal, record_length)?
+    var image: Bytes = bytes_from_text("")
+    if page_type == 1:
+        set image = yaza_db_page_new_v1(page_id, expected_lsn, 1, 0)?
+    else:
+        set image = yaza_db_catalog_root_page_encode_v1(page_id, expected_lsn, catalog)?
+    let payload: Bytes = yaza_db_wal_page_image_payload_encode_v1(page_id, expected_lsn, image)?
+    let appended: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(current_wal, YazaDbWalRecordV1(0, 0, 0, yaza_db_wal_type_full_page_image_v1(), 0, payload))?
+    if appended.record.lsn != expected_lsn: return err("YDBv1 catalog migration page-image LSN prediction changed")
+    let applied: Boolean = yaza_db_storage_redo_page_image_v1(storage, appended.record, appended.log.next_lsn)?
+    if not applied: return err("YDBv1 catalog migration page image was not applied")
+    return ok(appended)
+
+fn yaza_db_catalog_migration_fail_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, message: Text) -> Result[YazaDbCatalogMigrationV1, Text]:
+    let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(wal)
+    let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(storage)
+    return err(message)
+
+fn yaza_db_catalog_migrate_views_opened_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1) -> Result[YazaDbCatalogMigrationV1, Text]:
+    if storage.root != wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid): return yaza_db_catalog_migration_fail_v1(storage, wal, "YDBv1 catalog migration requires matching storage and WAL handles")
+    let existing_result: Result[YazaDbCatalogRootV1, Text] = yaza_db_catalog_storage_read_root_v1(storage.file, storage.header)
+    if not result_is_ok(existing_result): return yaza_db_catalog_migration_fail_v1(storage, wal, "YDBv1 catalog migration could not read the current descriptor: " + result_unwrap_error(existing_result))
+    let existing: YazaDbCatalogRootV1 = result_unwrap(existing_result)
+    if existing.sys_views_root != 0: return ok(YazaDbCatalogMigrationV1(storage, wal, existing, false))
+    if existing.generation >= yaza_db_catalog_max_page_id_v1(): return yaza_db_catalog_migration_fail_v1(storage, wal, "YDBv1 catalog generation is exhausted")
+
+    let begun_result: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_begin_with_reserve_v1(storage, wal, 2)
+    if not result_is_ok(begun_result): return yaza_db_catalog_migration_fail_v1(storage, wal, "YDBv1 catalog migration could not begin its bounded transaction: " + result_unwrap_error(begun_result))
+    var transaction: YazaDbWriteTransactionV1 = result_unwrap(begun_result)
+
+    let views_allocation_result: Result[YazaDbPageSpaceChangeV1, Text] = yaza_db_allocator_allocate_existing_v1(transaction.storage, transaction.wal, transaction.txn_id, transaction.last_lsn)
+    if not result_is_ok(views_allocation_result): return yaza_db_catalog_migration_fail_v1(transaction.storage, transaction.wal, "YDBv1 catalog migration could not allocate sys_views: " + result_unwrap_error(views_allocation_result))
+    let views_allocation: YazaDbPageSpaceChangeV1 = result_unwrap(views_allocation_result)
+    set transaction = YazaDbWriteTransactionV1(views_allocation.storage, views_allocation.wal, transaction.txn_id, transaction.commit_ts, views_allocation.record.lsn, transaction.pending_pages, transaction.pending_keys_hex, transaction.pending_rows_hex, transaction.active)
+    let views_image_result: Result[YazaDbWalAppendV1, Text] = yaza_db_catalog_migration_append_page_image_v1(transaction.storage, transaction.wal, views_allocation.page_id, 1, existing)
+    if not result_is_ok(views_image_result): return yaza_db_catalog_migration_fail_v1(transaction.storage, transaction.wal, "YDBv1 catalog migration could not initialize sys_views: " + result_unwrap_error(views_image_result))
+    set transaction = YazaDbWriteTransactionV1(transaction.storage, result_unwrap(views_image_result).log, transaction.txn_id, transaction.commit_ts, transaction.last_lsn, transaction.pending_pages, transaction.pending_keys_hex, transaction.pending_rows_hex, transaction.active)
+
+    let descriptor_allocation_result: Result[YazaDbPageSpaceChangeV1, Text] = yaza_db_allocator_allocate_existing_v1(transaction.storage, transaction.wal, transaction.txn_id, transaction.last_lsn)
+    if not result_is_ok(descriptor_allocation_result): return yaza_db_catalog_migration_fail_v1(transaction.storage, transaction.wal, "YDBv1 catalog migration could not allocate a v2 descriptor: " + result_unwrap_error(descriptor_allocation_result))
+    let descriptor_allocation: YazaDbPageSpaceChangeV1 = result_unwrap(descriptor_allocation_result)
+    set transaction = YazaDbWriteTransactionV1(descriptor_allocation.storage, descriptor_allocation.wal, transaction.txn_id, transaction.commit_ts, descriptor_allocation.record.lsn, transaction.pending_pages, transaction.pending_keys_hex, transaction.pending_rows_hex, transaction.active)
+
+    let upgraded_catalog: YazaDbCatalogRootV1 = YazaDbCatalogRootV1(existing.sys_tables_root, existing.sys_columns_root, existing.sys_indexes_root, existing.sys_constraints_root, existing.next_object_id, existing.generation + 1, views_allocation.page_id)
+    let descriptor_image_result: Result[YazaDbWalAppendV1, Text] = yaza_db_catalog_migration_append_page_image_v1(transaction.storage, transaction.wal, descriptor_allocation.page_id, 4, upgraded_catalog)
+    if not result_is_ok(descriptor_image_result): return yaza_db_catalog_migration_fail_v1(transaction.storage, transaction.wal, "YDBv1 catalog migration could not initialize the v2 descriptor: " + result_unwrap_error(descriptor_image_result))
+    set transaction = YazaDbWriteTransactionV1(transaction.storage, result_unwrap(descriptor_image_result).log, transaction.txn_id, transaction.commit_ts, transaction.last_lsn, transaction.pending_pages, transaction.pending_keys_hex, transaction.pending_rows_hex, transaction.active)
+
+    let committed_result: Result[YazaDbWriteCommitV1, Text] = yaza_db_write_transaction_commit_catalog_root_v1(transaction, descriptor_allocation.page_id)
+    if not result_is_ok(committed_result): return err("YDBv1 catalog migration commit failed; reopen through recovery before retrying: " + result_unwrap_error(committed_result))
+    let committed: YazaDbWriteCommitV1 = result_unwrap(committed_result)
+    let installed_result: Result[YazaDbCatalogRootV1, Text] = yaza_db_catalog_storage_read_root_v1(committed.storage.file, committed.storage.header)
+    if not result_is_ok(installed_result): return yaza_db_catalog_migration_fail_v1(committed.storage, committed.wal, "YDBv1 catalog migration committed but its descriptor could not be reopened: " + result_unwrap_error(installed_result))
+    return ok(YazaDbCatalogMigrationV1(committed.storage, committed.wal, result_unwrap(installed_result), true))

@@ -1,0 +1,64 @@
+# Bounded row-version lookup through verified LEAF_UPDATE before-images.
+# This module is a primitive; ordinary SQL scans do not call it yet.
+use "./mvcc_v1"
+use "./page_v1"
+use "./page_wal_v1"
+use "./row_v1"
+use "./wal_v1"
+
+fn yaza_db_mvcc_max_undo_steps_v1() -> Number:
+    return 128
+
+fn yaza_db_mvcc_row_encode_exact_v1(row: YazaDbRowV1, columns: List[YazaSqlColumnSchemaV1]) -> Result[Bytes, Text]:
+    var encoded: Bytes = yaza_db_row_encode_physical_schema_with_overflow_v1(row.values, row.nulls, row.overflow_refs, columns, row.version_ts, row.schema_version, row.schema_epoch, row.physical_column_count)?
+    if row.undo_ref > 0: set encoded = yaza_db_row_set_undo_ref_v1(encoded, row.undo_ref)?
+    if row.deleted: set encoded = yaza_db_row_set_deleted_v1(encoded, true)?
+    return ok(encoded)
+
+fn yaza_db_mvcc_history_row_from_page_v1(page: Bytes, page_id: Number, key: Bytes, columns: List[YazaSqlColumnSchemaV1], schema_version: Number) -> Result[YazaDbRowV1, Text]:
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, page_id)?
+    if header.page_type != 1 or header.level != 0: return err("YDBv1 MVCC history image is not a leaf page")
+    let slot_index: Number = yaza_db_page_lower_bound_v1(page, key, page_id)?
+    if slot_index >= header.count: return err("YDBv1 MVCC history image does not contain the referenced key")
+    let stored_key: Bytes = yaza_db_page_slot_key_v1(page, slot_index, page_id)?
+    if not bytes_equal(stored_key, key): return err("YDBv1 MVCC history image key does not match the row")
+    let slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(page, slot_index, page_id)?
+    return yaza_db_row_decode_for_schema_v1(slot.payload, columns, schema_version)
+
+fn yaza_db_mvcc_resolve_row_history_for_schema_v1(root: Number, db_uuid: Bytes, log_end_lsn: Number, key: Bytes, current_row: YazaDbRowV1, snapshot_ts: Number, own_txn_id: Number, transactions: List[YazaDbTxnStatusV1], columns: List[YazaSqlColumnSchemaV1], schema_version: Number) -> Result[Option[YazaDbRowV1], Text]:
+    if root < 0 or bytes_length(db_uuid) != 16 or log_end_lsn < 0 or bytes_length(key) < 1 or bytes_length(key) > 2048: return err("YDBv1 MVCC history lookup identity or bounds are invalid")
+    if list_count(columns) < 1 or list_count(columns) > 1024 or list_count(current_row.values) != list_count(columns) or list_count(current_row.nulls) != list_count(columns): return err("YDBv1 MVCC history row width does not match its schema")
+    var row: YazaDbRowV1 = current_row
+    var previous_lsn: Number = log_end_lsn
+    var step: Number = 0
+    while step < yaza_db_mvcc_max_undo_steps_v1():
+        let visible: Boolean = yaza_db_mvcc_version_visible_v1(row.version_ts, snapshot_ts, own_txn_id, transactions)?
+        if visible:
+            if row.deleted: return ok(none)
+            return ok(some(row))
+        if row.undo_ref == 0: return ok(none)
+        if row.undo_ref < 0 or row.undo_ref >= previous_lsn or row.undo_ref > yaza_db_row_max_undo_ref_v1(): return err("YDBv1 MVCC undo chain is non-monotonic or outside its WAL bound")
+        let record: YazaDbWalRecordV1 = yaza_db_wal_read_record_at_v1(root, db_uuid, row.undo_ref, log_end_lsn)?
+        if record.lsn != row.undo_ref or record.rec_type != yaza_db_wal_type_leaf_update_v1(): return err("YDBv1 MVCC undo reference does not identify a LEAF_UPDATE record")
+        if row.version_ts < 0:
+            let current_txn_id: Number = yaza_db_row_version_txn_decode_v1(row.version_ts)?
+            if current_txn_id != record.txn_id: return err("YDBv1 MVCC row transaction tag does not match its update record")
+        let mutation: YazaDbWalLeafMutationV1 = yaza_db_wal_leaf_mutation_payload_decode_v1(record)?
+        if mutation.page_id < 2: return err("YDBv1 MVCC undo record has an invalid leaf page ID")
+        let recorded_after: YazaDbRowV1 = yaza_db_mvcc_history_row_from_page_v1(mutation.after_image, mutation.page_id, key, columns, schema_version)?
+        let expected_after: Bytes = yaza_db_mvcc_row_encode_exact_v1(row, columns)?
+        let actual_after: Bytes = yaza_db_mvcc_row_encode_exact_v1(recorded_after, columns)?
+        if not bytes_equal(expected_after, actual_after): return err("YDBv1 MVCC undo record after-image does not match the current row")
+        let previous_row: YazaDbRowV1 = yaza_db_mvcc_history_row_from_page_v1(mutation.before_image, mutation.page_id, key, columns, schema_version)?
+        if previous_row.version_ts == 0: return err("YDBv1 MVCC undo record contains a zero-version before-image")
+        if previous_row.undo_ref >= record.lsn and previous_row.undo_ref != 0: return err("YDBv1 MVCC before-image points forward in the undo chain")
+        if previous_row.version_ts < 0 and previous_row.undo_ref == 0:
+            let previous_txn_id: Number = yaza_db_row_version_txn_decode_v1(previous_row.version_ts)?
+            if previous_txn_id != record.txn_id: return err("YDBv1 MVCC inserted before-image has an inconsistent transaction tag")
+        set row = previous_row
+        set previous_lsn = record.lsn
+        set step = step + 1
+    return err("YDBv1 MVCC undo chain exceeds the 128-version lookup bound")
+
+fn yaza_db_mvcc_resolve_row_history_v1(root: Number, db_uuid: Bytes, log_end_lsn: Number, key: Bytes, current_row: YazaDbRowV1, snapshot_ts: Number, own_txn_id: Number, transactions: List[YazaDbTxnStatusV1], columns: List[YazaSqlColumnSchemaV1]) -> Result[Option[YazaDbRowV1], Text]:
+    return yaza_db_mvcc_resolve_row_history_for_schema_v1(root, db_uuid, log_end_lsn, key, current_row, snapshot_ts, own_txn_id, transactions, columns, 1)

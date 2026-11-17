@@ -1,0 +1,120 @@
+use "std/fs"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/session_v1"
+use "../yazabase/sql_dispatch_v1"
+use "../yazabase/sql_executor_v1"
+use "../yazabase/sql_temporal_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/wal_v1"
+
+fn yazabase_sql_temporal_persist_v1(root_path: Text) -> Result[Boolean, Text]:
+    let root: Number = root_open(root_path)?
+    let database_name: Text = "temporal-persist-smoke.ydb"
+    let header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_from_text("time-smoke-ydb01"), 0, 1, 1, 0, 2, 1)
+    let empty_storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, database_name, header)?
+    let empty_storage_closed: Boolean = yaza_db_storage_close_v1(empty_storage)?
+    if not empty_storage_closed: return err("YazaBase temporal fixture could not close its genesis database")
+    let initialized: YazaDbCatalogBootstrapV1 = yaza_db_catalog_initialize_v1(root, database_name)?
+    let initial_wal_closed: Boolean = yaza_db_wal_log_close_v1(initialized.wal)?
+    let initial_storage_closed: Boolean = yaza_db_storage_close_v1(initialized.storage)?
+    if not initial_wal_closed or not initial_storage_closed: return err("YazaBase temporal fixture could not close catalog bootstrap handles")
+
+    let opened: YazaDbSessionV1 = yaza_db_session_open_v1(root, database_name)?
+    var session: YazaDbSessionV1 = opened
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let create_result: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "CREATE TABLE temporal_values (id INTEGER PRIMARY KEY, wall_time TIME NOT NULL DEFAULT '12:00:00', local_at TIMESTAMP NOT NULL, instant TIMESTAMP WITH TIME ZONE NOT NULL)", no_parameters)?
+    set session = create_result.session
+    let create_default_table: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "CREATE TABLE temporal_defaults (id INTEGER PRIMARY KEY, local_at TIMESTAMP NOT NULL DEFAULT '2000-01-02 03:04:05.123456', instant TIMESTAMPTZ NOT NULL DEFAULT '2000-01-02T03:04:05.123456+03:00')", no_parameters)?
+    set session = create_default_table.session
+    let insert_default_row: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "INSERT INTO temporal_defaults (id) VALUES (1)", no_parameters)?
+    set session = insert_default_row.session
+    let default_values: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT local_at, instant FROM temporal_defaults WHERE id = 1", no_parameters)?
+    set session = default_values.session
+    if not option_is_some(default_values.statement.query_result): return err("YazaBase timestamp DEFAULT lookup returned no result")
+    let default_value_rows: List[List[YazaSqlValueV1]] = option_unwrap(default_values.statement.query_result).rows
+    if list_count(default_value_rows) != 1: return err("YazaBase timestamp DEFAULT lookup returned the wrong row count")
+    let default_value_row: List[YazaSqlValueV1] = list_get(default_value_rows, 0)
+    if list_get(default_value_row, 0).text_value != "2000-01-02 03:04:05.123456" or list_get(default_value_row, 1).text_value != "2000-01-02T00:04:05.123456Z":
+        return err("YazaBase TIMESTAMP/TIMESTAMPTZ defaults did not materialize with their canonical semantics")
+    let inserted_first: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "INSERT INTO temporal_values (id, local_at, instant) VALUES (1, '2024-02-29 12:34:56.1203', '2024-01-02T03:04:05.123456+03:00')", no_parameters)?
+    set session = inserted_first.session
+    let inserted_rest: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "INSERT INTO temporal_values (id, wall_time, local_at, instant) VALUES (2, '06:30:00.5', '1969-12-31T23:59:59.999999', '2024-01-01T19:04:05.123456-05:00'), (3, '23:59:59.999999', '2025-01-01 00:00:00.000001', '2024-01-02T00:04:05.123457Z')", no_parameters)?
+    set session = inserted_rest.session
+    let unique_time: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "CREATE UNIQUE INDEX temporal_values_wall_time_uq ON temporal_values(wall_time)", no_parameters)?
+    set session = unique_time.session
+    let instant_index: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "CREATE INDEX temporal_values_instant_idx ON temporal_values(instant)", no_parameters)?
+    set session = instant_index.session
+
+    let defaults: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT wall_time FROM temporal_values WHERE id = 1", no_parameters)?
+    set session = defaults.session
+    if not option_is_some(defaults.statement.query_result): return err("YazaBase TIME DEFAULT query returned no result")
+    let default_rows: List[List[YazaSqlValueV1]] = option_unwrap(defaults.statement.query_result).rows
+    if list_count(default_rows) != 1 or list_get(list_get(default_rows, 0), 0).text_value != "12:00:00.000000": return err("YazaBase TIME DEFAULT did not materialize canonically")
+
+    let offset_lookup: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT COUNT(*) FROM temporal_values WHERE instant = '2024-01-02T00:04:05.123456Z'", no_parameters)?
+    set session = offset_lookup.session
+    if not option_is_some(offset_lookup.statement.query_result) or list_get(list_get(option_unwrap(offset_lookup.statement.query_result).rows, 0), 0).integer_value != 2:
+        return err("YazaBase TIMESTAMPTZ offset-equivalent comparison failed")
+    let explain: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "EXPLAIN SELECT id FROM temporal_values WHERE instant = '2024-01-02T00:04:05.123456Z'", no_parameters)?
+    set session = explain.session
+    if not option_is_some(explain.statement.explain_text) or text_find(option_unwrap(explain.statement.explain_text), "SecondaryIndexRangeScan(index=temporal_values_instant_idx") < 0:
+        return err("YazaBase TIMESTAMPTZ equality plan did not use its secondary index")
+
+    let extrema: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT MIN(local_at), MAX(local_at), MIN(instant), MAX(instant) FROM temporal_values", no_parameters)?
+    set session = extrema.session
+    if not option_is_some(extrema.statement.query_result): return err("YazaBase temporal MIN/MAX returned no result")
+    let extrema_row: List[YazaSqlValueV1] = list_get(option_unwrap(extrema.statement.query_result).rows, 0)
+    if list_get(extrema_row, 0).text_value != "1969-12-31 23:59:59.999999" or list_get(extrema_row, 1).text_value != "2025-01-01 00:00:00.000001":
+        return err("YazaBase civil TIMESTAMP MIN/MAX returned incorrect values")
+    if list_get(extrema_row, 2).text_value != "2024-01-02T00:04:05.123456Z" or list_get(extrema_row, 3).text_value != "2024-01-02T00:04:05.123457Z":
+        return err("YazaBase TIMESTAMPTZ MIN/MAX returned incorrect normalized instants")
+
+    let group_result: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT wall_time, COUNT(*) FROM temporal_values GROUP BY wall_time ORDER BY wall_time", no_parameters)?
+    set session = group_result.session
+    if not option_is_some(group_result.statement.query_result) or list_count(option_unwrap(group_result.statement.query_result).rows) != 3:
+        return err("YazaBase TIME GROUP BY did not preserve distinct times")
+
+    let bound_instant: Number = yaza_sql_timestamptz_parse_v1("2024-01-02T00:04:05.123456Z")?
+    let temporal_parameter: YazaSqlValueV1 = yaza_sql_value_integer_v1(15, bound_instant)?
+    let typed_parameters: List[YazaSqlValueV1] = [temporal_parameter]
+    let typed_lookup: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT COUNT(*) FROM temporal_values WHERE instant = $1", typed_parameters)?
+    set session = typed_lookup.session
+    if not option_is_some(typed_lookup.statement.query_result) or list_get(list_get(option_unwrap(typed_lookup.statement.query_result).rows, 0), 0).integer_value != 2:
+        return err("YazaBase typed TIMESTAMPTZ parameter failed")
+
+    let closed: Boolean = yaza_db_session_close_v1(session)?
+    if not closed: return err("YazaBase temporal fixture could not close before reopen")
+    let reopened_root: Number = root_open(root_path)?
+    var reopened: YazaDbSessionV1 = yaza_db_session_open_v1(reopened_root, database_name)?
+    let recovered: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(reopened, "SELECT instant FROM temporal_values WHERE id = 1", no_parameters)?
+    set reopened = recovered.session
+    if not option_is_some(recovered.statement.query_result): return err("YazaBase temporal value disappeared after reopen")
+    let recovered_rows: List[List[YazaSqlValueV1]] = option_unwrap(recovered.statement.query_result).rows
+    if list_count(recovered_rows) != 1 or list_get(list_get(recovered_rows, 0), 0).text_value != "2024-01-02T00:04:05.123456Z":
+        return err("YazaBase TIMESTAMPTZ normalization did not persist across reopen")
+    let recovered_default: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(reopened, "SELECT local_at, instant FROM temporal_defaults WHERE id = 1", no_parameters)?
+    set reopened = recovered_default.session
+    if not option_is_some(recovered_default.statement.query_result): return err("YazaBase TIMESTAMP defaults disappeared after reopen")
+    let recovered_default_rows: List[List[YazaSqlValueV1]] = option_unwrap(recovered_default.statement.query_result).rows
+    if list_count(recovered_default_rows) != 1 or list_get(list_get(recovered_default_rows, 0), 0).text_value != "2000-01-02 03:04:05.123456" or list_get(list_get(recovered_default_rows, 0), 1).text_value != "2000-01-02T00:04:05.123456Z":
+        return err("YazaBase TIMESTAMP/TIMESTAMPTZ defaults did not survive close/reopen")
+    let reopened_closed: Boolean = yaza_db_session_close_v1(reopened)?
+    if not reopened_closed: return err("YazaBase temporal fixture could not close after reopen")
+
+    let cleanup_root: Number = root_open(root_path)?
+    let removed: Boolean = remove(cleanup_root, database_name)?
+    let cleanup_synced: Boolean = sync_directory(cleanup_root)?
+    let cleanup_closed: Boolean = close(cleanup_root)?
+    if not removed or not cleanup_synced or not cleanup_closed:
+        return err("YazaBase temporal fixture cleanup failed")
+    return ok(true)
+
+start:
+    if arg_count() < 1:
+        say "usage: yazabase-sql-temporal-persist-v1-smoke <root-directory>"
+        exit(2)
+    let checked: Result[Boolean, Text] = yazabase_sql_temporal_persist_v1(arg(1))
+    if not result_is_ok(checked):
+        say result_unwrap_error(checked)
+        exit(1)
+    say "yazabase-sql-temporal-persist-v1-ok"

@@ -1,0 +1,50 @@
+# Catalog-driven SQL INSERT over the bounded persisted YDBv1 catalog profile.
+# This dispatches one INSERT VALUES statement and may publish bounded split
+# operations; UPDATE has a separate literal-only non-key profile, while multi-statement atomicity and general isolation remain absent.
+use "./catalog_snapshot_v1"
+use "./catalog_storage_v1"
+use "./query_v1"
+use "./sql_insert_v1"
+use "./sql_insert_bind_v1"
+use "./sql_insert_exec_v1"
+use "./sql_foreign_key_v1"
+use "./sql_check_v1"
+use "./index_maintenance_v1"
+use "./sql_insert_write_v1"
+use "./storage_v1"
+use "./wal_v1"
+
+fn yaza_db_execute_insert_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1]) -> Result[YazaDbWriteCommitV1, Text]:
+    if storage.root != wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid): return err("YDBv1 SQL INSERT storage and WAL handles belong to different databases")
+    let loaded: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(storage.file, storage.header)?
+    let parsed: YazaSqlInsertAstV1 = yaza_sql_parse_insert_v1(source)?
+    var view_index: Number = 0
+    while view_index < list_count(loaded.views):
+        if yaza_sql_bind_v1_identifier_matches(source, parsed.table_name.first_token, list_get(loaded.views, view_index).name):
+            return err("YDBv1 views are read-only; INSERT through a view is not supported")
+        set view_index = view_index + 1
+    let plan: YazaSqlBoundInsertPlanV1 = yaza_sql_bind_insert_v1(source, parsed, loaded.sql_snapshot)?
+    if plan.catalog_version != loaded.sql_snapshot.version: return err("YDBv1 SQL INSERT plan was bound against a stale catalog snapshot")
+    let table_index: Number = yaza_db_catalog_snapshot_table_index_v1(loaded.sql_snapshot.tables, plan.table_id)
+    if table_index < 0 or table_index >= list_count(loaded.root_page_ids) or table_index >= list_count(loaded.table_schema_versions): return err("YDBv1 SQL INSERT target has no persisted table root or schema version")
+    let table_root_page_id: Number = list_get(loaded.root_page_ids, table_index)
+    let table_schema_version: Number = list_get(loaded.table_schema_versions, table_index)
+    let catalog: YazaDbCatalogRootV1 = yaza_db_catalog_storage_read_root_v1(storage.file, storage.header)?
+    let table: YazaSqlTableSchemaV1 = list_get(loaded.sql_snapshot.tables, table_index)
+    let key_ordinals: List[Number] = yaza_db_query_clustered_key_ordinals_v1(storage.file, storage.header, catalog, plan.table_id, table_root_page_id, loaded.sql_snapshot.version, list_count(table.columns))?
+    let indexes: List[YazaDbSecondaryIndexV1] = yaza_db_index_maintenance_load_v1(storage, loaded, table_index)?
+    let batch: YazaSqlInsertMaterializedV1 = yaza_sql_materialize_insert_v1(plan, parameters)?
+    let foreign_rows_created: Result[List[List[YazaSqlValueV1]], Text] = list_try_new()
+    if not result_is_ok(foreign_rows_created): return err(result_unwrap_error(foreign_rows_created))
+    let foreign_rows: List[List[YazaSqlValueV1]] = result_unwrap(foreign_rows_created)
+    if not list_try_reserve(foreign_rows, list_count(batch.rows)): return err("YDBv1 SQL INSERT could not reserve foreign-key row validation metadata")
+    var foreign_row_index: Number = 0
+    while foreign_row_index < list_count(batch.rows):
+        if not list_try_push(foreign_rows, list_get(batch.rows, foreign_row_index).values): return err("YDBv1 SQL INSERT could not retain a row for foreign-key validation")
+        set foreign_row_index = foreign_row_index + 1
+    let foreign_keys_valid: Boolean = yaza_db_sql_foreign_key_validate_rows_v1(storage.file, storage.header, loaded, plan.table_id, foreign_rows)?
+    if not foreign_keys_valid: return err("YDBv1 SQL INSERT foreign-key preflight did not complete")
+    let checks_valid: Boolean = yaza_db_sql_check_validate_rows_v1(storage.file, storage.header, loaded, plan.table_id, foreign_rows)?
+    if not checks_valid: return err("YDBv1 SQL INSERT CHECK preflight did not complete")
+    let committed: YazaDbWriteCommitV1 = yaza_db_sql_insert_write_with_indexes_for_schema_v1(storage, wal, table_root_page_id, key_ordinals, table_schema_version, batch, indexes)?
+    return ok(YazaDbWriteCommitV1(committed.storage, committed.wal, committed.txn_id, committed.commit_ts, list_count(batch.rows)))

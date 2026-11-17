@@ -1,0 +1,122 @@
+use "url"
+
+# Bounded HTML text and quoted-attribute escaping written in YAZA.
+# Context-specific escaping is not rich-HTML sanitization or full URL parsing.
+# Escape one text chunk at a time; inputs are capped to bound temporary memory.
+
+fn html_escape_bytes(input: Bytes) -> Result[Text, Text]:
+    let input_length: Number = bytes_length(input)
+    if input_length > 65536:
+        return err("html: input exceeds the 64 KiB per-chunk limit")
+    let valid_text: Option[Text] = bytes_to_text_checked(input)
+    if not option_is_some(valid_text):
+        return err("html: input is not valid non-NUL UTF-8")
+    let value: Text = option_unwrap(valid_text)
+
+    var parts: TextList = text_list()
+    var segment_start: Number = 0
+    var cursor: Number = 0
+    var output_length: Number = 0
+    while cursor < input_length:
+        let byte: Number = bytes_get(input, cursor)
+        var replacement: Text = ""
+        if byte == 38:
+            set replacement = "&amp;"
+        elif byte == 60:
+            set replacement = "&lt;"
+        elif byte == 62:
+            set replacement = "&gt;"
+        elif byte == 34:
+            set replacement = "&quot;"
+        elif byte == 39:
+            set replacement = "&#39;"
+
+        if text_length(replacement) > 0:
+            let segment_length: Number = cursor - segment_start
+            let replacement_length: Number = text_length(replacement)
+            if output_length > 393216 - segment_length - replacement_length:
+                return err("html: escaped output exceeds the 384 KiB per-chunk limit")
+            if segment_length > 0:
+                list_push(parts, text_slice(value, segment_start, segment_length))
+            list_push(parts, replacement)
+            set output_length = output_length + segment_length + replacement_length
+            set cursor = cursor + 1
+            set segment_start = cursor
+        else:
+            set cursor = cursor + 1
+
+    let final_length: Number = input_length - segment_start
+    if output_length > 393216 - final_length:
+        return err("html: escaped output exceeds the 384 KiB per-chunk limit")
+    if final_length > 0:
+        list_push(parts, text_slice(value, segment_start, final_length))
+    return ok(text_join(parts, ""))
+
+fn html_escape(value: Text) -> Result[Text, Text]:
+    return html_escape_bytes(bytes_from_text(value))
+
+fn html_escape_text(value: Text) -> Result[Text, Text]:
+    return html_escape(value)
+
+fn html_escape_attribute(value: Text) -> Result[Text, Text]:
+    return html_escape(value)
+
+fn html_href_is_safe(value: Text) -> Result[Boolean, Text]:
+    let input: Bytes = bytes_from_text(value)
+    let length: Number = bytes_length(input)
+    if length > 2048:
+        return err("html: href exceeds the 2 KiB limit")
+    let valid_text: Option[Text] = bytes_to_text_checked(input)
+    if not option_is_some(valid_text):
+        return err("html: href is not valid non-NUL UTF-8")
+
+    var index: Number = 0
+    while index < length:
+        let byte: Number = bytes_get(input, index)
+        if byte <= 32 or byte == 127 or byte == 92 or byte > 126:
+            return err("html: href must use printable ASCII and percent-encoded non-ASCII bytes")
+        if byte == 37:
+            if index + 2 >= length:
+                return err("html: href contains an incomplete percent escape")
+            let high: Number = url_hex_value(bytes_get(input, index + 1))
+            let low: Number = url_hex_value(bytes_get(input, index + 2))
+            if high < 0 or low < 0:
+                return err("html: href contains an invalid percent escape")
+            let decoded: Number = high * 16 + low
+            if decoded < 32 or decoded == 127 or decoded == 92:
+                return err("html: href percent-encodes whitespace, controls, or backslash")
+            set index = index + 3
+        else:
+            set index = index + 1
+
+    if length >= 2 and bytes_get(input, 0) == 47 and bytes_get(input, 1) == 47:
+        return err("html: protocol-relative hrefs are not allowed")
+
+    var colon: Number = -1
+    set index = 0
+    var searching_scheme: Boolean = true
+    while index < length and searching_scheme:
+        let byte: Number = bytes_get(input, index)
+        if byte == 58:
+            set colon = index
+            set searching_scheme = false
+        elif byte == 47 or byte == 63 or byte == 35:
+            set searching_scheme = false
+        else:
+            set index = index + 1
+
+    if colon >= 0:
+        let scheme: Text = text_slice(value, 0, colon)
+        if not url_ascii_equal_ignore_case(scheme, "https"):
+            return err("html: href scheme is not allowed; use HTTPS or a relative URL")
+        let parsed: Result[WebUrl, Text] = url_parse_http(value)
+        if not result_is_ok(parsed):
+            return err("html: invalid HTTPS href: " + result_unwrap_error(parsed))
+
+    return ok(true)
+
+fn html_escape_href(value: Text) -> Result[Text, Text]:
+    let safe_url: Result[Boolean, Text] = html_href_is_safe(value)
+    if not result_is_ok(safe_url):
+        return err(result_unwrap_error(safe_url))
+    return html_escape_attribute(value)

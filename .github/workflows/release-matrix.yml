@@ -1,0 +1,179 @@
+name: YAZA Release Matrix
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and package (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-24.04
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+          - platform: darwin-arm64
+            runner: macos-15
+          - platform: darwin-x64
+            runner: macos-15-intel
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: startsWith(matrix.runner, 'ubuntu-')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang xz-utils libargon2-dev file
+
+      - name: Install macOS build dependencies
+        if: startsWith(matrix.runner, 'macos-')
+        run: |
+          brew list argon2 >/dev/null 2>&1 || brew install argon2
+          brew list xz >/dev/null 2>&1 || brew install xz
+
+      - name: Build compiler and YazaBase from source
+        run: sh scripts/build-host.sh
+
+      - name: Verify target and smoke test compiler and database
+        shell: bash
+        run: |
+          set -euo pipefail
+          file build/yaza-llvm build/yazabase-cli
+          build/yaza-llvm --version
+
+          hello_output=$(YAZA_STDLIB_DIR="$PWD/std" YAZA_RUNTIME_DIR="$PWD/runtime" \
+            build/yaza run examples/hello.yz)
+          printf '%s\n' "$hello_output"
+          grep -Fxq 'Hello, world!' <<< "$hello_output"
+
+          db_root=$(mktemp -d)
+          trap 'rm -rf "$db_root"' EXIT
+          build/yazabase-cli init "$db_root" ci_smoke
+          build/yazabase-cli set-user "$db_root" ci-user 'ci-only-password-2026'
+          build/yazabase-cli auth-check "$db_root" ci-user 'ci-only-password-2026'
+          build/yazabase-cli sql "$db_root" ci_smoke 'CREATE TABLE smoke (id BIGINT PRIMARY KEY, label TEXT)'
+          build/yazabase-cli sql "$db_root" ci_smoke "INSERT INTO smoke (id, label) VALUES (1, 'ready')"
+          query_output=$(build/yazabase-cli sql "$db_root" ci_smoke 'SELECT label FROM smoke WHERE id = 1')
+          printf '%s\n' "$query_output"
+          grep -Fq 'ready' <<< "$query_output"
+
+      - name: Package binaries built on this target
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(cat VERSION)
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag_version=${GITHUB_REF_NAME#v}
+            test "$tag_version" = "$version"
+          fi
+          YAZA_VERSION="$version" sh scripts/package-release-target.sh "${{ matrix.platform }}"
+
+      - name: Upload platform archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  validate:
+    name: Focused language, database, and API validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install validation dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang xz-utils libargon2-dev
+
+      - name: Build host tools
+        run: sh scripts/build-host.sh
+
+      - name: Validate Core 2 language features
+        run: sh scripts/validate-core2-features.sh
+
+      - name: Validate YazaBase API and configuration
+        run: |
+          sh scripts/validate-yazabase-api-v1.sh
+          sh scripts/validate-api-profile-config.sh
+          YAZA_STDLIB_DIR="$PWD/std" build/yaza run examples/auth-jwt-ywt-rbac-smoke.yz
+
+      - name: Validate API project generation
+        env:
+          YAZA_TEST_CLI: ${{ github.workspace }}/build/yaza
+        run: sh templates/api/tests/generation-smoke.sh
+
+      - name: Validate generated API self-test
+        shell: bash
+        run: |
+          set -euo pipefail
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          (
+            cd "$work"
+            "$GITHUB_WORKSPACE/build/yaza" new --api ci_api
+            cd ci_api
+            mkdir -p data
+            "$GITHUB_WORKSPACE/build/yazabase-cli" set-user ./data ci_admin 'ci-only-api-password-2026'
+            YAZA_STDLIB_DIR="$GITHUB_WORKSPACE/std" \
+            YAZA_RUNTIME_DIR="$GITHUB_WORKSPACE/runtime" \
+            YAZABASE_BIN="$GITHUB_WORKSPACE/build/yazabase-cli" \
+            YAZABASE_USER=ci_admin \
+            YAZABASE_PASSWORD='ci-only-api-password-2026' \
+            YAZA_AUTH_SECRET="$("$GITHUB_WORKSPACE/build/yaza" secret token)" \
+            YAZA_SELF_TEST=1 "$GITHUB_WORKSPACE/build/yaza" run src/main.yz
+          )
+
+  publish:
+    name: Publish verified release assets
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, validate]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download exact platform build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-files
+          merge-multiple: true
+
+      - name: Check matrix completeness and generate checksums
+        working-directory: release-files
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(find . -maxdepth 1 -name 'yaza-*.tar.gz' | wc -l | tr -d ' ')" = 4
+          test "$(find . -maxdepth 1 -name 'yazabase-*.tar.gz' | wc -l | tr -d ' ')" = 4
+          sha256sum ./*.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: YAZA ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            release-files/*.tar.gz
+            release-files/SHA256SUMS.txt

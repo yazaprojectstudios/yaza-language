@@ -1,0 +1,182 @@
+# Bounded RFC 4180-style CSV parsing and record encoding.
+# This first slice operates on a bounded Bytes value; async stream adapters follow.
+
+shape CsvRecord:
+    fields: TextList
+    next_offset: Number
+
+fn csv_decode_segment(input: Bytes, start: Number, length: Number) -> Option[Text]:
+    if length == 0:
+        return some("")
+    return bytes_to_text_checked(bytes_slice(input, start, length))
+
+fn csv_read_field(input: Bytes, start: Number) -> Result[TextList, Text]:
+    let input_length: Number = bytes_length(input)
+    if start < 0 or start > input_length:
+        return err("csv: field offset is outside the input")
+    if start == input_length:
+        let empty_field: TextList = text_list()
+        list_push(empty_field, "")
+        list_push(empty_field, number_text(start))
+        return ok(empty_field)
+    if bytes_get(input, start) == 34:
+        var cursor: Number = start + 1
+        var segment_start: Number = cursor
+        var decoded_length: Number = 0
+        var parts: TextList = text_list()
+        var closed: Boolean = false
+        while cursor < input_length and not closed:
+            if cursor - start > 2097152:
+                return err("csv: encoded field exceeds the 2 MiB limit")
+            if bytes_get(input, cursor) == 34:
+                if cursor + 1 < input_length and bytes_get(input, cursor + 1) == 34:
+                    let segment_length: Number = cursor - segment_start
+                    if decoded_length > 1048576 - segment_length - 1:
+                        return err("csv: decoded field exceeds the 1 MiB limit")
+                    set decoded_length = decoded_length + segment_length + 1
+                    let segment: Option[Text] = csv_decode_segment(input, segment_start, segment_length)
+                    if not option_is_some(segment):
+                        return err("csv: quoted field contains invalid UTF-8 or NUL")
+                    if segment_length > 0:
+                        list_push(parts, option_unwrap(segment))
+                    list_push(parts, "\"")
+                    set cursor = cursor + 2
+                    set segment_start = cursor
+                else:
+                    let segment_length: Number = cursor - segment_start
+                    if decoded_length > 1048576 - segment_length:
+                        return err("csv: decoded field exceeds the 1 MiB limit")
+                    set decoded_length = decoded_length + segment_length
+                    let segment: Option[Text] = csv_decode_segment(input, segment_start, segment_length)
+                    if not option_is_some(segment):
+                        return err("csv: quoted field contains invalid UTF-8 or NUL")
+                    if segment_length > 0:
+                        list_push(parts, option_unwrap(segment))
+                    set cursor = cursor + 1
+                    set closed = true
+            else:
+                set cursor = cursor + 1
+        if not closed:
+            return err("csv: quoted field is not terminated")
+        let quoted_field: TextList = text_list()
+        list_push(quoted_field, text_join(parts, ""))
+        list_push(quoted_field, number_text(cursor))
+        return ok(quoted_field)
+    var cursor: Number = start
+    while cursor < input_length and bytes_get(input, cursor) != 44 and bytes_get(input, cursor) != 13 and bytes_get(input, cursor) != 10:
+        if cursor - start >= 1048576:
+            return err("csv: field exceeds the 1 MiB limit")
+        if bytes_get(input, cursor) == 34:
+            return err("csv: quote inside an unquoted field")
+        set cursor = cursor + 1
+    let field_length: Number = cursor - start
+    let decoded: Option[Text] = csv_decode_segment(input, start, field_length)
+    if not option_is_some(decoded):
+        return err("csv: field contains invalid UTF-8 or NUL")
+    let field: TextList = text_list()
+    list_push(field, option_unwrap(decoded))
+    list_push(field, number_text(cursor))
+    return ok(field)
+
+fn csv_read_record(input: Bytes, offset: Number) -> Result[Option[CsvRecord], Text]:
+    let input_length: Number = bytes_length(input)
+    if input_length > 16777216:
+        return err("csv: input exceeds the 16 MiB in-memory limit")
+    if offset < 0 or offset > input_length:
+        return err("csv: record offset is outside the input")
+    if offset == input_length:
+        return ok(none)
+    var fields: TextList = text_list()
+    var cursor: Number = offset
+    var reading: Boolean = true
+    while reading:
+        if list_count(fields) >= 256:
+            return err("csv: record exceeds the 256-field limit")
+        let field_result: Result[TextList, Text] = csv_read_field(input, cursor)
+        if not result_is_ok(field_result):
+            return err(result_unwrap_error(field_result))
+        let field_data: TextList = result_unwrap(field_result)
+        list_push(fields, list_get(field_data, 0))
+        set cursor = number_parse(list_get(field_data, 1))
+        if cursor == input_length:
+            set reading = false
+        else:
+            let delimiter: Number = bytes_get(input, cursor)
+            if delimiter == 44:
+                set cursor = cursor + 1
+            elif delimiter == 13:
+                if cursor + 1 >= input_length or bytes_get(input, cursor + 1) != 10:
+                    return err("csv: record separators must use CRLF")
+                set cursor = cursor + 2
+                set reading = false
+            elif delimiter == 10:
+                return err("csv: record separators must use CRLF")
+            else:
+                return err("csv: expected a comma or record separator")
+    return ok(some(CsvRecord(fields, cursor)))
+
+fn csv_encode_field(value: Text) -> Result[Text, Text]:
+    let input: Bytes = bytes_from_text(value)
+    let input_length: Number = bytes_length(input)
+    if input_length > 1048576:
+        return err("csv: field exceeds the 1 MiB limit")
+    var needs_quotes: Boolean = false
+    var scan: Number = 0
+    while scan < input_length and not needs_quotes:
+        let byte: Number = bytes_get(input, scan)
+        if byte == 34 or byte == 44 or byte == 13 or byte == 10:
+            set needs_quotes = true
+        set scan = scan + 1
+    if not needs_quotes:
+        return ok(value)
+    var parts: TextList = text_list()
+    list_push(parts, "\"")
+    var cursor: Number = 0
+    var segment_start: Number = 0
+    while cursor < input_length:
+        if bytes_get(input, cursor) == 34:
+            let segment_length: Number = cursor - segment_start
+            let segment: Option[Text] = csv_decode_segment(input, segment_start, segment_length)
+            if not option_is_some(segment):
+                return err("csv: Text field contains invalid UTF-8 or NUL")
+            if segment_length > 0:
+                list_push(parts, option_unwrap(segment))
+            list_push(parts, "\"\"")
+            set cursor = cursor + 1
+            set segment_start = cursor
+        else:
+            set cursor = cursor + 1
+    let last_length: Number = input_length - segment_start
+    let last_segment: Option[Text] = csv_decode_segment(input, segment_start, last_length)
+    if not option_is_some(last_segment):
+        return err("csv: Text field contains invalid UTF-8 or NUL")
+    if last_length > 0:
+        list_push(parts, option_unwrap(last_segment))
+    list_push(parts, "\"")
+    return ok(text_join(parts, ""))
+
+fn csv_encode_record(fields: TextList) -> Result[Bytes, Text]:
+    let field_count: Number = list_count(fields)
+    if field_count == 0 or field_count > 256:
+        return err("csv: record must contain between 1 and 256 fields")
+    var encoded_parts: TextList = text_list()
+    var encoded_bytes: Number = 2
+    var index: Number = 0
+    while index < field_count:
+        let encoded_field: Result[Text, Text] = csv_encode_field(list_get(fields, index))
+        if not result_is_ok(encoded_field):
+            return err(result_unwrap_error(encoded_field))
+        let field_text: Text = result_unwrap(encoded_field)
+        let field_bytes: Number = bytes_length(bytes_from_text(field_text))
+        if encoded_bytes > 16777216 - field_bytes:
+            return err("csv: encoded record exceeds the 16 MiB limit")
+        set encoded_bytes = encoded_bytes + field_bytes
+        list_push(encoded_parts, field_text)
+        if index + 1 < field_count:
+            if encoded_bytes >= 16777216:
+                return err("csv: encoded record exceeds the 16 MiB limit")
+            set encoded_bytes = encoded_bytes + 1
+            list_push(encoded_parts, ",")
+        set index = index + 1
+    list_push(encoded_parts, "\r\n")
+    return ok(bytes_from_text(text_join(encoded_parts, "")))

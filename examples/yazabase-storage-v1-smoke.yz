@@ -1,0 +1,324 @@
+use "std/fs"
+use "../yazabase/storage_v1"
+use "../yazabase/overflow_v1"
+use "../yazabase/overflow_storage_v1"
+use "../yazabase/row_v1"
+use "../yazabase/meta_free_v1"
+use "../yazabase/catalog_v1"
+use "../yazabase/catalog_storage_v1"
+use "../yazabase/btree_scan_v1"
+use "../yazabase/key_codec_v1"
+
+fn yaza_base_storage_v1_check(root_path: Text) -> Result[Number, Text]:
+    let root: Number = root_open(root_path)?
+    let uuid: Bytes = bytes_from_text("0123456789abcdef")
+    let initial: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(uuid, 0, 1, 1, 0, 2, 1)
+    let database: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, "storage-smoke.ydb", initial)?
+    let created: Number = database.file
+    let duplicate_uuid_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(uuid, 0, 1, 1, 0, 2, 1)
+    let duplicate_while_open: Result[YazaDbStorageHandleV1, Text] = yaza_db_storage_create_empty_v1(root, "duplicate-uuid.ydb", duplicate_uuid_header)
+    if result_is_ok(duplicate_while_open):
+        let ignored_duplicate_close: Result[Boolean, Text] = yaza_db_storage_close_v1(result_unwrap(duplicate_while_open))
+        return err("YDBv1 allowed two open database files to share one UUID and WAL namespace")
+    if database.header.page_count != yaza_db_storage_preallocated_page_count_v1(): return err("YDBv1 creator did not expose its preallocated logical page range")
+    let initial_preallocated_size: Number = file_size(created)?
+    if initial_preallocated_size != yaza_db_storage_preallocation_granule_v1(): return err("YDBv1 storage creator did not preallocate one 64 MiB chunk")
+    let genesis_bitmap: Bytes = yaza_db_storage_read_page_v1(created, database.header, 2)?
+    let genesis_bitmap_self: Boolean = yaza_db_bitmap_page_bit_for_page_v1(genesis_bitmap, 2, 2)?
+    let genesis_first_page_free: Boolean = yaza_db_bitmap_page_bit_for_page_v1(genesis_bitmap, 3, 2)?
+    if not genesis_bitmap_self or genesis_first_page_free: return err("YDBv1 creator's initial BITMAP does not reserve itself or has an unexpected page allocation")
+    let competing_open: Result[YazaDbStorageHandleV1, Text] = yaza_db_storage_open_v1(root, "storage-smoke.ydb")
+    if result_is_ok(competing_open): return err("YDBv1 storage allowed a second database owner")
+    let data_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(uuid, 1, 1, 1, 0, 4, 1)
+    let row_columns: List[YazaSqlColumnSchemaV1] = List[YazaSqlColumnSchemaV1]()
+    list_push(row_columns, YazaSqlColumnSchemaV1("id", 4, false, 0, 0, 0, ""))
+    list_push(row_columns, YazaSqlColumnSchemaV1("label", 9, false, 1, 0, 0, ""))
+    let row_values: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    list_push(row_values, yaza_sql_executor_value_v1(4, 42, 0.0, false, ""))
+    list_push(row_values, yaza_sql_value_text_v1("persistent-row"))
+    let row_nulls: List[Boolean] = List[Boolean]()
+    list_push(row_nulls, false)
+    list_push(row_nulls, false)
+    let row_payload: Bytes = yaza_db_row_encode_v1(row_values, row_nulls, row_columns, 1)?
+    let bitmap_page: Bytes = yaza_db_bitmap_page_new_mapped_v1(2, 1)?
+    let initial_bitmap_write: Number = yaza_db_storage_write_page_v1(created, data_header, bitmap_page)?
+    if initial_bitmap_write != yaza_db_page_size_v1(): return err("YDBv1 storage fixture could not initialize its allocation bitmap")
+    let building_page: Bytes = yaza_db_page_new_v1(3, 1, 1, 0)?
+    let added: Number = yaza_db_page_add_slot_v1(building_page, bytes_from_text("key"), row_payload)?
+    if added != 0: return err("YDBv1 storage fixture created an unexpected slot")
+    let page: Bytes = yaza_db_page_finalize_v1(building_page)?
+    let unallocated_leaf_write: Result[Number, Text] = yaza_db_storage_write_page_v1(created, data_header, page)
+    if result_is_ok(unallocated_leaf_write): return err("YDBv1 storage wrote a data page whose bitmap bit was free")
+    let leaf_id_allocated: Boolean = yaza_db_bitmap_page_set_page_allocated_v1(bitmap_page, 3, true, 2, 2)?
+    if not leaf_id_allocated: return err("YDBv1 storage fixture could not reserve the leaf page ID")
+    let leaf_bitmap_write: Number = yaza_db_storage_write_page_v1(created, data_header, bitmap_page)?
+    if leaf_bitmap_write != yaza_db_page_size_v1(): return err("YDBv1 storage fixture could not persist the leaf allocation bit")
+    let written_page: Number = yaza_db_storage_write_page_v1(created, data_header, page)?
+    if written_page != yaza_db_page_size_v1(): return err("YDBv1 storage page write length is wrong")
+    let released_leaf_bit: Boolean = yaza_db_bitmap_page_set_page_allocated_v1(bitmap_page, 3, false, 3, 2)?
+    if not released_leaf_bit: return err("YDBv1 storage fixture could not clear the leaf allocation bit")
+    let released_bitmap_write: Number = yaza_db_storage_write_page_v1(created, data_header, bitmap_page)?
+    if released_bitmap_write != yaza_db_page_size_v1(): return err("YDBv1 storage fixture could not persist the freed leaf bit")
+    let unallocated_leaf_read: Result[Bytes, Text] = yaza_db_storage_read_page_v1(created, data_header, 3)
+    if result_is_ok(unallocated_leaf_read): return err("YDBv1 storage read a data page whose bitmap bit was free")
+    let restored_leaf_bit: Boolean = yaza_db_bitmap_page_set_page_allocated_v1(bitmap_page, 3, true, 4, 2)?
+    if not restored_leaf_bit: return err("YDBv1 storage fixture could not restore the leaf allocation bit")
+    let restored_bitmap_write: Number = yaza_db_storage_write_page_v1(created, data_header, bitmap_page)?
+    if restored_bitmap_write != yaza_db_page_size_v1(): return err("YDBv1 storage fixture could not persist the restored leaf bit")
+    let overflow_text: Text = text_try_repeat("x", 5000)?
+    let overflow_payload: Bytes = bytes_try_from_text(overflow_text)?
+    let overflow_page: Bytes = yaza_db_overflow_page_encode_v1(4, 1, 0, overflow_payload)?
+    let expanded_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(uuid, 1, 1, 1, 0, yaza_db_storage_preallocated_page_count_v1(), 1)
+    let overflow_id_allocated: Boolean = yaza_db_bitmap_page_set_page_allocated_v1(bitmap_page, 4, true, 5, 2)?
+    if not overflow_id_allocated: return err("YDBv1 storage fixture could not reserve the overflow page ID")
+    let allocation_bitmap_write: Number = yaza_db_storage_write_page_v1(created, expanded_header, bitmap_page)?
+    if allocation_bitmap_write != yaza_db_page_size_v1(): return err("YDBv1 storage fixture could not persist allocation bits")
+    let written_overflow_page: Number = yaza_db_storage_write_page_v1(created, expanded_header, overflow_page)?
+    if written_overflow_page != yaza_db_page_size_v1(): return err("YDBv1 storage overflow-page write length is wrong")
+    let read_overflow_page: Bytes = yaza_db_storage_read_page_v1(created, expanded_header, 4)?
+    let decoded_overflow_page: YazaDbOverflowPageV1 = yaza_db_overflow_page_decode_v1(read_overflow_page, 4)?
+    if bytes_length(decoded_overflow_page.payload) != bytes_length(overflow_payload) or not bytes_equal(decoded_overflow_page.payload, overflow_payload): return err("YDBv1 storage overflow-page round trip failed")
+    let overflow_reference: YazaDbOverflowRefV1 = YazaDbOverflowRefV1(4, bytes_length(overflow_payload), bytes_ydbv1_checksum(overflow_payload), 0)
+    let read_overflow_value: Bytes = yaza_db_storage_read_overflow_bytes_v1(created, expanded_header, overflow_reference)?
+    if not bytes_equal(read_overflow_value, overflow_payload): return err("YDBv1 file-backed overflow-chain read did not reconstruct the stored value")
+    let external_columns: List[YazaSqlColumnSchemaV1] = List[YazaSqlColumnSchemaV1]()
+    let external_values: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let external_nulls: List[Boolean] = List[Boolean]()
+    let external_refs: List[YazaDbOverflowRefV1] = List[YazaDbOverflowRefV1]()
+    list_push(external_columns, YazaSqlColumnSchemaV1("payload", 9, false, 0, 0, 0, ""))
+    list_push(external_values, yaza_sql_value_text_v1(overflow_text))
+    list_push(external_nulls, false)
+    list_push(external_refs, overflow_reference)
+    let external_row_bytes: Bytes = yaza_db_row_encode_for_schema_with_overflow_v1(external_values, external_nulls, external_refs, external_columns, 1, 1)?
+    let external_row: YazaDbRowV1 = yaza_db_row_decode_v1(external_row_bytes, external_columns)?
+    let materialized_external_row: YazaDbRowV1 = yaza_db_row_materialize_overflow_text_v1(created, expanded_header, external_row, external_columns)?
+    if list_get(materialized_external_row.values, 0).text_value != overflow_text: return err("YDBv1 file-backed row did not hydrate external TEXT")
+    let meta_payload: Bytes = bytes_from_text("sys_tables-root-v1")
+    let meta_page: Bytes = yaza_db_meta_page_encode_v1(5, 1, 2, 1, meta_payload)?
+    let meta_id_allocated: Boolean = yaza_db_bitmap_page_set_page_allocated_v1(bitmap_page, 5, true, 6, 2)?
+    if not meta_id_allocated: return err("YDBv1 storage fixture could not reserve the META page ID")
+    let meta_bitmap_write: Number = yaza_db_storage_write_page_v1(created, expanded_header, bitmap_page)?
+    if meta_bitmap_write != yaza_db_page_size_v1(): return err("YDBv1 storage fixture could not persist the META allocation bit")
+    let meta_page_write: Number = yaza_db_storage_write_page_v1(created, expanded_header, meta_page)?
+    if meta_page_write != yaza_db_page_size_v1(): return err("YDBv1 storage fixture could not persist an allocated META page")
+    let meta_page_read: Bytes = yaza_db_storage_read_page_v1(created, expanded_header, 5)?
+    let meta_page_decoded: YazaDbMetaPageV1 = yaza_db_meta_page_decode_v1(meta_page_read, 5)?
+    if meta_page_decoded.kind != 2 or not bytes_equal(meta_page_decoded.payload, meta_payload): return err("YDBv1 file-backed META page did not round-trip")
+    let allocated_free_image: Bytes = yaza_db_free_page_encode_v1(5, 2)?
+    if result_is_ok(yaza_db_storage_write_page_v1(created, expanded_header, allocated_free_image)): return err("YDBv1 storage overwrote an allocated page with a FREE image")
+    let root_tables_allocated: Boolean = yaza_db_bitmap_page_set_page_allocated_v1(bitmap_page, 7, true, 7, 2)?
+    let root_columns_allocated: Boolean = yaza_db_bitmap_page_set_page_allocated_v1(bitmap_page, 8, true, 8, 2)?
+    let root_indexes_allocated: Boolean = yaza_db_bitmap_page_set_page_allocated_v1(bitmap_page, 9, true, 9, 2)?
+    let root_constraints_allocated: Boolean = yaza_db_bitmap_page_set_page_allocated_v1(bitmap_page, 10, true, 10, 2)?
+    let catalog_descriptor_allocated: Boolean = yaza_db_bitmap_page_set_page_allocated_v1(bitmap_page, 11, true, 11, 2)?
+    let overflow_row_leaf_allocated: Boolean = yaza_db_bitmap_page_set_page_allocated_v1(bitmap_page, 12, true, 12, 2)?
+    let root_views_allocated: Boolean = yaza_db_bitmap_page_set_page_allocated_v1(bitmap_page, 13, true, 13, 2)?
+    if not root_tables_allocated or not root_columns_allocated or not root_indexes_allocated or not root_constraints_allocated or not catalog_descriptor_allocated or not root_views_allocated or not overflow_row_leaf_allocated: return err("YDBv1 storage fixture could not allocate all catalog and overflow-row pages")
+    let bitmap_header: YazaDbFileHeaderV1 = expanded_header
+    let written_bitmap_page: Number = yaza_db_storage_write_page_v1(created, bitmap_header, bitmap_page)?
+    if written_bitmap_page != yaza_db_page_size_v1(): return err("YDBv1 storage bitmap-page write length is wrong")
+    let root_tables_page: Bytes = yaza_db_page_new_v1(7, 1, 1, 0)?
+    let root_columns_page: Bytes = yaza_db_page_new_v1(8, 1, 1, 0)?
+    let root_indexes_page: Bytes = yaza_db_page_new_v1(9, 1, 1, 0)?
+    let root_constraints_page: Bytes = yaza_db_page_new_v1(10, 1, 1, 0)?
+    let root_views_page: Bytes = yaza_db_page_new_v1(13, 1, 1, 0)?
+    let root_tables_final: Bytes = yaza_db_page_finalize_v1(root_tables_page)?
+    let root_columns_final: Bytes = yaza_db_page_finalize_v1(root_columns_page)?
+    let root_indexes_final: Bytes = yaza_db_page_finalize_v1(root_indexes_page)?
+    let root_constraints_final: Bytes = yaza_db_page_finalize_v1(root_constraints_page)?
+    let root_views_final: Bytes = yaza_db_page_finalize_v1(root_views_page)?
+    let catalog_descriptor: Bytes = yaza_db_catalog_root_page_encode_v1(11, 20, YazaDbCatalogRootV1(7, 8, 9, 10, 5, 1, 13))?
+    let root_tables_write: Number = yaza_db_storage_write_page_v1(created, bitmap_header, root_tables_final)?
+    let root_columns_write: Number = yaza_db_storage_write_page_v1(created, bitmap_header, root_columns_final)?
+    let root_indexes_write: Number = yaza_db_storage_write_page_v1(created, bitmap_header, root_indexes_final)?
+    let root_constraints_write: Number = yaza_db_storage_write_page_v1(created, bitmap_header, root_constraints_final)?
+    let root_views_write: Number = yaza_db_storage_write_page_v1(created, bitmap_header, root_views_final)?
+    let catalog_descriptor_write: Number = yaza_db_storage_write_page_v1(created, bitmap_header, catalog_descriptor)?
+    let scan_values: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let scan_nulls: List[Boolean] = List[Boolean]()
+    let scan_overflow_refs: List[YazaDbOverflowRefV1] = List[YazaDbOverflowRefV1]()
+    list_push(scan_values, yaza_sql_executor_value_v1(4, 43, 0.0, false, ""))
+    list_push(scan_values, yaza_sql_value_text_v1(overflow_text))
+    list_push(scan_nulls, false)
+    list_push(scan_nulls, false)
+    list_push(scan_overflow_refs, yaza_db_row_empty_overflow_ref_v1())
+    list_push(scan_overflow_refs, overflow_reference)
+    let scan_row_payload: Bytes = yaza_db_row_encode_for_schema_with_overflow_v1(scan_values, scan_nulls, scan_overflow_refs, row_columns, 1, 1)?
+    let scan_key_ordinals: List[Number] = List[Number]()
+    list_push(scan_key_ordinals, 0)
+    let scan_key: Bytes = yaza_db_key_encode_composite_v1(scan_values, scan_nulls, row_columns, scan_key_ordinals)?
+    let overflow_row_leaf: Bytes = yaza_db_page_new_v1(12, 1, 1, 0)?
+    let overflow_row_slot: Number = yaza_db_page_add_slot_v1(overflow_row_leaf, scan_key, scan_row_payload)?
+    if overflow_row_slot != 0: return err("YDBv1 external-TEXT scan fixture could not create its leaf slot")
+    let overflow_row_leaf_final: Bytes = yaza_db_page_finalize_v1(overflow_row_leaf)?
+    let overflow_row_leaf_write: Number = yaza_db_storage_write_page_v1(created, bitmap_header, overflow_row_leaf_final)?
+    if overflow_row_leaf_write != yaza_db_page_size_v1(): return err("YDBv1 external-TEXT scan fixture could not persist its leaf")
+    let scanned_external_rows: List[YazaDbRowV1] = yaza_db_btree_read_rows_v1(created, bitmap_header, 12, row_columns, scan_key_ordinals, 1, 4)?
+    if list_count(scanned_external_rows) != 1: return err("YDBv1 external-TEXT B+Tree scan returned an unexpected row count")
+    let scanned_external_row: YazaDbRowV1 = list_get(scanned_external_rows, 0)
+    let scanned_external_text: YazaSqlValueV1 = list_get(scanned_external_row.values, 1)
+    if scanned_external_text.text_value != overflow_text: return err("YDBv1 B+Tree scan did not materialize external TEXT")
+    if root_tables_write != yaza_db_page_size_v1(): return err("YDBv1 storage fixture could not write the sys_tables root")
+    if root_columns_write != yaza_db_page_size_v1(): return err("YDBv1 storage fixture could not write the sys_columns root")
+    if root_indexes_write != yaza_db_page_size_v1(): return err("YDBv1 storage fixture could not write the sys_indexes root")
+    if root_constraints_write != yaza_db_page_size_v1(): return err("YDBv1 storage fixture could not write the sys_constraints root")
+    if root_views_write != yaza_db_page_size_v1(): return err("YDBv2 storage fixture could not write the optional sys_views root")
+    if catalog_descriptor_write != yaza_db_page_size_v1(): return err("YDBv1 storage fixture could not write the catalog-root descriptor")
+    let read_bitmap_page: Bytes = yaza_db_storage_read_page_v1(created, bitmap_header, 2)?
+    let first_bitmap_bit: Boolean = yaza_db_bitmap_page_bit_v1(read_bitmap_page, 0, 2)?
+    if not first_bitmap_bit: return err("YDBv1 storage bitmap page did not retain its self-allocation bit")
+    let persisted_leaf_allocation: Boolean = yaza_db_bitmap_page_bit_for_page_v1(read_bitmap_page, 3, 2)?
+    let persisted_overflow_allocation: Boolean = yaza_db_bitmap_page_bit_for_page_v1(read_bitmap_page, 4, 2)?
+    let persisted_meta_allocation: Boolean = yaza_db_bitmap_page_bit_for_page_v1(read_bitmap_page, 5, 2)?
+    let persisted_catalog_allocation: Boolean = yaza_db_bitmap_page_bit_for_page_v1(read_bitmap_page, 11, 2)?
+    let persisted_overflow_row_leaf: Boolean = yaza_db_bitmap_page_bit_for_page_v1(read_bitmap_page, 12, 2)?
+    if not persisted_leaf_allocation or not persisted_overflow_allocation or not persisted_meta_allocation or not persisted_catalog_allocation or not persisted_overflow_row_leaf: return err("YDBv1 storage bitmap did not retain allocated data-page IDs")
+    let committed_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(uuid, 2, 2, 1, 11, yaza_db_storage_preallocated_page_count_v1(), 1)
+    let header_copies: Number = yaza_db_storage_write_header_v1(created, committed_header)?
+    if header_copies != 2: return err("YDBv1 storage did not persist both file-header copies")
+
+    let selected: YazaDbFileHeaderV1 = yaza_db_storage_read_header_v1(created)?
+    if selected.checkpoint_lsn != 2 or selected.catalog_root != 11: return err("YDBv1 storage header round trip failed")
+    let persisted_catalog: YazaDbCatalogRootV1 = yaza_db_catalog_storage_read_root_v1(created, selected)?
+    if persisted_catalog.sys_tables_root != 7 or persisted_catalog.sys_constraints_root != 10 or persisted_catalog.sys_views_root != 13 or persisted_catalog.next_object_id != 5: return err("YDBv2 file-backed catalog root did not round-trip")
+    let same_lsn_mutation: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(uuid, 2, 3, 1, 11, 5, 1)
+    let same_lsn_update: Result[Number, Text] = yaza_db_storage_write_header_v1(created, same_lsn_mutation)
+    if result_is_ok(same_lsn_update): return err("YDBv1 storage allowed header contents to change without advancing checkpoint LSN")
+    let reserved_start_page: Bytes = yaza_db_page_new_v1(2, 1, 1, 0)?
+    let invalid_reserved_role: Result[Number, Text] = yaza_db_storage_write_page_v1(created, selected, reserved_start_page)
+    if result_is_ok(invalid_reserved_role): return err("YDBv1 storage accepted an index page at a reserved BITMAP page ID")
+    let invalid_bitmap_page: Bytes = yaza_db_page_new_v1(4, 1, 5, 0)?
+    let invalid_bitmap_role: Result[Number, Text] = yaza_db_storage_write_page_v1(created, selected, invalid_bitmap_page)
+    if result_is_ok(invalid_bitmap_role): return err("YDBv1 storage accepted a BITMAP outside its mapped range start")
+    let page_read: Bytes = yaza_db_storage_read_page_v1(created, selected, 3)?
+    let slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(page_read, 0, 3)?
+    let stored_row: YazaDbRowV1 = yaza_db_row_decode_v1(slot.payload, row_columns)?
+    if bytes_to_text(slot.key_suffix) != "key" or list_get(stored_row.values, 0).integer_value != 42 or list_get(stored_row.values, 1).text_value != "persistent-row": return err("YDBv1 file-backed row page round trip failed")
+
+    let first_copy: Bytes = read_exact(created, 0, yaza_db_page_size_v1())?
+    if not bytes_try_set(first_copy, 0, 0): return err("YDBv1 storage header-fallback fixture could not be changed")
+    let damaged_first_write: Number = write_exact(created, 0, first_copy)?
+    if damaged_first_write != yaza_db_page_size_v1(): return err("YDBv1 storage header-fallback fixture write was incomplete")
+    let fallback: YazaDbFileHeaderV1 = yaza_db_storage_read_header_v1(created)?
+    if fallback.checkpoint_lsn != committed_header.checkpoint_lsn: return err("YDBv1 storage did not fall back to the intact header copy")
+    let committed_bytes: Bytes = yaza_db_write_file_header_v1(committed_header)?
+    let restore_first: Number = write_exact(created, 0, committed_bytes)?
+    if restore_first != yaza_db_page_size_v1(): return err("YDBv1 first header restore was incomplete")
+    let restore_first_sync: Boolean = sync(created)?
+    if not restore_first_sync: return err("YDBv1 first header restore sync failed")
+
+    let split_brain: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(uuid, 2, 99, 1, 3, yaza_db_storage_preallocated_page_count_v1(), 1)
+    let split_bytes: Bytes = yaza_db_write_file_header_v1(split_brain)?
+    let split_write: Number = write_exact(created, yaza_db_page_size_v1(), split_bytes)?
+    if split_write != yaza_db_page_size_v1(): return err("YDBv1 split-brain fixture write was incomplete")
+    let split_result: Result[YazaDbFileHeaderV1, Text] = yaza_db_storage_read_header_v1(created)
+    if result_is_ok(split_result): return err("YDBv1 storage accepted conflicting headers at the same checkpoint LSN")
+    let reset_split_copy: Number = write_exact(created, yaza_db_page_size_v1(), committed_bytes)?
+    if reset_split_copy != yaza_db_page_size_v1(): return err("YDBv1 split-brain fixture could not be restored")
+    let reset_split_sync: Boolean = sync(created)?
+    if not reset_split_sync: return err("YDBv1 split-brain fixture restore sync failed")
+
+    let other_uuid: Bytes = bytes_from_text("fedcba9876543210")
+    let other_database: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(other_uuid, 9, 3, 1, 3, yaza_db_storage_preallocated_page_count_v1(), 1)
+    let other_database_bytes: Bytes = yaza_db_write_file_header_v1(other_database)?
+    let foreign_write: Number = write_exact(created, yaza_db_page_size_v1(), other_database_bytes)?
+    if foreign_write != yaza_db_page_size_v1(): return err("YDBv1 foreign-database header fixture write was incomplete")
+    let foreign_result: Result[YazaDbFileHeaderV1, Text] = yaza_db_storage_read_header_v1(created)
+    if result_is_ok(foreign_result): return err("YDBv1 storage accepted a valid header copy from another database")
+    let reset_foreign_copy: Number = write_exact(created, yaza_db_page_size_v1(), committed_bytes)?
+    if reset_foreign_copy != yaza_db_page_size_v1(): return err("YDBv1 foreign-database fixture could not be restored")
+    let reset_foreign_sync: Boolean = sync(created)?
+    if not reset_foreign_sync: return err("YDBv1 foreign-database fixture restore sync failed")
+
+    let newer: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(uuid, 3, 3, 1, 11, yaza_db_storage_preallocated_page_count_v1(), 1)
+    let newer_bytes: Bytes = yaza_db_write_file_header_v1(newer)?
+    let newer_write: Number = write_exact(created, 0, newer_bytes)?
+    if newer_write != yaza_db_page_size_v1(): return err("YDBv1 newer-header fixture write was incomplete")
+    let newer_sync: Boolean = sync(created)?
+    if not newer_sync: return err("YDBv1 newer-header fixture sync failed")
+    let selected_newer: YazaDbFileHeaderV1 = yaza_db_storage_read_header_v1(created)?
+    if selected_newer.checkpoint_lsn != 3: return err("YDBv1 storage did not select the highest valid checkpoint LSN")
+    let rollback_update: Result[Number, Text] = yaza_db_storage_write_header_v1(created, committed_header)
+    if result_is_ok(rollback_update): return err("YDBv1 storage allowed the checkpoint LSN to move backwards")
+    let reset_headers: Number = yaza_db_storage_write_header_v1(created, newer)?
+    if reset_headers != 2: return err("YDBv1 storage could not synchronize both header copies")
+
+    let both_invalid_first: Bytes = read_exact(created, 0, yaza_db_page_size_v1())?
+    let both_invalid_second: Bytes = read_exact(created, yaza_db_page_size_v1(), yaza_db_page_size_v1())?
+    if not bytes_try_set(both_invalid_first, 0, 0) or not bytes_try_set(both_invalid_second, 0, 0): return err("YDBv1 both-invalid fixture could not be changed")
+    let invalid_first_write: Number = write_exact(created, 0, both_invalid_first)?
+    let invalid_second_write: Number = write_exact(created, yaza_db_page_size_v1(), both_invalid_second)?
+    if invalid_first_write != yaza_db_page_size_v1() or invalid_second_write != yaza_db_page_size_v1(): return err("YDBv1 both-invalid fixture write was incomplete")
+    let both_invalid: Result[YazaDbFileHeaderV1, Text] = yaza_db_storage_read_header_v1(created)
+    if result_is_ok(both_invalid): return err("YDBv1 storage accepted two invalid file-header copies")
+    let invalid_update: Result[Number, Text] = yaza_db_storage_write_header_v1(created, newer)
+    if result_is_ok(invalid_update): return err("YDBv1 storage updated headers without a valid recovery base")
+    let restore_invalid_first: Number = write_exact(created, 0, newer_bytes)?
+    let restore_invalid_second: Number = write_exact(created, yaza_db_page_size_v1(), newer_bytes)?
+    if restore_invalid_first != yaza_db_page_size_v1() or restore_invalid_second != yaza_db_page_size_v1(): return err("YDBv1 both-invalid fixture could not be restored")
+    let restore_invalid_sync: Boolean = sync(created)?
+    if not restore_invalid_sync: return err("YDBv1 restored-header fixture sync failed")
+
+    let corrupted_page: Bytes = read_exact(created, yaza_db_page_size_v1() * 2, yaza_db_page_size_v1())?
+    if not bytes_try_set(corrupted_page, 500, 1): return err("YDBv1 data-page corruption fixture could not be changed")
+    let corrupted_page_write: Number = write_exact(created, yaza_db_page_size_v1() * 2, corrupted_page)?
+    if corrupted_page_write != yaza_db_page_size_v1(): return err("YDBv1 data-page corruption fixture write was incomplete")
+    let corrupt_read: Result[Bytes, Text] = yaza_db_storage_read_page_v1(created, newer, 2)
+    if result_is_ok(corrupt_read): return err("YDBv1 storage returned a page with an invalid CRC")
+    let repaired_page_write: Number = yaza_db_storage_write_page_v1(created, bitmap_header, bitmap_page)?
+    if repaired_page_write != yaza_db_page_size_v1(): return err("YDBv1 storage could not restore the page after corruption test")
+
+    let short_file: Boolean = truncate(created, yaza_db_page_size_v1() * 2)?
+    if not short_file: return err("YDBv1 short-file fixture could not be created")
+    let short_read: Result[Bytes, Text] = yaza_db_storage_read_page_v1(created, newer, 2)
+    if result_is_ok(short_read): return err("YDBv1 storage read a page beyond the physical file length")
+    let fast_short_read: Result[Bytes, Text] = yaza_db_storage_read_page_validated_file_v1(created, newer, 2)
+    if result_is_ok(fast_short_read): return err("YDBv1 validated-file fast read accepted a page beyond the physical file length")
+    let restored_length: Boolean = truncate(created, yaza_db_storage_preallocation_granule_v1())?
+    if not restored_length: return err("YDBv1 storage fixture could not restore its full length")
+    let restored_sync: Boolean = sync(created)?
+    if not restored_sync: return err("YDBv1 storage fixture length restore sync failed")
+    let restored_bitmap: Number = yaza_db_storage_write_page_v1(created, newer, bitmap_page)?
+    let restored_leaf: Number = yaza_db_storage_write_page_v1(created, newer, page)?
+    let restored_overflow: Number = yaza_db_storage_write_page_v1(created, newer, overflow_page)?
+    let restored_meta: Number = yaza_db_storage_write_page_v1(created, newer, meta_page)?
+    let restored_root_tables: Number = yaza_db_storage_write_page_v1(created, newer, root_tables_final)?
+    let restored_root_columns: Number = yaza_db_storage_write_page_v1(created, newer, root_columns_final)?
+    let restored_root_indexes: Number = yaza_db_storage_write_page_v1(created, newer, root_indexes_final)?
+    let restored_root_constraints: Number = yaza_db_storage_write_page_v1(created, newer, root_constraints_final)?
+    let restored_root_views: Number = yaza_db_storage_write_page_v1(created, newer, root_views_final)?
+    let restored_catalog_descriptor: Number = yaza_db_storage_write_page_v1(created, newer, catalog_descriptor)?
+    if restored_bitmap != yaza_db_page_size_v1() or restored_leaf != yaza_db_page_size_v1() or restored_overflow != yaza_db_page_size_v1() or restored_meta != yaza_db_page_size_v1(): return err("YDBv1 storage fixture could not restore allocated data pages after truncate")
+    if restored_root_tables != yaza_db_page_size_v1() or restored_root_columns != yaza_db_page_size_v1() or restored_root_indexes != yaza_db_page_size_v1() or restored_root_constraints != yaza_db_page_size_v1() or restored_root_views != yaza_db_page_size_v1() or restored_catalog_descriptor != yaza_db_page_size_v1(): return err("YDBv1 storage fixture could not restore catalog pages after truncate")
+    let restored_catalog_pages_sync: Boolean = sync(created)?
+    if not restored_catalog_pages_sync: return err("YDBv1 restored catalog-page sync failed")
+    let closed_database: Boolean = yaza_db_storage_close_v1(database)?
+    if not closed_database: return err("YDBv1 storage fixture close did not release its file and lock")
+    let duplicate_after_close: Result[YazaDbStorageHandleV1, Text] = yaza_db_storage_create_empty_v1(root, "duplicate-uuid.ydb", duplicate_uuid_header)
+    if result_is_ok(duplicate_after_close):
+        let ignored_duplicate_close: Result[Boolean, Text] = yaza_db_storage_close_v1(result_unwrap(duplicate_after_close))
+        return err("YDBv1 allowed a second database name to claim an already registered UUID")
+    let duplicate_file: Result[Number, Text] = open_read(root, "duplicate-uuid.ydb")
+    if result_is_ok(duplicate_file):
+        let ignored_duplicate_file_close: Result[Boolean, Text] = close(result_unwrap(duplicate_file))
+        return err("YDBv1 left a database file behind after rejecting a duplicate UUID")
+    let reopened_database: YazaDbStorageHandleV1 = yaza_db_storage_open_v1(root, "storage-smoke.ydb")?
+    if reopened_database.header.checkpoint_lsn != newer.checkpoint_lsn or reopened_database.header.page_count != yaza_db_storage_preallocated_page_count_v1(): return err("YDBv1 storage reopen did not load the persisted header")
+    let reopened_catalog: YazaDbCatalogRootV1 = yaza_db_catalog_storage_read_root_v1(reopened_database.file, reopened_database.header)?
+    if reopened_catalog.sys_tables_root != 7 or reopened_catalog.sys_columns_root != 8 or reopened_catalog.sys_indexes_root != 9 or reopened_catalog.sys_constraints_root != 10 or reopened_catalog.sys_views_root != 13: return err("YDBv2 catalog root did not survive close/reopen")
+    let closed_reopened: Boolean = yaza_db_storage_close_v1(reopened_database)?
+    if not closed_reopened: return err("YDBv1 reopened handle did not release its lock")
+    let ignored_remove: Boolean = remove(root, "storage-smoke.ydb")?
+    if not ignored_remove: return err("YDBv1 storage fixture removal failed")
+    let ignored_sync: Boolean = sync_directory(root)?
+    if not ignored_sync: return err("YDBv1 storage fixture directory sync failed")
+    let ignored_root_close: Boolean = close(root)?
+    if not ignored_root_close: return err("YDBv1 storage fixture root close failed")
+    return ok(header_copies + written_page)
+
+start:
+    let outcome: Result[Number, Text] = yaza_base_storage_v1_check(arg(1))
+    if result_is_ok(outcome):
+        say "yazabase-storage-v1-ok bytes=" + number_text(result_unwrap(outcome))
+    else:
+        say result_unwrap_error(outcome)

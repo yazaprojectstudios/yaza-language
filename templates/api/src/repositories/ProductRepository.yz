@@ -1,0 +1,266 @@
+# Transactional YazaBase SQL Product Repository (B+Tree + ARIES WAL + Parameterized Queries).
+# Uses real SQL statements via std/db/yazabase (--param binding) + std/csv (RFC 4180 CRLF parsing).
+
+use "std/db/yazabase"
+use "std/csv"
+use "std/convert"
+use "../errors/ApiError"
+use "../interfaces/ProductInput"
+use "../contracts/ProductRecord"
+use "../contracts/ProductDeleteOutcome"
+
+fn product_db_dir() -> Text:
+    let env_dir: Text = env_get("YAZABASE_DATA_DIR")
+    if env_dir != "":
+        return env_dir
+    return "./data"
+
+fn product_parse_csv_rows(csv_text: Text) -> List[ProductRecord]:
+    let out: List[ProductRecord] = List[ProductRecord]()
+    let raw_bytes: Bytes = bytes_from_text(csv_text)
+    let total_len: Number = bytes_length(raw_bytes)
+    if total_len == 0:
+        return out
+    var offset: Number = 0
+    var row_idx: Number = 0
+    while offset < total_len:
+        let rec_res: Result[Option[CsvRecord], Text] = csv_read_record(raw_bytes, offset)
+        if not result_is_ok(rec_res):
+            break
+        let rec_opt: Option[CsvRecord] = result_unwrap(rec_res)
+        if not option_is_some(rec_opt):
+            break
+        let rec: CsvRecord = option_unwrap(rec_opt)
+        set offset = rec.next_offset
+        if row_idx > 0 and list_count(rec.fields) >= 5:
+            let sku: Text = list_get(rec.fields, 0)
+            let name: Text = list_get(rec.fields, 1)
+            let price_res: Result[Number, Text] = number_try_parse(list_get(rec.fields, 2))
+            var price: Number = 0
+            if result_is_ok(price_res):
+                set price = result_unwrap(price_res)
+            let curr: Text = list_get(rec.fields, 3)
+            let avail_raw: Text = list_get(rec.fields, 4)
+            let avail: Boolean = avail_raw == "TRUE" or avail_raw == "true" or avail_raw == "1"
+            list_push(out, ProductRecord(sku, name, price, curr, avail))
+        set row_idx = row_idx + 1
+    return out
+
+fn product_insert_row(conn: YazaBaseConnection, row_id: Number, sku: Text, name: Text, price: Number, curr: Text, avail: Boolean) -> Result[Boolean, ApiError]:
+    let p: TextList = text_list()
+    list_push(p, "bigint:" + number_text(row_id))
+    list_push(p, "text:" + sku)
+    list_push(p, "text:" + name)
+    list_push(p, "bigint:" + number_text(price))
+    list_push(p, "text:" + curr)
+    if avail: list_push(p, "boolean:true")
+    else: list_push(p, "boolean:false")
+    let res: Result[Text, Text] = yazabase_exec_params(conn, "INSERT INTO products (id, sku, name, price_minor, currency, available) VALUES ($1, $2, $3, $4, $5, $6)", p)
+    if not result_is_ok(res):
+        return err(ApiError::Unavailable())
+    return ok(true)
+
+fn product_connect_and_ready() -> Result[YazaBaseConnection, ApiError]:
+    let conn_res: Result[YazaBaseConnection, Text] = yazabase_connect_default(product_db_dir(), "products")
+    if not result_is_ok(conn_res):
+        return err(ApiError::Unauthorized())
+    let conn: YazaBaseConnection = result_unwrap(conn_res)
+    let schema_marker: Text = conn.db_dir + "/.products_sql_schema_v1"
+    if not file_exists(schema_marker):
+        let lock_dir: Text = conn.db_dir + "/.products_schema.lock"
+        if directory_create(lock_dir) == 0:
+            let empty_p: TextList = text_list()
+            let probe: Result[Text, Text] = yazabase_query_csv(conn, "SELECT id FROM products LIMIT 1", empty_p)
+            if not result_is_ok(probe):
+                let ddl: Result[Text, Text] = yazabase_exec_params(conn, "CREATE TABLE products (id BIGINT PRIMARY KEY, sku TEXT NOT NULL, name TEXT NOT NULL, price_minor BIGINT NOT NULL, currency TEXT NOT NULL, available BOOLEAN NOT NULL)", empty_p)
+                if not result_is_ok(ddl):
+                    return err(ApiError::Unavailable())
+                let _s1: Boolean = product_insert_row(conn, 1, "sku-001", "Canvas Tote Bag", 129900, "IDR", true)?
+                let _s2: Boolean = product_insert_row(conn, 2, "sku-002", "Stainless Bottle", 89900, "IDR", true)?
+            let _w: Number = file_write(schema_marker, "1\n")
+        else:
+            var waited: Number = 0
+            while waited < 100 and not file_exists(schema_marker):
+                let _sl: Boolean = sleep_ms(15)
+                set waited = waited + 1
+    return ok(conn)
+
+fn product_next_row_id(conn: YazaBaseConnection) -> Number:
+    let empty_p: TextList = text_list()
+    let q_res: Result[Text, Text] = yazabase_query_csv(conn, "SELECT id FROM products ORDER BY id DESC LIMIT 1", empty_p)
+    var db_next: Number = 1
+    if result_is_ok(q_res):
+        let raw_bytes: Bytes = bytes_from_text(result_unwrap(q_res))
+        let total_len: Number = bytes_length(raw_bytes)
+        var offset: Number = 0
+        var row_idx: Number = 0
+        while offset < total_len:
+            let rec_res: Result[Option[CsvRecord], Text] = csv_read_record(raw_bytes, offset)
+            if not result_is_ok(rec_res): break
+            let rec_opt: Option[CsvRecord] = result_unwrap(rec_res)
+            if not option_is_some(rec_opt): break
+            let rec: CsvRecord = option_unwrap(rec_opt)
+            set offset = rec.next_offset
+            if row_idx == 1 and list_count(rec.fields) >= 1:
+                let n_res: Result[Number, Text] = number_try_parse(list_get(rec.fields, 0))
+                if result_is_ok(n_res):
+                    set db_next = result_unwrap(n_res) + 1
+                    break
+            set row_idx = row_idx + 1
+    let seq_path: Text = conn.db_dir + "/.products_next_id"
+    var seq_next: Number = db_next
+    if file_exists(seq_path):
+        let s_res: Result[Number, Text] = number_try_parse(text_trim(file_read(seq_path)))
+        if result_is_ok(s_res):
+            let s_val: Number = result_unwrap(s_res)
+            if s_val > seq_next:
+                set seq_next = s_val
+    let _w: Number = file_write(seq_path, number_text(seq_next + 1))
+    return seq_next
+
+fn product_repository_ping() -> Result[Boolean, ApiError]:
+    let conn: YazaBaseConnection = product_connect_and_ready()?
+    let empty_p: TextList = text_list()
+    let q_res: Result[Text, Text] = yazabase_query_csv(conn, "SELECT id FROM products LIMIT 1", empty_p)
+    if not result_is_ok(q_res):
+        return err(ApiError::Unavailable())
+    return ok(true)
+
+fn product_repository_list(limit: Number, offset: Number) -> Result[List[ProductRecord], ApiError]:
+    let conn: YazaBaseConnection = product_connect_and_ready()?
+    var start: Number = offset
+    if start < 0: set start = 0
+    var max_items: Number = limit
+    if max_items <= 0: set max_items = 50
+    let fetch_cap: Number = start + max_items
+    let empty_p: TextList = text_list()
+    let q_res: Result[Text, Text] = yazabase_query_csv(conn, "SELECT sku, name, price_minor, currency, available FROM products ORDER BY id ASC LIMIT " + number_text(fetch_cap), empty_p)
+    if not result_is_ok(q_res):
+        return err(ApiError::Unavailable())
+    let rows: List[ProductRecord] = product_parse_csv_rows(result_unwrap(q_res))
+    let out: List[ProductRecord] = List[ProductRecord]()
+    var i: Number = start
+    while i < list_count(rows) and list_count(out) < max_items:
+        list_push(out, list_get(rows, i))
+        set i = i + 1
+    return ok(out)
+
+fn product_repository_find(id: Text) -> Result[ProductRecord, ApiError]:
+    let conn: YazaBaseConnection = product_connect_and_ready()?
+    let p: TextList = text_list()
+    list_push(p, "text:" + id)
+    let q_res: Result[Text, Text] = yazabase_query_csv(conn, "SELECT sku, name, price_minor, currency, available FROM products WHERE sku = $1", p)
+    if not result_is_ok(q_res):
+        return err(ApiError::Unavailable())
+    let rows: List[ProductRecord] = product_parse_csv_rows(result_unwrap(q_res))
+    if list_count(rows) == 0:
+        return err(ApiError::NotFound())
+    return ok(list_get(rows, 0))
+
+fn product_repository_create(input: ProductInput) -> Result[ProductRecord, ApiError]:
+    let conn: YazaBaseConnection = product_connect_and_ready()?
+    let next_id: Number = product_next_row_id(conn)
+    var sku: Text = "sku-" + number_text(next_id)
+    if option_is_some(input.id):
+        set sku = option_unwrap(input.id)
+    let dup_p: TextList = text_list()
+    list_push(dup_p, "text:" + sku)
+    let dup_res: Result[Text, Text] = yazabase_query_csv(conn, "SELECT sku, name, price_minor, currency, available FROM products WHERE sku = $1", dup_p)
+    if result_is_ok(dup_res) and list_count(product_parse_csv_rows(result_unwrap(dup_res))) > 0:
+        return err(ApiError::AlreadyExists())
+
+    var name: Text = "Unnamed Product"
+    if option_is_some(input.name): set name = option_unwrap(input.name)
+    var price: Number = 0
+    if option_is_some(input.priceMinor): set price = option_unwrap(input.priceMinor)
+    var curr: Text = "IDR"
+    if option_is_some(input.currency): set curr = option_unwrap(input.currency)
+    var avail: Boolean = true
+    if option_is_some(input.available): set avail = option_unwrap(input.available)
+
+    let _ins: Boolean = product_insert_row(conn, next_id, sku, name, price, curr, avail)?
+    return ok(ProductRecord(sku, name, price, curr, avail))
+
+fn product_repository_replace(input: ProductInput) -> Result[ProductRecord, ApiError]:
+    if not option_is_some(input.id):
+        return err(ApiError::BadRequest())
+    let sku: Text = option_unwrap(input.id)
+    let _existing: ProductRecord = product_repository_find(sku)?
+    let conn: YazaBaseConnection = product_connect_and_ready()?
+
+    var name: Text = ""
+    if option_is_some(input.name): set name = option_unwrap(input.name)
+    var price: Number = 0
+    if option_is_some(input.priceMinor): set price = option_unwrap(input.priceMinor)
+    var curr: Text = "IDR"
+    if option_is_some(input.currency): set curr = option_unwrap(input.currency)
+    var avail: Boolean = true
+    if option_is_some(input.available): set avail = option_unwrap(input.available)
+
+    let p: TextList = text_list()
+    list_push(p, "text:" + name)
+    list_push(p, "bigint:" + number_text(price))
+    list_push(p, "text:" + curr)
+    if avail: list_push(p, "boolean:true")
+    else: list_push(p, "boolean:false")
+    list_push(p, "text:" + sku)
+    let up_res: Result[Text, Text] = yazabase_exec_params(conn, "UPDATE products SET name = $1, price_minor = $2, currency = $3, available = $4 WHERE sku = $5", p)
+    if not result_is_ok(up_res):
+        return err(ApiError::Unavailable())
+    return ok(ProductRecord(sku, name, price, curr, avail))
+
+fn product_repository_patch(input: ProductInput) -> Result[ProductRecord, ApiError]:
+    if not option_is_some(input.id):
+        return err(ApiError::BadRequest())
+    let sku: Text = option_unwrap(input.id)
+    let cur: ProductRecord = product_repository_find(sku)?
+    let conn: YazaBaseConnection = product_connect_and_ready()?
+
+    var next_name: Text = cur.name
+    if option_is_some(input.name): set next_name = option_unwrap(input.name)
+    var next_price: Number = cur.priceMinor
+    if option_is_some(input.priceMinor): set next_price = option_unwrap(input.priceMinor)
+    var next_curr: Text = cur.currency
+    if option_is_some(input.currency): set next_curr = option_unwrap(input.currency)
+    var next_avail: Boolean = cur.available
+    if option_is_some(input.available): set next_avail = option_unwrap(input.available)
+
+    let p: TextList = text_list()
+    list_push(p, "text:" + next_name)
+    list_push(p, "bigint:" + number_text(next_price))
+    list_push(p, "text:" + next_curr)
+    if next_avail: list_push(p, "boolean:true")
+    else: list_push(p, "boolean:false")
+    list_push(p, "text:" + sku)
+    let up_res: Result[Text, Text] = yazabase_exec_params(conn, "UPDATE products SET name = $1, price_minor = $2, currency = $3, available = $4 WHERE sku = $5", p)
+    if not result_is_ok(up_res):
+        return err(ApiError::Unavailable())
+    return ok(ProductRecord(sku, next_name, next_price, next_curr, next_avail))
+
+fn product_repository_delete(id: Text) -> Result[ProductDeleteOutcome, ApiError]:
+    let _existing: ProductRecord = product_repository_find(id)?
+    let conn: YazaBaseConnection = product_connect_and_ready()?
+    let p: TextList = text_list()
+    list_push(p, "text:" + id)
+    let del_res: Result[Text, Text] = yazabase_exec_params(conn, "DELETE FROM products WHERE sku = $1", p)
+    if not result_is_ok(del_res):
+        return err(ApiError::Unavailable())
+    return ok(ProductDeleteOutcome(id, true))
+
+async fn product_repository_list_async(limit: Number, offset: Number) -> Result[List[ProductRecord], ApiError]:
+    return product_repository_list(limit, offset)
+
+async fn product_repository_find_async(id: Text) -> Result[ProductRecord, ApiError]:
+    return product_repository_find(id)
+
+async fn product_repository_create_async(input: ProductInput) -> Result[ProductRecord, ApiError]:
+    return product_repository_create(input)
+
+async fn product_repository_replace_async(input: ProductInput) -> Result[ProductRecord, ApiError]:
+    return product_repository_replace(input)
+
+async fn product_repository_patch_async(input: ProductInput) -> Result[ProductRecord, ApiError]:
+    return product_repository_patch(input)
+
+async fn product_repository_delete_async(id: Text) -> Result[ProductDeleteOutcome, ApiError]:
+    return product_repository_delete(id)

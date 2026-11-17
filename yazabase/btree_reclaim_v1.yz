@@ -1,0 +1,119 @@
+# Preflight a bounded user B+Tree page set before a transactional DROP reclaims it.
+# Every non-root node must match its parent's level and key-fence interval.
+use "./btree_scan_v1"
+use "./page_v1"
+use "./storage_v1"
+
+shape YazaDbBtreeReclaimNodeV1:
+    page_id: Number
+    expected_level: Number
+    has_low_fence: Boolean
+    low_fence: Bytes
+    has_high_fence: Boolean
+    high_fence: Bytes
+
+shape YazaDbBtreeReclaimPlanV1:
+    page_ids: List[Number]
+    page_reads: Number
+
+fn yaza_db_btree_reclaim_max_pages_v1() -> Number:
+    return 65536
+
+fn yaza_db_btree_reclaim_seen_capacity_v1() -> Number:
+    return 131072
+
+fn yaza_db_btree_reclaim_seen_insert_v1(seen: List[Number], page_id: Number) -> Boolean:
+    let capacity: Number = list_count(seen)
+    if capacity != yaza_db_btree_reclaim_seen_capacity_v1() or page_id < 2: return false
+    var slot: Number = ((page_id % capacity) * 2654435761) % capacity
+    var probes: Number = 0
+    while probes < 4096 and probes < capacity:
+        let current_page_id: Number = list_get(seen, slot)
+        if current_page_id == page_id: return false
+        if current_page_id == 0:
+            return list_try_set(seen, slot, page_id)
+        set slot = (slot + 1) % capacity
+        set probes = probes + 1
+    return false
+
+fn yaza_db_btree_reclaim_check_fence_v1(page: Bytes, header: YazaDbPageHeaderV1, has_expected: Boolean, expected: Bytes, check_low: Boolean) -> Result[Boolean, Text]:
+    var actual_length: Number = header.high_fence_len
+    if check_low: set actual_length = header.low_fence_len
+    if not has_expected:
+        if actual_length != 0: return err("YDBv1 B+Tree reclaim found an unexpected page fence")
+        return ok(true)
+    if actual_length == 0: return err("YDBv1 B+Tree reclaim found a missing parent-derived fence")
+    let actual: Bytes = yaza_db_btree_fence_bytes_v1(page, header, check_low)?
+    if not bytes_equal(actual, expected): return err("YDBv1 B+Tree reclaim child fence does not match its parent range")
+    return ok(true)
+
+fn yaza_db_btree_reclaim_plan_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number) -> Result[YazaDbBtreeReclaimPlanV1, Text]:
+    if file < 0 or file_header.page_count < 2 or root_page_id < 2 or root_page_id >= file_header.page_count:
+        return err("YDBv1 B+Tree reclaim root is outside the allocated database")
+    let nodes_result: Result[List[YazaDbBtreeReclaimNodeV1], Text] = list_try_new()
+    let page_ids_result: Result[List[Number], Text] = list_try_new()
+    let seen_result: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(nodes_result) or not result_is_ok(page_ids_result) or not result_is_ok(seen_result): return err("YDBv1 B+Tree reclaim could not allocate its bounded traversal state")
+    let nodes: List[YazaDbBtreeReclaimNodeV1] = result_unwrap(nodes_result)
+    let page_ids: List[Number] = result_unwrap(page_ids_result)
+    let seen: List[Number] = result_unwrap(seen_result)
+    if not list_try_reserve(nodes, 256) or not list_try_reserve(page_ids, 256) or not list_try_reserve(seen, yaza_db_btree_reclaim_seen_capacity_v1()): return err("YDBv1 B+Tree reclaim could not reserve traversal state")
+    var seen_slot: Number = 0
+    while seen_slot < yaza_db_btree_reclaim_seen_capacity_v1():
+        if not list_try_push(seen, 0): return err("YDBv1 B+Tree reclaim could not initialize its repeated-page guard")
+        set seen_slot = seen_slot + 1
+    if not list_try_push(nodes, YazaDbBtreeReclaimNodeV1(root_page_id, -1, false, bytes_from_text(""), false, bytes_from_text(""))):
+        return err("YDBv1 B+Tree reclaim could not stage its root")
+
+    var cursor: Number = 0
+    var page_reads: Number = 0
+    while cursor < list_count(nodes):
+        if list_count(nodes) > yaza_db_btree_reclaim_max_pages_v1(): return err("YDBv1 B+Tree reclaim exceeds its 65,536-page bound")
+        let node: YazaDbBtreeReclaimNodeV1 = list_get(nodes, cursor)
+        if not yaza_db_btree_reclaim_seen_insert_v1(seen, node.page_id): return err("YDBv1 B+Tree reclaim found a repeated page ID or exceeded its page-set bound")
+        let page: Bytes = yaza_db_storage_read_page_v1(file, file_header, node.page_id)?
+        set page_reads = page_reads + 1
+        if page_reads > yaza_db_btree_max_page_reads_v1(): return err("YDBv1 B+Tree reclaim exceeded its page-read budget")
+        let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, node.page_id)?
+        if node.expected_level >= 0 and header.level != node.expected_level: return err("YDBv1 B+Tree reclaim found a child at the wrong level")
+        let low_ok: Boolean = yaza_db_btree_reclaim_check_fence_v1(page, header, node.has_low_fence, node.low_fence, true)?
+        let high_ok: Boolean = yaza_db_btree_reclaim_check_fence_v1(page, header, node.has_high_fence, node.high_fence, false)?
+        if not low_ok or not high_ok: return err("YDBv1 B+Tree reclaim found an inconsistent page range")
+        if not list_try_push(page_ids, node.page_id): return err("YDBv1 B+Tree reclaim could not retain a validated page ID")
+
+        if header.page_type == 1:
+            if header.level != 0: return err("YDBv1 B+Tree reclaim leaf has a non-zero level")
+        elif header.page_type == 2:
+            if header.level < 1: return err("YDBv1 B+Tree reclaim inner page has an invalid level")
+            var child_index: Number = 0
+            while child_index <= header.count:
+                var child_has_low: Boolean = false
+                var child_low: Bytes = bytes_from_text("")
+                if child_index == 0:
+                    if header.low_fence_len > 0:
+                        set child_has_low = true
+                        set child_low = yaza_db_btree_fence_bytes_v1(page, header, true)?
+                else:
+                    set child_has_low = true
+                    set child_low = yaza_db_page_slot_key_v1(page, child_index - 1, node.page_id)?
+
+                var child_has_high: Boolean = false
+                var child_high: Bytes = bytes_from_text("")
+                var child_page_id: Number = 0
+                if child_index < header.count:
+                    set child_has_high = true
+                    set child_high = yaza_db_page_slot_key_v1(page, child_index, node.page_id)?
+                    set child_page_id = yaza_db_btree_child_from_slot_v1(page, child_index, node.page_id, file_header.page_count)?
+                else:
+                    if header.high_fence_len > 0:
+                        set child_has_high = true
+                        set child_high = yaza_db_btree_fence_bytes_v1(page, header, false)?
+                    set child_page_id = yaza_db_btree_page_id_from_disk_pointer_v1(header.upper, file_header.page_count)?
+                if list_count(nodes) >= yaza_db_btree_reclaim_max_pages_v1(): return err("YDBv1 B+Tree reclaim exceeds its 65,536-page bound")
+                if not list_try_push(nodes, YazaDbBtreeReclaimNodeV1(child_page_id, header.level - 1, child_has_low, child_low, child_has_high, child_high)):
+                    return err("YDBv1 B+Tree reclaim could not queue a child page")
+                set child_index = child_index + 1
+        else:
+            return err("YDBv1 B+Tree reclaim encountered a non-index page in the table tree")
+        set cursor = cursor + 1
+    return ok(YazaDbBtreeReclaimPlanV1(page_ids, page_reads))

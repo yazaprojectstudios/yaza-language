@@ -1,0 +1,44 @@
+use "std/fs"
+use "../yazabase/checkpoint_v1"
+use "../yazabase/disk_quota_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/transaction_v1"
+use "../yazabase/wal_v1"
+
+fn yazabase_empty_transaction_v1_check(root_path: Text) -> Result[Number, Text]:
+    let root: Number = root_open(root_path)?
+    let database_name: Text = "empty-transaction-smoke.ydb"
+    let db_uuid: Bytes = bytes_from_text("empty-txn-v1-001")
+    let initial_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(db_uuid, 0, 1, 1, 0, 2, 1)
+    let storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, database_name, initial_header)?
+    let wal: YazaDbWalLogV1 = yaza_db_wal_log_open_for_v1(root, db_uuid)?
+    if wal.next_lsn != 0: return err("YDBv1 empty-transaction fixture did not begin at genesis LSN zero")
+    let transaction: YazaDbWriteTransactionV1 = yaza_db_write_transaction_begin_v1(storage, wal)?
+    if transaction.last_lsn != 0 or transaction.wal.next_lsn <= 0: return err("YDBv1 fresh transaction did not durably append its LSN-zero MTR_END")
+    let committed: YazaDbWriteCommitV1 = yaza_db_write_transaction_commit_v1(transaction)?
+    if committed.txn_id != 1 or committed.commit_ts != 1 or committed.storage.header.next_txn_id != 2 or committed.storage.header.next_commit_ts != 2: return err("YDBv1 first empty transaction did not publish its commit counters")
+    let wal_closed: Boolean = yaza_db_wal_log_close_v1(committed.wal)?
+    let storage_closed: Boolean = yaza_db_storage_close_v1(committed.storage)?
+    if not wal_closed or not storage_closed: return err("YDBv1 committed empty-transaction handles could not close")
+    let recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, database_name)?
+    if recovered.storage.header.next_txn_id != 2 or recovered.storage.header.next_commit_ts != 2: return err("YDBv1 recovery lost the first LSN-zero empty transaction commit")
+    let recovered_wal_closed: Boolean = yaza_db_wal_log_close_v1(recovered.wal)?
+    let recovered_storage_closed: Boolean = yaza_db_storage_close_v1(recovered.storage)?
+    if not recovered_wal_closed or not recovered_storage_closed: return err("YDBv1 recovered empty-transaction handles could not close")
+    let wal_name: Text = yaza_db_wal_segment_name_for_v1(0, db_uuid)?
+    let owner_name: Text = yaza_db_disk_quota_owner_name_v1(db_uuid)?
+    let database_removed: Boolean = remove(root, database_name)?
+    let wal_removed: Boolean = remove(root, wal_name)?
+    let owner_removed: Boolean = remove(root, owner_name)?
+    if not database_removed or not wal_removed or not owner_removed: return err("YDBv1 empty-transaction fixture cleanup failed")
+    let directory_synced: Boolean = sync_directory(root)?
+    let root_closed: Boolean = close(root)?
+    if not directory_synced or not root_closed: return err("YDBv1 empty-transaction fixture root cleanup failed")
+    return ok(committed.storage.header.next_txn_id)
+
+start:
+    let outcome: Result[Number, Text] = yazabase_empty_transaction_v1_check(arg(1))
+    if result_is_ok(outcome):
+        say "yazabase-empty-transaction-v1-ok next-txn=" + number_text(result_unwrap(outcome))
+    else:
+        say result_unwrap_error(outcome)

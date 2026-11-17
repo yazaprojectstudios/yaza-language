@@ -1,0 +1,257 @@
+# PostgreSQL connection URI parsing, implemented in YAZA.
+# This module configures PG* environment variables without logging credentials.
+
+fn pg_uri_hex_value(byte: Number) -> Number:
+    if byte >= 48 and byte <= 57:
+        return byte - 48
+    if byte >= 65 and byte <= 70:
+        return byte - 65 + 10
+    if byte >= 97 and byte <= 102:
+        return byte - 97 + 10
+    return -1
+
+fn pg_uri_decode(value: Text) -> Result[Text, Text]:
+    if text_length(value) > 2048:
+        return err("postgres URI: encoded component exceeds 2048 bytes")
+    var decoded_bytes: Bytes = bytes_from_text("")
+    var index: Number = 0
+    while index < text_length(value):
+        var byte: Number = text_byte(value, index)
+        if byte == 37:
+            if index + 2 >= text_length(value):
+                return err("postgres URI: incomplete percent escape")
+            let high: Number = pg_uri_hex_value(text_byte(value, index + 1))
+            let low: Number = pg_uri_hex_value(text_byte(value, index + 2))
+            if high < 0 or low < 0:
+                return err("postgres URI: invalid percent escape")
+            set byte = high * 16 + low
+            set index = index + 3
+        else:
+            set index = index + 1
+        if byte == 0 or byte < 32 or byte == 127:
+            return err("postgres URI: decoded control characters are not allowed")
+        set decoded_bytes = bytes_concat(decoded_bytes, bytes_from_number(byte))
+    let decoded_text: Option[Text] = bytes_to_text_checked(decoded_bytes)
+    if not option_is_some(decoded_text):
+        return err("postgres URI: component is not valid UTF-8")
+    return ok(option_unwrap(decoded_text))
+
+fn pg_uri_find_from(value: Text, start: Number, needle: Text) -> Number:
+    if start < 0 or start >= text_length(value):
+        return -1
+    let suffix: Text = text_slice(value, start, text_length(value) - start)
+    let found: Number = text_find(suffix, needle)
+    if found < 0:
+        return -1
+    return start + found
+
+fn pg_uri_valid_port(value: Text) -> Boolean:
+    let length: Number = text_length(value)
+    if length < 1 or length > 5:
+        return false
+    var index: Number = 0
+    while index < length:
+        let byte: Number = text_byte(value, index)
+        if byte < 48 or byte > 57:
+            return false
+        set index = index + 1
+    let port: Number = number_parse(value)
+    return port >= 1 and port <= 65535
+
+fn pg_uri_query_environment_name(key: Text) -> Text:
+    if key == "sslmode":
+        return "PGSSLMODE"
+    if key == "sslrootcert":
+        return "PGSSLROOTCERT"
+    if key == "application_name":
+        return "PGAPPNAME"
+    if key == "connect_timeout":
+        return "PGCONNECT_TIMEOUT"
+    if key == "target_session_attrs":
+        return "PGTARGETSESSIONATTRS"
+    if key == "channel_binding":
+        return "PGCHANNELBINDING"
+    if key == "gssencmode":
+        return "PGGSSENCMODE"
+    if key == "options":
+        return "PGOPTIONS"
+    return ""
+
+fn pg_uri_append_assignment(assignments: TextList, key: Text, value: Text) -> Boolean:
+    list_push(assignments, key)
+    list_push(assignments, value)
+    return true
+
+fn pg_uri_parse_config(url: Text) -> Result[TextList, Text]:
+    if text_length(url) < 14 or text_length(url) > 8192:
+        return err("postgres URI: URL length is outside the supported range")
+    if text_find(url, "#") >= 0:
+        return err("postgres URI: fragments are not supported")
+    var prefix_length: Number = 0
+    if text_starts_with(url, "postgresql://"):
+        set prefix_length = 13
+    else:
+        if text_starts_with(url, "postgres://"):
+            set prefix_length = 11
+        else:
+            return err("postgres URI: expected postgres:// or postgresql://")
+
+    var authority_end: Number = text_length(url)
+    let slash: Number = pg_uri_find_from(url, prefix_length, "/")
+    let question: Number = pg_uri_find_from(url, prefix_length, "?")
+    if slash >= 0 and (question < 0 or slash < question):
+        set authority_end = slash
+    else:
+        if question >= 0:
+            set authority_end = question
+
+    var at_sign: Number = -1
+    var scan: Number = prefix_length
+    while scan < authority_end:
+        if text_byte(url, scan) == 64:
+            set at_sign = scan
+        set scan = scan + 1
+
+    let assignments: TextList = text_list()
+    var host_start: Number = prefix_length
+    if at_sign >= 0:
+        let user_info: Text = text_slice(url, prefix_length, at_sign - prefix_length)
+        let user_colon: Number = text_find(user_info, ":")
+        var raw_user: Text = user_info
+        var has_password: Boolean = false
+        var raw_password: Text = ""
+        if user_colon >= 0:
+            set raw_user = text_slice(user_info, 0, user_colon)
+            set raw_password = text_slice(user_info, user_colon + 1, text_length(user_info) - user_colon - 1)
+            set has_password = true
+        let decoded_user: Result[Text, Text] = pg_uri_decode(raw_user)
+        if not result_is_ok(decoded_user):
+            return err(result_unwrap_error(decoded_user))
+        if result_unwrap(decoded_user) != "":
+            pg_uri_append_assignment(assignments, "PGUSER", result_unwrap(decoded_user))
+        if has_password:
+            let decoded_password: Result[Text, Text] = pg_uri_decode(raw_password)
+            if not result_is_ok(decoded_password):
+                return err(result_unwrap_error(decoded_password))
+            pg_uri_append_assignment(assignments, "PGPASSWORD", result_unwrap(decoded_password))
+        set host_start = at_sign + 1
+
+    var host: Text = ""
+    var raw_port: Text = ""
+    var port_separator_seen: Boolean = false
+    if host_start < authority_end:
+        if text_byte(url, host_start) == 91:
+            let closing_bracket: Number = pg_uri_find_from(url, host_start + 1, "]")
+            if closing_bracket < 0 or closing_bracket >= authority_end:
+                return err("postgres URI: malformed bracketed host")
+            let decoded_host: Result[Text, Text] = pg_uri_decode(text_slice(url, host_start + 1, closing_bracket - host_start - 1))
+            if not result_is_ok(decoded_host):
+                return err(result_unwrap_error(decoded_host))
+            set host = result_unwrap(decoded_host)
+            if host == "":
+                return err("postgres URI: bracketed host must not be empty")
+            if closing_bracket + 1 < authority_end:
+                if text_byte(url, closing_bracket + 1) != 58:
+                    return err("postgres URI: unexpected text after bracketed host")
+                set port_separator_seen = true
+                let decoded_port: Result[Text, Text] = pg_uri_decode(text_slice(url, closing_bracket + 2, authority_end - closing_bracket - 2))
+                if not result_is_ok(decoded_port):
+                    return err(result_unwrap_error(decoded_port))
+                set raw_port = result_unwrap(decoded_port)
+        else:
+            var host_colon: Number = -1
+            set scan = host_start
+            while scan < authority_end:
+                if text_byte(url, scan) == 58:
+                    if host_colon >= 0:
+                        return err("postgres URI: IPv6 hosts must use brackets")
+                    set host_colon = scan
+                set scan = scan + 1
+            var host_end: Number = authority_end
+            if host_colon >= 0:
+                set host_end = host_colon
+                set port_separator_seen = true
+                let decoded_port: Result[Text, Text] = pg_uri_decode(text_slice(url, host_colon + 1, authority_end - host_colon - 1))
+                if not result_is_ok(decoded_port):
+                    return err(result_unwrap_error(decoded_port))
+                set raw_port = result_unwrap(decoded_port)
+            let decoded_host: Result[Text, Text] = pg_uri_decode(text_slice(url, host_start, host_end - host_start))
+            if not result_is_ok(decoded_host):
+                return err(result_unwrap_error(decoded_host))
+            set host = result_unwrap(decoded_host)
+    if text_find(host, "@") >= 0 or text_find(host, "?") >= 0:
+        return err("postgres URI: invalid host")
+    if host != "":
+        pg_uri_append_assignment(assignments, "PGHOST", host)
+    if raw_port != "":
+        if not pg_uri_valid_port(raw_port):
+            return err("postgres URI: port must be between 1 and 65535")
+        pg_uri_append_assignment(assignments, "PGPORT", raw_port)
+    else:
+        if port_separator_seen:
+            return err("postgres URI: host port is empty")
+
+    if authority_end < text_length(url) and text_byte(url, authority_end) == 47:
+        var database_end: Number = text_length(url)
+        if question >= 0:
+            set database_end = question
+        let raw_database: Text = text_slice(url, authority_end + 1, database_end - authority_end - 1)
+        let decoded_database: Result[Text, Text] = pg_uri_decode(raw_database)
+        if not result_is_ok(decoded_database):
+            return err(result_unwrap_error(decoded_database))
+        if result_unwrap(decoded_database) == "" or text_find(result_unwrap(decoded_database), "/") >= 0:
+            return err("postgres URI: database path must contain one non-empty name")
+        pg_uri_append_assignment(assignments, "PGDATABASE", result_unwrap(decoded_database))
+    else:
+        return err("postgres URI: database path is required")
+
+    if question >= 0:
+        var query_cursor: Number = question + 1
+        while query_cursor < text_length(url):
+            let next_ampersand: Number = pg_uri_find_from(url, query_cursor, "&")
+            var pair_end: Number = text_length(url)
+            if next_ampersand >= 0:
+                set pair_end = next_ampersand
+            if pair_end == query_cursor:
+                return err("postgres URI: empty query parameter")
+            let pair: Text = text_slice(url, query_cursor, pair_end - query_cursor)
+            let equals: Number = text_find(pair, "=")
+            if equals <= 0:
+                return err("postgres URI: query parameters must use key=value")
+            let decoded_key: Result[Text, Text] = pg_uri_decode(text_slice(pair, 0, equals))
+            let decoded_value: Result[Text, Text] = pg_uri_decode(text_slice(pair, equals + 1, text_length(pair) - equals - 1))
+            if not result_is_ok(decoded_key) or not result_is_ok(decoded_value):
+                return err("postgres URI: invalid query parameter encoding")
+            let environment_name: Text = pg_uri_query_environment_name(result_unwrap(decoded_key))
+            if environment_name == "":
+                return err("postgres URI: unsupported connection option")
+            pg_uri_append_assignment(assignments, environment_name, result_unwrap(decoded_value))
+            if next_ampersand < 0:
+                set query_cursor = text_length(url)
+            else:
+                if next_ampersand + 1 == text_length(url):
+                    return err("postgres URI: empty trailing query parameter")
+                set query_cursor = next_ampersand + 1
+        if question + 1 == text_length(url):
+            return err("postgres URI: query string is empty")
+    return ok(assignments)
+
+fn pg_uri_configure_environment(url: Text) -> Number:
+    let parsed: Result[TextList, Text] = pg_uri_parse_config(url)
+    if not result_is_ok(parsed):
+        return 1
+    let assignments: TextList = result_unwrap(parsed)
+    var index: Number = 0
+    while index < list_count(assignments):
+        if env_set(list_get(assignments, index), list_get(assignments, index + 1)) != 0:
+            return 1
+        set index = index + 2
+    if env_get("PGCONNECT_TIMEOUT") == "":
+        if env_set("PGCONNECT_TIMEOUT", "5") != 0:
+            return 1
+    return 0
+
+fn pg_uri_transport_policy_valid(host: Text, ssl_mode: Text) -> Boolean:
+    if ssl_mode == "disable":
+        return host == "127.0.0.1" or host == "::1"
+    return ssl_mode == "verify-full" and host != ""

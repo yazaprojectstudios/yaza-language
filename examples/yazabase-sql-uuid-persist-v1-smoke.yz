@@ -1,0 +1,131 @@
+use "std/fs"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/session_v1"
+use "../yazabase/sql_dispatch_v1"
+use "../yazabase/sql_executor_v1"
+use "../yazabase/sql_uuid_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/wal_v1"
+
+fn yazabase_sql_uuid_persist_v1(root_path: Text) -> Result[Boolean, Text]:
+    let root: Number = root_open(root_path)?
+    let database_name: Text = "uuid-persist-smoke.ydb"
+    let header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_from_text("uuid-smoke-uuid1"), 0, 1, 1, 0, 2, 1)
+    let empty_storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, database_name, header)?
+    let empty_storage_closed: Boolean = yaza_db_storage_close_v1(empty_storage)?
+    if not empty_storage_closed: return err("YazaBase UUID fixture could not close its genesis database")
+    let initialized: YazaDbCatalogBootstrapV1 = yaza_db_catalog_initialize_v1(root, database_name)?
+    let initialized_wal_closed: Boolean = yaza_db_wal_log_close_v1(initialized.wal)?
+    let initialized_storage_closed: Boolean = yaza_db_storage_close_v1(initialized.storage)?
+    if not initialized_wal_closed or not initialized_storage_closed: return err("YazaBase UUID fixture could not close catalog bootstrap handles")
+
+    let opened: YazaDbSessionV1 = yaza_db_session_open_v1(root, database_name)?
+    var session: YazaDbSessionV1 = opened
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let create_result: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "CREATE TABLE uuid_values (id UUID PRIMARY KEY, token UUID NOT NULL, label TEXT NOT NULL, default_token UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000')", no_parameters)?
+    set session = create_result.session
+    let insert_result: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "INSERT INTO uuid_values (id, token, label) VALUES ('00000000-0000-0000-0000-000000000002', '550E8400-E29B-41D4-A716-446655440002', 'second'), ('00000000-0000-0000-0000-000000000001', '550e8400-e29b-41d4-a716-446655440001', 'first'), ('00000000-0000-0000-0000-00000000000a', '550e8400-e29b-41d4-a716-44665544000a', 'tenth')", no_parameters)?
+    set session = insert_result.session
+    let default_lookup: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT default_token FROM uuid_values WHERE id = '00000000-0000-0000-0000-000000000002'", no_parameters)?
+    set session = default_lookup.session
+    if not option_is_some(default_lookup.statement.query_result): return err("YazaBase UUID DEFAULT lookup returned no result")
+    let default_rows: List[List[YazaSqlValueV1]] = option_unwrap(default_lookup.statement.query_result).rows
+    if list_count(default_rows) != 1 or list_get(list_get(default_rows, 0), 0).text_value != "00000000-0000-0000-0000-000000000000": return err("YazaBase UUID DEFAULT was not materialized canonically")
+    let index_result: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "CREATE UNIQUE INDEX uuid_values_token_idx ON uuid_values(token)", no_parameters)?
+    set session = index_result.session
+
+    let case_lookup: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT id, label FROM uuid_values WHERE id = '00000000-0000-0000-0000-000000000001'", no_parameters)?
+    set session = case_lookup.session
+    if not option_is_some(case_lookup.statement.query_result): return err("YazaBase UUID primary-key equality returned no result")
+    let case_rows: List[List[YazaSqlValueV1]] = option_unwrap(case_lookup.statement.query_result).rows
+    if list_count(case_rows) != 1 or list_get(list_get(case_rows, 0), 1).text_value != "first": return err("YazaBase UUID primary-key equality returned the wrong row")
+
+    let secondary_lookup: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT label FROM uuid_values WHERE token = '550E8400-E29B-41D4-A716-446655440002'", no_parameters)?
+    set session = secondary_lookup.session
+    if not option_is_some(secondary_lookup.statement.query_result): return err("YazaBase UUID secondary-index lookup returned no result")
+    let secondary_rows: List[List[YazaSqlValueV1]] = option_unwrap(secondary_lookup.statement.query_result).rows
+    if list_count(secondary_rows) != 1 or list_get(list_get(secondary_rows, 0), 0).text_value != "second": return err("YazaBase UUID secondary-index lookup returned the wrong row")
+    let explain: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "EXPLAIN SELECT label FROM uuid_values WHERE token = '550e8400-e29b-41d4-a716-446655440002'", no_parameters)?
+    set session = explain.session
+    if not option_is_some(explain.statement.explain_text) or text_find(option_unwrap(explain.statement.explain_text), "SecondaryIndexRangeScan(index=uuid_values_token_idx") < 0:
+        return err("YazaBase UUID equality plan did not use its secondary index")
+
+    let ordered: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT id, label FROM uuid_values ORDER BY id", no_parameters)?
+    set session = ordered.session
+    if not option_is_some(ordered.statement.query_result): return err("YazaBase UUID ORDER BY returned no result")
+    let ordered_rows: List[List[YazaSqlValueV1]] = option_unwrap(ordered.statement.query_result).rows
+    if list_count(ordered_rows) != 3: return err("YazaBase UUID ORDER BY returned the wrong row count")
+    if list_get(list_get(ordered_rows, 0), 0).text_value != "00000000-0000-0000-0000-000000000001" or list_get(list_get(ordered_rows, 1), 0).text_value != "00000000-0000-0000-0000-000000000002" or list_get(list_get(ordered_rows, 2), 0).text_value != "00000000-0000-0000-0000-00000000000a":
+        return err("YazaBase UUID primary-key order is not canonical byte order")
+
+    let parameter_value: YazaSqlValueV1 = yaza_sql_value_uuid_v1("00000000-0000-0000-0000-000000000002")?
+    let parameters: List[YazaSqlValueV1] = [parameter_value]
+    let parameter_lookup: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT label FROM uuid_values WHERE id = $1", parameters)?
+    set session = parameter_lookup.session
+    if not option_is_some(parameter_lookup.statement.query_result): return err("YazaBase typed UUID parameter returned no result")
+    let parameter_rows: List[List[YazaSqlValueV1]] = option_unwrap(parameter_lookup.statement.query_result).rows
+    if list_count(parameter_rows) != 1 or list_get(list_get(parameter_rows, 0), 0).text_value != "second": return err("YazaBase typed UUID parameter returned the wrong row")
+
+    let lower_than_second: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT COUNT(*) FROM uuid_values WHERE id < '00000000-0000-0000-0000-000000000002'", no_parameters)?
+    set session = lower_than_second.session
+    if not option_is_some(lower_than_second.statement.query_result) or list_get(list_get(option_unwrap(lower_than_second.statement.query_result).rows, 0), 0).integer_value != 1:
+        return err("YazaBase UUID less-than comparison returned an incorrect count")
+    let extrema: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT MIN(id), MAX(id) FROM uuid_values", no_parameters)?
+    set session = extrema.session
+    if not option_is_some(extrema.statement.query_result): return err("YazaBase UUID MIN/MAX returned no result")
+    let extreme_row: List[YazaSqlValueV1] = list_get(option_unwrap(extrema.statement.query_result).rows, 0)
+    if list_get(extreme_row, 0).text_value != "00000000-0000-0000-0000-000000000001" or list_get(extreme_row, 1).text_value != "00000000-0000-0000-0000-00000000000a":
+        return err("YazaBase UUID MIN/MAX returned incorrect extremes")
+
+    let changed: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "UPDATE uuid_values SET token = '550e8400-e29b-41d4-a716-446655440003' WHERE id = '00000000-0000-0000-0000-000000000002'", no_parameters)?
+    set session = changed.session
+    let updated_lookup: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT label FROM uuid_values WHERE token = '550e8400-e29b-41d4-a716-446655440003'", no_parameters)?
+    set session = updated_lookup.session
+    if not option_is_some(updated_lookup.statement.query_result): return err("YazaBase UUID indexed UPDATE lost its replacement key")
+    let updated_rows: List[List[YazaSqlValueV1]] = option_unwrap(updated_lookup.statement.query_result).rows
+    if list_count(updated_rows) != 1 or list_get(list_get(updated_rows, 0), 0).text_value != "second": return err("YazaBase UUID indexed UPDATE returned the wrong row")
+
+    let session_closed: Boolean = yaza_db_session_close_v1(session)?
+    if not session_closed: return err("YazaBase UUID fixture could not close before recovery")
+    let reopened_root: Number = root_open(root_path)?
+    var reopened: YazaDbSessionV1 = yaza_db_session_open_v1(reopened_root, database_name)?
+    let recovered: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(reopened, "SELECT id, default_token FROM uuid_values WHERE token = '550e8400-e29b-41d4-a716-446655440003'", no_parameters)?
+    set reopened = recovered.session
+    if not option_is_some(recovered.statement.query_result): return err("YazaBase UUID did not survive close/reopen recovery")
+    let recovered_rows: List[List[YazaSqlValueV1]] = option_unwrap(recovered.statement.query_result).rows
+    if list_count(recovered_rows) != 1 or list_get(list_get(recovered_rows, 0), 0).text_value != "00000000-0000-0000-0000-000000000002" or list_get(list_get(recovered_rows, 0), 1).text_value != "00000000-0000-0000-0000-000000000000": return err("YazaBase UUID reopened row, DEFAULT, or secondary index is incorrect")
+    let deleted: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(reopened, "DELETE FROM uuid_values WHERE id = '00000000-0000-0000-0000-000000000001'", no_parameters)?
+    set reopened = deleted.session
+    let deleted_lookup: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(reopened, "SELECT id FROM uuid_values WHERE token = '550e8400-e29b-41d4-a716-446655440001'", no_parameters)?
+    set reopened = deleted_lookup.session
+    if not option_is_some(deleted_lookup.statement.query_result) or list_count(option_unwrap(deleted_lookup.statement.query_result).rows) != 0:
+        return err("YazaBase UUID DELETE did not remove its secondary index entry")
+
+    let final_session_closed: Boolean = yaza_db_session_close_v1(reopened)?
+    if not final_session_closed: return err("YazaBase UUID fixture could not close its final session")
+
+    let duplicate_root: Number = root_open(root_path)?
+    var duplicate_session: YazaDbSessionV1 = yaza_db_session_open_v1(duplicate_root, database_name)?
+    let duplicate_table: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(duplicate_session, "CREATE TABLE uuid_duplicates (id BIGINT PRIMARY KEY, token UUID NOT NULL)", no_parameters)?
+    set duplicate_session = duplicate_table.session
+    let duplicate_rows: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(duplicate_session, "INSERT INTO uuid_duplicates (id, token) VALUES (1, '550e8400-e29b-41d4-a716-446655440001'), (2, '550E8400-E29B-41D4-A716-446655440001')", no_parameters)?
+    set duplicate_session = duplicate_rows.session
+    let duplicate_index: Result[YazaDbSessionStatementV1, Text] = yaza_db_session_execute_v1(duplicate_session, "CREATE UNIQUE INDEX uuid_duplicates_token_idx ON uuid_duplicates(token)", no_parameters)
+    if result_is_ok(duplicate_index):
+        let unexpected_session: YazaDbSessionV1 = result_unwrap(duplicate_index).session
+        let ignored_close: Result[Boolean, Text] = yaza_db_session_close_v1(unexpected_session)
+        return err("YazaBase UNIQUE UUID index accepted duplicate values")
+
+    let cleanup_root: Number = root_open(root_path)?
+    let removed: Boolean = remove(cleanup_root, database_name)?
+    if not removed: return err("YazaBase UUID fixture could not remove its database")
+    let directory_synced: Boolean = sync_directory(cleanup_root)?
+    if not directory_synced: return err("YazaBase UUID fixture cleanup could not sync the directory")
+    let cleanup_root_closed: Boolean = close(cleanup_root)?
+    if not cleanup_root_closed: return err("YazaBase UUID fixture could not close its cleanup root")
+    return ok(true)
+
+start:
+    let outcome: Result[Boolean, Text] = yazabase_sql_uuid_persist_v1(arg(1))
+    if result_is_ok(outcome): say "yazabase-sql-uuid-persist-v1-ok"
+    else: say result_unwrap_error(outcome)

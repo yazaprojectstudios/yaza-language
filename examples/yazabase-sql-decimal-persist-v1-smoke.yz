@@ -1,0 +1,159 @@
+use "std/fs"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/checkpoint_v1"
+use "../yazabase/page_v1"
+use "../yazabase/sql_dispatch_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/wal_v1"
+
+fn yazabase_sql_decimal_persist_v1(root_path: Text) -> Result[Boolean, Text]:
+    let root: Number = root_open(root_path)?
+    let db_name: Text = "decimal-persist-smoke.ydb"
+    let header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_from_text("dec-smoke-uuid01"), 0, 1, 1, 0, 2, 1)
+    let empty_storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, db_name, header)?
+    let empty_closed: Boolean = yaza_db_storage_close_v1(empty_storage)?
+    if not empty_closed: return err("YazaBase DECIMAL fixture could not close its genesis database")
+
+    let initialized: YazaDbCatalogBootstrapV1 = yaza_db_catalog_initialize_v1(root, db_name)?
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let create_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(initialized.storage, initialized.wal, "CREATE TABLE amounts (id BIGINT PRIMARY KEY, amount DECIMAL(10, 2) NOT NULL, reserve DECIMAL(10, 2) DEFAULT -0.25, other_scale DECIMAL(10, 3) DEFAULT 0.001, amount_cap DECIMAL(4, 2) DEFAULT 99.99, amount_step DECIMAL(4, 2) DEFAULT 0.01)", no_parameters)?
+    if not option_is_some(create_result.write_commit): return err("YazaBase DECIMAL table DDL did not commit")
+    let created: YazaDbWriteCommitV1 = option_unwrap(create_result.write_commit)
+    let create_wal_closed: Boolean = yaza_db_wal_log_close_v1(created.wal)?
+    let create_storage_closed: Boolean = yaza_db_storage_close_v1(created.storage)?
+    if not create_wal_closed or not create_storage_closed: return err("YazaBase DECIMAL fixture could not close after DDL")
+
+    let reopened_for_insert: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, db_name)?
+    let insert_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(reopened_for_insert.storage, reopened_for_insert.wal, "INSERT INTO amounts (id, amount) VALUES (1, 123.45), (2, -9.99)", no_parameters)?
+    if not option_is_some(insert_result.write_commit): return err("YazaBase DECIMAL literal INSERT did not commit")
+    let inserted: YazaDbWriteCommitV1 = option_unwrap(insert_result.write_commit)
+    let index_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(inserted.storage, inserted.wal, "CREATE UNIQUE INDEX amounts_amount_idx ON amounts(amount)", no_parameters)?
+    if not option_is_some(index_result.write_commit): return err("YazaBase DECIMAL secondary-index build did not commit")
+    let indexed: YazaDbWriteCommitV1 = option_unwrap(index_result.write_commit)
+    let index_wal_closed: Boolean = yaza_db_wal_log_close_v1(indexed.wal)?
+    let index_storage_closed: Boolean = yaza_db_storage_close_v1(indexed.storage)?
+    if not index_wal_closed or not index_storage_closed: return err("YazaBase DECIMAL fixture could not close after index build")
+
+    let recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, db_name)?
+    let explain_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(recovered.storage, recovered.wal, "EXPLAIN SELECT id FROM amounts WHERE amount = 123.45", no_parameters)?
+    if not option_is_some(explain_result.explain_text) or text_find(option_unwrap(explain_result.explain_text), "SecondaryIndexRangeScan(index=amounts_amount_idx") < 0:
+        return err("YazaBase DECIMAL equality plan did not select its secondary index")
+    let equality_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(explain_result.storage, explain_result.wal, "SELECT id FROM amounts WHERE amount = 123.45", no_parameters)?
+    if not option_is_some(equality_result.query_result) or list_count(option_unwrap(equality_result.query_result).rows) != 1 or list_get(list_get(option_unwrap(equality_result.query_result).rows, 0), 0).integer_value != 1:
+        return err("YazaBase DECIMAL secondary-index equality lookup returned the wrong row")
+    let select_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(equality_result.storage, equality_result.wal, "SELECT id, amount, reserve FROM amounts ORDER BY amount", no_parameters)?
+    if not option_is_some(select_result.query_result): return err("YazaBase DECIMAL close/reopen SELECT returned no result")
+    let selected: YazaSqlQueryResultV1 = option_unwrap(select_result.query_result)
+    if list_count(selected.rows) != 2: return err("YazaBase DECIMAL close/reopen SELECT returned the wrong row count")
+    if list_get(list_get(selected.rows, 0), 1).text_value != "-9.99" or list_get(list_get(selected.rows, 1), 1).text_value != "123.45": return err("YazaBase DECIMAL close/reopen SELECT or ordering corrupted stored values")
+    if list_get(selected.columns, 1).type_id != 10 or list_get(selected.columns, 1).precision != 10 or list_get(selected.columns, 1).scale != 2: return err("YazaBase DECIMAL close/reopen SELECT lost declared precision or scale")
+    if list_get(list_get(selected.rows, 0), 2).text_value != "-0.25" or list_get(list_get(selected.rows, 1), 2).text_value != "-0.25": return err("YazaBase DECIMAL DEFAULT did not materialize exactly for omitted columns")
+
+    let sum_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(select_result.storage, select_result.wal, "SELECT SUM(amount) AS total FROM amounts", no_parameters)?
+    if not option_is_some(sum_result.query_result): return err("YazaBase DECIMAL persistent SUM returned no result")
+    let sum_query: YazaSqlQueryResultV1 = option_unwrap(sum_result.query_result)
+    if list_get(list_get(sum_query.rows, 0), 0).text_value != "113.46": return err("YazaBase DECIMAL persistent SUM was not exact")
+    if list_get(sum_query.columns, 0).precision != 38 or list_get(sum_query.columns, 0).scale != 2: return err("YazaBase DECIMAL persistent SUM lost result metadata")
+
+    let extreme_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(sum_result.storage, sum_result.wal, "SELECT MIN(amount), MAX(amount) FROM amounts", no_parameters)?
+    if not option_is_some(extreme_result.query_result): return err("YazaBase DECIMAL persistent MIN/MAX returned no result")
+    let extreme_query: YazaSqlQueryResultV1 = option_unwrap(extreme_result.query_result)
+    if list_get(list_get(extreme_query.rows, 0), 0).text_value != "-9.99" or list_get(list_get(extreme_query.rows, 0), 1).text_value != "123.45": return err("YazaBase DECIMAL persistent MIN/MAX returned incorrect values")
+
+    let duplicate_insert: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(extreme_result.storage, extreme_result.wal, "INSERT INTO amounts (id, amount) VALUES (3, 123.45)", no_parameters)
+    if result_is_ok(duplicate_insert): return err("YazaBase DECIMAL UNIQUE INDEX accepted an exact duplicate INSERT")
+    let duplicate_update: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(extreme_result.storage, extreme_result.wal, "UPDATE amounts SET amount = 123.45 WHERE id = 2", no_parameters)
+    if result_is_ok(duplicate_update): return err("YazaBase DECIMAL UNIQUE INDEX accepted an exact duplicate UPDATE")
+    let decimal_scale_mismatch: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(extreme_result.storage, extreme_result.wal, "UPDATE amounts SET amount = amount + other_scale WHERE id = 2", no_parameters)
+    if result_is_ok(decimal_scale_mismatch): return err("YazaBase DECIMAL arithmetic accepted different operand scales")
+    let decimal_precision_overflow: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(extreme_result.storage, extreme_result.wal, "UPDATE amounts SET amount_cap = amount_cap + amount_step WHERE id = 2", no_parameters)
+    if result_is_ok(decimal_precision_overflow): return err("YazaBase DECIMAL arithmetic accepted a result outside declared precision")
+    let update_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(extreme_result.storage, extreme_result.wal, "UPDATE amounts SET amount = 7.25 WHERE id = 2", no_parameters)?
+    if not option_is_some(update_result.write_commit): return err("YazaBase DECIMAL indexed UPDATE did not commit")
+    let updated: YazaDbWriteCommitV1 = option_unwrap(update_result.write_commit)
+    let decimal_add_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(updated.storage, updated.wal, "UPDATE amounts SET amount = amount + reserve WHERE id = 2", no_parameters)?
+    if not option_is_some(decimal_add_result.write_commit): return err("YazaBase exact DECIMAL addition UPDATE did not commit")
+    let decimal_added: YazaDbWriteCommitV1 = option_unwrap(decimal_add_result.write_commit)
+    let decimal_subtract_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(decimal_added.storage, decimal_added.wal, "UPDATE amounts SET amount = amount - reserve WHERE id = 1", no_parameters)?
+    if not option_is_some(decimal_subtract_result.write_commit): return err("YazaBase exact DECIMAL subtraction UPDATE did not commit")
+    let decimal_subtracted: YazaDbWriteCommitV1 = option_unwrap(decimal_subtract_result.write_commit)
+    let decimal_literal_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(decimal_subtracted.storage, decimal_subtracted.wal, "UPDATE amounts SET amount = amount + 0.01 WHERE id = 2", no_parameters)?
+    if not option_is_some(decimal_literal_result.write_commit): return err("YazaBase exact DECIMAL literal arithmetic UPDATE did not commit")
+    let decimal_literal_updated: YazaDbWriteCommitV1 = option_unwrap(decimal_literal_result.write_commit)
+    let decimal_bind_decimal: YazaSqlDecimalV1 = yaza_sql_decimal_parse_v1("0.02", 10, 2)?
+    let decimal_bind_value: YazaSqlValueV1 = yaza_sql_value_decimal_v1(decimal_bind_decimal)?
+    let decimal_bind_parameters: List[YazaSqlValueV1] = [decimal_bind_value]
+    let decimal_bind_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(decimal_literal_updated.storage, decimal_literal_updated.wal, "UPDATE amounts SET amount = amount + $1 WHERE id = 2", decimal_bind_parameters)?
+    if not option_is_some(decimal_bind_result.write_commit): return err("YazaBase exact DECIMAL bound arithmetic UPDATE did not commit")
+    let decimal_bind_updated: YazaDbWriteCommitV1 = option_unwrap(decimal_bind_result.write_commit)
+    let updated_lookup: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(decimal_bind_updated.storage, decimal_bind_updated.wal, "SELECT id, amount FROM amounts WHERE amount = 7.03", no_parameters)?
+    if not option_is_some(updated_lookup.query_result) or list_count(option_unwrap(updated_lookup.query_result).rows) != 1 or list_get(list_get(option_unwrap(updated_lookup.query_result).rows, 0), 0).integer_value != 2:
+        return err("YazaBase DECIMAL arithmetic UPDATE did not preserve its exact indexed key")
+    if list_get(list_get(option_unwrap(updated_lookup.query_result).rows, 0), 1).text_value != "7.03": return err("YazaBase DECIMAL addition with a literal or bind lost exact decimal scale or value")
+    let subtract_lookup: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(updated_lookup.storage, updated_lookup.wal, "SELECT id, amount FROM amounts WHERE amount = 123.70", no_parameters)?
+    if not option_is_some(subtract_lookup.query_result) or list_count(option_unwrap(subtract_lookup.query_result).rows) != 1 or list_get(list_get(option_unwrap(subtract_lookup.query_result).rows, 0), 0).integer_value != 1: return err("YazaBase DECIMAL subtraction did not update its indexed key")
+    if list_get(list_get(option_unwrap(subtract_lookup.query_result).rows, 0), 1).text_value != "123.70": return err("YazaBase DECIMAL subtraction lost exact decimal scale or value")
+    let unsupported_multiply: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(subtract_lookup.storage, subtract_lookup.wal, "UPDATE amounts SET amount = amount * 2 WHERE id = 2", no_parameters)
+    if result_is_ok(unsupported_multiply): return err("YazaBase DECIMAL UPDATE accepted unsupported multiplication")
+    let zero_subtract_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(subtract_lookup.storage, subtract_lookup.wal, "UPDATE amounts SET amount = amount - 0.00 WHERE id = 2", no_parameters)?
+    if not option_is_some(zero_subtract_result.write_commit): return err("YazaBase DECIMAL zero subtraction UPDATE did not commit")
+    let zero_subtracted: YazaDbWriteCommitV1 = option_unwrap(zero_subtract_result.write_commit)
+    let zero_subtract_lookup: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(zero_subtracted.storage, zero_subtracted.wal, "SELECT id, amount FROM amounts WHERE amount = 7.03", no_parameters)?
+    if not option_is_some(zero_subtract_lookup.query_result) or list_count(option_unwrap(zero_subtract_lookup.query_result).rows) != 1 or list_get(list_get(option_unwrap(zero_subtract_lookup.query_result).rows, 0), 0).integer_value != 2 or list_get(list_get(option_unwrap(zero_subtract_lookup.query_result).rows, 0), 1).text_value != "7.03":
+        return err("YazaBase DECIMAL zero subtraction corrupted stored or indexed value")
+    let bound_delta_decimal: YazaSqlDecimalV1 = yaza_sql_decimal_parse_v1("0.04", 10, 2)?
+    let bound_delta_value: YazaSqlValueV1 = yaza_sql_value_decimal_v1(bound_delta_decimal)?
+    let bound_id_value: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, 2)?
+    let bound_arith_parameters: List[YazaSqlValueV1] = [bound_delta_value, bound_id_value]
+    let bound_add_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(zero_subtract_lookup.storage, zero_subtract_lookup.wal, "UPDATE amounts SET amount = amount + $1 WHERE id = $2", bound_arith_parameters)?
+    if not option_is_some(bound_add_result.write_commit): return err("YazaBase DECIMAL typed bind addition UPDATE did not commit")
+    let bound_added: YazaDbWriteCommitV1 = option_unwrap(bound_add_result.write_commit)
+    let bound_add_lookup: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(bound_added.storage, bound_added.wal, "SELECT id, amount FROM amounts WHERE amount = 7.07", no_parameters)?
+    if not option_is_some(bound_add_lookup.query_result) or list_count(option_unwrap(bound_add_lookup.query_result).rows) != 1 or list_get(list_get(option_unwrap(bound_add_lookup.query_result).rows, 0), 0).integer_value != 2 or list_get(list_get(option_unwrap(bound_add_lookup.query_result).rows, 0), 1).text_value != "7.07":
+        return err("YazaBase DECIMAL typed bind addition did not update stored or indexed value")
+    let resurrect_subtract_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(bound_add_lookup.storage, bound_add_lookup.wal, "UPDATE amounts SET amount = amount - $1 WHERE id = $2", bound_arith_parameters)?
+    if not option_is_some(resurrect_subtract_result.write_commit): return err("YazaBase DECIMAL tombstone-resurrection subtraction UPDATE did not commit")
+    let resurrect_subtracted: YazaDbWriteCommitV1 = option_unwrap(resurrect_subtract_result.write_commit)
+    let resurrect_lookup: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(resurrect_subtracted.storage, resurrect_subtracted.wal, "SELECT id, amount FROM amounts WHERE amount = 7.03", no_parameters)?
+    if not option_is_some(resurrect_lookup.query_result) or list_count(option_unwrap(resurrect_lookup.query_result).rows) != 1 or list_get(list_get(option_unwrap(resurrect_lookup.query_result).rows, 0), 0).integer_value != 2 or list_get(list_get(option_unwrap(resurrect_lookup.query_result).rows, 0), 1).text_value != "7.03":
+        return err("YazaBase DECIMAL secondary-index tombstone resurrection did not update stored or indexed value")
+    let bound_subtract_parameters: List[YazaSqlValueV1] = [decimal_bind_value, bound_id_value]
+    let bound_subtract_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(resurrect_lookup.storage, resurrect_lookup.wal, "UPDATE amounts SET amount = amount - $1 WHERE id = $2", bound_subtract_parameters)?
+    if not option_is_some(bound_subtract_result.write_commit): return err("YazaBase DECIMAL typed bind subtraction UPDATE did not commit")
+    let bound_subtracted: YazaDbWriteCommitV1 = option_unwrap(bound_subtract_result.write_commit)
+    let bound_subtract_lookup: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(bound_subtracted.storage, bound_subtracted.wal, "SELECT id, amount FROM amounts WHERE amount = 7.01", no_parameters)?
+    if not option_is_some(bound_subtract_lookup.query_result) or list_count(option_unwrap(bound_subtract_lookup.query_result).rows) != 1 or list_get(list_get(option_unwrap(bound_subtract_lookup.query_result).rows, 0), 0).integer_value != 2 or list_get(list_get(option_unwrap(bound_subtract_lookup.query_result).rows, 0), 1).text_value != "7.01":
+        return err("YazaBase DECIMAL typed bind subtraction did not update stored or indexed value")
+    let reserve_null_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(bound_subtract_lookup.storage, bound_subtract_lookup.wal, "UPDATE amounts SET reserve = NULL WHERE id = 2", no_parameters)?
+    if not option_is_some(reserve_null_result.write_commit): return err("YazaBase nullable DECIMAL NULL UPDATE did not commit")
+    let reserve_nulled: YazaDbWriteCommitV1 = option_unwrap(reserve_null_result.write_commit)
+    let null_arith_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(reserve_nulled.storage, reserve_nulled.wal, "UPDATE amounts SET reserve = reserve + 0.01 WHERE id = 2", no_parameters)?
+    if not option_is_some(null_arith_result.write_commit): return err("YazaBase DECIMAL NULL propagation UPDATE did not commit")
+    let null_arith_updated: YazaDbWriteCommitV1 = option_unwrap(null_arith_result.write_commit)
+    let null_check_lookup: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(null_arith_updated.storage, null_arith_updated.wal, "SELECT id, reserve FROM amounts WHERE id = 2 AND reserve IS NULL", no_parameters)?
+    if not option_is_some(null_check_lookup.query_result) or list_count(option_unwrap(null_check_lookup.query_result).rows) != 1 or list_get(list_get(option_unwrap(null_check_lookup.query_result).rows, 0), 0).integer_value != 2 or not list_get(list_get(option_unwrap(null_check_lookup.query_result).rows, 0), 1).is_null:
+        return err("YazaBase DECIMAL NULL propagation did not preserve NULL")
+    let not_null_rejection: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_statement_v1(null_check_lookup.storage, null_check_lookup.wal, "UPDATE amounts SET amount = amount + reserve WHERE id = 2", no_parameters)
+    if result_is_ok(not_null_rejection): return err("YazaBase DECIMAL NULL arithmetic bypassed NOT NULL constraint")
+    let delete_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(null_check_lookup.storage, null_check_lookup.wal, "DELETE FROM amounts WHERE id = 2", no_parameters)?
+    if not option_is_some(delete_result.write_commit): return err("YazaBase DECIMAL indexed DELETE did not commit")
+    let deleted: YazaDbWriteCommitV1 = option_unwrap(delete_result.write_commit)
+    let deleted_lookup: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(deleted.storage, deleted.wal, "SELECT id FROM amounts WHERE amount = 7.25", no_parameters)?
+    if not option_is_some(deleted_lookup.query_result) or list_count(option_unwrap(deleted_lookup.query_result).rows) != 0:
+        return err("YazaBase DECIMAL secondary-index DELETE left a visible key")
+
+    let final_wal_closed: Boolean = yaza_db_wal_log_close_v1(deleted_lookup.wal)?
+    let final_storage_closed: Boolean = yaza_db_storage_close_v1(deleted_lookup.storage)?
+    if not final_wal_closed or not final_storage_closed: return err("YazaBase DECIMAL fixture did not close recovered handles")
+    let removed: Boolean = remove(root, db_name)?
+    if not removed: return err("YazaBase DECIMAL fixture could not remove its database")
+    let synced: Boolean = sync_directory(root)?
+    if not synced: return err("YazaBase DECIMAL fixture cleanup did not sync its directory")
+    let root_closed: Boolean = close(root)?
+    if not root_closed: return err("YazaBase DECIMAL fixture could not close its root")
+    return ok(true)
+
+start:
+    let outcome: Result[Boolean, Text] = yazabase_sql_decimal_persist_v1(arg(1))
+    if result_is_ok(outcome): say "yazabase-sql-decimal-persist-v1-ok"
+    else: say result_unwrap_error(outcome)

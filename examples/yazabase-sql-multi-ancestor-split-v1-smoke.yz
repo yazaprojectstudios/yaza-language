@@ -1,0 +1,244 @@
+use "std/fs"
+use "../yazabase/checkpoint_v1"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/catalog_snapshot_v1"
+use "../yazabase/key_codec_v1"
+use "../yazabase/page_v1"
+use "../yazabase/row_v1"
+use "../yazabase/sql_binder_v1"
+use "../yazabase/sql_dispatch_v1"
+use "../yazabase/sql_executor_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/transaction_v1"
+use "../yazabase/wal_v1"
+
+fn yazabase_sql_multi_ancestor_text_v1(index: Number) -> Result[Text, Text]:
+    if index < 0 or index > 50: return err("YDBv1 multi-ancestor fixture key index is outside its bound")
+    let buffer: Bytes = bytes_try_new_zeroed(2000)?
+    var byte_index: Number = 0
+    while byte_index < 1999:
+        if not bytes_try_set(buffer, byte_index, 97): return err("YDBv1 multi-ancestor fixture key prefix could not be written")
+        set byte_index = byte_index + 1
+    if not bytes_try_set(buffer, 1999, 48 + index): return err("YDBv1 multi-ancestor fixture key suffix could not be written")
+    return bytes_try_to_text(buffer)
+
+fn yazabase_sql_multi_ancestor_key_v1(index: Number, columns: List[YazaSqlColumnSchemaV1]) -> Result[Bytes, Text]:
+    let text_value: Text = yazabase_sql_multi_ancestor_text_v1(index)?
+    let value: YazaSqlValueV1 = yaza_sql_value_text_v1(text_value)
+    let values: List[YazaSqlValueV1] = [value]
+    let nulls: List[Boolean] = [false]
+    let ordinals: List[Number] = [0]
+    return yaza_db_key_encode_composite_v1(values, nulls, columns, ordinals)
+
+fn yazabase_sql_multi_ancestor_row_v1(index: Number, columns: List[YazaSqlColumnSchemaV1], commit_ts: Number) -> Result[Bytes, Text]:
+    let text_value: Text = yazabase_sql_multi_ancestor_text_v1(index)?
+    let value: YazaSqlValueV1 = yaza_sql_value_text_v1(text_value)
+    let values: List[YazaSqlValueV1] = [value]
+    let nulls: List[Boolean] = [false]
+    return yaza_db_row_encode_v1(values, nulls, columns, commit_ts)
+
+fn yazabase_sql_multi_ancestor_write_page_v1(storage: YazaDbStorageHandleV1, page: Bytes) -> Result[Boolean, Text]:
+    let written: Number = yaza_db_storage_write_page_v1(storage.file, storage.header, page)?
+    if written != yaza_db_page_size_v1(): return err("YDBv1 multi-ancestor fixture wrote an incomplete page")
+    return ok(true)
+
+fn yazabase_sql_multi_ancestor_write_empty_leaf_v1(storage: YazaDbStorageHandleV1, page_id: Number, has_low: Boolean, low_index: Number, has_high: Boolean, high_index: Number, columns: List[YazaSqlColumnSchemaV1]) -> Result[Boolean, Text]:
+    let empty: Bytes = bytes_from_text("")
+    var low_key: Bytes = empty
+    var high_key: Bytes = empty
+    if has_low: set low_key = yazabase_sql_multi_ancestor_key_v1(low_index, columns)?
+    if has_high: set high_key = yazabase_sql_multi_ancestor_key_v1(high_index, columns)?
+    let blank: Bytes = yaza_db_page_new_v1(page_id, 0, 1, 0)?
+    let page: Bytes = yaza_db_page_set_fences_v1(blank, has_low, low_key, has_high, high_key)?
+    return yazabase_sql_multi_ancestor_write_page_v1(storage, page)
+
+fn yazabase_sql_multi_ancestor_pointer_v1(page_id: Number) -> Result[Bytes, Text]:
+    let pointer: Bytes = bytes_try_new_zeroed(8)?
+    if not yaza_db_write_uint_le_v1(pointer, 0, page_id * 2, 8): return err("YDBv1 multi-ancestor child pointer could not be encoded")
+    return ok(pointer)
+
+fn yazabase_sql_multi_ancestor_write_inner_v1(storage: YazaDbStorageHandleV1, page_id: Number, level: Number, first_key_index: Number, key_step: Number, separator_count: Number, first_child_page_id: Number, upper_child_page_id: Number, has_low: Boolean, low_index: Number, has_high: Boolean, high_index: Number, columns: List[YazaSqlColumnSchemaV1]) -> Result[Boolean, Text]:
+    let empty: Bytes = bytes_from_text("")
+    var low_key: Bytes = empty
+    var high_key: Bytes = empty
+    if has_low: set low_key = yazabase_sql_multi_ancestor_key_v1(low_index, columns)?
+    if has_high: set high_key = yazabase_sql_multi_ancestor_key_v1(high_index, columns)?
+    let blank: Bytes = yaza_db_page_new_v1(page_id, 0, 2, level)?
+    if not yaza_db_page_set_upper_v1(blank, upper_child_page_id): return err("YDBv1 multi-ancestor INNER upper child could not be set")
+    let initialized: Bytes = yaza_db_page_finalize_v1(blank)?
+    let fenced: Bytes = yaza_db_page_set_fences_v1(initialized, has_low, low_key, has_high, high_key)?
+    var page: Bytes = fenced
+    var slot_index: Number = 0
+    while slot_index < separator_count:
+        let key: Bytes = yazabase_sql_multi_ancestor_key_v1(first_key_index + slot_index * key_step, columns)?
+        let child_id: Number = first_child_page_id + slot_index
+        let pointer: Bytes = yazabase_sql_multi_ancestor_pointer_v1(child_id)?
+        let inserted: Number = yaza_db_page_add_slot_v1(page, key, pointer)?
+        if inserted != slot_index: return err("YDBv1 multi-ancestor INNER separators are not ordered")
+        set slot_index = slot_index + 1
+    let packed: Bytes = yaza_db_page_finalize_v1(page)?
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(packed, page_id)?
+    if header.count != separator_count or header.level != level: return err("YDBv1 multi-ancestor INNER metadata did not survive finalization")
+    return yazabase_sql_multi_ancestor_write_page_v1(storage, packed)
+
+fn yazabase_sql_multi_ancestor_seed_v1(storage: YazaDbStorageHandleV1, root_page_id: Number, columns: List[YazaSqlColumnSchemaV1], commit_ts: Number) -> Result[Number, Text]:
+    let grandparent_page_id: Number = 2048
+    let first_parent_page_id: Number = 2049
+    let parent_child_count: Number = 8
+    let first_target_leaf_page_id: Number = 2057
+    let gp_upper_inner_page_id: Number = 2056
+    let gp_upper_leaf_page_id: Number = 2071
+    let right_inner_page_id: Number = 2072
+    let right_child_inner_page_id: Number = 2073
+    let right_leaf_page_id: Number = 2074
+    let reserved_page_end: Number = 2074
+    let empty: Bytes = bytes_from_text("")
+    let first_parent_separator: Bytes = yazabase_sql_multi_ancestor_key_v1(10, columns)?
+    let gp_first_separator: Bytes = yazabase_sql_multi_ancestor_key_v1(20, columns)?
+    let root_separator: Bytes = yazabase_sql_multi_ancestor_key_v1(50, columns)?
+
+    # Reserve the seeded tree nodes and leaves in the bootstrap bitmap range.
+    let bitmap: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, 2)?
+    let bitmap_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(bitmap, 2)?
+    var reserved_page_id: Number = grandparent_page_id
+    while reserved_page_id <= reserved_page_end:
+        let address: YazaDbBitmapAddressV1 = yaza_db_bitmap_address_v1(reserved_page_id)?
+        if address.bitmap_page_id != 2: return err("YDBv1 multi-ancestor fixture crossed its bootstrap bitmap range")
+        let was_allocated: Boolean = yaza_db_bitmap_page_bit_v1(bitmap, address.bit_index, 2)?
+        if was_allocated: return err("YDBv1 multi-ancestor fixture page range was already allocated")
+        let claimed: Boolean = yaza_db_bitmap_page_set_allocated_v1(bitmap, address.bit_index, true, bitmap_header.page_lsn, 2)?
+        if not claimed: return err("YDBv1 multi-ancestor fixture could not reserve its page range")
+        set reserved_page_id = reserved_page_id + 1
+    let bitmap_written: Number = yaza_db_storage_write_page_v1(storage.file, storage.header, bitmap)?
+    if bitmap_written != yaza_db_page_size_v1(): return err("YDBv1 multi-ancestor fixture could not write its allocation bitmap")
+
+    # The first leaf and both ancestor levels are full at a 2,000-byte TEXT key width.
+    let target_leaf_blank: Bytes = yaza_db_page_new_v1(first_target_leaf_page_id, 0, 1, 0)?
+    let target_leaf: Bytes = yaza_db_page_set_fences_v1(target_leaf_blank, false, empty, true, first_parent_separator)?
+    var leaf: Bytes = target_leaf
+    var next_key: Number = 0
+    var leaf_full: Boolean = false
+    while next_key < 10 and not leaf_full:
+        let key: Bytes = yazabase_sql_multi_ancestor_key_v1(next_key, columns)?
+        let row: Bytes = yazabase_sql_multi_ancestor_row_v1(next_key, columns, commit_ts)?
+        let added: Result[Number, Text] = yaza_db_page_add_slot_v1(leaf, key, row)
+        if result_is_ok(added):
+            set next_key = next_key + 1
+        else:
+            let message: Text = result_unwrap_error(added)
+            if not text_starts_with(message, "YDBv1 page has insufficient free space") and not text_starts_with(message, "YDBv1 slot array is full"): return err("YDBv1 multi-ancestor fixture could not fill its leaf: " + message)
+            set leaf_full = true
+    if not leaf_full or next_key < 2 or next_key >= 10: return err("YDBv1 multi-ancestor fixture target leaf is not full")
+    let finalized_leaf: Bytes = yaza_db_page_finalize_v1(leaf)?
+    let target_leaf_written: Boolean = yazabase_sql_multi_ancestor_write_page_v1(storage, finalized_leaf)?
+    if not target_leaf_written: return err("YDBv1 multi-ancestor fixture target leaf write failed")
+
+    # This full level-1 INNER page routes eight leaf ranges and has high fence 20.
+    let target_parent_written: Boolean = yazabase_sql_multi_ancestor_write_inner_v1(storage, first_parent_page_id, 1, 10, 1, 7, first_target_leaf_page_id, first_target_leaf_page_id + 7, false, 0, true, 20, columns)?
+    if not target_parent_written: return err("YDBv1 multi-ancestor fixture target parent write failed")
+    var leaf_index: Number = 1
+    while leaf_index < parent_child_count:
+        let page_id: Number = first_target_leaf_page_id + leaf_index
+        let low_index: Number = 9 + leaf_index
+        var high_index: Number = 20
+        var has_high: Boolean = true
+        if leaf_index < 7: set high_index = 10 + leaf_index
+        let written: Boolean = yazabase_sql_multi_ancestor_write_empty_leaf_v1(storage, page_id, true, low_index, has_high, high_index, columns)?
+        if not written: return err("YDBv1 multi-ancestor fixture leaf sibling write failed")
+        set leaf_index = leaf_index + 1
+
+    # Seed six sibling level-1 nodes and the upper child of the full grandparent.
+    var child_index: Number = 1
+    while child_index < 7:
+        let inner_page_id: Number = first_parent_page_id + child_index
+        let leaf_page_id: Number = 2064 + child_index
+        let low_index: Number = 20 + (child_index - 1) * 4
+        let high_index: Number = 20 + child_index * 4
+        let empty_inner: Boolean = yazabase_sql_multi_ancestor_write_inner_v1(storage, inner_page_id, 1, 0, 1, 0, 0, leaf_page_id, true, low_index, true, high_index, columns)?
+        if not empty_inner: return err("YDBv1 multi-ancestor fixture sibling INNER write failed")
+        let empty_leaf: Boolean = yazabase_sql_multi_ancestor_write_empty_leaf_v1(storage, leaf_page_id, true, low_index, true, high_index, columns)?
+        if not empty_leaf: return err("YDBv1 multi-ancestor fixture sibling leaf write failed")
+        set child_index = child_index + 1
+
+    # A full level-2 grandparent contains the full target parent and has roomless fences.
+    let gp_upper_inner: Boolean = yazabase_sql_multi_ancestor_write_inner_v1(storage, gp_upper_inner_page_id, 1, 0, 1, 0, 0, gp_upper_leaf_page_id, true, 44, true, 50, columns)?
+    if not gp_upper_inner: return err("YDBv1 multi-ancestor fixture grandparent upper INNER write failed")
+    let gp_upper_leaf: Boolean = yazabase_sql_multi_ancestor_write_empty_leaf_v1(storage, gp_upper_leaf_page_id, true, 44, true, 50, columns)?
+    if not gp_upper_leaf: return err("YDBv1 multi-ancestor fixture grandparent upper leaf write failed")
+    let grandparent: Boolean = yazabase_sql_multi_ancestor_write_inner_v1(storage, grandparent_page_id, 2, 20, 4, 7, first_parent_page_id, gp_upper_inner_page_id, false, 0, true, 50, columns)?
+    if not grandparent: return err("YDBv1 multi-ancestor fixture full grandparent write failed")
+
+    # Build a valid right-side level-2 subtree at the root separator.
+    let right_child: Boolean = yazabase_sql_multi_ancestor_write_inner_v1(storage, right_child_inner_page_id, 1, 0, 1, 0, 0, right_leaf_page_id, true, 50, false, 0, columns)?
+    if not right_child: return err("YDBv1 multi-ancestor fixture right child INNER write failed")
+    let right_leaf: Boolean = yazabase_sql_multi_ancestor_write_empty_leaf_v1(storage, right_leaf_page_id, true, 50, false, 0, columns)?
+    if not right_leaf: return err("YDBv1 multi-ancestor fixture right leaf write failed")
+    let right_inner: Boolean = yazabase_sql_multi_ancestor_write_inner_v1(storage, right_inner_page_id, 2, 0, 1, 0, 0, right_child_inner_page_id, true, 50, false, 0, columns)?
+    if not right_inner: return err("YDBv1 multi-ancestor fixture root right INNER write failed")
+
+    let root_blank: Bytes = yaza_db_page_new_v1(root_page_id, 0, 2, 3)?
+    if not yaza_db_page_set_upper_v1(root_blank, right_inner_page_id): return err("YDBv1 multi-ancestor fixture table root upper child could not be set")
+    let grandparent_pointer: Bytes = yazabase_sql_multi_ancestor_pointer_v1(grandparent_page_id)?
+    let root_slot: Number = yaza_db_page_add_slot_v1(root_blank, root_separator, grandparent_pointer)?
+    if root_slot != 0: return err("YDBv1 multi-ancestor fixture root separator could not be installed")
+    let root_page: Bytes = yaza_db_page_finalize_v1(root_blank)?
+    let root_written: Boolean = yazabase_sql_multi_ancestor_write_page_v1(storage, root_page)?
+    if not root_written: return err("YDBv1 multi-ancestor fixture table root write failed")
+    let seed_synced: Boolean = sync(storage.file)?
+    if not seed_synced: return err("YDBv1 multi-ancestor fixture page seed could not sync")
+    return ok(next_key)
+
+fn yazabase_sql_multi_ancestor_check_v1(root_path: Text) -> Result[Number, Text]:
+    let root: Number = root_open(root_path)?
+    let database_name: Text = "sql-multi-ancestor-smoke.ydb"
+    let db_uuid: Bytes = bytes_from_text("sql-multianc-001")
+    let initial_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(db_uuid, 0, 1, 1, 0, 2, 1)
+    let empty_storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, database_name, initial_header)?
+    let empty_closed: Boolean = yaza_db_storage_close_v1(empty_storage)?
+    if not empty_closed: return err("YDBv1 multi-ancestor fixture could not close its empty database")
+    let initialized: YazaDbCatalogBootstrapV1 = yaza_db_catalog_initialize_v1(root, database_name)?
+    let no_parameters: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let create_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(initialized.storage, initialized.wal, "CREATE TABLE deep_rows (id TEXT PRIMARY KEY)", no_parameters)?
+    if create_result.statement_kind != yaza_db_sql_statement_kind_create_table_v1() or not option_is_some(create_result.write_commit): return err("YDBv1 multi-ancestor fixture could not create its table")
+    let created: YazaDbWriteCommitV1 = option_unwrap(create_result.write_commit)
+    let catalog: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(created.storage.file, created.storage.header)?
+    let table_index: Number = list_count(catalog.sql_snapshot.tables) - 1
+    if table_index < 4 or table_index >= list_count(catalog.root_page_ids): return err("YDBv1 multi-ancestor fixture could not find its table")
+    let table: YazaSqlTableSchemaV1 = list_get(catalog.sql_snapshot.tables, table_index)
+    if table.name != "deep_rows" or list_count(table.columns) != 1 or list_get(table.columns, 0).type_id != 9: return err("YDBv1 multi-ancestor fixture loaded the wrong schema")
+    let table_root_page_id: Number = list_get(catalog.root_page_ids, table_index)
+    let next_key: Number = yazabase_sql_multi_ancestor_seed_v1(created.storage, table_root_page_id, table.columns, created.commit_ts)?
+    let target_text: Text = yazabase_sql_multi_ancestor_text_v1(next_key)?
+    let target_sql: Text = "'" + target_text + "'"
+    let insert_source: Text = "INSERT INTO deep_rows VALUES (" + target_sql + ")"
+    let insert_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(created.storage, created.wal, insert_source, no_parameters)?
+    if insert_result.statement_kind != yaza_db_sql_statement_kind_insert_v1() or not option_is_some(insert_result.write_commit): return err("YDBv1 multi-ancestor SQL INSERT did not commit")
+    let inserted: YazaDbWriteCommitV1 = option_unwrap(insert_result.write_commit)
+    let root_after: Bytes = yaza_db_storage_read_page_v1(inserted.storage.file, inserted.storage.header, table_root_page_id)?
+    let root_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(root_after, table_root_page_id)?
+    if root_header.page_type != 2 or root_header.level != 3 or root_header.count != 2: return err("YDBv1 catalog INSERT did not propagate through two full ancestors into the table root")
+    let inserted_wal_closed: Boolean = yaza_db_wal_log_close_v1(inserted.wal)?
+    let inserted_storage_closed: Boolean = yaza_db_storage_close_v1(inserted.storage)?
+    if not inserted_wal_closed or not inserted_storage_closed: return err("YDBv1 multi-ancestor SQL INSERT handles did not close")
+
+    let recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, database_name)?
+    let select_source: Text = "SELECT id FROM deep_rows WHERE id = " + target_sql
+    let selected_result: YazaDbSqlStatementResultV1 = yaza_db_execute_statement_v1(recovered.storage, recovered.wal, select_source, no_parameters)?
+    if not option_is_some(selected_result.query_result): return err("YDBv1 multi-ancestor fixture SELECT returned no result")
+    let selected: YazaSqlQueryResultV1 = option_unwrap(selected_result.query_result)
+    if list_count(selected.rows) != 1 or list_get(list_get(selected.rows, 0), 0).text_value != target_text: return err("YDBv1 SQL row did not survive multi-ancestor split recovery")
+    let recovered_wal_closed: Boolean = yaza_db_wal_log_close_v1(selected_result.wal)?
+    let recovered_storage_closed: Boolean = yaza_db_storage_close_v1(selected_result.storage)?
+    if not recovered_wal_closed or not recovered_storage_closed: return err("YDBv1 recovered SQL handles did not close")
+    let database_removed: Boolean = remove(root, database_name)?
+    let root_synced: Boolean = sync_directory(root)?
+    let root_closed: Boolean = close(root)?
+    if not database_removed or not root_synced or not root_closed: return err("YDBv1 multi-ancestor fixture cleanup failed")
+    return ok(text_length(target_text))
+
+start:
+    let outcome: Result[Number, Text] = yazabase_sql_multi_ancestor_check_v1(arg(1))
+    if result_is_ok(outcome):
+        say "yazabase-sql-multi-ancestor-split-v1-ok key-bytes=" + number_text(result_unwrap(outcome))
+    else:
+        say result_unwrap_error(outcome)

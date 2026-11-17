@@ -1,0 +1,131 @@
+# Bounded, persisted scalar CHECK constraints for YDBv1 DML.
+# This profile supports one column compared with one scalar literal.
+use "./catalog_schema_v1"
+use "./catalog_snapshot_v1"
+use "./query_v1"
+use "./row_v1"
+use "./sql_binder_v1"
+use "./sql_create_table_v1"
+use "./sql_executor_v1"
+use "./sql_insert_exec_v1"
+
+shape YazaDbSqlCheckV1:
+    constraint_id: Number
+    table_id: Number
+    column_ordinal: Number
+    comparison_operator: Number
+    literal: Text
+
+fn yaza_db_sql_check_parse_uint_v1(value: Text, maximum: Number) -> Result[Number, Text]:
+    if text_length(value) < 1 or maximum < 0: return err("YDBv1 CHECK catalog integer is empty or has an invalid bound")
+    var parsed: Number = 0
+    var index: Number = 0
+    while index < text_length(value):
+        let byte: Number = text_byte(value, index)
+        if byte < 48 or byte > 57: return err("YDBv1 CHECK catalog integer is not canonical unsigned decimal text")
+        let digit: Number = byte - 48
+        if parsed > maximum / 10 or parsed * 10 + digit > maximum: return err("YDBv1 CHECK catalog integer exceeds its bound")
+        set parsed = parsed * 10 + digit
+        set index = index + 1
+    if number_text(parsed) != value: return err("YDBv1 CHECK catalog integer is not canonical")
+    return ok(parsed)
+
+fn yaza_db_sql_check_load_v1(file: Number, file_header: YazaDbFileHeaderV1, loaded: YazaDbCatalogSnapshotWithRootsV1) -> Result[List[YazaDbSqlCheckV1], Text]:
+    let created: Result[List[YazaDbSqlCheckV1], Text] = list_try_new()
+    if not result_is_ok(created): return err(result_unwrap_error(created))
+    let checks: List[YazaDbSqlCheckV1] = result_unwrap(created)
+    let constraint_schema: List[YazaSqlColumnSchemaV1] = yaza_db_catalog_table_schema_v1(4)?
+    let stored: List[YazaDbRowV1] = yaza_db_catalog_snapshot_read_tree_v1(file, file_header, loaded.catalog.sys_constraints_root, constraint_schema, [0], loaded.sql_snapshot.version, yaza_db_catalog_max_object_id_v1())?
+    if list_count(stored) > yaza_db_catalog_max_object_id_v1(): return err("YDBv1 CHECK catalog scan exceeded the object-ID bound")
+    var row_index: Number = 0
+    while row_index < list_count(stored):
+        let row: YazaDbRowV1 = list_get(stored, row_index)
+        if list_count(row.values) != 6 or list_count(row.nulls) != 6 or row.version_ts < 1 or row.version_ts > loaded.sql_snapshot.version: return err("YDBv1 sys_constraints row is malformed or has an invalid version")
+        if list_get(row.nulls, 0) or list_get(row.nulls, 1) or list_get(row.nulls, 2) or list_get(row.nulls, 3) or list_get(row.nulls, 4): return err("YDBv1 sys_constraints required fields contain NULL")
+        if list_get(row.values, 3).integer_value == 4:
+            if list_get(row.nulls, 5): return err("YDBv1 CHECK catalog row lacks its comparison literal")
+            let constraint_id: Number = list_get(row.values, 0).integer_value
+            let table_id: Number = list_get(row.values, 1).integer_value
+            let key_text: Text = list_get(row.values, 4).text_value
+            let expression_text: Text = list_get(row.values, 5).text_value
+            if text_length(expression_text) > 4096: return err("YDBv1 CHECK catalog expression exceeds its size bound")
+            let ordinal: Number = yaza_db_sql_check_parse_uint_v1(key_text, 1023)?
+            var separator: Number = -1
+            var byte_index: Number = 0
+            while byte_index < text_length(expression_text):
+                if text_byte(expression_text, byte_index) == 58 and separator < 0:
+                    set separator = byte_index
+                set byte_index = byte_index + 1
+            if separator < 1 or separator >= text_length(expression_text) - 1: return err("YDBv1 CHECK catalog expression is malformed")
+            let operator_text: Text = text_slice(expression_text, 0, separator)
+            let comparison_operator: Number = yaza_db_sql_check_parse_uint_v1(operator_text, 6)?
+            if comparison_operator < 1: return err("YDBv1 CHECK catalog comparison operator is invalid")
+            let literal: Text = text_slice(expression_text, separator + 1, text_length(expression_text) - separator - 1)
+            if text_length(literal) < 1 or text_length(literal) > 4096: return err("YDBv1 CHECK catalog literal exceeds its size bound")
+            if constraint_id < 1 or table_id <= 4 or text_length(list_get(row.values, 2).text_value) == 0: return err("YDBv1 CHECK catalog identity is invalid")
+            let table_index: Number = yaza_db_catalog_snapshot_table_index_v1(loaded.sql_snapshot.tables, table_id)
+            if table_index < 0: return err("YDBv1 CHECK constraint references a missing physical table")
+            let table: YazaSqlTableSchemaV1 = list_get(loaded.sql_snapshot.tables, table_index)
+            if ordinal >= list_count(table.columns): return err("YDBv1 CHECK column ordinal exceeds the table schema")
+            let column: YazaSqlColumnSchemaV1 = list_get(table.columns, ordinal)
+            if not yaza_sql_bind_v1_comparison_valid(column.type_id, comparison_operator): return err("YDBv1 CHECK comparison operator is invalid for its column type")
+            let expected: Result[YazaSqlValueV1, Text] = yaza_sql_insert_materialize_default_v1(literal, column)
+            if not result_is_ok(expected): return err("YDBv1 CHECK catalog literal is invalid for its column type")
+            var prior_index: Number = 0
+            while prior_index < list_count(checks):
+                if list_get(checks, prior_index).constraint_id == constraint_id: return err("YDBv1 CHECK catalog contains a duplicate constraint identity")
+                set prior_index = prior_index + 1
+            if not list_try_push(checks, YazaDbSqlCheckV1(constraint_id, table_id, ordinal, comparison_operator, literal)): return err("YDBv1 CHECK catalog could not retain constraint metadata")
+        elif list_get(row.values, 3).integer_value != 1 and list_get(row.values, 3).integer_value != 2 and list_get(row.values, 3).integer_value != 3:
+            return err("YDBv1 sys_constraints contains an unsupported constraint kind")
+        set row_index = row_index + 1
+    return ok(checks)
+
+fn yaza_db_sql_check_validate_candidate_rows_v1(loaded: YazaDbCatalogSnapshotWithRootsV1, table_id: Number, rows: List[YazaDbRowV1], candidates: List[YazaSqlCreateCheckPlanV1]) -> Result[Boolean, Text]:
+    if table_id <= 4 or list_count(rows) > 65536 or list_count(candidates) < 1 or list_count(candidates) > 64: return err("YDBv1 ALTER TABLE CHECK validation is outside its bounded profile")
+    let table_index: Number = yaza_db_catalog_snapshot_table_index_v1(loaded.sql_snapshot.tables, table_id)
+    if table_index < 0: return err("YDBv1 ALTER TABLE CHECK target is missing from its catalog snapshot")
+    let table: YazaSqlTableSchemaV1 = list_get(loaded.sql_snapshot.tables, table_index)
+    var row_index: Number = 0
+    while row_index < list_count(rows):
+        let row: YazaDbRowV1 = list_get(rows, row_index)
+        if row.deleted or list_count(row.values) != list_count(table.columns) or list_count(row.nulls) != list_count(table.columns): return err("YDBv1 ALTER TABLE CHECK scan returned a malformed current row")
+        var check_index: Number = 0
+        while check_index < list_count(candidates):
+            let check: YazaSqlCreateCheckPlanV1 = list_get(candidates, check_index)
+            if check.column_ordinal < 0 or check.column_ordinal >= list_count(table.columns) or check.comparison_operator < 1 or check.comparison_operator > 6: return err("YDBv1 ALTER TABLE CHECK plan contains an invalid column or operator")
+            let column: YazaSqlColumnSchemaV1 = list_get(table.columns, check.column_ordinal)
+            let actual: YazaSqlValueV1 = list_get(row.values, check.column_ordinal)
+            if actual.type_id != column.type_id or actual.is_null != list_get(row.nulls, check.column_ordinal): return err("YDBv1 ALTER TABLE CHECK scan found inconsistent row typing")
+            if not actual.is_null:
+                let expected: YazaSqlValueV1 = yaza_sql_insert_materialize_default_v1(check.literal, column)?
+                if not expected.is_null and not yaza_sql_executor_apply_comparison_v1(yaza_sql_executor_compare_values_v1("", actual, expected), check.comparison_operator):
+                    return err("YDBv1 ALTER TABLE CHECK would reject an existing row")
+            set check_index = check_index + 1
+        set row_index = row_index + 1
+    return ok(true)
+
+fn yaza_db_sql_check_validate_rows_v1(file: Number, file_header: YazaDbFileHeaderV1, loaded: YazaDbCatalogSnapshotWithRootsV1, table_id: Number, rows: List[List[YazaSqlValueV1]]) -> Result[Boolean, Text]:
+    if table_id <= 4 or list_count(rows) > 1024: return err("YDBv1 CHECK validation is outside its bounded table or row profile")
+    let checks: List[YazaDbSqlCheckV1] = yaza_db_sql_check_load_v1(file, file_header, loaded)?
+    let table_index: Number = yaza_db_catalog_snapshot_table_index_v1(loaded.sql_snapshot.tables, table_id)
+    if table_index < 0: return err("YDBv1 CHECK validation target is missing from its catalog snapshot")
+    let table: YazaSqlTableSchemaV1 = list_get(loaded.sql_snapshot.tables, table_index)
+    var row_index: Number = 0
+    while row_index < list_count(rows):
+        let values: List[YazaSqlValueV1] = list_get(rows, row_index)
+        if list_count(values) != list_count(table.columns): return err("YDBv1 CHECK validation received a malformed row")
+        var check_index: Number = 0
+        while check_index < list_count(checks):
+            let check: YazaDbSqlCheckV1 = list_get(checks, check_index)
+            if check.table_id == table_id:
+                let column: YazaSqlColumnSchemaV1 = list_get(table.columns, check.column_ordinal)
+                let actual: YazaSqlValueV1 = list_get(values, check.column_ordinal)
+                if actual.type_id != column.type_id: return err("YDBv1 CHECK validation found a row value with the wrong type")
+                if not actual.is_null:
+                    let expected: YazaSqlValueV1 = yaza_sql_insert_materialize_default_v1(check.literal, column)?
+                    if not expected.is_null and not yaza_sql_executor_apply_comparison_v1(yaza_sql_executor_compare_values_v1("", actual, expected), check.comparison_operator):
+                        return err("YDBv1 CHECK constraint " + number_text(check.constraint_id) + " rejected a row")
+            set check_index = check_index + 1
+        set row_index = row_index + 1
+    return ok(true)

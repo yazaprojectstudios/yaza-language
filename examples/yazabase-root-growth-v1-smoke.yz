@@ -1,0 +1,596 @@
+use "std/fs"
+use "../yazabase/page_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/checkpoint_v1"
+use "../yazabase/transaction_v1"
+use "../yazabase/btree_scan_v1"
+use "../yazabase/wal_v1"
+
+shape YazaDbRootGrowthSeedV1:
+    storage: YazaDbStorageHandleV1
+    wal: YazaDbWalLogV1
+
+fn yazabase_root_growth_write_leaf_v1(storage: YazaDbStorageHandleV1, page_id: Number, has_low: Boolean, low_key: Bytes, has_high: Boolean, high_key: Bytes) -> Result[Boolean, Text]:
+    let blank: Bytes = yaza_db_page_new_v1(page_id, 0, 1, 0)?
+    let page: Bytes = yaza_db_page_set_fences_v1(blank, has_low, low_key, has_high, high_key)?
+    let written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, page)?
+    if written != yaza_db_page_size_v1(): return err("YDBv1 root-growth fixture could not persist a child leaf")
+    return ok(true)
+
+fn yazabase_root_growth_key_v1(value: Number) -> Result[Bytes, Text]:
+    if value < 0 or value > 4294967295: return err("YDBv1 root-growth test key is outside its 32-bit range")
+    let key: Bytes = bytes_try_new_zeroed(4)?
+    if not bytes_try_set(key, 0, value / 16777216) or not bytes_try_set(key, 1, value / 65536 % 256) or not bytes_try_set(key, 2, value / 256 % 256) or not bytes_try_set(key, 3, value % 256): return err("YDBv1 root-growth test key could not be encoded")
+    return ok(key)
+
+fn yazabase_root_growth_seed_v1(root: Number, database_name: Text, db_uuid: Bytes) -> Result[YazaDbRootGrowthSeedV1, Text]:
+    let initial_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(db_uuid, 0, 1, 1, 0, 2, 1)
+    let storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, database_name, initial_header)?
+
+    # Genesis fixture: root page 3 and its five level-0 children (pages 4..8).
+    let bitmap: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, 2)?
+    var bit_index: Number = 1
+    while bit_index <= 6:
+        let claimed: Boolean = yaza_db_bitmap_page_set_allocated_v1(bitmap, bit_index, true, 0, 2)?
+        if not claimed: return err("YDBv1 root-growth fixture could not reserve its genesis page range")
+        set bit_index = bit_index + 1
+    let bitmap_written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, bitmap)?
+    if bitmap_written != yaza_db_page_size_v1(): return err("YDBv1 root-growth fixture could not persist its allocation bitmap")
+
+    let empty: Bytes = bytes_from_text("")
+    let leaf_4: Boolean = yazabase_root_growth_write_leaf_v1(storage, 4, false, empty, true, bytes_from_text("b"))?
+    let leaf_5: Boolean = yazabase_root_growth_write_leaf_v1(storage, 5, true, bytes_from_text("b"), true, bytes_from_text("d"))?
+    let leaf_6: Boolean = yazabase_root_growth_write_leaf_v1(storage, 6, true, bytes_from_text("d"), true, bytes_from_text("f"))?
+    let leaf_7: Boolean = yazabase_root_growth_write_leaf_v1(storage, 7, true, bytes_from_text("f"), true, bytes_from_text("h"))?
+    let leaf_8: Boolean = yazabase_root_growth_write_leaf_v1(storage, 8, true, bytes_from_text("h"), false, empty)?
+
+    let inner_root: Bytes = yaza_db_page_new_v1(3, 0, 2, 1)?
+    if not yaza_db_page_set_upper_v1(inner_root, 8): return err("YDBv1 root-growth fixture could not set the source root's upper child")
+    let pointer_4: Bytes = bytes_try_new_zeroed(8)?
+    let pointer_5: Bytes = bytes_try_new_zeroed(8)?
+    let pointer_6: Bytes = bytes_try_new_zeroed(8)?
+    let pointer_7: Bytes = bytes_try_new_zeroed(8)?
+    if not yaza_db_write_uint_le_v1(pointer_4, 0, 8, 8) or not yaza_db_write_uint_le_v1(pointer_5, 0, 10, 8) or not yaza_db_write_uint_le_v1(pointer_6, 0, 12, 8) or not yaza_db_write_uint_le_v1(pointer_7, 0, 14, 8): return err("YDBv1 root-growth fixture could not encode source child pointers")
+    let slot_b: Number = yaza_db_page_add_slot_v1(inner_root, bytes_from_text("b"), pointer_4)?
+    let slot_d: Number = yaza_db_page_add_slot_v1(inner_root, bytes_from_text("d"), pointer_5)?
+    let slot_f: Number = yaza_db_page_add_slot_v1(inner_root, bytes_from_text("f"), pointer_6)?
+    let slot_h: Number = yaza_db_page_add_slot_v1(inner_root, bytes_from_text("h"), pointer_7)?
+    if slot_b != 0 or slot_d != 1 or slot_f != 2 or slot_h != 3: return err("YDBv1 root-growth fixture could not build sorted root separators")
+    let packed_root: Bytes = yaza_db_page_finalize_v1(inner_root)?
+    let root_written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, packed_root)?
+    if root_written != yaza_db_page_size_v1(): return err("YDBv1 root-growth fixture could not persist its source root")
+
+    let wal: YazaDbWalLogV1 = yaza_db_wal_log_open_for_v1(root, db_uuid)?
+    return ok(YazaDbRootGrowthSeedV1(storage, wal))
+
+fn yazabase_root_growth_leaf_seed_v1(root: Number, database_name: Text, db_uuid: Bytes) -> Result[YazaDbRootGrowthSeedV1, Text]:
+    let initial_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(db_uuid, 0, 1, 1, 0, 2, 1)
+    let storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, database_name, initial_header)?
+    let bitmap: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, 2)?
+    let root_claimed: Boolean = yaza_db_bitmap_page_set_allocated_v1(bitmap, 1, true, 0, 2)?
+    if not root_claimed: return err("YDBv1 LEAF-root fixture could not reserve page 3")
+    let bitmap_written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, bitmap)?
+    if bitmap_written != yaza_db_page_size_v1(): return err("YDBv1 LEAF-root fixture could not persist its bitmap")
+    let root_page: Bytes = yaza_db_page_new_v1(3, 0, 1, 0)?
+    let payload: Bytes = bytes_from_text("v")
+    let key_100: Bytes = yazabase_root_growth_key_v1(100)?
+    let key_200: Bytes = yazabase_root_growth_key_v1(200)?
+    let key_300: Bytes = yazabase_root_growth_key_v1(300)?
+    let key_400: Bytes = yazabase_root_growth_key_v1(400)?
+    let slot_100: Number = yaza_db_page_add_slot_v1(root_page, key_100, payload)?
+    let slot_200: Number = yaza_db_page_add_slot_v1(root_page, key_200, payload)?
+    let slot_300: Number = yaza_db_page_add_slot_v1(root_page, key_300, payload)?
+    let slot_400: Number = yaza_db_page_add_slot_v1(root_page, key_400, payload)?
+    if slot_100 != 0 or slot_200 != 1 or slot_300 != 2 or slot_400 != 3: return err("YDBv1 LEAF-root fixture could not create a sorted full root")
+    let packed_root: Bytes = yaza_db_page_finalize_v1(root_page)?
+    let root_written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, packed_root)?
+    if root_written != yaza_db_page_size_v1(): return err("YDBv1 LEAF-root fixture could not persist its root page")
+    let wal: YazaDbWalLogV1 = yaza_db_wal_log_open_for_v1(root, db_uuid)?
+    return ok(YazaDbRootGrowthSeedV1(storage, wal))
+
+fn yazabase_root_growth_full_seed_v1(root: Number) -> Result[YazaDbRootGrowthSeedV1, Text]:
+    let db_uuid: Bytes = bytes_from_text("fullroot-uuid-01")
+    let initial_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(db_uuid, 0, 1, 1, 0, 2, 1)
+    let storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, "root-growth-full-smoke.ydb", initial_header)?
+    let inner_slot_count: Number = 680
+    let child_count: Number = inner_slot_count + 1
+
+    let bitmap: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, 2)?
+    var bit_index: Number = 1
+    while bit_index <= child_count + 1:
+        let claimed: Boolean = yaza_db_bitmap_page_set_allocated_v1(bitmap, bit_index, true, 0, 2)?
+        if not claimed: return err("YDBv1 full-root fixture could not reserve its leaf-page range")
+        set bit_index = bit_index + 1
+    let bitmap_written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, bitmap)?
+    if bitmap_written != yaza_db_page_size_v1(): return err("YDBv1 full-root fixture could not persist its allocation bitmap")
+
+    let source_root: Bytes = yaza_db_page_new_v1(3, 0, 2, 1)?
+    if not yaza_db_page_set_upper_v1(source_root, 4 + inner_slot_count): return err("YDBv1 full-root fixture could not set the rightmost child")
+    var child_index: Number = 0
+    while child_index <= inner_slot_count:
+        let page_id: Number = 4 + child_index
+        let has_low: Boolean = child_index > 0
+        let has_high: Boolean = child_index < inner_slot_count
+        var low_key: Bytes = bytes_from_text("")
+        var high_key: Bytes = bytes_from_text("")
+        if has_low: set low_key = yazabase_root_growth_key_v1(1000 + (child_index - 1) * 32)?
+        if has_high: set high_key = yazabase_root_growth_key_v1(1000 + child_index * 32)?
+        let blank_leaf: Bytes = yaza_db_page_new_v1(page_id, 0, 1, 0)?
+        var leaf: Bytes = yaza_db_page_set_fences_v1(blank_leaf, has_low, low_key, has_high, high_key)?
+        if child_index == 0:
+            let key_100: Bytes = yazabase_root_growth_key_v1(100)?
+            let key_200: Bytes = yazabase_root_growth_key_v1(200)?
+            let key_300: Bytes = yazabase_root_growth_key_v1(300)?
+            let key_400: Bytes = yazabase_root_growth_key_v1(400)?
+            let payload: Bytes = bytes_from_text("v")
+            let leaf_slot_100: Number = yaza_db_page_add_slot_v1(leaf, key_100, payload)?
+            let leaf_slot_200: Number = yaza_db_page_add_slot_v1(leaf, key_200, payload)?
+            let leaf_slot_300: Number = yaza_db_page_add_slot_v1(leaf, key_300, payload)?
+            let leaf_slot_400: Number = yaza_db_page_add_slot_v1(leaf, key_400, payload)?
+            if leaf_slot_100 != 0 or leaf_slot_200 != 1 or leaf_slot_300 != 2 or leaf_slot_400 != 3: return err("YDBv1 full-root target leaf could not be populated")
+            set leaf = yaza_db_page_finalize_v1(leaf)?
+        let leaf_written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, leaf)?
+        if leaf_written != yaza_db_page_size_v1(): return err("YDBv1 full-root fixture could not persist every child leaf")
+
+        if child_index < inner_slot_count:
+            let separator: Bytes = high_key
+            let pointer: Bytes = bytes_try_new_zeroed(8)?
+            if not yaza_db_write_uint_le_v1(pointer, 0, page_id * 2, 8): return err("YDBv1 full-root fixture child pointer could not be encoded")
+            let added: Result[Number, Text] = yaza_db_page_add_slot_v1(source_root, separator, pointer)
+            if not result_is_ok(added): return err("YDBv1 full-root fixture could not fill its root: " + result_unwrap_error(added))
+        set child_index = child_index + 1
+
+    let finalized_source_root: Bytes = yaza_db_page_finalize_v1(source_root)?
+    let root_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(finalized_source_root, 3)?
+    if root_header.count != inner_slot_count: return err("YDBv1 full-root fixture did not build the intended number of separators")
+    let overflow_separator: Bytes = yazabase_root_growth_key_v1(1000 + inner_slot_count * 32)?
+    let overflow_pointer: Bytes = bytes_try_new_zeroed(8)?
+    if not yaza_db_write_uint_le_v1(overflow_pointer, 0, (4 + child_count) * 2, 8): return err("YDBv1 full-root overflow child pointer could not be encoded")
+    let overflow_probe: Result[Number, Text] = yaza_db_page_add_slot_v1(finalized_source_root, overflow_separator, overflow_pointer)
+    if result_is_ok(overflow_probe): return err("YDBv1 full-root fixture unexpectedly had room for another separator")
+    let packed_root: Bytes = yaza_db_page_finalize_v1(source_root)?
+    let root_written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, packed_root)?
+    if root_written != yaza_db_page_size_v1(): return err("YDBv1 full-root fixture could not persist its root")
+    let wal: YazaDbWalLogV1 = yaza_db_wal_log_open_for_v1(root, db_uuid)?
+    return ok(YazaDbRootGrowthSeedV1(storage, wal))
+
+fn yazabase_root_growth_nested_seed_v1(root: Number, database_name: Text, db_uuid: Bytes) -> Result[YazaDbRootGrowthSeedV1, Text]:
+    let initial_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(db_uuid, 0, 1, 1, 0, 2, 1)
+    let storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, database_name, initial_header)?
+    let inner_slot_count: Number = 680
+    let child_count: Number = inner_slot_count + 1
+    let root_separator: Bytes = yazabase_root_growth_key_v1(30000)?
+
+    let bitmap: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, 2)?
+    var bit_index: Number = 1
+    while bit_index <= child_count + 4:
+        let claimed: Boolean = yaza_db_bitmap_page_set_allocated_v1(bitmap, bit_index, true, 0, 2)?
+        if not claimed: return err("YDBv1 nested-parent fixture could not reserve its page range")
+        set bit_index = bit_index + 1
+    let bitmap_written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, bitmap)?
+    if bitmap_written != yaza_db_page_size_v1(): return err("YDBv1 nested-parent fixture could not persist its allocation bitmap")
+
+    let parent: Bytes = yaza_db_page_new_v1(4, 0, 2, 1)?
+    if not yaza_db_page_set_upper_v1(parent, 4 + child_count): return err("YDBv1 nested-parent fixture could not set the full parent's upper child")
+    let empty: Bytes = bytes_from_text("")
+    var child_index: Number = 0
+    while child_index <= inner_slot_count:
+        let page_id: Number = 5 + child_index
+        let has_low: Boolean = child_index > 0
+        let has_high: Boolean = child_index < inner_slot_count
+        var low_key: Bytes = empty
+        var high_key: Bytes = root_separator
+        if has_low: set low_key = yazabase_root_growth_key_v1(1000 + (child_index - 1) * 32)?
+        if has_high: set high_key = yazabase_root_growth_key_v1(1000 + child_index * 32)?
+        let blank_leaf: Bytes = yaza_db_page_new_v1(page_id, 0, 1, 0)?
+        var leaf: Bytes = yaza_db_page_set_fences_v1(blank_leaf, has_low, low_key, has_high, high_key)?
+        if child_index == 0:
+            let key_100: Bytes = yazabase_root_growth_key_v1(100)?
+            let key_200: Bytes = yazabase_root_growth_key_v1(200)?
+            let key_300: Bytes = yazabase_root_growth_key_v1(300)?
+            let key_400: Bytes = yazabase_root_growth_key_v1(400)?
+            let payload: Bytes = bytes_from_text("v")
+            let leaf_slot_100: Number = yaza_db_page_add_slot_v1(leaf, key_100, payload)?
+            let leaf_slot_200: Number = yaza_db_page_add_slot_v1(leaf, key_200, payload)?
+            let leaf_slot_300: Number = yaza_db_page_add_slot_v1(leaf, key_300, payload)?
+            let leaf_slot_400: Number = yaza_db_page_add_slot_v1(leaf, key_400, payload)?
+            if leaf_slot_100 != 0 or leaf_slot_200 != 1 or leaf_slot_300 != 2 or leaf_slot_400 != 3: return err("YDBv1 nested-parent target leaf could not be populated")
+            set leaf = yaza_db_page_finalize_v1(leaf)?
+        let leaf_written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, leaf)?
+        if leaf_written != yaza_db_page_size_v1(): return err("YDBv1 nested-parent fixture could not persist a leaf")
+        if child_index < inner_slot_count:
+            let separator: Bytes = high_key
+            let pointer: Bytes = bytes_try_new_zeroed(8)?
+            if not yaza_db_write_uint_le_v1(pointer, 0, page_id * 2, 8): return err("YDBv1 nested-parent fixture could not encode a child pointer")
+            let added: Result[Number, Text] = yaza_db_page_add_slot_v1(parent, separator, pointer)
+            if not result_is_ok(added): return err("YDBv1 nested-parent fixture could not fill its non-root page: " + result_unwrap_error(added))
+        set child_index = child_index + 1
+
+    let packed_parent: Bytes = yaza_db_page_finalize_v1(parent)?
+    let fenced_parent: Bytes = yaza_db_page_set_fences_v1(packed_parent, false, empty, true, root_separator)?
+    let parent_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(fenced_parent, 4)?
+    if parent_header.count != inner_slot_count: return err("YDBv1 nested-parent fixture did not build the intended separator count")
+    let parent_overflow_key: Bytes = yazabase_root_growth_key_v1(1000 + inner_slot_count * 32)?
+    let parent_overflow_pointer: Bytes = bytes_try_new_zeroed(8)?
+    if not yaza_db_write_uint_le_v1(parent_overflow_pointer, 0, (5 + child_count) * 2, 8): return err("YDBv1 nested-parent fixture could not encode its overflow pointer")
+    let parent_overflow: Result[Number, Text] = yaza_db_page_add_slot_v1(fenced_parent, parent_overflow_key, parent_overflow_pointer)
+    if result_is_ok(parent_overflow): return err("YDBv1 nested-parent fixture unexpectedly left room in its non-root page")
+    let parent_written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, fenced_parent)?
+    if parent_written != yaza_db_page_size_v1(): return err("YDBv1 nested-parent fixture could not persist its full non-root page")
+
+    let upper_inner: Bytes = yaza_db_page_new_v1(5 + child_count, 0, 2, 1)?
+    if not yaza_db_page_set_upper_v1(upper_inner, 6 + child_count): return err("YDBv1 nested-parent fixture could not set the root's upper child")
+    let packed_upper_inner: Bytes = yaza_db_page_finalize_v1(upper_inner)?
+    let fenced_upper_inner: Bytes = yaza_db_page_set_fences_v1(packed_upper_inner, true, root_separator, false, empty)?
+    let upper_inner_written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, fenced_upper_inner)?
+    if upper_inner_written != yaza_db_page_size_v1(): return err("YDBv1 nested-parent fixture could not persist the root's upper inner page")
+    let upper_leaf: Bytes = yaza_db_page_new_v1(6 + child_count, 0, 1, 0)?
+    let fenced_upper_leaf: Bytes = yaza_db_page_set_fences_v1(upper_leaf, true, root_separator, false, empty)?
+    let upper_leaf_written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, fenced_upper_leaf)?
+    if upper_leaf_written != yaza_db_page_size_v1(): return err("YDBv1 nested-parent fixture could not persist the root's upper leaf")
+
+    let inner_root: Bytes = yaza_db_page_new_v1(3, 0, 2, 2)?
+    if not yaza_db_page_set_upper_v1(inner_root, 5 + child_count): return err("YDBv1 nested-parent fixture could not set the root's upper child")
+    let lower_pointer: Bytes = bytes_try_new_zeroed(8)?
+    if not yaza_db_write_uint_le_v1(lower_pointer, 0, 8, 8): return err("YDBv1 nested-parent fixture could not encode the lower root child")
+    let root_slot: Number = yaza_db_page_add_slot_v1(inner_root, root_separator, lower_pointer)?
+    if root_slot != 0: return err("YDBv1 nested-parent fixture could not build the root separator")
+    let packed_root: Bytes = yaza_db_page_finalize_v1(inner_root)?
+    let root_written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, packed_root)?
+    if root_written != yaza_db_page_size_v1(): return err("YDBv1 nested-parent fixture could not persist its root")
+
+    let wal: YazaDbWalLogV1 = yaza_db_wal_log_open_for_v1(root, db_uuid)?
+    return ok(YazaDbRootGrowthSeedV1(storage, wal))
+
+fn yazabase_root_growth_deep_seed_v1(root: Number, database_name: Text, db_uuid: Bytes) -> Result[YazaDbRootGrowthSeedV1, Text]:
+    let initial_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(db_uuid, 0, 1, 1, 0, 2, 1)
+    let storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, database_name, initial_header)?
+    let q_slot_count: Number = 680
+    let p_slot_count: Number = 680
+    let root_separator: Bytes = yazabase_root_growth_key_v1(1000000)?
+    let first_q_separator: Bytes = yazabase_root_growth_key_v1(10000)?
+    let empty: Bytes = bytes_from_text("")
+
+    let bitmap: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, 2)?
+    var bit_index: Number = 1
+    while bit_index <= 2047:
+        let claimed: Boolean = yaza_db_bitmap_page_set_allocated_v1(bitmap, bit_index, true, 0, 2)?
+        if not claimed: return err("YDBv1 deep-parent fixture could not reserve its pages")
+        set bit_index = bit_index + 1
+    let bitmap_written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, bitmap)?
+    if bitmap_written != yaza_db_page_size_v1(): return err("YDBv1 deep-parent fixture could not persist its bitmap")
+
+    # Build the target full level-1 INNER page and all its routable leaf children.
+    let p0: Bytes = yaza_db_page_new_v1(5, 0, 2, 1)?
+    if not yaza_db_page_set_upper_v1(p0, 1366): return err("YDBv1 deep-parent fixture could not set the target INNER upper child")
+    var p_index: Number = 0
+    while p_index <= p_slot_count:
+        let leaf_page_id: Number = 686 + p_index
+        let has_low: Boolean = p_index > 0
+        let has_high: Boolean = true
+        var leaf_low: Bytes = empty
+        var leaf_high: Bytes = first_q_separator
+        if has_low: set leaf_low = yazabase_root_growth_key_v1(100 + (p_index - 1) * 10)?
+        if has_high: set leaf_high = yazabase_root_growth_key_v1(100 + p_index * 10)?
+        let blank_leaf: Bytes = yaza_db_page_new_v1(leaf_page_id, 0, 1, 0)?
+        var leaf: Bytes = yaza_db_page_set_fences_v1(blank_leaf, has_low, leaf_low, has_high, leaf_high)?
+        if p_index == 26:
+            let key_350: Bytes = yazabase_root_growth_key_v1(350)?
+            let key_352: Bytes = yazabase_root_growth_key_v1(352)?
+            let key_354: Bytes = yazabase_root_growth_key_v1(354)?
+            let key_356: Bytes = yazabase_root_growth_key_v1(356)?
+            let payload: Bytes = bytes_from_text("v")
+            let slot_350: Number = yaza_db_page_add_slot_v1(leaf, key_350, payload)?
+            let slot_352: Number = yaza_db_page_add_slot_v1(leaf, key_352, payload)?
+            let slot_354: Number = yaza_db_page_add_slot_v1(leaf, key_354, payload)?
+            let slot_356: Number = yaza_db_page_add_slot_v1(leaf, key_356, payload)?
+            if slot_350 != 0 or slot_352 != 1 or slot_354 != 2 or slot_356 != 3: return err("YDBv1 deep-parent target leaf could not be populated")
+            set leaf = yaza_db_page_finalize_v1(leaf)?
+        let leaf_written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, leaf)?
+        if leaf_written != yaza_db_page_size_v1(): return err("YDBv1 deep-parent fixture could not persist a lower leaf")
+        if p_index < p_slot_count:
+            let separator: Bytes = yazabase_root_growth_key_v1(100 + p_index * 10)?
+            let pointer: Bytes = bytes_try_new_zeroed(8)?
+            if not yaza_db_write_uint_le_v1(pointer, 0, leaf_page_id * 2, 8): return err("YDBv1 deep-parent leaf pointer could not be encoded")
+            let added: Result[Number, Text] = yaza_db_page_add_slot_v1(p0, separator, pointer)
+            if not result_is_ok(added): return err("YDBv1 deep-parent fixture could not fill the target INNER page: " + result_unwrap_error(added))
+        set p_index = p_index + 1
+    let packed_p0: Bytes = yaza_db_page_finalize_v1(p0)?
+    let fenced_p0: Bytes = yaza_db_page_set_fences_v1(packed_p0, false, empty, true, first_q_separator)?
+    let p0_written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, fenced_p0)?
+    if p0_written != yaza_db_page_size_v1(): return err("YDBv1 deep-parent fixture could not persist the target INNER page")
+
+    # The level-2 page above it is full too; its parent root still has room.
+    let q0: Bytes = yaza_db_page_new_v1(4, 0, 2, 2)?
+    if not yaza_db_page_set_upper_v1(q0, 685): return err("YDBv1 deep-parent fixture could not set the middle INNER upper child")
+    var q_index: Number = 0
+    while q_index < q_slot_count:
+        let child_page_id: Number = 5 + q_index
+        let separator: Bytes = yazabase_root_growth_key_v1(10000 + q_index * 1000)?
+        let pointer: Bytes = bytes_try_new_zeroed(8)?
+        if not yaza_db_write_uint_le_v1(pointer, 0, child_page_id * 2, 8): return err("YDBv1 deep-parent inner pointer could not be encoded")
+        let added: Result[Number, Text] = yaza_db_page_add_slot_v1(q0, separator, pointer)
+        if not result_is_ok(added): return err("YDBv1 deep-parent fixture could not fill the middle INNER page: " + result_unwrap_error(added))
+        set q_index = q_index + 1
+    let packed_q0: Bytes = yaza_db_page_finalize_v1(q0)?
+    let fenced_q0: Bytes = yaza_db_page_set_fences_v1(packed_q0, false, empty, true, root_separator)?
+    let q0_written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, fenced_q0)?
+    if q0_written != yaza_db_page_size_v1(): return err("YDBv1 deep-parent fixture could not persist the middle INNER page")
+
+    var sibling_index: Number = 1
+    while sibling_index <= q_slot_count:
+        let p_page_id: Number = 5 + sibling_index
+        let child_leaf_id: Number = 1366 + sibling_index
+        let p_low: Bytes = yazabase_root_growth_key_v1(10000 + (sibling_index - 1) * 1000)?
+        var p_high: Bytes = root_separator
+        if sibling_index < q_slot_count: set p_high = yazabase_root_growth_key_v1(10000 + sibling_index * 1000)?
+        let sibling_inner: Bytes = yaza_db_page_new_v1(p_page_id, 0, 2, 1)?
+        if not yaza_db_page_set_upper_v1(sibling_inner, child_leaf_id): return err("YDBv1 deep-parent fixture could not set a sibling's only child")
+        let packed_sibling: Bytes = yaza_db_page_finalize_v1(sibling_inner)?
+        let fenced_sibling: Bytes = yaza_db_page_set_fences_v1(packed_sibling, true, p_low, true, p_high)?
+        let sibling_written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, fenced_sibling)?
+        if sibling_written != yaza_db_page_size_v1(): return err("YDBv1 deep-parent fixture could not persist a sibling INNER page")
+        let sibling_leaf: Bytes = yaza_db_page_new_v1(child_leaf_id, 0, 1, 0)?
+        let fenced_sibling_leaf: Bytes = yaza_db_page_set_fences_v1(sibling_leaf, true, p_low, true, p_high)?
+        let sibling_leaf_written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, fenced_sibling_leaf)?
+        if sibling_leaf_written != yaza_db_page_size_v1(): return err("YDBv1 deep-parent fixture could not persist a sibling leaf")
+        set sibling_index = sibling_index + 1
+
+    let upper_q: Bytes = yaza_db_page_new_v1(2047, 0, 2, 2)?
+    if not yaza_db_page_set_upper_v1(upper_q, 2048): return err("YDBv1 deep-parent fixture could not set the root's upper Q child")
+    let packed_upper_q: Bytes = yaza_db_page_finalize_v1(upper_q)?
+    let fenced_upper_q: Bytes = yaza_db_page_set_fences_v1(packed_upper_q, true, root_separator, false, empty)?
+    let upper_q_written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, fenced_upper_q)?
+    if upper_q_written != yaza_db_page_size_v1(): return err("YDBv1 deep-parent fixture could not persist the upper Q page")
+    let upper_p: Bytes = yaza_db_page_new_v1(2048, 0, 2, 1)?
+    if not yaza_db_page_set_upper_v1(upper_p, 2049): return err("YDBv1 deep-parent fixture could not set the upper P child's leaf")
+    let packed_upper_p: Bytes = yaza_db_page_finalize_v1(upper_p)?
+    let fenced_upper_p: Bytes = yaza_db_page_set_fences_v1(packed_upper_p, true, root_separator, false, empty)?
+    let upper_p_written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, fenced_upper_p)?
+    if upper_p_written != yaza_db_page_size_v1(): return err("YDBv1 deep-parent fixture could not persist the upper P page")
+    let upper_leaf: Bytes = yaza_db_page_new_v1(2049, 0, 1, 0)?
+    let fenced_upper_leaf: Bytes = yaza_db_page_set_fences_v1(upper_leaf, true, root_separator, false, empty)?
+    let upper_leaf_written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, fenced_upper_leaf)?
+    if upper_leaf_written != yaza_db_page_size_v1(): return err("YDBv1 deep-parent fixture could not persist the root's upper leaf")
+
+    let root_page: Bytes = yaza_db_page_new_v1(3, 0, 2, 3)?
+    if not yaza_db_page_set_upper_v1(root_page, 2047): return err("YDBv1 deep-parent fixture could not set the root's upper child")
+    let root_pointer: Bytes = bytes_try_new_zeroed(8)?
+    if not yaza_db_write_uint_le_v1(root_pointer, 0, 8, 8): return err("YDBv1 deep-parent fixture could not encode the lower root child")
+    let root_slot: Number = yaza_db_page_add_slot_v1(root_page, root_separator, root_pointer)?
+    if root_slot != 0: return err("YDBv1 deep-parent fixture could not add its root separator")
+    let packed_root: Bytes = yaza_db_page_finalize_v1(root_page)?
+    let root_written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, packed_root)?
+    if root_written != yaza_db_page_size_v1(): return err("YDBv1 deep-parent fixture could not persist its root")
+    let wal: YazaDbWalLogV1 = yaza_db_wal_log_open_for_v1(root, db_uuid)?
+    return ok(YazaDbRootGrowthSeedV1(storage, wal))
+
+fn yazabase_root_growth_check_v1(root_path: Text) -> Result[Number, Text]:
+    let root: Number = root_open(root_path)?
+
+    # A full root that is still a LEAF must become an INNER root with two
+    # allocated LEAF children in one reversible page-set record.
+    let leaf_seed: YazaDbRootGrowthSeedV1 = yazabase_root_growth_leaf_seed_v1(root, "root-growth-leaf-smoke.ydb", bytes_from_text("leafroot-uuid001"))?
+    let leaf_transaction: YazaDbWriteTransactionV1 = yaza_db_write_transaction_begin_v1(leaf_seed.storage, leaf_seed.wal)?
+    let leaf_key: Bytes = yazabase_root_growth_key_v1(350)?
+    let leaf_split: YazaDbWriteTransactionV1 = yaza_db_write_transaction_split_leaf_with_parent_v1(leaf_transaction, 3, 3, leaf_key)?
+    let leaf_root: Bytes = yaza_db_storage_read_page_v1(leaf_split.storage.file, leaf_split.storage.header, 3)?
+    let leaf_root_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(leaf_root, 3)?
+    if leaf_root_header.page_type != 2 or leaf_root_header.level != 1 or leaf_root_header.count != 1: return err("YDBv1 full LEAF root did not promote to one INNER level")
+    let leaf_commit: YazaDbWriteCommitV1 = yaza_db_write_transaction_commit_v1(leaf_split)?
+    let leaf_wal_closed: Boolean = yaza_db_wal_log_close_v1(leaf_commit.wal)?
+    let leaf_storage_closed: Boolean = yaza_db_storage_close_v1(leaf_commit.storage)?
+    if not leaf_wal_closed or not leaf_storage_closed: return err("YDBv1 LEAF-root writer handles could not close")
+    let leaf_recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "root-growth-leaf-smoke.ydb")?
+    let leaf_left_key: Bytes = yazabase_root_growth_key_v1(250)?
+    let leaf_left_seek: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(leaf_recovered.storage.file, leaf_recovered.storage.header, 3, leaf_left_key)?
+    let leaf_right_seek: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(leaf_recovered.storage.file, leaf_recovered.storage.header, 3, leaf_key)?
+    if leaf_left_seek.leaf_page_id != 4 or leaf_right_seek.leaf_page_id != 5: return err("YDBv1 LEAF-root promotion did not preserve left/right seek routing after reopen")
+    let leaf_recovered_wal_closed: Boolean = yaza_db_wal_log_close_v1(leaf_recovered.wal)?
+    let leaf_recovered_storage_closed: Boolean = yaza_db_storage_close_v1(leaf_recovered.storage)?
+    if not leaf_recovered_wal_closed or not leaf_recovered_storage_closed: return err("YDBv1 LEAF-root recovery handles could not close")
+
+    let leaf_loser_seed: YazaDbRootGrowthSeedV1 = yazabase_root_growth_leaf_seed_v1(root, "root-growth-leaf-loser.ydb", bytes_from_text("leafroot-losr001"))?
+    let leaf_loser_transaction: YazaDbWriteTransactionV1 = yaza_db_write_transaction_begin_v1(leaf_loser_seed.storage, leaf_loser_seed.wal)?
+    let leaf_loser_split: YazaDbWriteTransactionV1 = yaza_db_write_transaction_split_leaf_with_parent_v1(leaf_loser_transaction, 3, 3, leaf_key)?
+    let leaf_loser_wal_closed: Boolean = yaza_db_wal_log_close_v1(leaf_loser_split.wal)?
+    let leaf_loser_storage_closed: Boolean = yaza_db_storage_close_v1(leaf_loser_split.storage)?
+    if not leaf_loser_wal_closed or not leaf_loser_storage_closed: return err("YDBv1 uncommitted LEAF-root handles could not close")
+    let leaf_loser_recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "root-growth-leaf-loser.ydb")?
+    let leaf_loser_root: Bytes = yaza_db_storage_read_page_v1(leaf_loser_recovered.storage.file, leaf_loser_recovered.storage.header, 3)?
+    let leaf_loser_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(leaf_loser_root, 3)?
+    let leaf_loser_bitmap: Bytes = yaza_db_storage_read_page_v1(leaf_loser_recovered.storage.file, leaf_loser_recovered.storage.header, 2)?
+    let leaf_loser_left_address: YazaDbBitmapAddressV1 = yaza_db_bitmap_address_v1(4)?
+    let leaf_loser_right_address: YazaDbBitmapAddressV1 = yaza_db_bitmap_address_v1(5)?
+    let leaf_loser_left_allocated: Boolean = yaza_db_bitmap_page_bit_v1(leaf_loser_bitmap, leaf_loser_left_address.bit_index, 2)?
+    let leaf_loser_right_allocated: Boolean = yaza_db_bitmap_page_bit_v1(leaf_loser_bitmap, leaf_loser_right_address.bit_index, 2)?
+    if leaf_loser_header.page_type != 1 or leaf_loser_header.level != 0 or leaf_loser_header.count != 4 or leaf_loser_left_allocated or leaf_loser_right_allocated: return err("YDBv1 loser LEAF-root recovery did not restore the root and release both children")
+    let leaf_loser_wal_again: Boolean = yaza_db_wal_log_close_v1(leaf_loser_recovered.wal)?
+    let leaf_loser_storage_again: Boolean = yaza_db_storage_close_v1(leaf_loser_recovered.storage)?
+    if not leaf_loser_wal_again or not leaf_loser_storage_again: return err("YDBv1 loser LEAF-root recovery handles could not close")
+
+    let committed_seed: YazaDbRootGrowthSeedV1 = yazabase_root_growth_seed_v1(root, "root-growth-smoke.ydb", bytes_from_text("root-growth-uuid"))?
+    let storage: YazaDbStorageHandleV1 = committed_seed.storage
+    let wal: YazaDbWalLogV1 = committed_seed.wal
+    let begun: YazaDbWriteTransactionV1 = yaza_db_write_transaction_begin_v1(storage, wal)?
+    let grown: YazaDbWriteTransactionV1 = yaza_db_write_transaction_grow_root_v1(begun, 3)?
+    let root_before_commit: Bytes = yaza_db_storage_read_page_v1(grown.storage.file, grown.storage.header, 3)?
+    let root_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(root_before_commit, 3)?
+    if root_header.level != 2 or root_header.count != 1 or root_header.upper < 4: return err("YDBv1 transactional root growth did not publish the new root shape")
+    let committed: YazaDbWriteCommitV1 = yaza_db_write_transaction_commit_v1(grown)?
+    if committed.txn_id != 1 or committed.commit_ts != 1: return err("YDBv1 root growth did not commit with its transaction")
+    let wal_closed: Boolean = yaza_db_wal_log_close_v1(committed.wal)?
+    let storage_closed: Boolean = yaza_db_storage_close_v1(committed.storage)?
+    if not wal_closed or not storage_closed: return err("YDBv1 root-growth writer handles could not close")
+
+    let recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "root-growth-smoke.ydb")?
+    let persisted_root: Bytes = yaza_db_storage_read_page_v1(recovered.storage.file, recovered.storage.header, 3)?
+    let persisted_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(persisted_root, 3)?
+    if persisted_header.level != 2 or persisted_header.count != 1: return err("YDBv1 root growth did not survive database reopen")
+    let seek_a: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(recovered.storage.file, recovered.storage.header, 3, bytes_from_text("a"))?
+    let seek_c: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(recovered.storage.file, recovered.storage.header, 3, bytes_from_text("c"))?
+    let seek_f: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(recovered.storage.file, recovered.storage.header, 3, bytes_from_text("f"))?
+    let seek_z: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(recovered.storage.file, recovered.storage.header, 3, bytes_from_text("z"))?
+    if seek_a.leaf_page_id != 4 or seek_c.leaf_page_id != 5 or seek_f.leaf_page_id != 7 or seek_z.leaf_page_id != 8: return err("YDBv1 seek routed incorrectly through the grown root")
+    let recovered_wal_closed: Boolean = yaza_db_wal_log_close_v1(recovered.wal)?
+    let recovered_storage_closed: Boolean = yaza_db_storage_close_v1(recovered.storage)?
+    if not recovered_wal_closed or not recovered_storage_closed: return err("YDBv1 root-growth recovery handles could not close")
+
+    # A crash after NODE_SPLIT but before COMMIT must restore the old root and
+    # release both allocated child pages. Reopen a separate seeded database.
+    let loser_seed: YazaDbRootGrowthSeedV1 = yazabase_root_growth_seed_v1(root, "root-growth-loser.ydb", bytes_from_text("grow-loser-uuid1"))?
+    let loser_transaction: YazaDbWriteTransactionV1 = yaza_db_write_transaction_begin_v1(loser_seed.storage, loser_seed.wal)?
+    let loser_grown: YazaDbWriteTransactionV1 = yaza_db_write_transaction_grow_root_v1(loser_transaction, 3)?
+    let loser_wal_closed: Boolean = yaza_db_wal_log_close_v1(loser_grown.wal)?
+    let loser_storage_closed: Boolean = yaza_db_storage_close_v1(loser_grown.storage)?
+    if not loser_wal_closed or not loser_storage_closed: return err("YDBv1 uncommitted root-growth handles could not close")
+    let loser_recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "root-growth-loser.ydb")?
+    let loser_root: Bytes = yaza_db_storage_read_page_v1(loser_recovered.storage.file, loser_recovered.storage.header, 3)?
+    let loser_root_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(loser_root, 3)?
+    if loser_root_header.level != 1 or loser_root_header.count != 4: return err("YDBv1 loser root promotion recovery did not restore the old root level and separators")
+    let loser_bitmap: Bytes = yaza_db_storage_read_page_v1(loser_recovered.storage.file, loser_recovered.storage.header, 2)?
+    let loser_left_address: YazaDbBitmapAddressV1 = yaza_db_bitmap_address_v1(9)?
+    let loser_right_address: YazaDbBitmapAddressV1 = yaza_db_bitmap_address_v1(10)?
+    let loser_left_allocated: Boolean = yaza_db_bitmap_page_bit_v1(loser_bitmap, loser_left_address.bit_index, 2)?
+    let loser_right_allocated: Boolean = yaza_db_bitmap_page_bit_v1(loser_bitmap, loser_right_address.bit_index, 2)?
+    if loser_left_allocated or loser_right_allocated: return err("YDBv1 loser root promotion recovery leaked its new child allocations")
+    let loser_seek_a: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(loser_recovered.storage.file, loser_recovered.storage.header, 3, bytes_from_text("a"))?
+    let loser_seek_z: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(loser_recovered.storage.file, loser_recovered.storage.header, 3, bytes_from_text("z"))?
+    if loser_seek_a.leaf_page_id != 4 or loser_seek_z.leaf_page_id != 8: return err("YDBv1 loser root promotion recovery damaged the original tree routes")
+    let loser_recovery_wal_closed: Boolean = yaza_db_wal_log_close_v1(loser_recovered.wal)?
+    let loser_recovery_storage_closed: Boolean = yaza_db_storage_close_v1(loser_recovered.storage)?
+    if not loser_recovery_wal_closed or not loser_recovery_storage_closed: return err("YDBv1 loser root promotion recovery handles could not close")
+
+    let loser_again: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "root-growth-loser.ydb")?
+    if loser_again.applied_checkpoint_count != 0: return err("YDBv1 loser root promotion recovery was not idempotent")
+    let loser_again_wal_closed: Boolean = yaza_db_wal_log_close_v1(loser_again.wal)?
+    let loser_again_storage_closed: Boolean = yaza_db_storage_close_v1(loser_again.storage)?
+    if not loser_again_wal_closed or not loser_again_storage_closed: return err("YDBv1 idempotent loser root-growth handles could not close")
+
+    # Exercise the real leaf-split admission path when its immediate root is
+    # physically full. It must promote the root, re-seek, and finish the split.
+    let full_seed: YazaDbRootGrowthSeedV1 = yazabase_root_growth_full_seed_v1(root)?
+    let full_transaction: YazaDbWriteTransactionV1 = yaza_db_write_transaction_begin_v1(full_seed.storage, full_seed.wal)?
+    let target_key: Bytes = yazabase_root_growth_key_v1(350)?
+    let full_split: YazaDbWriteTransactionV1 = yaza_db_write_transaction_split_leaf_with_parent_v1(full_transaction, 3, 4, target_key)?
+    let full_root: Bytes = yaza_db_storage_read_page_v1(full_split.storage.file, full_split.storage.header, 3)?
+    let full_root_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(full_root, 3)?
+    if full_root_header.level != 2 or full_root_header.count != 1: return err("YDBv1 full-root leaf split did not promote and retain the root")
+    let committed_full_split: YazaDbWriteCommitV1 = yaza_db_write_transaction_commit_v1(full_split)?
+    let full_wal_closed: Boolean = yaza_db_wal_log_close_v1(committed_full_split.wal)?
+    let full_storage_closed: Boolean = yaza_db_storage_close_v1(committed_full_split.storage)?
+    if not full_wal_closed or not full_storage_closed: return err("YDBv1 full-root writer handles could not close")
+    let full_recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "root-growth-full-smoke.ydb")?
+    let full_left_key: Bytes = yazabase_root_growth_key_v1(100)?
+    let full_left_seek: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(full_recovered.storage.file, full_recovered.storage.header, 3, full_left_key)?
+    let full_right_seek: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(full_recovered.storage.file, full_recovered.storage.header, 3, target_key)?
+    if full_left_seek.leaf_page_id != 4 or full_right_seek.leaf_page_id != 687: return err("YDBv1 full-root split did not route to both halves of the new leaf range")
+    let full_recovered_wal_closed: Boolean = yaza_db_wal_log_close_v1(full_recovered.wal)?
+    let full_recovered_storage_closed: Boolean = yaza_db_storage_close_v1(full_recovered.storage)?
+    if not full_recovered_wal_closed or not full_recovered_storage_closed: return err("YDBv1 full-root recovery handles could not close")
+
+    # A full non-root INNER page must split with its still-open root parent in
+    # the same five-page NODE_SPLIT record as the leaf split.
+    let nested_seed: YazaDbRootGrowthSeedV1 = yazabase_root_growth_nested_seed_v1(root, "root-growth-nested-smoke.ydb", bytes_from_text("nsp-uuid-0000001"))?
+    let nested_transaction: YazaDbWriteTransactionV1 = yaza_db_write_transaction_begin_v1(nested_seed.storage, nested_seed.wal)?
+    let nested_key: Bytes = yazabase_root_growth_key_v1(350)?
+    let nested_split: YazaDbWriteTransactionV1 = yaza_db_write_transaction_split_leaf_with_parent_v1(nested_transaction, 3, 5, nested_key)?
+    let nested_root: Bytes = yaza_db_storage_read_page_v1(nested_split.storage.file, nested_split.storage.header, 3)?
+    let nested_root_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(nested_root, 3)?
+    if nested_root_header.level != 2 or nested_root_header.count != 2: return err("YDBv1 non-root split did not install its promoted separator in the root")
+    let nested_parent: Bytes = yaza_db_storage_read_page_v1(nested_split.storage.file, nested_split.storage.header, 4)?
+    let nested_parent_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(nested_parent, 4)?
+    if nested_parent_header.level != 1 or nested_parent_header.count < 1 or nested_parent_header.count >= 680: return err("YDBv1 full non-root page did not become a valid left split page")
+    let nested_committed: YazaDbWriteCommitV1 = yaza_db_write_transaction_commit_v1(nested_split)?
+    let nested_wal_closed: Boolean = yaza_db_wal_log_close_v1(nested_committed.wal)?
+    let nested_storage_closed: Boolean = yaza_db_storage_close_v1(nested_committed.storage)?
+    if not nested_wal_closed or not nested_storage_closed: return err("YDBv1 nested split writer handles could not close")
+    let nested_recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "root-growth-nested-smoke.ydb")?
+    let nested_left_key: Bytes = yazabase_root_growth_key_v1(100)?
+    let nested_left_seek: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(nested_recovered.storage.file, nested_recovered.storage.header, 3, nested_left_key)?
+    let nested_right_seek: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(nested_recovered.storage.file, nested_recovered.storage.header, 3, nested_key)?
+    if nested_left_seek.leaf_page_id != 5 or nested_right_seek.leaf_page_id != 689: return err("YDBv1 cascading non-root split did not preserve both leaf routes after reopen")
+    let nested_recovered_wal_closed: Boolean = yaza_db_wal_log_close_v1(nested_recovered.wal)?
+    let nested_recovered_storage_closed: Boolean = yaza_db_storage_close_v1(nested_recovered.storage)?
+    if not nested_recovered_wal_closed or not nested_recovered_storage_closed: return err("YDBv1 nested split recovery handles could not close")
+
+    # A loser transaction must undo the complete five-page page set and release
+    # both allocations without leaving the grandparent pointing at a split.
+    let nested_loser_seed: YazaDbRootGrowthSeedV1 = yazabase_root_growth_nested_seed_v1(root, "root-growth-nested-loser.ydb", bytes_from_text("nloser-uuid-0001"))?
+    let nested_loser_transaction: YazaDbWriteTransactionV1 = yaza_db_write_transaction_begin_v1(nested_loser_seed.storage, nested_loser_seed.wal)?
+    let nested_loser_split: YazaDbWriteTransactionV1 = yaza_db_write_transaction_split_leaf_with_parent_v1(nested_loser_transaction, 3, 5, nested_key)?
+    let nested_loser_wal_closed: Boolean = yaza_db_wal_log_close_v1(nested_loser_split.wal)?
+    let nested_loser_storage_closed: Boolean = yaza_db_storage_close_v1(nested_loser_split.storage)?
+    if not nested_loser_wal_closed or not nested_loser_storage_closed: return err("YDBv1 nested loser split handles could not close")
+    let nested_loser_recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "root-growth-nested-loser.ydb")?
+    let nested_loser_root: Bytes = yaza_db_storage_read_page_v1(nested_loser_recovered.storage.file, nested_loser_recovered.storage.header, 3)?
+    let nested_loser_root_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(nested_loser_root, 3)?
+    let nested_loser_parent: Bytes = yaza_db_storage_read_page_v1(nested_loser_recovered.storage.file, nested_loser_recovered.storage.header, 4)?
+    let nested_loser_parent_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(nested_loser_parent, 4)?
+    let nested_loser_bitmap: Bytes = yaza_db_storage_read_page_v1(nested_loser_recovered.storage.file, nested_loser_recovered.storage.header, 2)?
+    let nested_loser_leaf_address: YazaDbBitmapAddressV1 = yaza_db_bitmap_address_v1(688)?
+    let nested_loser_inner_address: YazaDbBitmapAddressV1 = yaza_db_bitmap_address_v1(689)?
+    let nested_loser_leaf_allocated: Boolean = yaza_db_bitmap_page_bit_v1(nested_loser_bitmap, nested_loser_leaf_address.bit_index, 2)?
+    let nested_loser_inner_allocated: Boolean = yaza_db_bitmap_page_bit_v1(nested_loser_bitmap, nested_loser_inner_address.bit_index, 2)?
+    if nested_loser_root_header.level != 2 or nested_loser_root_header.count != 1 or nested_loser_parent_header.count != 680 or nested_loser_leaf_allocated or nested_loser_inner_allocated: return err("YDBv1 nested loser recovery did not restore the original tree and release its split pages")
+    let nested_loser_recovered_wal_closed: Boolean = yaza_db_wal_log_close_v1(nested_loser_recovered.wal)?
+    let nested_loser_recovered_storage_closed: Boolean = yaza_db_storage_close_v1(nested_loser_recovered.storage)?
+    if not nested_loser_recovered_wal_closed or not nested_loser_recovered_storage_closed: return err("YDBv1 nested loser recovery handles could not close")
+
+    # Two full INNER ancestors must be split top-down into individually
+    # atomic NODE_SPLIT records before the leaf split can propagate.
+    let deep_seed: YazaDbRootGrowthSeedV1 = yazabase_root_growth_deep_seed_v1(root, "root-growth-deep-smoke.ydb", bytes_from_text("deep-split-uuid1"))?
+    let deep_transaction: YazaDbWriteTransactionV1 = yaza_db_write_transaction_begin_v1(deep_seed.storage, deep_seed.wal)?
+    let deep_key: Bytes = yazabase_root_growth_key_v1(350)?
+    let deep_split: YazaDbWriteTransactionV1 = yaza_db_write_transaction_split_leaf_with_parent_v1(deep_transaction, 3, 712, deep_key)?
+    let deep_root: Bytes = yaza_db_storage_read_page_v1(deep_split.storage.file, deep_split.storage.header, 3)?
+    let deep_root_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(deep_root, 3)?
+    if deep_root_header.level != 3 or deep_root_header.count != 2: return err("YDBv1 two-level propagation did not split the full middle ancestor")
+    let deep_committed: YazaDbWriteCommitV1 = yaza_db_write_transaction_commit_v1(deep_split)?
+    let deep_wal_closed: Boolean = yaza_db_wal_log_close_v1(deep_committed.wal)?
+    let deep_storage_closed: Boolean = yaza_db_storage_close_v1(deep_committed.storage)?
+    if not deep_wal_closed or not deep_storage_closed: return err("YDBv1 deep split writer handles could not close")
+    let deep_recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "root-growth-deep-smoke.ydb")?
+    let deep_left_seek: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(deep_recovered.storage.file, deep_recovered.storage.header, 3, deep_key)?
+    let deep_right_key: Bytes = yazabase_root_growth_key_v1(355)?
+    let deep_right_seek: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(deep_recovered.storage.file, deep_recovered.storage.header, 3, deep_right_key)?
+    if deep_left_seek.leaf_page_id != 712 or deep_right_seek.leaf_page_id != 2052: return err("YDBv1 two-level ancestor propagation did not preserve leaf routing after reopen")
+    let deep_recovered_wal_closed: Boolean = yaza_db_wal_log_close_v1(deep_recovered.wal)?
+    let deep_recovered_storage_closed: Boolean = yaza_db_storage_close_v1(deep_recovered.storage)?
+    if not deep_recovered_wal_closed or not deep_recovered_storage_closed: return err("YDBv1 deep split recovery handles could not close")
+
+    let deep_loser_seed: YazaDbRootGrowthSeedV1 = yazabase_root_growth_deep_seed_v1(root, "root-growth-deep-loser.ydb", bytes_from_text("deep-loser-uuid1"))?
+    let deep_loser_transaction: YazaDbWriteTransactionV1 = yaza_db_write_transaction_begin_v1(deep_loser_seed.storage, deep_loser_seed.wal)?
+    let deep_loser_split: YazaDbWriteTransactionV1 = yaza_db_write_transaction_split_leaf_with_parent_v1(deep_loser_transaction, 3, 712, deep_key)?
+    let deep_loser_wal_closed: Boolean = yaza_db_wal_log_close_v1(deep_loser_split.wal)?
+    let deep_loser_storage_closed: Boolean = yaza_db_storage_close_v1(deep_loser_split.storage)?
+    if not deep_loser_wal_closed or not deep_loser_storage_closed: return err("YDBv1 deep loser split handles could not close")
+    let deep_loser_recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "root-growth-deep-loser.ydb")?
+    let deep_loser_root: Bytes = yaza_db_storage_read_page_v1(deep_loser_recovered.storage.file, deep_loser_recovered.storage.header, 3)?
+    let deep_loser_root_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(deep_loser_root, 3)?
+    let deep_loser_q: Bytes = yaza_db_storage_read_page_v1(deep_loser_recovered.storage.file, deep_loser_recovered.storage.header, 4)?
+    let deep_loser_q_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(deep_loser_q, 4)?
+    let deep_loser_p: Bytes = yaza_db_storage_read_page_v1(deep_loser_recovered.storage.file, deep_loser_recovered.storage.header, 5)?
+    let deep_loser_p_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(deep_loser_p, 5)?
+    let deep_loser_bitmap: Bytes = yaza_db_storage_read_page_v1(deep_loser_recovered.storage.file, deep_loser_recovered.storage.header, 2)?
+    let deep_alloc_address_q: YazaDbBitmapAddressV1 = yaza_db_bitmap_address_v1(2050)?
+    let deep_alloc_address_p: YazaDbBitmapAddressV1 = yaza_db_bitmap_address_v1(2051)?
+    let deep_alloc_address_leaf: YazaDbBitmapAddressV1 = yaza_db_bitmap_address_v1(2052)?
+    let deep_alloc_q: Boolean = yaza_db_bitmap_page_bit_v1(deep_loser_bitmap, deep_alloc_address_q.bit_index, 2)?
+    let deep_alloc_p: Boolean = yaza_db_bitmap_page_bit_v1(deep_loser_bitmap, deep_alloc_address_p.bit_index, 2)?
+    let deep_alloc_leaf: Boolean = yaza_db_bitmap_page_bit_v1(deep_loser_bitmap, deep_alloc_address_leaf.bit_index, 2)?
+    if deep_loser_root_header.level != 3 or deep_loser_root_header.count != 1 or deep_loser_q_header.count != 680 or deep_loser_p_header.count != 680 or deep_alloc_q or deep_alloc_p or deep_alloc_leaf: return err("YDBv1 deep loser recovery did not restore both full ancestors and release all split pages")
+    let deep_loser_recovered_wal_closed: Boolean = yaza_db_wal_log_close_v1(deep_loser_recovered.wal)?
+    let deep_loser_recovered_storage_closed: Boolean = yaza_db_storage_close_v1(deep_loser_recovered.storage)?
+    if not deep_loser_recovered_wal_closed or not deep_loser_recovered_storage_closed: return err("YDBv1 deep loser recovery handles could not close")
+
+    let root_closed: Boolean = close(root)?
+    if not root_closed: return err("YDBv1 root-growth fixture root could not close")
+    return ok(10)
+
+start:
+    let outcome: Result[Number, Text] = yazabase_root_growth_check_v1(arg(1))
+    if result_is_ok(outcome):
+        say "yazabase-root-growth-v1-ok seeks=" + number_text(result_unwrap(outcome))
+    else:
+        say result_unwrap_error(outcome)

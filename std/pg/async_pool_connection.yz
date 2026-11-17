@@ -1,0 +1,137 @@
+# Scheduler-driven pooled PostgreSQL connection setup.
+# Pool acquisition, TCP/TLS, PostgreSQL startup, and SCRAM share one task
+# lifetime. A successful result is already attached to the pool and must be
+# released with pg_pool_release after the caller finishes its work.
+use "async_pool"
+use "async_connection"
+use "pool"
+use "std/security/secret"
+
+shape PgPoolConnectAsyncState:
+    phase: Number
+    checkout_state: Option[PgPoolCheckoutAsyncState]
+    connection_state: Option[PgAsyncConnectionState]
+    identity: Bytes
+    maximum: Number
+    idle_timeout_ms: Number
+    acquire_deadline_ms: Number
+    connection_timeout_ms: Number
+    host: Text
+    port: Number
+    username: Text
+    database: Text
+    password: Option[SecretText]
+    reservation: Number
+
+variant PgPoolConnectAsyncStep:
+    Progress(state: PgPoolConnectAsyncState)
+    WaitPool(state: PgPoolConnectAsyncState)
+    WaitConnect(state: PgPoolConnectAsyncState)
+    WaitRead(state: PgPoolConnectAsyncState)
+    WaitWrite(state: PgPoolConnectAsyncState)
+    Complete(connection: Number)
+
+fn pg_pool_connect_async_state(phase: Number, checkout_state: Option[PgPoolCheckoutAsyncState], connection_state: Option[PgAsyncConnectionState], identity: Bytes, maximum: Number, idle_timeout_ms: Number, acquire_deadline_ms: Number, connection_timeout_ms: Number, host: Text, port: Number, username: Text, database: Text, password: Option[SecretText], reservation: Number) -> PgPoolConnectAsyncState:
+    return PgPoolConnectAsyncState(phase, checkout_state, connection_state, identity, maximum, idle_timeout_ms, acquire_deadline_ms, connection_timeout_ms, host, port, username, database, password, reservation)
+
+fn pg_pool_connect_async_begin(identity: Bytes, maximum: Number, acquire_timeout_ms: Number, idle_timeout_ms: Number, connection_timeout_ms: Number, host: Text, port: Number, username: Text, database: Text, password: SecretText) -> Result[PgPoolConnectAsyncState, Text]:
+    if connection_timeout_ms < 1 or connection_timeout_ms > 3600000:
+        let wiped: Boolean = secret_zeroize(password)
+        return err("postgres async pool connect: connection timeout must be between 1 and 3600000 milliseconds")
+    if host == "" or text_length(host) > 253 or port < 1 or port > 65535:
+        let wiped: Boolean = secret_zeroize(password)
+        return err("postgres async pool connect: host or port is invalid")
+    if username == "" or text_length(username) > 1024 or database == "" or text_length(database) > 1024:
+        let wiped: Boolean = secret_zeroize(password)
+        return err("postgres async pool connect: username or database is invalid")
+    let checkout: Result[PgPoolCheckoutAsyncState, Text] = pg_pool_checkout_async_begin(identity, maximum, acquire_timeout_ms, idle_timeout_ms)
+    if not result_is_ok(checkout):
+        let wiped: Boolean = secret_zeroize(password)
+        return err(result_unwrap_error(checkout))
+    let checkout_state: PgPoolCheckoutAsyncState = result_unwrap(checkout)
+    return ok(pg_pool_connect_async_state(0, some(checkout_state), none, identity, maximum, idle_timeout_ms, checkout_state.acquire_deadline_ms, connection_timeout_ms, host, port, username, database, some(password), 0))
+
+fn pg_pool_connect_async_after_connect(state: PgPoolConnectAsyncState, step: PgAsyncConnectionStep) -> Result[PgPoolConnectAsyncStep, Text]:
+    match step:
+        Progress(connection_state):
+            return ok(PgPoolConnectAsyncStep::Progress(pg_pool_connect_async_state(1, none, some(connection_state), state.identity, state.maximum, state.idle_timeout_ms, state.acquire_deadline_ms, state.connection_timeout_ms, state.host, state.port, state.username, state.database, none, state.reservation)))
+        WaitConnect(connection_state):
+            return ok(PgPoolConnectAsyncStep::WaitConnect(pg_pool_connect_async_state(1, none, some(connection_state), state.identity, state.maximum, state.idle_timeout_ms, state.acquire_deadline_ms, state.connection_timeout_ms, state.host, state.port, state.username, state.database, none, state.reservation)))
+        WaitRead(connection_state):
+            return ok(PgPoolConnectAsyncStep::WaitRead(pg_pool_connect_async_state(1, none, some(connection_state), state.identity, state.maximum, state.idle_timeout_ms, state.acquire_deadline_ms, state.connection_timeout_ms, state.host, state.port, state.username, state.database, none, state.reservation)))
+        WaitWrite(connection_state):
+            return ok(PgPoolConnectAsyncStep::WaitWrite(pg_pool_connect_async_state(1, none, some(connection_state), state.identity, state.maximum, state.idle_timeout_ms, state.acquire_deadline_ms, state.connection_timeout_ms, state.host, state.port, state.username, state.database, none, state.reservation)))
+        Complete(connection):
+            if not pg_pool_attach(state.reservation, connection):
+                let closed: Number = net_close(connection)
+                let released: Boolean = pg_pool_release(state.reservation, false)
+                return err("postgres async pool connect: could not attach the authenticated connection to its reservation")
+            return ok(PgPoolConnectAsyncStep::Complete(connection))
+
+fn pg_pool_connect_async_step(state: PgPoolConnectAsyncState) -> Result[PgPoolConnectAsyncStep, Text]:
+    if task_or_request_cancelled():
+        let cancelled: Boolean = pg_pool_connect_async_cancel(state)
+        return err("postgres async pool connect: operation was cancelled")
+    if state.phase == 0:
+        if not option_is_some(state.checkout_state) or option_is_some(state.connection_state) or not option_is_some(state.password) or state.reservation != 0:
+            if option_is_some(state.password):
+                let wiped: Boolean = secret_zeroize(option_unwrap(state.password))
+            return err("postgres async pool connect: checkout state is malformed")
+        let checked: Result[PgPoolCheckoutAsyncStep, Text] = pg_pool_checkout_async_step(option_unwrap(state.checkout_state))
+        if not result_is_ok(checked):
+            let wiped: Boolean = secret_zeroize(option_unwrap(state.password))
+            return err(result_unwrap_error(checked))
+        match result_unwrap(checked):
+            Wait(checkout_state):
+                return ok(PgPoolConnectAsyncStep::WaitPool(pg_pool_connect_async_state(0, some(checkout_state), none, state.identity, state.maximum, state.idle_timeout_ms, state.acquire_deadline_ms, state.connection_timeout_ms, state.host, state.port, state.username, state.database, state.password, 0)))
+            Ready(connection_or_reservation):
+                if connection_or_reservation > 0:
+                    let wiped: Boolean = secret_zeroize(option_unwrap(state.password))
+                    return ok(PgPoolConnectAsyncStep::Complete(connection_or_reservation))
+                if connection_or_reservation >= 0:
+                    let wiped: Boolean = secret_zeroize(option_unwrap(state.password))
+                    return err("postgres async pool connect: pool returned an invalid reservation")
+                let now: Number = monotonic_ms()
+                if now < 0 or now >= state.acquire_deadline_ms:
+                    let released: Boolean = pg_pool_release(connection_or_reservation, false)
+                    let wiped: Boolean = secret_zeroize(option_unwrap(state.password))
+                    return err("postgres async pool connect: acquisition deadline expired before connection setup")
+                var connect_timeout: Number = state.connection_timeout_ms
+                if state.acquire_deadline_ms - now < connect_timeout:
+                    set connect_timeout = state.acquire_deadline_ms - now
+                let connecting: Result[PgAsyncConnectionState, Text] = pg_connect_async_begin(state.host, state.port, state.username, state.database, option_unwrap(state.password), connect_timeout)
+                if not result_is_ok(connecting):
+                    let released: Boolean = pg_pool_release(connection_or_reservation, false)
+                    return err(result_unwrap_error(connecting))
+                let connecting_state: PgAsyncConnectionState = result_unwrap(connecting)
+                return ok(PgPoolConnectAsyncStep::Progress(pg_pool_connect_async_state(1, none, some(connecting_state), state.identity, state.maximum, state.idle_timeout_ms, state.acquire_deadline_ms, state.connection_timeout_ms, state.host, state.port, state.username, state.database, none, connection_or_reservation)))
+    if state.phase == 1:
+        if option_is_some(state.checkout_state) or not option_is_some(state.connection_state) or option_is_some(state.password) or state.reservation >= 0:
+            let cancelled: Boolean = pg_pool_connect_async_cancel(state)
+            return err("postgres async pool connect: connection state is malformed")
+        let advanced: Result[PgAsyncConnectionStep, Text] = pg_connect_async_step(option_unwrap(state.connection_state))
+        if not result_is_ok(advanced):
+            let released: Boolean = pg_pool_release(state.reservation, false)
+            return err(result_unwrap_error(advanced))
+        return pg_pool_connect_async_after_connect(state, result_unwrap(advanced))
+    let cancelled: Boolean = pg_pool_connect_async_cancel(state)
+    return err("postgres async pool connect: continuation phase is unknown")
+
+# Call after any Wait* outcome and before returning YAZA_TASK_STEP_WAIT. For a
+# pool wait, this registers pool-release readiness; for socket waits, it
+# registers the PostgreSQL connector's read/write readiness.
+fn pg_pool_connect_async_wait(state: PgPoolConnectAsyncState, writable: Boolean) -> Result[Boolean, Text]:
+    if state.phase == 0 and option_is_some(state.checkout_state) and not option_is_some(state.connection_state):
+        return pg_pool_checkout_async_wait(option_unwrap(state.checkout_state))
+    if state.phase == 1 and not option_is_some(state.checkout_state) and option_is_some(state.connection_state):
+        return pg_connect_async_wait(option_unwrap(state.connection_state), writable)
+    return err("postgres async pool connect: readiness wait does not match a suspended continuation")
+
+fn pg_pool_connect_async_cancel(state: PgPoolConnectAsyncState) -> Boolean:
+    if state.phase == 0 and option_is_some(state.password):
+        return secret_zeroize(option_unwrap(state.password))
+    if state.phase == 1 and option_is_some(state.connection_state) and state.reservation < 0:
+        let cancelled: Boolean = pg_connect_async_cancel(option_unwrap(state.connection_state))
+        let released: Boolean = pg_pool_release(state.reservation, false)
+        return cancelled and released
+    return false

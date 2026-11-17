@@ -1,0 +1,58 @@
+use "../yazabase/mvcc_v1"
+use "../yazabase/row_v1"
+
+fn yaza_base_mvcc_v1_check() -> Result[Number, Text]:
+    let transactions: List[YazaDbTxnStatusV1] = List[YazaDbTxnStatusV1]()
+    list_push(transactions, YazaDbTxnStatusV1(10, yaza_db_mvcc_txn_state_active_v1(), 0))
+    list_push(transactions, YazaDbTxnStatusV1(11, yaza_db_mvcc_txn_state_committed_v1(), 5))
+    list_push(transactions, YazaDbTxnStatusV1(12, yaza_db_mvcc_txn_state_committed_v1(), 8))
+    list_push(transactions, YazaDbTxnStatusV1(13, yaza_db_mvcc_txn_state_aborted_v1(), 0))
+
+    let old_committed_tag: Boolean = yaza_db_mvcc_version_visible_v1(4, 5, 0, transactions)?
+    let boundary_committed_tag: Boolean = yaza_db_mvcc_version_visible_v1(5, 5, 0, transactions)?
+    let future_committed_tag: Boolean = yaza_db_mvcc_version_visible_v1(8, 5, 0, transactions)?
+    if not old_committed_tag or not boundary_committed_tag or future_committed_tag: return err("YDBv1 MVCC committed timestamp visibility is incorrect")
+
+    let own_version: Number = yaza_db_row_version_txn_encode_v1(10)?
+    let other_active_version: Number = yaza_db_row_version_txn_encode_v1(10)?
+    let committed_version: Number = yaza_db_row_version_txn_encode_v1(11)?
+    let future_committed_version: Number = yaza_db_row_version_txn_encode_v1(12)?
+    let aborted_version: Number = yaza_db_row_version_txn_encode_v1(13)?
+    let own_visible: Boolean = yaza_db_mvcc_version_visible_v1(own_version, 5, 10, transactions)?
+    let active_visible: Boolean = yaza_db_mvcc_version_visible_v1(other_active_version, 20, 20, transactions)?
+    let committed_visible: Boolean = yaza_db_mvcc_version_visible_v1(committed_version, 5, 0, transactions)?
+    let future_txn_visible: Boolean = yaza_db_mvcc_version_visible_v1(future_committed_version, 5, 0, transactions)?
+    let aborted_visible: Boolean = yaza_db_mvcc_version_visible_v1(aborted_version, 20, 0, transactions)?
+    if not own_visible or active_visible or not committed_visible or future_txn_visible or aborted_visible: return err("YDBv1 in-progress transaction visibility is incorrect")
+
+    let zero_version_result: Result[Boolean, Text] = yaza_db_mvcc_version_visible_v1(0, 5, 0, transactions)
+    let zero_snapshot_result: Result[Boolean, Text] = yaza_db_mvcc_version_visible_v1(own_version, 0, 10, transactions)
+    let zero_txn_tag_result: Result[Boolean, Text] = yaza_db_mvcc_version_visible_v1(yaza_db_row_version_min_signed_v1(), 5, 0, transactions)
+    if result_is_ok(zero_version_result) or result_is_ok(zero_snapshot_result) or result_is_ok(zero_txn_tag_result): return err("YDBv1 MVCC accepted a zero version, snapshot, or transaction tag")
+
+    let missing_version: Number = yaza_db_row_version_txn_encode_v1(99)?
+    let missing_status_result: Result[Boolean, Text] = yaza_db_mvcc_version_visible_v1(missing_version, 20, 0, transactions)
+    let missing_status_accepted: Boolean = result_is_ok(missing_status_result)
+    if missing_status_accepted: return err("YDBv1 MVCC accepted a version without transaction status")
+    let original_status: YazaDbTxnStatusV1 = list_get(transactions, 1)
+    let duplicate_status_set: Boolean = list_try_set(transactions, 1, list_get(transactions, 0))
+    if not duplicate_status_set: return err("YDBv1 MVCC duplicate-status fixture could not mutate its transaction table")
+    let duplicate_status_result: Result[Boolean, Text] = yaza_db_mvcc_version_visible_v1(committed_version, 5, 0, transactions)
+    let duplicate_status_accepted: Boolean = result_is_ok(duplicate_status_result)
+    if duplicate_status_accepted: return err("YDBv1 MVCC accepted a duplicate transaction ID")
+    let duplicate_restore: Boolean = list_try_set(transactions, 1, original_status)
+    if not duplicate_restore: return err("YDBv1 MVCC duplicate-status fixture could not restore its transaction table")
+
+    let malformed_status_set: Boolean = list_try_set(transactions, 1, YazaDbTxnStatusV1(11, yaza_db_mvcc_txn_state_committed_v1(), 0))
+    if not malformed_status_set: return err("YDBv1 MVCC malformed-status fixture could not mutate its transaction table")
+    let malformed_status_result: Result[Boolean, Text] = yaza_db_mvcc_version_visible_v1(committed_version, 5, 0, transactions)
+    let malformed_status_accepted: Boolean = result_is_ok(malformed_status_result)
+    if malformed_status_accepted: return err("YDBv1 MVCC accepted an invalid transaction status")
+    return ok(1)
+
+start:
+    let outcome: Result[Number, Text] = yaza_base_mvcc_v1_check()
+    if result_is_ok(outcome):
+        say "yazabase-mvcc-v1-ok"
+    else:
+        say result_unwrap_error(outcome)

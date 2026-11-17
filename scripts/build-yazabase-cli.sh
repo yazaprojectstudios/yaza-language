@@ -1,0 +1,28 @@
+#!/bin/sh
+set -eu
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PROJECT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+COMPILER=${YAZA_LLVM_COMPILER:-"$PROJECT_DIR/build/yaza-llvm"}
+COMPILER_PROCESS_LIMIT_BYTES=${YAZA_COMPILER_PROCESS_LIMIT_BYTES:-34359738368}
+COMPILER_LIST_VECTOR_LIMIT_BYTES=${YAZA_COMPILER_LIST_VECTOR_LIMIT_BYTES:-34359738368}
+COMPILER_MAX_LIST_ITEMS=${YAZA_COMPILER_MAX_LIST_ITEMS:-32000000}
+case "$COMPILER" in
+  /*) ;;
+  *) COMPILER="$(pwd)/$COMPILER" ;;
+esac
+
+if [ ! -x "$COMPILER" ]; then
+  printf 'error: executable YAZA LLVM compiler not found: %s\n' "$COMPILER" >&2
+  exit 127
+fi
+STDLIB_DIR=${YAZA_STDLIB_DIR:-"$PROJECT_DIR/std"}
+mkdir -p "$PROJECT_DIR/build"
+cd "$PROJECT_DIR"
+YAZA_RT_V1_PROCESS_LIMIT_BYTES="$COMPILER_PROCESS_LIMIT_BYTES" \
+YAZA_RT_V1_MAX_LIST_VECTOR_BYTES="$COMPILER_LIST_VECTOR_LIMIT_BYTES" \
+YAZA_RT_V1_MAX_LIST_ITEMS="$COMPILER_MAX_LIST_ITEMS" \
+YAZA_STDLIB_DIR="$STDLIB_DIR" \
+  "$COMPILER" build --release "$PROJECT_DIR/compiler/yazabase_cli.yz" \
+  -o "$PROJECT_DIR/build/yazabase-cli"
+printf 'Built YazaBase CLI support executable: %s\n' "$PROJECT_DIR/build/yazabase-cli"

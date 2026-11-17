@@ -1,0 +1,101 @@
+# Deterministic bounded fuzz smoke for SQL lexer/parser state transitions.
+use "../yazabase/sql_lexer_v1"
+use "../yazabase/sql_parser_v3"
+
+shape YazaBaseSqlFuzzCaseV1:
+    next_state: Number
+    valid: Boolean
+
+fn yaza_base_sql_fuzz_next_v1(state: Number) -> Number:
+    return (state * 1103515245 + 12345) % 2147483647
+
+fn yaza_base_sql_fuzz_expression_nodes_v1(source: Text, nodes: List[YazaSqlExpressionNodeV3], root: Number) -> Boolean:
+    let node_count: Number = list_count(nodes)
+    if node_count > 4096 or root < -1 or root >= node_count: return false
+    var node_index: Number = 0
+    while node_index < node_count:
+        let node: YazaSqlExpressionNodeV3 = list_get(nodes, node_index)
+        if node.start_byte < 0 or node.end_byte < node.start_byte or node.end_byte > text_length(source): return false
+        if node.operator_start_byte < node.start_byte or node.operator_end_byte < node.operator_start_byte or node.operator_end_byte > node.end_byte: return false
+        if node.kind == 2 or node.kind == 3:
+            if node.left_index < 0 or node.left_index >= node_index or node.right_index < 0 or node.right_index >= node_index: return false
+        elif node.kind == 4:
+            if node.left_index < 0 or node.left_index >= node_index or node.right_index != -1: return false
+        elif node.kind != 1 and node.kind != 5:
+            return false
+        set node_index = node_index + 1
+    if root >= 0 and root != node_count - 1: return false
+    return true
+
+fn yaza_base_sql_fuzz_validate_v1(source: Text) -> Boolean:
+    let lexed: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(source)
+    let parsed: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(source)
+    if not result_is_ok(lexed): return not result_is_ok(parsed)
+
+    let tokens: List[YazaSqlTokenV1] = result_unwrap(lexed)
+    if list_count(tokens) == 0: return false
+    var token_index: Number = 0
+    var previous_end: Number = 0
+    while token_index < list_count(tokens):
+        let token: YazaSqlTokenV1 = list_get(tokens, token_index)
+        if token.start_byte < previous_end or token.end_byte < token.start_byte or token.end_byte > text_length(source): return false
+        if token.kind == 0 and (token_index != list_count(tokens) - 1 or token.start_byte != text_length(source) or token.end_byte != text_length(source)): return false
+        set previous_end = token.end_byte
+        set token_index = token_index + 1
+    if list_get(tokens, list_count(tokens) - 1).kind != 0: return false
+
+    if not result_is_ok(parsed): return true
+    let query: YazaSqlSelectAstV3 = result_unwrap(parsed)
+    if query.version != 3 or query.start_byte < 0 or query.end_byte < query.start_byte or query.end_byte > text_length(source): return false
+    if list_count(query.projections) == 0 or list_count(query.projections) > 1024 or list_count(query.group_by) > 64: return false
+    if query.join_type < 0 or query.join_type > 3: return false
+    if query.has_where:
+        if not yaza_base_sql_fuzz_expression_nodes_v1(source, query.where_nodes, query.where_root): return false
+        if query.where_root < 0: return false
+    elif query.where_root != -1 or list_count(query.where_nodes) != 0:
+        return false
+    if query.has_having:
+        if not yaza_base_sql_fuzz_expression_nodes_v1(source, query.having_nodes, query.having_root): return false
+        if query.having_root < 0: return false
+    elif query.having_root != -1 or list_count(query.having_nodes) != 0:
+        return false
+    return true
+
+fn yaza_base_sql_fuzz_generated_case_v1(seed: Number) -> YazaBaseSqlFuzzCaseV1:
+    let alphabet: Text = "SELECTselectFROMfromWHEREwhereGROUPBYHAVINGORDERLIMITJOINONINNERDISTINCTNULLTRUEFALSECOUNTSUMMINMAXAVG0123456789_ abcdefXYZ'\"(),.*+-/=<>!?:;$\t\n"
+    var state: Number = seed
+    let length: Number = seed % 257
+    var source: Text = ""
+    var index: Number = 0
+    while index < length:
+        set state = yaza_base_sql_fuzz_next_v1(state)
+        let character: Text = text_slice(alphabet, state % text_length(alphabet), 1)
+        let appended: Result[Text, Text] = text_try_concat(source, character)
+        if not result_is_ok(appended): return YazaBaseSqlFuzzCaseV1(state, false)
+        set source = result_unwrap(appended)
+        set index = index + 1
+    return YazaBaseSqlFuzzCaseV1(state, yaza_base_sql_fuzz_validate_v1(source))
+
+fn yaza_base_sql_parser_fuzz_v1() -> Boolean:
+    if not yaza_base_sql_fuzz_validate_v1("SELECT id, name FROM users WHERE active = TRUE ORDER BY id LIMIT 20"): return false
+    if not yaza_base_sql_fuzz_validate_v1("SELECT u.id, COUNT(*) AS n FROM users AS u JOIN events AS e ON u.id = e.user_id WHERE e.note = 'it''s' GROUP BY u.id HAVING COUNT(*) > 1"): return false
+    if not yaza_base_sql_fuzz_validate_v1("SELECT id FROM users WHERE (id = 1 AND active IS NOT NULL) OR name = 'unfinished"): return false
+    if not yaza_base_sql_fuzz_validate_v1("SELECT SUM(value) FROM values_table HAVING SUM(value) >= $1; SELECT secret FROM keys"): return false
+
+    var state: Number = 987654321
+    var iteration: Number = 0
+    while iteration < 2048:
+        set state = yaza_base_sql_fuzz_next_v1(state)
+        arena_scope 262144:
+            let generated: YazaBaseSqlFuzzCaseV1 = yaza_base_sql_fuzz_generated_case_v1(state)
+            set state = generated.next_state
+            if not generated.valid: return false
+        set iteration = iteration + 1
+    return true
+
+start:
+    let initial_used: Number = arena_used()
+    arena_scope 1048576:
+        assert yaza_base_sql_parser_fuzz_v1()
+    assert arena_used() == initial_used
+    say "yazabase-sql-parser-fuzz-v1-ok cases=2052"

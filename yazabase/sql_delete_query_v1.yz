@@ -1,0 +1,363 @@
+# Persistent bounded DELETE through the current typed SELECT and WAL paths.
+# It materializes at most the current SELECT budget, preflights every key/page,
+# then commits deletes atomically in the existing single-writer transaction.
+use "./catalog_snapshot_v1"
+use "./catalog_storage_v1"
+use "./key_codec_v1"
+use "./page_v1"
+use "./page_wal_v1"
+use "./query_v1"
+use "./row_v1"
+use "./sql_binder_v1"
+use "./sql_delete_v1"
+use "./sql_foreign_key_v1"
+use "./index_maintenance_v1"
+use "./sql_executor_v1"
+use "./sql_parser_v3"
+use "./storage_v1"
+use "./transaction_v1"
+use "./wal_v1"
+
+shape YazaDbSqlDeleteTargetV1:
+    key: Bytes
+    page_id: Number
+    tombstone_payload: Bytes
+    index_targets: List[YazaDbSecondaryIndexTargetV1]
+
+fn yaza_db_sql_delete_key_v1(row: List[YazaSqlValueV1], columns: List[YazaSqlColumnSchemaV1], key_ordinals: List[Number]) -> Result[Bytes, Text]:
+    let column_count: Number = list_count(columns)
+    if column_count < 1 or column_count > 1024 or list_count(row) != column_count: return err("YDBv1 DELETE row width does not match the bound table schema")
+    let nulls_result: Result[List[Boolean], Text] = list_try_new()
+    if not result_is_ok(nulls_result): return err(result_unwrap_error(nulls_result))
+    let nulls: List[Boolean] = result_unwrap(nulls_result)
+    if not list_try_reserve(nulls, column_count): return err("YDBv1 DELETE could not reserve row null metadata")
+    var ordinal: Number = 0
+    while ordinal < column_count:
+        let value: YazaSqlValueV1 = list_get(row, ordinal)
+        let column: YazaSqlColumnSchemaV1 = list_get(columns, ordinal)
+        if value.type_id != column.type_id or value.source_literal: return err("YDBv1 DELETE query returned a value inconsistent with the catalog schema")
+        if not list_try_push(nulls, value.is_null): return err("YDBv1 DELETE could not build row null metadata")
+        set ordinal = ordinal + 1
+    return yaza_db_key_encode_composite_v1(row, nulls, columns, key_ordinals)
+
+fn yaza_db_sql_delete_tombstone_for_schema_v1(row: List[YazaSqlValueV1], overflow_refs: List[YazaDbOverflowRefV1], columns: List[YazaSqlColumnSchemaV1], schema_version: Number, commit_ts: Number) -> Result[Bytes, Text]:
+    let column_count: Number = list_count(columns)
+    if commit_ts < 1 or column_count < 1 or column_count > 1024 or list_count(row) != column_count: return err("YDBv1 DELETE tombstone row or commit timestamp is invalid")
+    let values_result: Result[List[YazaSqlValueV1], Text] = list_try_new()
+    let nulls_result: Result[List[Boolean], Text] = list_try_new()
+    if not result_is_ok(values_result) or not result_is_ok(nulls_result): return err("YDBv1 DELETE could not allocate tombstone metadata")
+    let values: List[YazaSqlValueV1] = result_unwrap(values_result)
+    let nulls: List[Boolean] = result_unwrap(nulls_result)
+    if not list_try_reserve(values, column_count) or not list_try_reserve(nulls, column_count): return err("YDBv1 DELETE could not reserve tombstone metadata")
+    var column_index: Number = 0
+    while column_index < column_count:
+        let value: YazaSqlValueV1 = list_get(row, column_index)
+        let column: YazaSqlColumnSchemaV1 = list_get(columns, column_index)
+        if value.type_id != column.type_id or value.source_literal or (value.is_null and not column.nullable): return err("YDBv1 DELETE row does not match its tombstone schema")
+        if not list_try_push(values, value) or not list_try_push(nulls, value.is_null): return err("YDBv1 DELETE could not build tombstone values")
+        set column_index = column_index + 1
+    let encoded: Bytes = yaza_db_row_encode_for_schema_with_overflow_v1(values, nulls, overflow_refs, columns, commit_ts, schema_version)?
+    return yaza_db_row_set_deleted_v1(encoded, true)
+
+fn yaza_db_sql_delete_tombstone_v1(row: List[YazaSqlValueV1], columns: List[YazaSqlColumnSchemaV1], commit_ts: Number) -> Result[Bytes, Text]:
+    return yaza_db_sql_delete_tombstone_for_schema_v1(row, List[YazaDbOverflowRefV1](), columns, 1, commit_ts)
+
+fn yaza_db_sql_delete_close_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1) -> Unit:
+    let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(wal)
+    let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(storage)
+    return
+
+fn yaza_db_sql_delete_secondary_row_before_v1(left_row_index: Number, right_row_index: Number, targets: List[YazaDbSqlDeleteTargetV1], index_number: Number) -> Boolean:
+    let left_row: YazaDbSqlDeleteTargetV1 = list_get(targets, left_row_index)
+    let right_row: YazaDbSqlDeleteTargetV1 = list_get(targets, right_row_index)
+    let left_target: YazaDbSecondaryIndexTargetV1 = list_get(left_row.index_targets, index_number)
+    let right_target: YazaDbSecondaryIndexTargetV1 = list_get(right_row.index_targets, index_number)
+    if left_target.page_id != right_target.page_id: return left_target.page_id < right_target.page_id
+    let key_comparison: Number = yaza_db_compare_bytes_v1(left_target.entry.key, right_target.entry.key)
+    if key_comparison != 0: return key_comparison < 0
+    return left_row_index < right_row_index
+
+fn yaza_db_sql_delete_secondary_swap_v1(row_order: List[Number], left: Number, right: Number) -> Boolean:
+    if left < 0 or right < 0 or left >= list_count(row_order) or right >= list_count(row_order): return false
+    let left_value: Number = list_get(row_order, left)
+    let right_value: Number = list_get(row_order, right)
+    if not list_try_set(row_order, left, right_value): return false
+    if not list_try_set(row_order, right, left_value): return false
+    return true
+
+fn yaza_db_sql_delete_secondary_sift_down_v1(row_order: List[Number], targets: List[YazaDbSqlDeleteTargetV1], index_number: Number, start: Number, end: Number) -> Boolean:
+    var root: Number = start
+    while root * 2 + 1 < end:
+        let left: Number = root * 2 + 1
+        var greatest: Number = root
+        if yaza_db_sql_delete_secondary_row_before_v1(list_get(row_order, greatest), list_get(row_order, left), targets, index_number): set greatest = left
+        let right: Number = left + 1
+        if right < end and yaza_db_sql_delete_secondary_row_before_v1(list_get(row_order, greatest), list_get(row_order, right), targets, index_number): set greatest = right
+        if greatest == root: return true
+        if not yaza_db_sql_delete_secondary_swap_v1(row_order, root, greatest): return false
+        set root = greatest
+    return true
+
+fn yaza_db_sql_delete_sort_secondary_rows_v1(row_order: List[Number], targets: List[YazaDbSqlDeleteTargetV1], index_number: Number) -> Boolean:
+    let row_count: Number = list_count(row_order)
+    if row_count < 1 or row_count != list_count(targets): return false
+    var start: Number = row_count / 2
+    while start > 0:
+        set start = start - 1
+        if not yaza_db_sql_delete_secondary_sift_down_v1(row_order, targets, index_number, start, row_count): return false
+    var end: Number = row_count
+    while end > 1:
+        if not yaza_db_sql_delete_secondary_swap_v1(row_order, 0, end - 1): return false
+        set end = end - 1
+        if not yaza_db_sql_delete_secondary_sift_down_v1(row_order, targets, index_number, 0, end): return false
+    return true
+
+fn yaza_db_sql_delete_secondary_group_failure_v1(transaction: YazaDbWriteTransactionV1, message: Text) -> Text:
+    yaza_db_sql_delete_close_v1(transaction.storage, transaction.wal)
+    return "YDBv1 DELETE secondary-index group staging failed; writer handles were closed and recovery is required: " + message
+
+fn yaza_db_sql_delete_secondary_index_groups_v1(transaction: YazaDbWriteTransactionV1, targets: List[YazaDbSqlDeleteTargetV1], index_number: Number) -> Result[YazaDbWriteTransactionV1, Text]:
+    let row_count: Number = list_count(targets)
+    if row_count == 0: return ok(transaction)
+    if row_count < 0 or index_number < 0: return err(yaza_db_sql_delete_secondary_group_failure_v1(transaction, "row or index ordinal is outside its bound"))
+    let order_result: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(order_result): return err(yaza_db_sql_delete_secondary_group_failure_v1(transaction, result_unwrap_error(order_result)))
+    let row_order: List[Number] = result_unwrap(order_result)
+    if not list_try_reserve(row_order, row_count): return err(yaza_db_sql_delete_secondary_group_failure_v1(transaction, "could not reserve row-order metadata"))
+    var row_index: Number = 0
+    while row_index < row_count:
+        let row: YazaDbSqlDeleteTargetV1 = list_get(targets, row_index)
+        if index_number >= list_count(row.index_targets): return err(yaza_db_sql_delete_secondary_group_failure_v1(transaction, "a row is missing its preflighted index target"))
+        if not list_try_push(row_order, row_index): return err(yaza_db_sql_delete_secondary_group_failure_v1(transaction, "could not initialize row-order metadata"))
+        set row_index = row_index + 1
+    if not yaza_db_sql_delete_sort_secondary_rows_v1(row_order, targets, index_number):
+        return err(yaza_db_sql_delete_secondary_group_failure_v1(transaction, "could not sort preflighted targets by index leaf"))
+
+    let groups_result: Result[List[YazaDbWriteLeafUpdateGroupV1], Text] = list_try_new()
+    if not result_is_ok(groups_result): return err(yaza_db_sql_delete_secondary_group_failure_v1(transaction, result_unwrap_error(groups_result)))
+    var groups: List[YazaDbWriteLeafUpdateGroupV1] = result_unwrap(groups_result)
+    if not list_try_reserve(groups, 128): return err(yaza_db_sql_delete_secondary_group_failure_v1(transaction, "could not reserve the bounded leaf-group batch"))
+    var current: YazaDbWriteTransactionV1 = transaction
+    var current_page_id: Number = -1
+    var current_updates: List[YazaDbWriteLeafUpdateV1] = List[YazaDbWriteLeafUpdateV1]()
+    var updates_initialized: Boolean = false
+    var sorted_index: Number = 0
+    while sorted_index < row_count:
+        let target_row_index: Number = list_get(row_order, sorted_index)
+        let row: YazaDbSqlDeleteTargetV1 = list_get(targets, target_row_index)
+        let target: YazaDbSecondaryIndexTargetV1 = list_get(row.index_targets, index_number)
+        if not updates_initialized or target.page_id != current_page_id:
+            if updates_initialized:
+                if not list_try_push(groups, YazaDbWriteLeafUpdateGroupV1(current_page_id, current_updates)):
+                    return err(yaza_db_sql_delete_secondary_group_failure_v1(current, "could not append a staged leaf update group"))
+                if list_count(groups) == 128:
+                    let mutated: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_mutate_leaf_groups_v1(current, groups)
+                    if not result_is_ok(mutated): return err("YDBv1 SQL DELETE secondary-index grouped mutation failed; reopen through recovery: " + result_unwrap_error(mutated))
+                    set current = result_unwrap(mutated)
+                    let next_groups_result: Result[List[YazaDbWriteLeafUpdateGroupV1], Text] = list_try_new()
+                    if not result_is_ok(next_groups_result): return err(yaza_db_sql_delete_secondary_group_failure_v1(current, result_unwrap_error(next_groups_result)))
+                    set groups = result_unwrap(next_groups_result)
+                    if not list_try_reserve(groups, 128): return err(yaza_db_sql_delete_secondary_group_failure_v1(current, "could not reserve the next bounded leaf-group batch"))
+            let updates_result: Result[List[YazaDbWriteLeafUpdateV1], Text] = list_try_new()
+            if not result_is_ok(updates_result): return err(yaza_db_sql_delete_secondary_group_failure_v1(current, result_unwrap_error(updates_result)))
+            set current_updates = result_unwrap(updates_result)
+            set current_page_id = target.page_id
+            set updates_initialized = true
+        if not list_try_push(current_updates, YazaDbWriteLeafUpdateV1(target.entry.key, target.tombstone)):
+            return err(yaza_db_sql_delete_secondary_group_failure_v1(current, "could not stage an index-row tombstone"))
+        set sorted_index = sorted_index + 1
+    if updates_initialized:
+        if not list_try_push(groups, YazaDbWriteLeafUpdateGroupV1(current_page_id, current_updates)):
+            return err(yaza_db_sql_delete_secondary_group_failure_v1(current, "could not append the final staged leaf update group"))
+    if list_count(groups) > 0:
+        let mutated: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_mutate_leaf_groups_v1(current, groups)
+        if not result_is_ok(mutated): return err("YDBv1 SQL DELETE secondary-index grouped mutation failed; reopen through recovery: " + result_unwrap_error(mutated))
+        set current = result_unwrap(mutated)
+    return ok(current)
+
+fn yaza_db_execute_delete_with_checkpoint_policy_profiled_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], defer_checkpoint: Boolean, profile_ns: List[Number]) -> Result[YazaDbWriteCommitV1, Text]:
+    let profile_enabled: Boolean = list_count(profile_ns) >= 34
+    var profile_started_ns: Number = 0
+    if profile_enabled: set profile_started_ns = monotonic_ns()
+    if storage.root != wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid): return err("YDBv1 SQL DELETE storage and WAL handles belong to different databases")
+    let select_source: Text = yaza_sql_parse_delete_v1(source)?
+    let loaded: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(storage.file, storage.header)?
+    let parsed: YazaSqlSelectAstV3 = yaza_sql_parse_select_v3(select_source)?
+    var view_index: Number = 0
+    while view_index < list_count(loaded.views):
+        if yaza_sql_bind_v1_identifier_matches(select_source, parsed.table_name.first_token, list_get(loaded.views, view_index).name):
+            return err("YDBv1 views are read-only; DELETE through a view is not supported")
+        set view_index = view_index + 1
+    let plan: YazaSqlBoundPlanV1 = yaza_sql_bind_select_v1(select_source, parsed, loaded.sql_snapshot)?
+    if plan.catalog_version != loaded.sql_snapshot.version: return err("YDBv1 DELETE predicate was bound against a stale catalog snapshot")
+    if plan.distinct or plan.has_limit or list_count(plan.order_by) != 0 or list_count(plan.projections) < 1: return err("YDBv1 DELETE predicate plan has unsupported output modifiers")
+    let table_index: Number = yaza_db_catalog_snapshot_table_index_v1(loaded.sql_snapshot.tables, plan.table_id)
+    if table_index < 0 or table_index >= list_count(loaded.root_page_ids) or table_index >= list_count(loaded.table_schema_versions): return err("YDBv1 DELETE target has no persisted table root or schema version")
+    let table: YazaSqlTableSchemaV1 = list_get(loaded.sql_snapshot.tables, table_index)
+    let table_schema_version: Number = list_get(loaded.table_schema_versions, table_index)
+    if list_count(plan.projections) != list_count(table.columns): return err("YDBv1 DELETE predicate plan does not return the complete target row")
+    var projection_index: Number = 0
+    while projection_index < list_count(plan.projections):
+        let projection: YazaSqlBoundProjectionV1 = list_get(plan.projections, projection_index)
+        if projection.column_ordinal != projection_index or projection.type_id != list_get(table.columns, projection_index).type_id: return err("YDBv1 DELETE predicate projection does not match the target row layout")
+        set projection_index = projection_index + 1
+    let table_root_page_id: Number = list_get(loaded.root_page_ids, table_index)
+    let catalog: YazaDbCatalogRootV1 = loaded.catalog
+    let key_ordinals: List[Number] = yaza_db_query_clustered_key_ordinals_v1(storage.file, storage.header, catalog, plan.table_id, table_root_page_id, loaded.sql_snapshot.version, list_count(table.columns))?
+    let indexes: List[YazaDbSecondaryIndexV1] = yaza_db_index_maintenance_load_v1(storage, loaded, table_index)?
+    let select_tokens: List[YazaSqlTokenV1] = yaza_sql_lex_v1(select_source)?
+    if profile_enabled: set profile_started_ns = yaza_db_query_profile_record_ns_v1(profile_ns, 22, profile_started_ns, monotonic_ns())
+    if profile_enabled: set profile_started_ns = monotonic_ns()
+    let query_result: YazaSqlQueryResultV1 = yaza_db_execute_single_select_with_cached_catalog_v1(storage.file, storage.header, select_source, select_tokens, parameters, loaded)?
+    if profile_enabled: set profile_started_ns = yaza_db_query_profile_record_ns_v1(profile_ns, 23, profile_started_ns, monotonic_ns())
+    if profile_enabled: set profile_started_ns = monotonic_ns()
+    let row_count: Number = list_count(query_result.rows)
+    if row_count > 65536 or row_count * list_count(table.columns) > 1048576: return err("YDBv1 DELETE result exceeds the bounded row/cell profile")
+    let foreign_restrict_ok: Boolean = yaza_db_sql_foreign_key_restrict_delete_v1(storage.file, storage.header, loaded, plan.table_id, query_result.rows)?
+    if not foreign_restrict_ok: return err("YDBv1 DELETE foreign-key restriction check did not complete")
+    let targets_result: Result[List[YazaDbSqlDeleteTargetV1], Text] = list_try_new()
+    if not result_is_ok(targets_result): return err(result_unwrap_error(targets_result))
+    let targets: List[YazaDbSqlDeleteTargetV1] = result_unwrap(targets_result)
+    if not list_try_reserve(targets, row_count): return err("YDBv1 DELETE could not reserve its bounded target list")
+    var total_key_bytes: Number = 0
+    var total_index_key_bytes: Number = 0
+    var row_index: Number = 0
+    var previous_key: Bytes = bytes_from_text("")
+    var cached_leaf_page_id: Number = -1
+    var cached_leaf_page: Bytes = bytes_from_text("")
+    var cached_leaf_header: YazaDbPageHeaderV1 = YazaDbPageHeaderV1(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    var cached_next_slot: Number = 0
+    while row_index < row_count:
+        let row: List[YazaSqlValueV1] = list_get(query_result.rows, row_index)
+        let key: Bytes = yaza_db_sql_delete_key_v1(row, table.columns, key_ordinals)?
+        if bytes_length(key) > 2048 or total_key_bytes > 67108864 - bytes_length(key): return err("YDBv1 DELETE key metadata exceeds its memory bound")
+        if row_index > 0 and yaza_db_compare_bytes_v1(previous_key, key) >= 0: return err("YDBv1 DELETE result is not in strict clustered-key order")
+        var page_id: Number = -1
+        var page: Bytes = bytes_from_text("")
+        var slot_index: Number = -1
+        var page_header: YazaDbPageHeaderV1 = YazaDbPageHeaderV1(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        if cached_leaf_page_id >= 2:
+            let cached_slot: Number = yaza_db_page_lower_bound_from_validated_header_v1(cached_leaf_page, cached_leaf_header, key, cached_next_slot)?
+            if cached_slot < cached_leaf_header.count:
+                let cached_slot_data: YazaDbPageSlotV1 = yaza_db_page_slot_from_validated_header_v1(cached_leaf_page, cached_leaf_header, cached_slot)?
+                let cached_key: Bytes = yaza_db_page_slot_key_from_validated_header_v1(cached_leaf_page, cached_leaf_header, cached_slot_data)?
+                if bytes_equal(cached_key, key):
+                    set page_id = cached_leaf_page_id
+                    set page = cached_leaf_page
+                    set slot_index = cached_slot
+                    set page_header = cached_leaf_header
+        if page_id < 0:
+            let seek: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(storage.file, storage.header, table_root_page_id, key)?
+            set page_id = seek.leaf_page_id
+            set page = seek.leaf_page
+            set page_header = seek.leaf_header
+            set slot_index = yaza_db_page_lower_bound_validated_header_v1(page, page_header, key)?
+            if slot_index >= page_header.count: return err("YDBv1 DELETE selected a row that is absent from its current leaf")
+        if slot_index < 0 or slot_index >= page_header.count: return err("YDBv1 DELETE selected a row that is absent from its current leaf")
+        let selected_slot: YazaDbPageSlotV1 = yaza_db_page_slot_from_validated_header_v1(page, page_header, slot_index)?
+        let stored_key: Bytes = yaza_db_page_slot_key_from_validated_header_v1(page, page_header, selected_slot)?
+        if not bytes_equal(stored_key, key): return err("YDBv1 DELETE selected a row whose clustered key changed")
+        let old_slot: YazaDbPageSlotV1 = selected_slot
+        let stored_row: YazaDbRowV1 = yaza_db_row_decode_for_schema_v1(old_slot.payload, table.columns, table_schema_version)?
+        let tombstone_payload: Bytes = yaza_db_sql_delete_tombstone_for_schema_v1(row, stored_row.overflow_refs, table.columns, table_schema_version, storage.header.next_commit_ts)?
+        let index_targets_created: Result[List[YazaDbSecondaryIndexTargetV1], Text] = list_try_new()
+        if not result_is_ok(index_targets_created): return err("YDBv1 DELETE could not allocate secondary-index target metadata")
+        let index_targets: List[YazaDbSecondaryIndexTargetV1] = result_unwrap(index_targets_created)
+        if not list_try_reserve(index_targets, list_count(indexes)): return err("YDBv1 DELETE could not reserve secondary-index target metadata")
+        let row_nulls: List[Boolean] = yaza_db_index_maintenance_nulls_v1(row)?
+        var index_number: Number = 0
+        while index_number < list_count(indexes):
+            let index: YazaDbSecondaryIndexV1 = list_get(indexes, index_number)
+            let entry: YazaDbSqlCreateIndexEntryV1 = yaza_db_index_maintenance_entry_v1(row, row_nulls, index)?
+            let target: YazaDbSecondaryIndexTargetV1 = yaza_db_index_maintenance_find_entry_v1(storage.file, storage.header, index, entry)?
+            if bytes_length(entry.key) > 2048 or total_index_key_bytes > 67108864 - bytes_length(entry.key): return err("YDBv1 DELETE secondary-index key metadata exceeds its memory bound")
+            if not list_try_push(index_targets, target): return err("YDBv1 DELETE could not retain a secondary-index target")
+            set total_index_key_bytes = total_index_key_bytes + bytes_length(entry.key)
+            set index_number = index_number + 1
+        if not list_try_push(targets, YazaDbSqlDeleteTargetV1(key, page_id, tombstone_payload, index_targets)): return err("YDBv1 DELETE could not retain a preflighted target")
+        set cached_leaf_page_id = page_id
+        set cached_leaf_page = page
+        set cached_leaf_header = page_header
+        set cached_next_slot = slot_index + 1
+        set previous_key = key
+        set total_key_bytes = total_key_bytes + bytes_length(key)
+        set row_index = row_index + 1
+
+    if profile_enabled: set profile_started_ns = yaza_db_query_profile_record_ns_v1(profile_ns, 24, profile_started_ns, monotonic_ns())
+    if profile_enabled: set profile_started_ns = monotonic_ns()
+    let mutation_count: Number = row_count * (list_count(indexes) + 1)
+    if mutation_count > 65536: return err("YDBv1 DELETE secondary-index mutations exceed their bounded write count")
+    var begun_result: Result[YazaDbWriteTransactionV1, Text] = err("YDBv1 DELETE transaction begin path was not selected")
+    if profile_enabled: set profile_started_ns = monotonic_ns()
+    if defer_checkpoint:
+        set begun_result = yaza_db_write_transaction_begin_deferred_checkpoint_v1(storage, wal)
+    else:
+        set begun_result = yaza_db_write_transaction_begin_v1(storage, wal)
+    let begun: YazaDbWriteTransactionV1 = begun_result?
+    if profile_enabled: set profile_started_ns = yaza_db_query_profile_record_ns_v1(profile_ns, 27, profile_started_ns, monotonic_ns())
+    if begun.commit_ts != storage.header.next_commit_ts:
+        yaza_db_sql_delete_close_v1(begun.storage, begun.wal)
+        return err("YDBv1 DELETE commit timestamp changed after tombstone preflight; reopen through recovery before reuse")
+    if not yaza_db_write_transaction_tail_fits_v1(begun, mutation_count + 1):
+        yaza_db_sql_delete_close_v1(begun.storage, begun.wal)
+        return err("YDBv1 DELETE result exceeds the bounded WAL recovery-tail budget; reopen through recovery before reuse")
+    var current: YazaDbWriteTransactionV1 = begun
+    var group_start: Number = 0
+    while group_start < row_count:
+        if profile_enabled: set profile_started_ns = monotonic_ns()
+        let first_target: YazaDbSqlDeleteTargetV1 = list_get(targets, group_start)
+        var group_end: Number = group_start + 1
+        while group_end < row_count and list_get(targets, group_end).page_id == first_target.page_id:
+            set group_end = group_end + 1
+        let updates_result: Result[List[YazaDbWriteLeafUpdateV1], Text] = list_try_new()
+        if not result_is_ok(updates_result):
+            yaza_db_sql_delete_close_v1(current.storage, current.wal)
+            return err("YDBv1 DELETE could not allocate a leaf-page mutation group: " + result_unwrap_error(updates_result))
+        let updates: List[YazaDbWriteLeafUpdateV1] = result_unwrap(updates_result)
+        if not list_try_reserve(updates, group_end - group_start):
+            yaza_db_sql_delete_close_v1(current.storage, current.wal)
+            return err("YDBv1 DELETE could not reserve its bounded leaf-page mutation group")
+        var group_index: Number = group_start
+        while group_index < group_end:
+            let target: YazaDbSqlDeleteTargetV1 = list_get(targets, group_index)
+            if not list_try_push(updates, YazaDbWriteLeafUpdateV1(target.key, target.tombstone_payload)):
+                yaza_db_sql_delete_close_v1(current.storage, current.wal)
+                return err("YDBv1 DELETE could not append to its leaf-page mutation group")
+            set group_index = group_index + 1
+        if profile_enabled: set profile_started_ns = yaza_db_query_profile_record_ns_v1(profile_ns, 28, profile_started_ns, monotonic_ns())
+        let mutated: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_mutate_leaf_group_profiled_v1(current, first_target.page_id, updates, profile_ns)
+        if not result_is_ok(mutated): return err("YDBv1 SQL DELETE page-group mutation failed; reopen through recovery before reuse: " + result_unwrap_error(mutated))
+        set current = result_unwrap(mutated)
+        set group_start = group_end
+    var index_number: Number = 0
+    while index_number < list_count(indexes):
+        let grouped_index_result: Result[YazaDbWriteTransactionV1, Text] = yaza_db_sql_delete_secondary_index_groups_v1(current, targets, index_number)
+        if not result_is_ok(grouped_index_result): return err(result_unwrap_error(grouped_index_result))
+        set current = result_unwrap(grouped_index_result)
+        set index_number = index_number + 1
+    if profile_enabled: set profile_started_ns = yaza_db_query_profile_record_ns_v1(profile_ns, 25, profile_started_ns, monotonic_ns())
+    if profile_enabled: set profile_started_ns = monotonic_ns()
+    var committed: Result[YazaDbWriteCommitV1, Text] = err("YDBv1 DELETE transaction commit was not selected")
+    if defer_checkpoint:
+        set committed = yaza_db_write_transaction_commit_deferred_checkpoint_v1(current)
+    else:
+        set committed = yaza_db_write_transaction_commit_v1(current)
+    if profile_enabled: let ignored_commit_profile: Number = yaza_db_query_profile_record_ns_v1(profile_ns, 26, profile_started_ns, monotonic_ns())
+    if not result_is_ok(committed):
+        let message: Text = result_unwrap_error(committed)
+        yaza_db_sql_delete_close_v1(current.storage, current.wal)
+        return err("YDBv1 SQL DELETE commit failed; reopen through recovery before reuse: " + message)
+    let result: YazaDbWriteCommitV1 = result_unwrap(committed)
+    return ok(YazaDbWriteCommitV1(result.storage, result.wal, result.txn_id, result.commit_ts, row_count))
+
+fn yaza_db_execute_delete_with_checkpoint_policy_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], defer_checkpoint: Boolean) -> Result[YazaDbWriteCommitV1, Text]:
+    return yaza_db_execute_delete_with_checkpoint_policy_profiled_v1(storage, wal, source, parameters, defer_checkpoint, List[Number]())
+
+fn yaza_db_execute_delete_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1]) -> Result[YazaDbWriteCommitV1, Text]:
+    return yaza_db_execute_delete_with_checkpoint_policy_v1(storage, wal, source, parameters, false)
+
+fn yaza_db_execute_delete_deferred_checkpoint_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1]) -> Result[YazaDbWriteCommitV1, Text]:
+    return yaza_db_execute_delete_with_checkpoint_policy_v1(storage, wal, source, parameters, true)
+
+fn yaza_db_execute_delete_profiled_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], profile_ns: List[Number]) -> Result[YazaDbWriteCommitV1, Text]:
+    return yaza_db_execute_delete_with_checkpoint_policy_profiled_v1(storage, wal, source, parameters, false, profile_ns)

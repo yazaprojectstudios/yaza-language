@@ -1,0 +1,66 @@
+# Shared physical key and row layout for bounded single-column secondary indexes.
+use "./key_codec_v1"
+use "./row_v1"
+use "./sql_create_index_v1"
+use "./sql_executor_v1"
+
+shape YazaDbSqlCreateIndexEntryV1:
+    values: List[YazaSqlValueV1]
+    nulls: List[Boolean]
+    key: Bytes
+
+fn yaza_db_sql_create_index_entry_schema_v1(plan: YazaSqlCreateIndexPlanV1, primary_key_ordinals: List[Number]) -> Result[List[YazaSqlColumnSchemaV1], Text]:
+    let count: Number = list_count(primary_key_ordinals) + 1
+    if not yaza_sql_create_index_plan_valid_v1(plan) or count < 2 or count > 1024: return err("YDBv1 secondary-index entry schema is outside its supported bound")
+    let created: Result[List[YazaSqlColumnSchemaV1], Text] = list_try_new()
+    if not result_is_ok(created): return err(result_unwrap_error(created))
+    let columns: List[YazaSqlColumnSchemaV1] = result_unwrap(created)
+    if not list_try_reserve(columns, count): return err("YDBv1 secondary-index entry schema could not reserve its bounded columns")
+    let indexed_column: YazaSqlColumnSchemaV1 = list_get(plan.table_columns, plan.index_column_ordinal)
+    if not list_try_push(columns, YazaSqlColumnSchemaV1("indexed_value", indexed_column.type_id, indexed_column.nullable, 0, indexed_column.precision, indexed_column.scale, "")):
+        return err("YDBv1 secondary-index entry schema could not add the indexed value")
+    var key_index: Number = 0
+    while key_index < list_count(primary_key_ordinals):
+        let source_ordinal: Number = list_get(primary_key_ordinals, key_index)
+        if source_ordinal < 0 or source_ordinal >= list_count(plan.table_columns): return err("YDBv1 secondary-index primary-key ordinal is outside the table schema")
+        let source_column: YazaSqlColumnSchemaV1 = list_get(plan.table_columns, source_ordinal)
+        let name: Text = "pk_" + number_text(key_index)
+        if not list_try_push(columns, YazaSqlColumnSchemaV1(name, source_column.type_id, false, key_index + 1, source_column.precision, source_column.scale, "")):
+            return err("YDBv1 secondary-index entry schema could not add a primary-key suffix column")
+        set key_index = key_index + 1
+    return ok(columns)
+
+fn yaza_db_sql_create_index_entry_key_ordinals_v1(entry_columns: List[YazaSqlColumnSchemaV1]) -> Result[List[Number], Text]:
+    let count: Number = list_count(entry_columns)
+    if count < 2 or count > 1024: return err("YDBv1 secondary-index entry key width is outside its supported bound")
+    let created: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(created): return err(result_unwrap_error(created))
+    let ordinals: List[Number] = result_unwrap(created)
+    if not list_try_reserve(ordinals, count): return err("YDBv1 secondary-index key could not reserve its bounded ordinals")
+    var ordinal: Number = 0
+    while ordinal < count:
+        if not list_try_push(ordinals, ordinal): return err("YDBv1 secondary-index key could not append its column ordinal")
+        set ordinal = ordinal + 1
+    return ok(ordinals)
+
+fn yaza_db_sql_create_index_entry_v1(source_row: YazaDbRowV1, plan: YazaSqlCreateIndexPlanV1, primary_key_ordinals: List[Number], entry_columns: List[YazaSqlColumnSchemaV1], entry_key_ordinals: List[Number]) -> Result[YazaDbSqlCreateIndexEntryV1, Text]:
+    if source_row.deleted or list_count(source_row.values) != list_count(plan.table_columns) or list_count(source_row.nulls) != list_count(plan.table_columns): return err("YDBv1 secondary-index source row does not match the table schema")
+    let values_created: Result[List[YazaSqlValueV1], Text] = list_try_new()
+    let nulls_created: Result[List[Boolean], Text] = list_try_new()
+    if not result_is_ok(values_created) or not result_is_ok(nulls_created): return err("YDBv1 secondary-index entry could not allocate row metadata")
+    let values: List[YazaSqlValueV1] = result_unwrap(values_created)
+    let nulls: List[Boolean] = result_unwrap(nulls_created)
+    let entry_count: Number = list_count(primary_key_ordinals) + 1
+    if not list_try_reserve(values, entry_count) or not list_try_reserve(nulls, entry_count): return err("YDBv1 secondary-index entry could not reserve its bounded row")
+    let indexed_ordinal: Number = plan.index_column_ordinal
+    if not list_try_push(values, list_get(source_row.values, indexed_ordinal)) or not list_try_push(nulls, list_get(source_row.nulls, indexed_ordinal)):
+        return err("YDBv1 secondary-index entry could not copy the indexed value")
+    var key_index: Number = 0
+    while key_index < list_count(primary_key_ordinals):
+        let source_ordinal: Number = list_get(primary_key_ordinals, key_index)
+        if source_ordinal < 0 or source_ordinal >= list_count(source_row.values) or list_get(source_row.nulls, source_ordinal): return err("YDBv1 secondary-index source row has an invalid NULL primary key")
+        if not list_try_push(values, list_get(source_row.values, source_ordinal)) or not list_try_push(nulls, false): return err("YDBv1 secondary-index entry could not append its primary-key suffix")
+        set key_index = key_index + 1
+    let key: Bytes = yaza_db_key_encode_composite_v1(values, nulls, entry_columns, entry_key_ordinals)?
+    if bytes_length(key) < 1 or bytes_length(key) > 2048: return err("YDBv1 secondary-index physical key is outside its page-key bound")
+    return ok(YazaDbSqlCreateIndexEntryV1(values, nulls, key))

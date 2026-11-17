@@ -1,0 +1,292 @@
+# YazaBase HTTP & API Parity Smoke Test (Item 5)
+use "std/fs"
+use "std/net"
+use "std/http"
+use "std/json"
+use "std/ybif"
+use "std/ywt"
+use "std/db/yazabase"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/session_v1"
+use "../yazabase/sql_dispatch_v1"
+use "../yazabase/sql_executor_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/wal_v1"
+use "../yazabase/api_v1"
+
+shape ApiExchangeResult:
+    session: YazaDbSessionV1
+    headers_text: Text
+    body_bytes: Bytes
+    body_text: Text
+
+fn api_request_with_content_length(request_raw: Text) -> Text:
+    let header_end: Number = text_find(request_raw, "\r\n\r\n")
+    if header_end < 0: return request_raw
+    let header_text: Text = text_slice(request_raw, 0, header_end)
+    if text_find(header_text, "Content-Length:") >= 0 or text_find(header_text, "content-length:") >= 0:
+        return request_raw
+    let body_start: Number = header_end + 4
+    let body_length: Number = text_length(request_raw) - body_start
+    if body_length == 0: return request_raw
+    let body: Text = text_slice(request_raw, body_start, body_length)
+    return header_text + "\r\nContent-Length: " + number_text(body_length) + "\r\n\r\n" + body
+
+fn api_find_body_offset(b: Bytes) -> Number:
+    let len: Number = bytes_length(b)
+    var i: Number = 0
+    while i + 3 < len:
+        if bytes_get(b, i) == 13 and bytes_get(b, i + 1) == 10 and bytes_get(b, i + 2) == 13 and bytes_get(b, i + 3) == 10:
+            return i + 4
+        set i = i + 1
+    return 0
+
+fn api_call_with_root(session: YazaDbSessionV1, root_path: Text, db_name: Text, request_raw: Text, auth_secret: Text) -> Result[ApiExchangeResult, Text]:
+    let s1_res: Result[Number, Text] = tcp_pair_create()
+    if not result_is_ok(s1_res): return err("tcp_pair_create failed: " + result_unwrap_error(s1_res))
+    let s1: Number = result_unwrap(s1_res)
+
+    let s2_res: Result[Number, Text] = tcp_pair_peer(s1)
+    if not result_is_ok(s2_res): return err("tcp_pair_peer failed: " + result_unwrap_error(s2_res))
+    let s2: Number = result_unwrap(s2_res)
+
+    let req_bytes: Bytes = bytes_from_text(api_request_with_content_length(request_raw))
+    let w_res: Result[Number, Text] = tcp_write(s2, req_bytes, 2000)
+    if not result_is_ok(w_res): return err("tcp_write failed: " + result_unwrap_error(w_res))
+
+    let handle_res: Result[YazaDbSessionV1, Text] = yaza_api_handle_connection_ex(session, root_path, db_name, s1, auth_secret, monotonic_ms(), 1)
+    if not result_is_ok(handle_res): return err("yaza_api_handle_connection failed: " + result_unwrap_error(handle_res))
+    let next_session: YazaDbSessionV1 = result_unwrap(handle_res)
+
+    let r_res: Result[Bytes, Text] = tcp_read(s2, 65536, 2000)
+    if not result_is_ok(r_res): return err("tcp_read failed: " + result_unwrap_error(r_res))
+    let resp_bytes: Bytes = result_unwrap(r_res)
+
+    let _c1: Result[Boolean, Text] = tcp_close(s1)
+    let _c2: Result[Boolean, Text] = tcp_close(s2)
+
+    let body_offset: Number = api_find_body_offset(resp_bytes)
+    var headers_text: Text = ""
+    var body_bytes: Bytes = bytes_empty()
+    var body_text: Text = ""
+    if body_offset > 0:
+        let h_slice: Bytes = bytes_slice(resp_bytes, 0, body_offset)
+        set headers_text = bytes_to_text(h_slice)
+        let b_len: Number = bytes_length(resp_bytes) - body_offset
+        if b_len > 0:
+            set body_bytes = bytes_slice(resp_bytes, body_offset, b_len)
+            let b_text_res: Result[Text, Text] = bytes_try_to_text(body_bytes)
+            if result_is_ok(b_text_res):
+                set body_text = result_unwrap(b_text_res)
+    else:
+        let full_text_res: Result[Text, Text] = bytes_try_to_text(resp_bytes)
+        if result_is_ok(full_text_res):
+            set headers_text = result_unwrap(full_text_res)
+
+    return ok(ApiExchangeResult(next_session, headers_text, body_bytes, body_text))
+
+fn api_call(session: YazaDbSessionV1, db_name: Text, request_raw: Text, auth_secret: Text) -> Result[ApiExchangeResult, Text]:
+    return api_call_with_root(session, "", db_name, request_raw, auth_secret)
+
+fn yazabase_api_v1_smoke(root_path: Text) -> Result[Number, Text]:
+    let initial_root_result: Result[Number, Text] = root_open(root_path)
+    if not result_is_ok(initial_root_result): return err("initial root open failed: " + result_unwrap_error(initial_root_result))
+    let root: Number = result_unwrap(initial_root_result)
+    let database_name: Text = "api-v1-smoke.ydb"
+    let header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_from_text("db-api-uuid-0001"), 0, 1, 1, 0, 2, 1)
+    let empty_storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, database_name, header)?
+    let empty_closed: Boolean = yaza_db_storage_close_v1(empty_storage)?
+    if not empty_closed: return err("could not close empty database")
+    let initialized: YazaDbCatalogBootstrapV1 = yaza_db_catalog_initialize_v1(root, database_name)?
+    let initialized_wal_closed: Boolean = yaza_db_wal_log_close_v1(initialized.wal)?
+    let initialized_storage_closed: Boolean = yaza_db_storage_close_v1(initialized.storage)?
+    if not initialized_wal_closed or not initialized_storage_closed: return err("could not close catalog bootstrap handles")
+
+    var session: YazaDbSessionV1 = yaza_db_session_open_v1(root, database_name)?
+    let credential_set: Result[Boolean, Text] = yazabase_set_credentials(root_path, "api_admin", "StrongPassphrase-API-Smoke-2026")
+    if not result_is_ok(credential_set): return err("could not configure API smoke credentials: " + result_unwrap_error(credential_set))
+    let credential_contents: Text = file_read(root_path + "/.yaza_credentials")
+    if text_find(credential_contents, "hash=$argon2id$v=19$m=19456,t=2,p=1$") < 0:
+        return err("new credential was not stored using the current Argon2id profile")
+    if yazabase_verify_credentials(root_path, "api_admin", "Wrong-Passphrase-API-Smoke-2026"):
+        return err("incorrect API password was accepted")
+    let auth_secret: Text = "yaza-api-secret-key-42-0123456789abcdef"
+
+    # Test 1: GET /readyz
+    let r1: ApiExchangeResult = api_call(session, database_name, "GET /readyz HTTP/1.1\r\nHost: localhost\r\n\r\n", auth_secret)?
+    set session = r1.session
+    if text_find(r1.headers_text, "200 OK") < 0: return err("test 1: expected 200 OK on /readyz")
+    if text_find(r1.headers_text, "X-Content-Type-Options: nosniff") < 0: return err("test 1: expected nosniff header")
+    if text_find(r1.headers_text, "X-Frame-Options: DENY") < 0: return err("test 1: expected DENY header")
+    if text_find(r1.headers_text, "X-Request-Id:") < 0: return err("test 1: expected X-Request-Id header")
+    if text_find(r1.body_text, "\"ready\"") < 0: return err("test 1: expected ready status in body")
+
+    # Test 2: GET /livez
+    let r2: ApiExchangeResult = api_call(session, database_name, "GET /livez HTTP/1.1\r\nHost: localhost\r\n\r\n", auth_secret)?
+    set session = r2.session
+    if text_find(r2.headers_text, "200 OK") < 0: return err("test 2: expected 200 OK on /livez")
+    if text_find(r2.body_text, "\"alive\"") < 0: return err("test 2: expected alive status in body")
+
+    # Test 3: OPTIONS /api/v1/sql (CORS preflight)
+    let r3: ApiExchangeResult = api_call(session, database_name, "OPTIONS /api/v1/sql HTTP/1.1\r\nHost: localhost\r\n\r\n", auth_secret)?
+    set session = r3.session
+    if text_find(r3.headers_text, "204 No Content") < 0: return err("test 3: expected 204 No Content on OPTIONS")
+    if text_find(r3.headers_text, "Access-Control-Allow-Origin: *") < 0: return err("test 3: expected CORS header")
+
+    # Test 4: YWT auth token (fail-closed credential check + protected route)
+    let bad_empty_auth: ApiExchangeResult = api_call_with_root(session, root_path, database_name, "POST /api/v1/sql HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\r\n{\"sql\":\"SELECT 1;\"}", "")?
+    set session = bad_empty_auth.session
+    if text_find(bad_empty_auth.headers_text, "401 Unauthorized") < 0: return err("test 4-neg1: empty secret must return 401 Unauthorized")
+
+    let bad_user_tok: ApiExchangeResult = api_call_with_root(session, root_path, database_name, "POST /api/v1/auth/token HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\r\n{\"username\":\"tcp-probe-user\",\"password\":\"wrong\"}", auth_secret)?
+    set session = bad_user_tok.session
+    if text_find(bad_user_tok.headers_text, "401 Unauthorized") < 0: return err("test 4-neg2: invalid credentials must return 401 Unauthorized")
+
+    let default_user_tok: ApiExchangeResult = api_call_with_root(session, root_path, database_name, "POST /api/v1/auth/token HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\r\n{\"username\":\"yaza\",\"password\":\"yaza_dev_password\"}", auth_secret)?
+    set session = default_user_tok.session
+    if text_find(default_user_tok.headers_text, "401 Unauthorized") < 0: return err("test 4-neg3: development default credentials must not issue API tokens")
+
+    let auth_body: Text = "{\"username\":\"api_admin\",\"password\":\"StrongPassphrase-API-Smoke-2026\"}"
+    let r4: ApiExchangeResult = api_call_with_root(session, root_path, database_name, "POST /api/v1/auth/token HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\r\n" + auth_body, auth_secret)?
+    set session = r4.session
+    if text_find(r4.headers_text, "200 OK") < 0: return err("test 4: expected 200 OK on /api/v1/auth/token; got: " + r4.body_text)
+    let token_opt: Option[Text] = json_extract_string(r4.body_text, "token")
+    if not option_is_some(token_opt): return err("test 4: expected token in response")
+    let token: Text = option_unwrap(token_opt)
+
+    let r4b: ApiExchangeResult = api_call(session, database_name, "GET /api/v1/protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + token + "\r\n\r\n", auth_secret)?
+    set session = r4b.session
+    if text_find(r4b.headers_text, "200 OK") < 0: return err("test 4b: expected 200 OK on /api/v1/protected")
+    if text_find(r4b.body_text, "\"authorized\"") < 0: return err("test 4b: expected authorized status")
+
+    let r4c: ApiExchangeResult = api_call(session, database_name, "GET /api/v1/protected HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer badtoken\r\n\r\n", auth_secret)?
+    set session = r4c.session
+    if text_find(r4c.headers_text, "401 Unauthorized") < 0: return err("test 4c: expected 401 Unauthorized")
+
+    # Test 5: Metrics Probes (Prometheus text and JSON)
+    let r_met1: ApiExchangeResult = api_call(session, database_name, "GET /metrics HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + token + "\r\n\r\n", auth_secret)?
+    set session = r_met1.session
+    if text_find(r_met1.headers_text, "200 OK") < 0: return err("test 5: expected 200 OK on /metrics")
+    if text_find(r_met1.body_text, "yazabase_uptime_seconds") < 0: return err("test 5: expected yazabase_uptime_seconds in metrics")
+    if text_find(r_met1.body_text, "yazabase_requests_total") < 0: return err("test 5: expected yazabase_requests_total in metrics")
+
+    let r_met2: ApiExchangeResult = api_call(session, database_name, "GET /api/v1/metrics HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + token + "\r\nAccept: application/json\r\n\r\n", auth_secret)?
+    set session = r_met2.session
+    if text_find(r_met2.headers_text, "200 OK") < 0: return err("test 5b: expected 200 OK on /api/v1/metrics")
+    if text_find(r_met2.body_text, "\"uptime_seconds\"") < 0: return err("test 5b: expected uptime_seconds JSON")
+
+    # Test 6: Request Size Limit (413 Payload Too Large)
+    let r_large: ApiExchangeResult = api_call(session, database_name, "POST /api/v1/sql HTTP/1.1\r\nHost: localhost\r\nContent-Length: 70000\r\n\r\n", auth_secret)?
+    set session = r_large.session
+    if text_find(r_large.headers_text, "413 Payload Too Large") < 0: return err("test 6: expected 413 Payload Too Large")
+
+    # Test 7: POST /api/v1/sql - DDL CREATE TABLE
+    let ddl_sql: Text = "CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT NOT NULL, price DOUBLE NOT NULL);"
+    let ddl_body: Text = "{\"sql\":\"" + json_escape_text(ddl_sql) + "\"}"
+    let r7: ApiExchangeResult = api_call(session, database_name, "POST /api/v1/sql HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + token + "\r\nContent-Type: application/json\r\n\r\n" + ddl_body, auth_secret)?
+    set session = r7.session
+    if text_find(r7.headers_text, "200 OK") < 0: return err("test 7: expected 200 OK on DDL CREATE TABLE")
+    if text_find(r7.body_text, "\"status\":\"ok\"") < 0: return err("test 7: expected status ok")
+
+    # Test 8: RESTful Tables Catalog (GET /api/v1/tables)
+    let r_tbls: ApiExchangeResult = api_call(session, database_name, "GET /api/v1/tables HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + token + "\r\n\r\n", auth_secret)?
+    set session = r_tbls.session
+    if text_find(r_tbls.headers_text, "200 OK") < 0: return err("test 8: expected 200 OK on GET /api/v1/tables")
+    if text_find(r_tbls.body_text, "\"items\"") < 0: return err("test 8: expected items in tables catalog")
+
+    # Test 9: RESTful Insert (POST /api/v1/tables/items)
+    let post_item_body: Text = "{\"values\":\"(1, 'keyboard', 89.5)\"}"
+    let r_ins: ApiExchangeResult = api_call(session, database_name, "POST /api/v1/tables/items HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + token + "\r\nContent-Type: application/json\r\n\r\n" + post_item_body, auth_secret)?
+    set session = r_ins.session
+    if text_find(r_ins.headers_text, "201 Created") < 0: return err("test 9: expected 201 Created on POST table; got headers: " + r_ins.headers_text + " body: " + r_ins.body_text)
+    if text_find(r_ins.body_text, "\"created\"") < 0: return err("test 9: expected status created")
+
+    # Insert more items via SQL
+    let dml_sql: Text = "INSERT INTO items VALUES (2, 'mouse', 25.0), (3, 'monitor', 299.99);"
+    let dml_body: Text = "{\"sql\":\"" + json_escape_text(dml_sql) + "\"}"
+    let r9b: ApiExchangeResult = api_call(session, database_name, "POST /api/v1/sql HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + token + "\r\nContent-Type: application/json\r\n\r\n" + dml_body, auth_secret)?
+    set session = r9b.session
+    if text_find(r9b.headers_text, "200 OK") < 0: return err("test 9b: expected 200 OK on INSERT")
+
+    # Test 10: RESTful Single Record Lookup (GET /api/v1/tables/items/1)
+    let r_get1: ApiExchangeResult = api_call(session, database_name, "GET /api/v1/tables/items/1 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + token + "\r\n\r\n", auth_secret)?
+    set session = r_get1.session
+    if text_find(r_get1.headers_text, "200 OK") < 0: return err("test 10: expected 200 OK on GET single item")
+    if text_find(r_get1.body_text, "\"keyboard\"") < 0: return err("test 10: expected keyboard in item 1")
+
+    # Test 11: RESTful 404 Lookup (GET /api/v1/tables/items/999)
+    let r_404: ApiExchangeResult = api_call(session, database_name, "GET /api/v1/tables/items/999 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + token + "\r\n\r\n", auth_secret)?
+    set session = r_404.session
+    if text_find(r_404.headers_text, "404 Not Found") < 0: return err("test 11: expected 404 Not Found on missing item")
+
+    # Test 12: RESTful Update Record (PUT /api/v1/tables/items/1)
+    let update_body: Text = "{\"set\":\"price = 99.99\"}"
+    let r_put: ApiExchangeResult = api_call(session, database_name, "PUT /api/v1/tables/items/1 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + token + "\r\nContent-Type: application/json\r\n\r\n" + update_body, auth_secret)?
+    set session = r_put.session
+    if text_find(r_put.headers_text, "200 OK") < 0: return err("test 12: expected 200 OK on PUT update")
+    if text_find(r_put.body_text, "\"updated\"") < 0: return err("test 12: expected updated in body")
+
+    # Test 13: RESTful Delete Record (DELETE /api/v1/tables/items/2)
+    let r_del: ApiExchangeResult = api_call(session, database_name, "DELETE /api/v1/tables/items/2 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + token + "\r\n\r\n", auth_secret)?
+    set session = r_del.session
+    if text_find(r_del.headers_text, "200 OK") < 0: return err("test 13: expected 200 OK on DELETE")
+    if text_find(r_del.body_text, "\"deleted\"") < 0: return err("test 13: expected deleted in body")
+
+    # Test 14: RESTful Query Table with limit (GET /api/v1/tables/items?limit=1)
+    let r_page: ApiExchangeResult = api_call(session, database_name, "GET /api/v1/tables/items?limit=1 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + token + "\r\n\r\n", auth_secret)?
+    set session = r_page.session
+    if text_find(r_page.headers_text, "200 OK") < 0: return err("test 14: expected 200 OK on limit query; got: " + r_page.headers_text + " body: " + r_page.body_text)
+    if text_find(r_page.body_text, "\"row_count\":1") < 0: return err("test 14: expected row_count: 1; got body: " + r_page.body_text)
+
+    # Test 15: POST /api/v1/sql - Query with JSON negotiation
+    let q_sql: Text = "SELECT id, name, price FROM items ORDER BY id ASC;"
+    let q_body: Text = "{\"sql\":\"" + json_escape_text(q_sql) + "\"}"
+    let r15: ApiExchangeResult = api_call(session, database_name, "POST /api/v1/sql HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + token + "\r\nAccept: application/json\r\nContent-Type: application/json\r\n\r\n" + q_body, auth_secret)?
+    set session = r15.session
+    if text_find(r15.headers_text, "200 OK") < 0: return err("test 15: expected 200 OK on SELECT JSON")
+    if text_find(r15.headers_text, "Content-Type: application/json") < 0: return err("test 15: expected application/json")
+    if text_find(r15.body_text, "\"keyboard\"") < 0: return err("test 15: expected keyboard in result")
+    if text_find(r15.body_text, "\"row_count\":2") < 0: return err("test 15: expected row_count: 2 (since item 2 was deleted)")
+
+    # Test 16: POST /api/v1/sql - Query with YBIF negotiation
+    let r16: ApiExchangeResult = api_call(session, database_name, "POST /api/v1/sql HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + token + "\r\nAccept: application/x-ybif\r\nContent-Type: application/json\r\n\r\n" + q_body, auth_secret)?
+    set session = r16.session
+    if text_find(r16.headers_text, "200 OK") < 0: return err("test 16: expected 200 OK on SELECT YBIF")
+    if text_find(r16.headers_text, "Content-Type: application/x-ybif") < 0: return err("test 16: expected application/x-ybif")
+    if not ybif_is_valid_header(r16.body_bytes): return err("test 16: expected valid YBIF header in body")
+    if bytes_length(r16.body_bytes) < 10: return err("test 16: expected non-empty YBIF payload")
+
+    # Test 17: Automatic Session Recovery on Statement Error
+    let bad_body: Text = "{\"sql\":\"SELECT * FORM items;\"}"
+    let r17: ApiExchangeResult = api_call_with_root(session, root_path, database_name, "POST /api/v1/sql HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + token + "\r\nContent-Type: application/json\r\n\r\n" + bad_body, auth_secret)?
+    set session = r17.session
+    if text_find(r17.headers_text, "400 Bad Request") < 0: return err("test 17: expected 400 Bad Request on syntax error")
+    if not session.is_open: return err("test 17: expected session to be automatically recovered")
+
+    # Immediate follow-up query proves session was recovered and ready
+    let r17b: ApiExchangeResult = api_call(session, database_name, "POST /api/v1/sql HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + token + "\r\nContent-Type: application/json\r\n\r\n" + q_body, auth_secret)?
+    set session = r17b.session
+    if text_find(r17b.headers_text, "200 OK") < 0: return err("test 17b: expected 200 OK after session recovery")
+
+    # Test 18: TCP listen / accept smoke
+    let listener_res: Result[Number, Text] = tcp_listen("127.0.0.1", 19875, 8)
+    if not result_is_ok(listener_res): return err("test 18: tcp_listen failed: " + result_unwrap_error(listener_res))
+    let listener: Number = result_unwrap(listener_res)
+    let accept_timeout_res: Result[Number, Text] = tcp_accept(listener, 10)
+    if result_is_ok(accept_timeout_res): return err("test 18: unexpected client on accept")
+    let _lclose: Result[Boolean, Text] = tcp_close(listener)
+
+    # Clean session shutdown
+    let closed_session: Boolean = yaza_db_session_close_v1(session)?
+    if not closed_session: return err("could not close session cleanly")
+    return ok(0)
+
+start:
+    var root_path: Text = "build/yazabase-api-test-root"
+    if arg_count() > 0:
+        set root_path = arg(1)
+    let smoke_result: Result[Number, Text] = yazabase_api_v1_smoke(root_path)
+    if not result_is_ok(smoke_result):
+        say "FAIL: " + result_unwrap_error(smoke_result)
+        exit(1)
+    say "yazabase-api-v1-smoke: PASS"

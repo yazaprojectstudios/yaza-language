@@ -1,0 +1,130 @@
+# Transactional DROP INDEX for the bounded single-column secondary-index profile.
+# The catalog tombstone and every validated index page are committed together.
+use "./allocator_v1"
+use "./btree_reclaim_v1"
+use "./catalog_schema_v1"
+use "./catalog_snapshot_v1"
+use "./catalog_storage_v1"
+use "./catalog_v1"
+use "./index_catalog_v1"
+use "./key_codec_v1"
+use "./page_v1"
+use "./row_v1"
+use "./sql_create_table_write_v1"
+use "./storage_v1"
+use "./transaction_v1"
+use "./wal_v1"
+
+fn yaza_db_sql_drop_index_close_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1) -> Unit:
+    let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(wal)
+    let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(storage)
+    return
+
+fn yaza_db_sql_drop_index_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, index_name: Text) -> Result[YazaDbWriteCommitV1, Text]:
+    if storage.root != wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid): return err("YDBv1 DROP INDEX storage and WAL handles belong to different databases")
+    if storage.header.catalog_root == 0 or storage.header.next_commit_ts < 2: return err("YDBv1 DROP INDEX requires an initialized committed catalog")
+    let visible_ts: Number = storage.header.next_commit_ts - 1
+    let rows: List[YazaDbRowV1] = yaza_db_index_catalog_rows_v1(storage.file, storage.header, visible_ts)?
+    var matched_index: Number = -1
+    var row_index: Number = 0
+    while row_index < list_count(rows):
+        let row: YazaDbRowV1 = list_get(rows, row_index)
+        if list_get(row.values, 2).text_value == index_name:
+            if matched_index >= 0: return err("YDBv1 DROP INDEX found duplicate current catalog names")
+            set matched_index = row_index
+        set row_index = row_index + 1
+    if matched_index < 0: return err("YDBv1 DROP INDEX target does not exist")
+
+    let index_row: YazaDbRowV1 = list_get(rows, matched_index)
+    let index_id: Number = list_get(index_row.values, 0).integer_value
+    let table_id: Number = list_get(index_row.values, 1).integer_value
+    let root_page_id: Number = list_get(index_row.values, 3).integer_value
+    let index_kind: Number = list_get(index_row.values, 4).integer_value
+    if index_kind == yaza_db_catalog_index_kind_primary_v1(): return err("YDBv1 DROP INDEX cannot remove a primary index")
+    if index_kind == yaza_db_catalog_index_kind_secondary_building_v1(): return err("YDBv1 DROP INDEX cannot remove an index while its build is incomplete")
+    if index_kind != yaza_db_catalog_index_kind_secondary_active_v1():
+        return err("YDBv1 DROP INDEX supports only ACTIVE secondary indexes")
+    if index_id < 1 or table_id < 1 or root_page_id < 2 or root_page_id >= storage.header.page_count:
+        return err("YDBv1 DROP INDEX catalog identity or root is outside its valid range")
+
+    let catalog: YazaDbCatalogRootV1 = yaza_db_catalog_storage_read_root_v1(storage.file, storage.header)?
+    let constraints_schema: List[YazaSqlColumnSchemaV1] = yaza_db_catalog_table_schema_v1(4)?
+    let constraints: List[YazaDbRowV1] = yaza_db_catalog_snapshot_read_tree_v1(storage.file, storage.header, catalog.sys_constraints_root, constraints_schema, [0], visible_ts, 4096)?
+    var constraint_index: Number = 0
+    while constraint_index < list_count(constraints):
+        let constraint: YazaDbRowV1 = list_get(constraints, constraint_index)
+        if not constraint.deleted and list_get(constraint.values, 1).integer_value == table_id and list_get(constraint.values, 2).text_value == index_name and list_get(constraint.values, 3).integer_value == 2:
+            return err("YDBv1 DROP INDEX cannot remove the backing index of a UNIQUE constraint")
+        set constraint_index = constraint_index + 1
+    if catalog.generation >= yaza_db_catalog_max_page_id_v1(): return err("YDBv1 DROP INDEX catalog generation space is exhausted")
+    if root_page_id == storage.header.catalog_root or root_page_id == catalog.sys_tables_root or root_page_id == catalog.sys_columns_root or root_page_id == catalog.sys_indexes_root or root_page_id == catalog.sys_constraints_root or (catalog.sys_views_root != 0 and root_page_id == catalog.sys_views_root):
+        return err("YDBv1 DROP INDEX root overlaps a system catalog page")
+    let reclaim: YazaDbBtreeReclaimPlanV1 = yaza_db_btree_reclaim_plan_v1(storage.file, storage.header, root_page_id)?
+    if list_count(reclaim.page_ids) < 1 or list_count(reclaim.page_ids) > yaza_db_btree_reclaim_max_pages_v1():
+        return err("YDBv1 DROP INDEX reclaim plan is outside its page bound")
+    var reclaim_index: Number = 0
+    while reclaim_index < list_count(reclaim.page_ids):
+        let page_id: Number = list_get(reclaim.page_ids, reclaim_index)
+        if page_id == storage.header.catalog_root or page_id == catalog.sys_tables_root or page_id == catalog.sys_columns_root or page_id == catalog.sys_indexes_root or page_id == catalog.sys_constraints_root or (catalog.sys_views_root != 0 and page_id == catalog.sys_views_root):
+            return err("YDBv1 DROP INDEX reclaim plan overlaps a protected catalog page")
+        set reclaim_index = reclaim_index + 1
+
+    let schema: List[YazaSqlColumnSchemaV1] = yaza_db_catalog_table_schema_v1(3)?
+    let key_ordinals: List[Number] = [0]
+    let key: Bytes = yaza_db_key_encode_composite_v1(index_row.values, index_row.nulls, schema, key_ordinals)?
+    if bytes_length(key) < 1 or bytes_length(key) > 2048: return err("YDBv1 DROP INDEX catalog key is outside its bounded encoding")
+    let commit_ts: Number = storage.header.next_commit_ts
+    let encoded: Bytes = yaza_db_row_encode_v1(index_row.values, index_row.nulls, schema, commit_ts)?
+    let tombstone: Bytes = yaza_db_row_set_deleted_v1(encoded, true)?
+    let seek: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(storage.file, storage.header, catalog.sys_indexes_root, key)?
+    let page_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(seek.leaf_page, seek.leaf_page_id)?
+    if page_header.page_type != 1 or page_header.level != 0: return err("YDBv1 DROP INDEX catalog lookup did not resolve to a leaf")
+    let slot_index: Number = yaza_db_page_lower_bound_v1(seek.leaf_page, key, seek.leaf_page_id)?
+    if slot_index >= page_header.count: return err("YDBv1 DROP INDEX catalog row disappeared during preflight")
+    let stored_key: Bytes = yaza_db_page_slot_key_v1(seek.leaf_page, slot_index, seek.leaf_page_id)?
+    if not bytes_equal(stored_key, key): return err("YDBv1 DROP INDEX catalog key changed during preflight")
+
+    let begun_result: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_begin_prepared_v1(storage, wal)
+    if not result_is_ok(begun_result): return err(result_unwrap_error(begun_result))
+    let begun: YazaDbWriteTransactionV1 = result_unwrap(begun_result)
+    if begun.commit_ts != commit_ts:
+        yaza_db_sql_drop_index_close_v1(begun.storage, begun.wal)
+        return err("YDBv1 DROP INDEX commit timestamp changed after preflight; reopen through recovery")
+
+    let leaf_record_bytes: Number = yaza_db_wal_header_size_v1() + yaza_db_wal_leaf_mutation_payload_size_v1()
+    let catalog_image_bytes: Number = yaza_db_wal_header_size_v1() + yaza_db_wal_page_image_payload_size_v1()
+    let free_page_record_bytes: Number = yaza_db_wal_header_size_v1() + yaza_db_page_space_payload_size_v1()
+    let additional_leaf_bytes: Number = leaf_record_bytes + catalog_image_bytes
+    if free_page_record_bytes < 1 or additional_leaf_bytes < 0 or list_count(reclaim.page_ids) > (9223372036854775807 - additional_leaf_bytes) / free_page_record_bytes:
+        yaza_db_sql_drop_index_close_v1(begun.storage, begun.wal)
+        return err("YDBv1 DROP INDEX WAL reservation arithmetic overflowed")
+    let required_wal_bytes: Number = additional_leaf_bytes + list_count(reclaim.page_ids) * free_page_record_bytes
+    if not yaza_db_write_transaction_tail_fits_bytes_v1(begun, required_wal_bytes):
+        yaza_db_sql_drop_index_close_v1(begun.storage, begun.wal)
+        return err("YDBv1 DROP INDEX exceeds the bounded WAL recovery-tail budget")
+
+    let next_catalog: YazaDbCatalogRootV1 = YazaDbCatalogRootV1(catalog.sys_tables_root, catalog.sys_columns_root, catalog.sys_indexes_root, catalog.sys_constraints_root, catalog.next_object_id, catalog.generation + 1, catalog.sys_views_root)
+    let catalog_append_result: Result[YazaDbWalAppendV1, Text] = yaza_db_sql_create_table_append_catalog_root_v1(begun.storage, begun.wal, begun.storage.header.catalog_root, next_catalog)
+    if not result_is_ok(catalog_append_result):
+        yaza_db_sql_drop_index_close_v1(begun.storage, begun.wal)
+        return err("YDBv1 DROP INDEX could not advance catalog generation; reopen through recovery: " + result_unwrap_error(catalog_append_result))
+    let catalog_append: YazaDbWalAppendV1 = result_unwrap(catalog_append_result)
+    # FULL_PAGE_IMAGE records use txn_id=0, so they are outside this transaction's prev_lsn chain.
+    var current: YazaDbWriteTransactionV1 = YazaDbWriteTransactionV1(begun.storage, catalog_append.log, begun.txn_id, begun.commit_ts, begun.last_lsn, begun.pending_pages, begun.pending_keys_hex, begun.pending_rows_hex, begun.active)
+    let mutation: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_mutate_leaf_v1(current, yaza_db_wal_type_leaf_update_v1(), seek.leaf_page_id, key, tombstone)
+    if not result_is_ok(mutation): return err("YDBv1 DROP INDEX catalog tombstone failed; reopen through recovery: " + result_unwrap_error(mutation))
+    set current = result_unwrap(mutation)
+    var free_index: Number = 0
+    while free_index < list_count(reclaim.page_ids):
+        let freed: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_free_page_v1(current, list_get(reclaim.page_ids, free_index))
+        if not result_is_ok(freed):
+            yaza_db_sql_drop_index_close_v1(current.storage, current.wal)
+            return err("YDBv1 DROP INDEX page reclamation failed; reopen through recovery: " + result_unwrap_error(freed))
+        set current = result_unwrap(freed)
+        set free_index = free_index + 1
+    let committed: Result[YazaDbWriteCommitV1, Text] = yaza_db_write_transaction_commit_v1(current)
+    if not result_is_ok(committed):
+        let message: Text = result_unwrap_error(committed)
+        yaza_db_sql_drop_index_close_v1(current.storage, current.wal)
+        return err("YDBv1 DROP INDEX commit failed; reopen through recovery: " + message)
+    return ok(result_unwrap(committed))

@@ -1,0 +1,173 @@
+# Reusable single-process SQL session over one exclusively locked YDBv1 database.
+# Sessions own the root capability, storage handle, and WAL handle until close.
+use "std/fs"
+use "./checkpoint_v1"
+use "./catalog_snapshot_v1"
+use "./btree_scan_v1"
+use "./query_v1"
+use "./row_v1"
+use "./sql_dispatch_v1"
+use "./sql_executor_v1"
+use "./sql_lexer_v1"
+use "./sql_parser_v2"
+use "./storage_v1"
+use "./wal_v1"
+
+shape YazaDbSessionV1:
+    root: Number
+    storage: YazaDbStorageHandleV1
+    wal: YazaDbWalLogV1
+    catalog_cache: Option[YazaDbCatalogSnapshotWithRootsV1]
+    index_rows_cache: Option[List[YazaDbRowV1]]
+    is_open: Boolean
+
+shape YazaDbSessionStatementV1:
+    session: YazaDbSessionV1
+    statement: YazaDbSqlStatementResultV1
+
+fn yaza_db_session_open_v1(root: Number, database_name: Text) -> Result[YazaDbSessionV1, Text]:
+    if root < 0 or text_length(database_name) < 1 or text_length(database_name) > 255:
+        return err("YDBv1 session root or database name is outside its bound")
+    let recovery_result: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_open_recovered_v1(root, database_name)
+    if not result_is_ok(recovery_result):
+        let ignored_root_close: Result[Boolean, Text] = close(root)
+        return err(result_unwrap_error(recovery_result))
+    let recovered: YazaDbCheckpointRecoveryV1 = result_unwrap(recovery_result)
+    if recovered.storage.root != root or recovered.wal.root != root or not bytes_equal(recovered.storage.header.db_uuid, recovered.wal.db_uuid):
+        let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(recovered.wal)
+        let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(recovered.storage)
+        let ignored_root_close: Result[Boolean, Text] = close(root)
+        return err("YDBv1 session recovery returned mismatched database capabilities")
+    return ok(YazaDbSessionV1(root, recovered.storage, recovered.wal, none, none, true))
+
+fn yaza_db_session_cacheable_select_v1(source: Text, tokens: List[YazaSqlTokenV1]) -> Boolean:
+    if list_count(tokens) < 3 or not yaza_sql_v2_is_keyword(source, tokens, 0, "SELECT"): return false
+    var from_count: Number = 0
+    var index: Number = 1
+    while index < list_count(tokens):
+        if yaza_sql_v2_is_keyword(source, tokens, index, "FROM"):
+            set from_count = from_count + 1
+        elif yaza_sql_v2_is_keyword(source, tokens, index, "SELECT") or yaza_sql_v2_is_keyword(source, tokens, index, "WITH") or yaza_sql_v2_is_keyword(source, tokens, index, "UNION") or yaza_sql_v2_is_keyword(source, tokens, index, "INTERSECT") or yaza_sql_v2_is_keyword(source, tokens, index, "EXCEPT") or yaza_sql_v2_is_keyword(source, tokens, index, "JOIN"):
+            return false
+        set index = index + 1
+    return from_count == 1
+
+fn yaza_db_session_catalog_at_current_version_v1(cached: YazaDbCatalogSnapshotWithRootsV1, storage: YazaDbStorageHandleV1) -> YazaDbCatalogSnapshotWithRootsV1:
+    let snapshot: YazaSqlCatalogSnapshotV1 = YazaSqlCatalogSnapshotV1(storage.header.next_commit_ts - 1, cached.sql_snapshot.tables, cached.sql_snapshot.column_defaults)
+    return YazaDbCatalogSnapshotWithRootsV1(cached.catalog, snapshot, cached.root_page_ids, cached.table_schema_versions, cached.views)
+
+fn yaza_db_session_invalidates_catalog_v1(statement_kind: Number) -> Boolean:
+    return statement_kind == yaza_db_sql_statement_kind_insert_v1() or statement_kind == yaza_db_sql_statement_kind_create_table_v1() or statement_kind == yaza_db_sql_statement_kind_delete_v1() or statement_kind == yaza_db_sql_statement_kind_update_v1() or statement_kind == yaza_db_sql_statement_kind_drop_table_v1() or statement_kind == yaza_db_sql_statement_kind_alter_table_v1() or statement_kind == yaza_db_sql_statement_kind_create_index_v1() or statement_kind == yaza_db_sql_statement_kind_drop_index_v1()
+
+fn yaza_db_session_close_after_statement_error_v1(session: YazaDbSessionV1) -> Text:
+    var cleanup_error: Text = ""
+    let wal_closed: Result[Boolean, Text] = yaza_db_wal_log_close_v1(session.wal)
+    let storage_closed: Result[Boolean, Text] = yaza_db_storage_close_v1(session.storage)
+    let root_closed: Result[Boolean, Text] = close(session.root)
+    if not result_is_ok(wal_closed): set cleanup_error = "WAL close: " + result_unwrap_error(wal_closed)
+    elif not result_unwrap(wal_closed): set cleanup_error = "WAL close returned false"
+    if not result_is_ok(storage_closed):
+        if text_length(cleanup_error) > 0: set cleanup_error = cleanup_error + "; "
+        set cleanup_error = cleanup_error + "storage close: " + result_unwrap_error(storage_closed)
+    elif not result_unwrap(storage_closed):
+        if text_length(cleanup_error) > 0: set cleanup_error = cleanup_error + "; "
+        set cleanup_error = cleanup_error + "storage close returned false"
+    if not result_is_ok(root_closed):
+        if text_length(cleanup_error) > 0: set cleanup_error = cleanup_error + "; "
+        set cleanup_error = cleanup_error + "root close: " + result_unwrap_error(root_closed)
+    elif not result_unwrap(root_closed):
+        if text_length(cleanup_error) > 0: set cleanup_error = cleanup_error + "; "
+        set cleanup_error = cleanup_error + "root close returned false"
+    return cleanup_error
+
+fn yaza_db_session_execute_profiled_v1(session: YazaDbSessionV1, source: Text, parameters: List[YazaSqlValueV1], profile_ns: List[Number]) -> Result[YazaDbSessionStatementV1, Text]:
+    if not session.is_open: return err("YDBv1 SQL session is closed")
+    if session.root < 0 or session.storage.root != session.root or session.wal.root != session.root or not bytes_equal(session.storage.header.db_uuid, session.wal.db_uuid):
+        return err("YDBv1 SQL session handles do not identify one open database")
+    var next_catalog_cache: Option[YazaDbCatalogSnapshotWithRootsV1] = session.catalog_cache
+    var next_index_rows_cache: Option[List[YazaDbRowV1]] = session.index_rows_cache
+    var executed: Result[YazaDbSqlStatementResultV1, Text] = err("YDBv1 session statement did not execute")
+    var lex_started_ns: Number = 0
+    if list_count(profile_ns) >= 4: set lex_started_ns = monotonic_ns()
+    let tokens_result: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(source)
+    if list_count(profile_ns) >= 4 and lex_started_ns > 0:
+        let ignored_lex_profile: Number = yaza_db_query_profile_record_ns_v1(profile_ns, 0, lex_started_ns, monotonic_ns())
+    if result_is_ok(tokens_result):
+        let tokens: List[YazaSqlTokenV1] = result_unwrap(tokens_result)
+        if yaza_db_session_cacheable_select_v1(source, tokens):
+            var catalog_started_ns: Number = 0
+            if list_count(profile_ns) >= 4: set catalog_started_ns = monotonic_ns()
+            var snapshot_result: Result[YazaDbCatalogSnapshotWithRootsV1, Text] = err("YDBv1 session catalog cache was not loaded")
+            if option_is_some(session.catalog_cache):
+                set snapshot_result = ok(yaza_db_session_catalog_at_current_version_v1(option_unwrap(session.catalog_cache), session.storage))
+            else:
+                set snapshot_result = yaza_db_catalog_snapshot_load_with_roots_v1(session.storage.file, session.storage.header)
+            if list_count(profile_ns) >= 4 and catalog_started_ns > 0:
+                let ignored_catalog_profile: Number = yaza_db_query_profile_record_ns_v1(profile_ns, 0, catalog_started_ns, monotonic_ns())
+            if not result_is_ok(snapshot_result):
+                set executed = err(result_unwrap_error(snapshot_result))
+            else:
+                let snapshot: YazaDbCatalogSnapshotWithRootsV1 = result_unwrap(snapshot_result)
+                var index_rows_result: Result[List[YazaDbRowV1], Text] = err("YDBv1 session index cache was not loaded")
+                if option_is_some(session.index_rows_cache):
+                    set index_rows_result = ok(option_unwrap(session.index_rows_cache))
+                else:
+                    set index_rows_result = yaza_db_query_clustered_index_rows_v1(session.storage.file, session.storage.header, snapshot.catalog, snapshot.sql_snapshot.version)
+                if not result_is_ok(index_rows_result):
+                    set executed = err(result_unwrap_error(index_rows_result))
+                else:
+                    let index_rows: List[YazaDbRowV1] = result_unwrap(index_rows_result)
+                    let query_result: Result[YazaSqlQueryResultV1, Text] = yaza_db_execute_single_select_with_cached_catalog_and_index_rows_profiled_v1(session.storage.file, session.storage.header, source, tokens, parameters, snapshot, index_rows, profile_ns)
+                    if not result_is_ok(query_result):
+                        set executed = err(result_unwrap_error(query_result))
+                    else:
+                        set next_catalog_cache = some(snapshot)
+                        set next_index_rows_cache = some(index_rows)
+                        set executed = ok(YazaDbSqlStatementResultV1(yaza_db_sql_statement_kind_select_v1(), some(result_unwrap(query_result)), none, none, session.storage, session.wal))
+        else:
+            if list_count(profile_ns) >= 34:
+                set executed = yaza_db_execute_session_statement_profiled_v1(session.storage, session.wal, source, parameters, profile_ns)
+            else:
+                set executed = yaza_db_execute_session_statement_v1(session.storage, session.wal, source, parameters)
+    else:
+        set executed = yaza_db_execute_statement_v1(session.storage, session.wal, source, parameters)
+    if not result_is_ok(executed):
+        let error: Text = result_unwrap_error(executed)
+        let cleanup_error: Text = yaza_db_session_close_after_statement_error_v1(session)
+        if text_length(cleanup_error) > 0: return err(error + "; YDBv1 session cleanup failed: " + cleanup_error)
+        return err(error)
+    let statement: YazaDbSqlStatementResultV1 = result_unwrap(executed)
+    if statement.storage.root != session.root or statement.wal.root != session.root or not bytes_equal(statement.storage.header.db_uuid, statement.wal.db_uuid):
+        let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(statement.wal)
+        let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(statement.storage)
+        let ignored_root_close: Result[Boolean, Text] = close(session.root)
+        return err("YDBv1 SQL statement returned handles for a different session database")
+    if yaza_db_session_invalidates_catalog_v1(statement.statement_kind):
+        set next_catalog_cache = none
+        set next_index_rows_cache = none
+    elif option_is_some(next_catalog_cache):
+        set next_catalog_cache = some(yaza_db_session_catalog_at_current_version_v1(option_unwrap(next_catalog_cache), statement.storage))
+    let next_session: YazaDbSessionV1 = YazaDbSessionV1(session.root, statement.storage, statement.wal, next_catalog_cache, next_index_rows_cache, true)
+    return ok(YazaDbSessionStatementV1(next_session, statement))
+
+fn yaza_db_session_execute_v1(session: YazaDbSessionV1, source: Text, parameters: List[YazaSqlValueV1]) -> Result[YazaDbSessionStatementV1, Text]:
+    return yaza_db_session_execute_profiled_v1(session, source, parameters, List[Number]())
+
+fn yaza_db_session_close_v1(session: YazaDbSessionV1) -> Result[Boolean, Text]:
+    if not session.is_open: return err("YDBv1 SQL session is already closed")
+    let checkpointed: Result[YazaDbCheckpointResultV1, Text] = yaza_db_checkpoint_clean_v1(session.storage, session.wal, 0)
+    if not result_is_ok(checkpointed):
+        let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(session.wal)
+        let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(session.storage)
+        let ignored_root_close: Result[Boolean, Text] = close(session.root)
+        return err("YDBv1 SQL session final checkpoint failed: " + result_unwrap_error(checkpointed))
+    let final_state: YazaDbCheckpointResultV1 = result_unwrap(checkpointed)
+    let wal_closed: Result[Boolean, Text] = yaza_db_wal_log_close_v1(final_state.wal)
+    let storage_closed: Result[Boolean, Text] = yaza_db_storage_close_v1(final_state.storage)
+    let root_closed: Result[Boolean, Text] = close(session.root)
+    if not result_is_ok(wal_closed): return err("YDBv1 session WAL close failed: " + result_unwrap_error(wal_closed))
+    if not result_is_ok(storage_closed): return err("YDBv1 session storage close failed: " + result_unwrap_error(storage_closed))
+    if not result_is_ok(root_closed): return err("YDBv1 session root close failed: " + result_unwrap_error(root_closed))
+    if not result_unwrap(wal_closed) or not result_unwrap(storage_closed) or not result_unwrap(root_closed):
+        return err("YDBv1 session close did not release every database capability")
+    return ok(true)

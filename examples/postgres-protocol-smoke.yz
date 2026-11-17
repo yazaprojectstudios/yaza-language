@@ -1,0 +1,402 @@
+use "std/pg/protocol"
+
+fn pg_test_error_field(code: Number, value: Text) -> Bytes:
+    return bytes_concat(bytes_from_number(code), pg_cstring(value))
+
+start:
+    let encoded_length: Result[Bytes, Text] = pg_u32_be(196608)
+    assert result_is_ok(encoded_length)
+    let version: Bytes = result_unwrap(encoded_length)
+    assert bytes_length(version) == 4
+    assert bytes_get(version, 0) == 0
+    assert bytes_get(version, 1) == 3
+    assert bytes_get(version, 2) == 0
+    assert bytes_get(version, 3) == 0
+
+    let decoded: Result[Number, Text] = pg_read_u32_be(version, 0)
+    assert result_is_ok(decoded)
+    assert result_unwrap(decoded) == 196608
+    let out_of_bounds: Result[Number, Text] = pg_read_u32_be(version, 1)
+    assert not result_is_ok(out_of_bounds)
+    let valid_text: Option[Text] = bytes_to_text_checked(bytes_from_text("YAZA"))
+    assert option_is_some(valid_text)
+    assert option_unwrap(valid_text) == "YAZA"
+    let invalid_utf8: Option[Text] = bytes_to_text_checked(bytes_from_number(255))
+    assert not option_is_some(invalid_utf8)
+    let negative: Result[Bytes, Text] = pg_u32_be(-1)
+    assert not result_is_ok(negative)
+    let maximum: Result[Bytes, Text] = pg_u32_be(4294967295)
+    assert result_is_ok(maximum)
+    let maximum_bytes: Bytes = result_unwrap(maximum)
+    assert bytes_get(maximum_bytes, 0) == 255
+    assert bytes_get(maximum_bytes, 1) == 255
+    assert bytes_get(maximum_bytes, 2) == 255
+    assert bytes_get(maximum_bytes, 3) == 255
+    let maximum_roundtrip: Result[Number, Text] = pg_read_u32_be(maximum_bytes, 0)
+    assert result_is_ok(maximum_roundtrip)
+    assert result_unwrap(maximum_roundtrip) == 4294967295
+    let signed_minus_one: Result[Number, Text] = pg_read_i32_be(maximum_bytes, 0)
+    assert result_is_ok(signed_minus_one)
+    assert result_unwrap(signed_minus_one) == -1
+
+    let startup_result: Result[Bytes, Text] = pg_startup_packet("yaza", "catalog")
+    assert result_is_ok(startup_result)
+    let startup: Bytes = result_unwrap(startup_result)
+    let startup_length: Result[Number, Text] = pg_read_u32_be(startup, 0)
+    assert result_is_ok(startup_length)
+    assert result_unwrap(startup_length) == bytes_length(startup)
+    assert bytes_get(startup, 5) == 3
+    assert bytes_get(startup, 8) == 117
+    assert bytes_get(startup, 12) == 0
+    assert bytes_get(startup, 13) == 121
+
+    let ssl_request_result: Result[Bytes, Text] = pg_ssl_request()
+    assert result_is_ok(ssl_request_result)
+    let ssl_request: Bytes = result_unwrap(ssl_request_result)
+    assert bytes_length(ssl_request) == 8
+    let ssl_request_length: Result[Number, Text] = pg_read_u32_be(ssl_request, 0)
+    let ssl_request_code: Result[Number, Text] = pg_read_u32_be(ssl_request, 4)
+    assert result_is_ok(ssl_request_length)
+    assert result_unwrap(ssl_request_length) == 8
+    assert result_is_ok(ssl_request_code)
+    assert result_unwrap(ssl_request_code) == 80877103
+    let server_accepts_ssl: Result[Boolean, Text] = pg_parse_ssl_response(bytes_from_number(83))
+    assert result_is_ok(server_accepts_ssl)
+    assert result_unwrap(server_accepts_ssl)
+    let server_refuses_ssl: Result[Boolean, Text] = pg_parse_ssl_response(bytes_from_number(78))
+    assert result_is_ok(server_refuses_ssl)
+    assert not result_unwrap(server_refuses_ssl)
+    assert not result_is_ok(pg_parse_ssl_response(bytes_from_number(88)))
+
+    let cancel_result: Result[Bytes, Text] = pg_cancel_request(123, 456)
+    assert result_is_ok(cancel_result)
+    let cancel_packet: Bytes = result_unwrap(cancel_result)
+    assert bytes_length(cancel_packet) == 16
+    let cancel_code: Result[Number, Text] = pg_read_u32_be(cancel_packet, 4)
+    assert result_is_ok(cancel_code)
+    assert result_unwrap(cancel_code) == 80877102
+
+    let query_result: Result[Bytes, Text] = pg_query_message("select 1")
+    assert result_is_ok(query_result)
+    let query: Bytes = result_unwrap(query_result)
+    assert bytes_get(query, 0) == 81
+    let decoded_query: Result[PgBackendFrame, Text] = pg_parse_backend_frame(query)
+    assert result_is_ok(decoded_query)
+    assert result_unwrap(decoded_query).tag == 81
+    let truncated_query: Bytes = bytes_slice(query, 0, 3)
+    let truncated_frame: Result[PgBackendFrame, Text] = pg_parse_backend_frame(truncated_query)
+    assert not result_is_ok(truncated_frame)
+    let invalid_tag_bytes: Bytes = bytes_concat(bytes_from_number(0), bytes_slice(query, 1, bytes_length(query) - 1))
+    let invalid_tag_frame: Result[PgBackendFrame, Text] = pg_parse_backend_frame(invalid_tag_bytes)
+    assert not result_is_ok(invalid_tag_frame)
+
+    let parse_message_result: Result[Bytes, Text] = pg_parse_message("statement1", "select $1")
+    assert result_is_ok(parse_message_result)
+    let parse_message: Bytes = result_unwrap(parse_message_result)
+    assert bytes_get(parse_message, 0) == 80
+    let parse_frame: Result[PgBackendFrame, Text] = pg_parse_backend_frame(parse_message)
+    assert result_is_ok(parse_frame)
+    assert result_unwrap(parse_frame).tag == 80
+    let parameter_oids: TextList = text_list()
+    list_push(parameter_oids, "25")
+    list_push(parameter_oids, "23")
+    list_push(parameter_oids, "16")
+    let typed_parse_result: Result[Bytes, Text] = pg_parse_message_with_oids("", "SELECT $1, $2, $3", parameter_oids)
+    assert result_is_ok(typed_parse_result)
+    let typed_parse_frame: PgBackendFrame = result_unwrap(pg_parse_backend_frame(result_unwrap(typed_parse_result)))
+    let statement_cursor: Number = number_parse(list_get(result_unwrap(pg_read_cstring(typed_parse_frame.payload, 0)), 1))
+    let sql_cursor: Number = number_parse(list_get(result_unwrap(pg_read_cstring(typed_parse_frame.payload, statement_cursor)), 1))
+    assert result_unwrap(pg_read_u16_be(typed_parse_frame.payload, sql_cursor)) == 3
+    assert result_unwrap(pg_read_u32_be(typed_parse_frame.payload, sql_cursor + 2)) == 25
+    assert result_unwrap(pg_read_u32_be(typed_parse_frame.payload, sql_cursor + 6)) == 23
+    assert result_unwrap(pg_read_u32_be(typed_parse_frame.payload, sql_cursor + 10)) == 16
+    let invalid_oids: TextList = text_list()
+    list_push(invalid_oids, "-1")
+    assert not result_is_ok(pg_parse_message_with_oids("", "SELECT $1", invalid_oids))
+    list_set(invalid_oids, 0, "not-an-oid")
+    assert not result_is_ok(pg_parse_message_with_oids("", "SELECT $1", invalid_oids))
+    let bound_values: TextList = text_list()
+    list_push(bound_values, "sku-1'); DROP TABLE products; --")
+    list_push(bound_values, "")
+    let bind_message_result: Result[Bytes, Text] = pg_bind_text_message("", "statement1", bound_values)
+    assert result_is_ok(bind_message_result)
+    let bind_message: Bytes = result_unwrap(bind_message_result)
+    let bind_frame: Result[PgBackendFrame, Text] = pg_parse_backend_frame(bind_message)
+    assert result_is_ok(bind_frame)
+    assert result_unwrap(bind_frame).tag == 66
+    let encoded_parameter_length: Result[Number, Text] = pg_read_u32_be(bind_message, 21)
+    assert result_is_ok(encoded_parameter_length)
+    assert result_unwrap(encoded_parameter_length) == bytes_length(bytes_from_text("sku-1'); DROP TABLE products; --"))
+    assert bytes_get(bind_message, 25) == 115
+    let nullable_values: TextList = text_list()
+    list_push(nullable_values, "sku-1'); DROP TABLE products; --")
+    list_push(nullable_values, "")
+    list_push(nullable_values, "ignored-for-null")
+    let bind_null_flags: TextList = text_list()
+    list_push(bind_null_flags, "0")
+    list_push(bind_null_flags, "0")
+    list_push(bind_null_flags, "1")
+    let bind_values_result: Result[Bytes, Text] = pg_bind_values_message("", "", nullable_values, bind_null_flags)
+    assert result_is_ok(bind_values_result)
+    let bind_values: Bytes = result_unwrap(bind_values_result)
+    let first_value_length: Number = result_unwrap(pg_read_u32_be(bind_values, 11))
+    assert bytes_equal(bytes_slice(bind_values, 15, first_value_length), bytes_from_text("sku-1'); DROP TABLE products; --"))
+    let empty_value_length_offset: Number = 15 + first_value_length
+    assert result_unwrap(pg_read_u32_be(bind_values, empty_value_length_offset)) == 0
+    let null_length_offset: Number = empty_value_length_offset + 4
+    assert result_unwrap(pg_read_u32_be(bind_values, null_length_offset)) == 4294967295
+    assert not result_is_ok(pg_bind_values_message("", "", nullable_values, text_list()))
+    let invalid_null_flags: TextList = text_list()
+    list_push(invalid_null_flags, "yes")
+    list_push(invalid_null_flags, "0")
+    list_push(invalid_null_flags, "1")
+    assert not result_is_ok(pg_bind_values_message("", "", nullable_values, invalid_null_flags))
+    let extended_exchange_result: Result[Bytes, Text] = pg_extended_query_message_with_oids("SELECT $1, $2, $3", nullable_values, bind_null_flags, parameter_oids)
+    assert result_is_ok(extended_exchange_result)
+    let extended_exchange: Bytes = result_unwrap(extended_exchange_result)
+    let expected_frontend_tags: TextList = text_list()
+    list_push(expected_frontend_tags, "80")
+    list_push(expected_frontend_tags, "66")
+    list_push(expected_frontend_tags, "68")
+    list_push(expected_frontend_tags, "69")
+    list_push(expected_frontend_tags, "83")
+    let mismatched_oids: TextList = text_list()
+    list_push(mismatched_oids, "25")
+    list_push(mismatched_oids, "23")
+    assert not result_is_ok(pg_extended_query_message_with_oids("SELECT $1, $2, $3", nullable_values, bind_null_flags, mismatched_oids))
+
+    let typed_parameters: PgParameters = pg_parameters_new()
+    assert result_is_ok(pg_parameters_add_text(typed_parameters, "typed text"))
+    assert result_is_ok(pg_parameters_add_number(typed_parameters, -42))
+    assert result_is_ok(pg_parameters_add_int32(typed_parameters, int32_from_number(2147483647)))
+    assert result_is_ok(pg_parameters_add_float64(typed_parameters, 3.5))
+    assert result_is_ok(pg_parameters_add_boolean(typed_parameters, false))
+    let binary_parameter: Bytes = bytes_concat(bytes_from_number(0), bytes_concat(bytes_from_number(65), bytes_from_number(255)))
+    assert result_is_ok(pg_parameters_add_bytes(typed_parameters, binary_parameter))
+    assert result_is_ok(pg_parameters_add_null(typed_parameters, 23))
+    assert result_is_ok(pg_parameters_add_text_as(typed_parameters, "123.45", 1700))
+    assert result_is_ok(pg_parameters_validate(typed_parameters))
+    assert list_count(typed_parameters.values) == 8
+    assert list_get(typed_parameters.values, 0) == "typed text"
+    assert list_get(typed_parameters.type_oids, 0) == "25"
+    assert list_get(typed_parameters.values, 1) == "-42"
+    assert list_get(typed_parameters.type_oids, 1) == "20"
+    assert list_get(typed_parameters.values, 2) == "2147483647"
+    assert list_get(typed_parameters.type_oids, 2) == "23"
+    assert list_get(typed_parameters.values, 3) == "3.5"
+    assert list_get(typed_parameters.type_oids, 3) == "701"
+    assert list_get(typed_parameters.values, 4) == "false"
+    assert list_get(typed_parameters.type_oids, 4) == "16"
+    let bytea_prefix: Text = option_unwrap(bytes_to_text_checked(bytes_from_number(92))) + "x"
+    assert list_get(typed_parameters.values, 5) == bytea_prefix + "0041ff"
+    assert list_get(typed_parameters.type_oids, 5) == "17"
+    assert list_get(typed_parameters.null_flags, 6) == "1"
+    assert list_get(typed_parameters.type_oids, 6) == "23"
+    assert list_get(typed_parameters.values, 7) == "123.45"
+    assert list_get(typed_parameters.type_oids, 7) == "1700"
+    assert not result_is_ok(pg_parameters_add_text_as(typed_parameters, "invalid OID", 4294967296))
+    assert list_count(typed_parameters.values) == 8
+    let typed_parameter_message: Result[Bytes, Text] = pg_parameters_message("SELECT $1, $2, $3, $4, $5, $6, $7, $8", typed_parameters)
+    assert result_is_ok(typed_parameter_message)
+    let malformed_typed_parameters: PgParameters = PgParameters(typed_parameters.values, typed_parameters.null_flags, mismatched_oids)
+    assert not result_is_ok(pg_parameters_validate(malformed_typed_parameters))
+
+    var exchange_offset: Number = 0
+    var exchange_index: Number = 0
+    while exchange_index < list_count(expected_frontend_tags):
+        let frontend_length: Number = result_unwrap(pg_read_u32_be(extended_exchange, exchange_offset + 1))
+        let frontend_size: Number = frontend_length + 1
+        let frontend_frame: Result[PgBackendFrame, Text] = pg_parse_backend_frame(bytes_slice(extended_exchange, exchange_offset, frontend_size))
+        assert result_is_ok(frontend_frame)
+        assert result_unwrap(frontend_frame).tag == number_parse(list_get(expected_frontend_tags, exchange_index))
+        set exchange_offset = exchange_offset + frontend_size
+        set exchange_index = exchange_index + 1
+    assert exchange_offset == bytes_length(extended_exchange)
+    let describe_statement: Result[Bytes, Text] = pg_describe_message("S", "statement1")
+    assert result_is_ok(describe_statement)
+    let describe_portal: Result[Bytes, Text] = pg_describe_message("P", "portal1")
+    assert result_is_ok(describe_portal)
+    assert not result_is_ok(pg_describe_message("X", "statement1"))
+    let execute_message: Result[Bytes, Text] = pg_execute_message("portal1", 25)
+    assert result_is_ok(execute_message)
+    assert not result_is_ok(pg_execute_message("portal1", -1))
+    let sync_message: Result[Bytes, Text] = pg_sync_message()
+    let flush_message: Result[Bytes, Text] = pg_flush_message()
+    let close_message: Result[Bytes, Text] = pg_close_message("S", "statement1")
+    assert result_is_ok(sync_message)
+    assert result_is_ok(flush_message)
+    assert result_is_ok(close_message)
+    assert bytes_length(result_unwrap(sync_message)) == 5
+
+    let ready_idle: Result[PgTransactionStatus, Text] = pg_parse_ready_for_query(PgBackendFrame(90, bytes_from_number(73)))
+    assert result_is_ok(ready_idle)
+    let idle_status: PgTransactionStatus = result_unwrap(ready_idle)
+    match idle_status:
+        Idle:
+            assert true
+        InTransaction:
+            assert false
+        FailedTransaction:
+            assert false
+    let ready_failed: Result[PgTransactionStatus, Text] = pg_parse_ready_for_query(PgBackendFrame(90, bytes_from_number(69)))
+    assert result_is_ok(ready_failed)
+    let failed_status: PgTransactionStatus = result_unwrap(ready_failed)
+    match failed_status:
+        Idle:
+            assert false
+        InTransaction:
+            assert false
+        FailedTransaction:
+            assert true
+    assert not result_is_ok(pg_parse_ready_for_query(PgBackendFrame(90, bytes_from_number(88))))
+
+    let command_complete: Result[Text, Text] = pg_parse_command_complete(PgBackendFrame(67, pg_cstring("INSERT 0 1")))
+    assert result_is_ok(command_complete)
+    assert result_unwrap(command_complete) == "INSERT 0 1"
+    let key_payload: Bytes = bytes_concat(result_unwrap(pg_u32_be(123)), result_unwrap(pg_u32_be(456)))
+    let backend_key: Result[PgBackendKeyData, Text] = pg_parse_backend_key_data(PgBackendFrame(75, key_payload))
+    assert result_is_ok(backend_key)
+    assert result_unwrap(backend_key).process_id == 123
+    assert result_unwrap(backend_key).secret_key == 456
+    let parameter_payload: Bytes = bytes_concat(pg_cstring("server_version"), pg_cstring("18.0"))
+    let parameter_status: Result[PgParameterStatus, Text] = pg_parse_parameter_status(PgBackendFrame(83, parameter_payload))
+    assert result_is_ok(parameter_status)
+    assert result_unwrap(parameter_status).name == "server_version"
+    assert result_unwrap(parameter_status).value == "18.0"
+
+    let backend_length: Result[Bytes, Text] = pg_u32_be(5)
+    assert result_is_ok(backend_length)
+    let backend_header: Bytes = bytes_concat(bytes_from_number(90), result_unwrap(backend_length))
+    let backend_message: Bytes = bytes_concat(backend_header, bytes_from_text("I"))
+    let parsed: Result[PgBackendFrame, Text] = pg_parse_backend_frame(backend_message)
+    assert result_is_ok(parsed)
+    let frame: PgBackendFrame = result_unwrap(parsed)
+    assert frame.tag == 90
+    assert bytes_equal(frame.payload, bytes_from_text("I"))
+
+    let auth_code: Result[Bytes, Text] = pg_u32_be(5)
+    assert result_is_ok(auth_code)
+    let auth_body: Bytes = bytes_concat(result_unwrap(auth_code), bytes_from_text("salt"))
+    let auth_frame: PgBackendFrame = PgBackendFrame(82, auth_body)
+    let auth: Result[PgAuthentication, Text] = pg_parse_authentication(auth_frame)
+    assert result_is_ok(auth)
+    let auth_value: PgAuthentication = result_unwrap(auth)
+    match auth_value:
+        Accepted:
+            assert false
+        CleartextPassword:
+            assert false
+        Md5Password(salt):
+            assert bytes_equal(salt, bytes_from_text("salt"))
+        Sasl(_):
+            assert false
+        SaslContinue(_):
+            assert false
+        SaslFinal(_):
+            assert false
+        Unsupported(_):
+            assert false
+
+    let sasl_code: Result[Bytes, Text] = pg_u32_be(10)
+    assert result_is_ok(sasl_code)
+    let sasl_name: Bytes = bytes_from_text("SCRAM-SHA-256")
+    let sasl_terminator: Bytes = bytes_concat(bytes_from_number(0), bytes_from_number(0))
+    let sasl_mechanisms: Bytes = bytes_concat(sasl_name, sasl_terminator)
+    let sasl_body: Bytes = bytes_concat(result_unwrap(sasl_code), sasl_mechanisms)
+    let sasl_frame: PgBackendFrame = PgBackendFrame(82, sasl_body)
+    let sasl_auth: Result[PgAuthentication, Text] = pg_parse_authentication(sasl_frame)
+    assert result_is_ok(sasl_auth)
+    let sasl_auth_value: PgAuthentication = result_unwrap(sasl_auth)
+    match sasl_auth_value:
+        Accepted:
+            assert false
+        CleartextPassword:
+            assert false
+        Md5Password(_):
+            assert false
+        Sasl(mechanisms):
+            assert bytes_length(mechanisms) == 15
+        SaslContinue(_):
+            assert false
+        SaslFinal(_):
+            assert false
+        Unsupported(_):
+            assert false
+
+    let malformed_sasl: Bytes = bytes_concat(result_unwrap(sasl_code), sasl_name)
+    let malformed_frame: PgBackendFrame = PgBackendFrame(82, malformed_sasl)
+    let malformed_auth: Result[PgAuthentication, Text] = pg_parse_authentication(malformed_frame)
+    assert not result_is_ok(malformed_auth)
+
+    let row_count: Bytes = bytes_concat(bytes_from_number(0), bytes_from_number(2))
+    let text_length: Result[Bytes, Text] = pg_u32_be(3)
+    assert result_is_ok(text_length)
+    let first_field_header: Bytes = bytes_concat(row_count, result_unwrap(text_length))
+    let first_field: Bytes = bytes_concat(first_field_header, bytes_from_text("sku"))
+    let null_length: Bytes = bytes_concat(bytes_from_number(255), bytes_from_number(255))
+    let null_length_tail: Bytes = bytes_concat(null_length, bytes_from_number(255))
+    let null_length_bytes: Bytes = bytes_concat(null_length_tail, bytes_from_number(255))
+    let row_payload: Bytes = bytes_concat(first_field, null_length_bytes)
+    let row_fields: Result[Number, Text] = pg_data_row_field_count(row_payload)
+    assert result_is_ok(row_fields)
+    assert result_unwrap(row_fields) == 2
+    let first_value_result: Result[Option[Bytes], Text] = pg_data_row_field(row_payload, 0)
+    assert result_is_ok(first_value_result)
+    let first_value: Option[Bytes] = result_unwrap(first_value_result)
+    assert option_is_some(first_value)
+    assert bytes_equal(option_unwrap(first_value), bytes_from_text("sku"))
+    let null_value_result: Result[Option[Bytes], Text] = pg_data_row_field(row_payload, 1)
+    assert result_is_ok(null_value_result)
+    assert not option_is_some(result_unwrap(null_value_result))
+    assert not result_is_ok(pg_data_row_field(row_payload, 2))
+    let trailing_row: Bytes = bytes_concat(row_payload, bytes_from_number(1))
+    assert not result_is_ok(pg_data_row_field_count(trailing_row))
+
+    let description_count: Bytes = bytes_concat(bytes_from_number(0), bytes_from_number(1))
+    let description_name: Bytes = bytes_concat(bytes_from_text("sku"), bytes_from_number(0))
+    let zero_word: Result[Bytes, Text] = pg_u32_be(0)
+    let text_oid: Result[Bytes, Text] = pg_u32_be(25)
+    let minus_one_word: Result[Bytes, Text] = pg_u32_be(4294967295)
+    assert result_is_ok(zero_word)
+    assert result_is_ok(text_oid)
+    assert result_is_ok(minus_one_word)
+    let oid_and_attribute: Bytes = bytes_concat(result_unwrap(zero_word), bytes_slice(result_unwrap(zero_word), 2, 2))
+    let type_and_size: Bytes = bytes_concat(result_unwrap(text_oid), bytes_slice(result_unwrap(minus_one_word), 2, 2))
+    let modifier_and_format: Bytes = bytes_concat(result_unwrap(minus_one_word), bytes_slice(result_unwrap(zero_word), 2, 2))
+    let description_fixed_a: Bytes = bytes_concat(oid_and_attribute, type_and_size)
+    let description_fixed_b: Bytes = bytes_concat(description_fixed_a, modifier_and_format)
+    let description_body_a: Bytes = bytes_concat(description_count, description_name)
+    let description_body_b: Bytes = bytes_concat(description_body_a, description_fixed_b)
+    let description_count_result: Result[Number, Text] = pg_row_description_field_count(description_body_b)
+    assert result_is_ok(description_count_result)
+    assert result_unwrap(description_count_result) == 1
+    let description_result: Result[PgColumnDescription, Text] = pg_row_description_field(description_body_b, 0)
+    assert result_is_ok(description_result)
+    let column: PgColumnDescription = result_unwrap(description_result)
+    assert column.name == "sku"
+    assert column.type_oid == 25
+    assert column.type_size == -1
+    assert column.type_modifier == -1
+    assert column.format_code == 0
+    assert not result_is_ok(pg_row_description_field(description_body_b, 1))
+
+    var error_payload: Bytes = pg_test_error_field(83, "ERROR")
+    set error_payload = bytes_concat(error_payload, pg_test_error_field(86, "ERROR"))
+    set error_payload = bytes_concat(error_payload, pg_test_error_field(67, "23505"))
+    set error_payload = bytes_concat(error_payload, pg_test_error_field(77, "duplicate key"))
+    set error_payload = bytes_concat(error_payload, pg_test_error_field(68, "safe detail"))
+    set error_payload = bytes_concat(error_payload, bytes_from_number(0))
+    let server_error_frame: PgBackendFrame = PgBackendFrame(69, error_payload)
+    let server_error_result: Result[PgServerError, Text] = pg_parse_error_response(server_error_frame)
+    assert result_is_ok(server_error_result)
+    let server_error: PgServerError = result_unwrap(server_error_result)
+    assert server_error.severity == "ERROR"
+    assert server_error.sqlstate == "23505"
+    assert server_error.message == "duplicate key"
+    assert option_is_some(server_error.detail)
+    assert option_unwrap(server_error.detail) == "safe detail"
+    assert not option_is_some(server_error.hint)
+    assert not result_is_ok(pg_parse_error_response(PgBackendFrame(69, bytes_slice(error_payload, 0, bytes_length(error_payload) - 1))))
+    let bad_sqlstate_payload: Bytes = bytes_concat(pg_test_error_field(67, "not-a-code"), pg_test_error_field(77, "bad"))
+    let bad_sqlstate_fields: Bytes = bytes_concat(bytes_concat(pg_test_error_field(86, "ERROR"), bad_sqlstate_payload), bytes_from_number(0))
+    assert not result_is_ok(pg_parse_error_response(PgBackendFrame(69, bad_sqlstate_fields)))

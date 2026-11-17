@@ -1,0 +1,338 @@
+# SCRAM-SHA-256 client authentication. Crypto primitives are OS-provider calls;
+# protocol state, framing, parsing, and proof construction stay in YAZA.
+use "protocol"
+
+shape PgScramClientFirst:
+    bare: Text
+    message: Text
+    nonce: Text
+
+shape PgScramClientFinal:
+    message: Text
+    expected_server_signature: Bytes
+
+fn pg_scram_base64_value(byte: Number) -> Number:
+    if byte >= 65 and byte <= 90:
+        return byte - 65
+    if byte >= 97 and byte <= 122:
+        return byte - 97 + 26
+    if byte >= 48 and byte <= 57:
+        return byte - 48 + 52
+    if byte == 43:
+        return 62
+    if byte == 47:
+        return 63
+    return -1
+
+fn pg_scram_base64_encode(input: Bytes) -> Result[Text, Text]:
+    if bytes_length(input) > 3072:
+        return err("SCRAM base64 input exceeds 3072 bytes")
+    let alphabet: Text = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    let length: Number = bytes_length(input)
+    var index: Number = 0
+    var encoded: Text = ""
+    while index < length:
+        let first: Number = bytes_get(input, index)
+        var second: Number = 0
+        var third: Number = 0
+        let has_second: Boolean = index + 1 < length
+        let has_third: Boolean = index + 2 < length
+        if has_second:
+            set second = bytes_get(input, index + 1)
+        if has_third:
+            set third = bytes_get(input, index + 2)
+        let digit0: Number = first / 4
+        let digit1: Number = (first % 4) * 16 + second / 16
+        set encoded = encoded + text_slice(alphabet, digit0, 1) + text_slice(alphabet, digit1, 1)
+        if has_second:
+            let digit2: Number = (second % 16) * 4 + third / 64
+            set encoded = encoded + text_slice(alphabet, digit2, 1)
+        else:
+            set encoded = encoded + "="
+        if has_third:
+            let digit3: Number = third % 64
+            set encoded = encoded + text_slice(alphabet, digit3, 1)
+        else:
+            set encoded = encoded + "="
+        set index = index + 3
+    return ok(encoded)
+
+fn pg_scram_base64_decode(input: Text) -> Result[Bytes, Text]:
+    let encoded: Bytes = bytes_from_text(input)
+    let length: Number = bytes_length(encoded)
+    if length > 4096 or length % 4 != 0:
+        return err("SCRAM base64 input has an invalid size")
+    var output: Bytes = bytes_from_text("")
+    var index: Number = 0
+    while index < length:
+        let first: Number = pg_scram_base64_value(bytes_get(encoded, index))
+        let second: Number = pg_scram_base64_value(bytes_get(encoded, index + 1))
+        let third_byte: Number = bytes_get(encoded, index + 2)
+        let fourth_byte: Number = bytes_get(encoded, index + 3)
+        let final_block: Boolean = index + 4 == length
+        if first < 0 or second < 0:
+            return err("SCRAM base64 input contains an invalid alphabet byte")
+        var third: Number = 0
+        var fourth: Number = 0
+        var padding: Number = 0
+        if third_byte == 61:
+            set padding = 2
+            if not final_block or fourth_byte != 61 or second % 16 != 0:
+                return err("SCRAM base64 padding is malformed")
+        else:
+            set third = pg_scram_base64_value(third_byte)
+            if third < 0:
+                return err("SCRAM base64 input contains an invalid alphabet byte")
+            if fourth_byte == 61:
+                set padding = 1
+                if not final_block or third % 4 != 0:
+                    return err("SCRAM base64 padding is malformed")
+            else:
+                set fourth = pg_scram_base64_value(fourth_byte)
+                if fourth < 0:
+                    return err("SCRAM base64 input contains an invalid alphabet byte")
+        let first_output: Number = first * 4 + second / 16
+        set output = bytes_concat(output, bytes_from_number(first_output))
+        if padding < 2:
+            let second_output: Number = (second % 16) * 16 + third / 4
+            set output = bytes_concat(output, bytes_from_number(second_output))
+        if padding == 0:
+            let third_output: Number = (third % 4) * 64 + fourth
+            set output = bytes_concat(output, bytes_from_number(third_output))
+        set index = index + 4
+    return ok(output)
+
+fn pg_scram_escape_username(username: Text) -> Result[Text, Text]:
+    let input: Bytes = bytes_from_text(username)
+    let length: Number = bytes_length(input)
+    if length == 0 or length > 255:
+        return err("SCRAM username must contain 1 to 255 UTF-8 bytes")
+    var output: Text = ""
+    var index: Number = 0
+    while index < length:
+        let byte: Number = bytes_get(input, index)
+        if byte < 32 or byte > 126:
+            return err("SCRAM username requires SASLprep-compatible printable ASCII")
+        if byte == 44:
+            set output = output + "=2C"
+        else:
+            if byte == 61:
+                set output = output + "=3D"
+            else:
+                set output = output + text_slice(username, index, 1)
+        set index = index + 1
+    return ok(output)
+
+fn pg_scram_validate_saslprep_ascii_bytes(input: Bytes, label: Text) -> Result[Boolean, Text]:
+    let length: Number = bytes_length(input)
+    var index: Number = 0
+    while index < length:
+        let byte: Number = bytes_get(input, index)
+        # Until Unicode 3.2 SASLprep tables are bundled, accept only the
+        # printable ASCII subset whose preparation is identity-preserving.
+        if byte < 32 or byte > 126:
+            return err("SCRAM " + label + " must be printable ASCII; Unicode SASLprep is not available")
+        set index = index + 1
+    return ok(true)
+
+fn pg_scram_client_first_with_nonce(username: Text, nonce: Text) -> Result[PgScramClientFirst, Text]:
+    let escaped: Result[Text, Text] = pg_scram_escape_username(username)
+    if not result_is_ok(escaped):
+        return err(result_unwrap_error(escaped))
+    let nonce_bytes: Bytes = bytes_from_text(nonce)
+    let nonce_length: Number = bytes_length(nonce_bytes)
+    if nonce_length < 16 or nonce_length > 256:
+        return err("SCRAM nonce must contain 16 to 256 bytes")
+    var index: Number = 0
+    while index < nonce_length:
+        if pg_scram_base64_value(bytes_get(nonce_bytes, index)) < 0:
+            return err("SCRAM nonce must use the base64 alphabet without padding")
+        set index = index + 1
+    let bare: Text = "n=" + result_unwrap(escaped) + ",r=" + nonce
+    return ok(PgScramClientFirst(bare, "n,," + bare, nonce))
+
+fn pg_scram_client_first(username: Text) -> Result[PgScramClientFirst, Text]:
+    let random: Bytes = secure_random_bytes(18)
+    let nonce: Result[Text, Text] = pg_scram_base64_encode(random)
+    if not result_is_ok(nonce):
+        return err(result_unwrap_error(nonce))
+    return pg_scram_client_first_with_nonce(username, result_unwrap(nonce))
+
+fn pg_scram_initial_message(first: PgScramClientFirst) -> Result[Bytes, Text]:
+    let mechanism: Bytes = pg_cstring("SCRAM-SHA-256")
+    let initial: Bytes = bytes_from_text(first.message)
+    let length: Result[Bytes, Text] = pg_u32_be(bytes_length(initial))
+    if not result_is_ok(length):
+        return err(result_unwrap_error(length))
+    let with_length: Bytes = bytes_concat(mechanism, result_unwrap(length))
+    return pg_frontend_message("p", bytes_concat(with_length, initial))
+
+fn pg_scram_parse_iterations(value: Text) -> Result[Number, Text]:
+    let digits: Bytes = bytes_from_text(value)
+    let length: Number = bytes_length(digits)
+    if length == 0 or length > 7:
+        return err("SCRAM iteration count is malformed")
+    var count: Number = 0
+    var index: Number = 0
+    while index < length:
+        let byte: Number = bytes_get(digits, index)
+        if byte < 48 or byte > 57:
+            return err("SCRAM iteration count is not decimal")
+        set count = count * 10 + byte - 48
+        if count > 1000000:
+            return err("SCRAM iteration count exceeds the 1000000 limit")
+        set index = index + 1
+    if count < 4096:
+        return err("SCRAM iteration count is below the 4096 security minimum")
+    return ok(count)
+
+fn pg_scram_xor(left: Bytes, right: Bytes) -> Result[Bytes, Text]:
+    if bytes_length(left) != bytes_length(right):
+        return err("SCRAM proof operands have different lengths")
+    var output: Bytes = bytes_from_text("")
+    var index: Number = 0
+    while index < bytes_length(left):
+        var first: Number = bytes_get(left, index)
+        var second: Number = bytes_get(right, index)
+        var bit: Number = 1
+        var result_byte: Number = 0
+        var bit_index: Number = 0
+        while bit_index < 8:
+            if first % 2 != second % 2:
+                set result_byte = result_byte + bit
+            set first = first / 2
+            set second = second / 2
+            set bit = bit * 2
+            set bit_index = bit_index + 1
+        set output = bytes_concat(output, bytes_from_number(result_byte))
+        set index = index + 1
+    return ok(output)
+
+fn pg_scram_client_final(first: PgScramClientFirst, password: Text, server_first: Text) -> Result[PgScramClientFinal, Text]:
+    let password_bytes: Bytes = bytes_from_text(password)
+    let result: Result[PgScramClientFinal, Text] = pg_scram_client_final_bytes(first, password_bytes, server_first)
+    let wiped: Number = bytes_zeroize(password_bytes)
+    return result
+
+fn pg_scram_client_final_bytes(first: PgScramClientFirst, password_bytes: Bytes, server_first: Text) -> Result[PgScramClientFinal, Text]:
+    if bytes_length(password_bytes) > 1024 or bytes_length(bytes_from_text(server_first)) > 4096:
+        return err("SCRAM password or server-first message exceeds its input limit")
+    let password_status: Result[Boolean, Text] = pg_scram_validate_saslprep_ascii_bytes(password_bytes, "password")
+    if not result_is_ok(password_status):
+        return err(result_unwrap_error(password_status))
+    var attributes: TextList = text_split(server_first, ",")
+    if list_count(attributes) < 3 or list_count(attributes) > 16:
+        return err("SCRAM server-first message has an invalid attribute count")
+    var server_nonce: Text = ""
+    var salt_text: Text = ""
+    var iterations_text: Text = ""
+    var saw_nonce: Boolean = false
+    var saw_salt: Boolean = false
+    var saw_iterations: Boolean = false
+    let seen_attributes: TextList = text_list()
+    var attribute_index: Number = 0
+    while attribute_index < list_count(attributes):
+        let attribute: Text = list_get(attributes, attribute_index)
+        let separator: Number = text_find(attribute, "=")
+        if separator != 1:
+            return err("SCRAM server-first attribute is malformed")
+        let name: Text = text_slice(attribute, 0, 1)
+        let value: Text = text_slice(attribute, 2, text_length(attribute) - 2)
+        let name_byte: Number = text_byte(name, 0)
+        if not ((name_byte >= 65 and name_byte <= 90) or (name_byte >= 97 and name_byte <= 122)):
+            return err("SCRAM server-first attribute name must be an ASCII letter")
+        var seen_index: Number = 0
+        while seen_index < list_count(seen_attributes):
+            if list_get(seen_attributes, seen_index) == name:
+                return err("SCRAM server-first message duplicates an attribute")
+            set seen_index = seen_index + 1
+        list_push(seen_attributes, name)
+        if text_length(value) == 0:
+            return err("SCRAM server-first attribute is empty")
+        let value_bytes: Bytes = bytes_from_text(value)
+        var value_index: Number = 0
+        while value_index < bytes_length(value_bytes):
+            let value_byte: Number = bytes_get(value_bytes, value_index)
+            if value_byte < 32 or value_byte > 126:
+                return err("SCRAM server-first attribute value contains a non-printable byte")
+            set value_index = value_index + 1
+        if name == "m":
+            return err("SCRAM server requires an unsupported mandatory extension")
+        if name == "r":
+            if saw_nonce:
+                return err("SCRAM server-first message duplicates the nonce")
+            set saw_nonce = true
+            set server_nonce = value
+        else:
+            if name == "s":
+                if saw_salt:
+                    return err("SCRAM server-first message duplicates the salt")
+                set saw_salt = true
+                set salt_text = value
+            else:
+                if name == "i":
+                    if saw_iterations:
+                        return err("SCRAM server-first message duplicates the iteration count")
+                    set saw_iterations = true
+                    set iterations_text = value
+        set attribute_index = attribute_index + 1
+    if not saw_nonce or not saw_salt or not saw_iterations:
+        return err("SCRAM server-first message is missing a required attribute")
+    if not text_starts_with(server_nonce, first.nonce) or text_length(server_nonce) <= text_length(first.nonce):
+        return err("SCRAM server nonce does not extend the client nonce")
+    let iterations: Result[Number, Text] = pg_scram_parse_iterations(iterations_text)
+    if not result_is_ok(iterations):
+        return err(result_unwrap_error(iterations))
+    let salt_result: Result[Bytes, Text] = pg_scram_base64_decode(salt_text)
+    if not result_is_ok(salt_result):
+        return err(result_unwrap_error(salt_result))
+    let salt: Bytes = result_unwrap(salt_result)
+    if bytes_length(salt) == 0 or bytes_length(salt) > 1024:
+        return err("SCRAM salt must contain 1 to 1024 bytes")
+    let salted_result: Result[Bytes, Text] = crypto_pbkdf2_sha256(password_bytes, salt, result_unwrap(iterations), 32)
+    if not result_is_ok(salted_result):
+        return err(result_unwrap_error(salted_result))
+    let salted_password: Bytes = result_unwrap(salted_result)
+    let client_key: Bytes = crypto_hmac_sha256(salted_password, bytes_from_text("Client Key"))
+    let stored_key: Bytes = crypto_sha256(client_key)
+    let client_final_without_proof: Text = "c=biws,r=" + server_nonce
+    let auth_message: Text = first.bare + "," + server_first + "," + client_final_without_proof
+    let client_signature: Bytes = crypto_hmac_sha256(stored_key, bytes_from_text(auth_message))
+    let proof_result: Result[Bytes, Text] = pg_scram_xor(client_key, client_signature)
+    if not result_is_ok(proof_result):
+        let wipe_salted_password: Number = bytes_zeroize(salted_password)
+        let wipe_client_key: Number = bytes_zeroize(client_key)
+        let wipe_stored_key: Number = bytes_zeroize(stored_key)
+        let wipe_client_signature: Number = bytes_zeroize(client_signature)
+        return err(result_unwrap_error(proof_result))
+    let wipe_client_signature: Number = bytes_zeroize(client_signature)
+    let proof_text: Result[Text, Text] = pg_scram_base64_encode(result_unwrap(proof_result))
+    if not result_is_ok(proof_text):
+        let wipe_salted_password: Number = bytes_zeroize(salted_password)
+        let wipe_client_key: Number = bytes_zeroize(client_key)
+        let wipe_stored_key: Number = bytes_zeroize(stored_key)
+        return err(result_unwrap_error(proof_text))
+    let server_key: Bytes = crypto_hmac_sha256(salted_password, bytes_from_text("Server Key"))
+    let expected_server_signature: Bytes = crypto_hmac_sha256(server_key, bytes_from_text(auth_message))
+    let message: Text = client_final_without_proof + ",p=" + result_unwrap(proof_text)
+    let wipe_salted_password: Number = bytes_zeroize(salted_password)
+    let wipe_client_key: Number = bytes_zeroize(client_key)
+    let wipe_stored_key: Number = bytes_zeroize(stored_key)
+    let wipe_server_key: Number = bytes_zeroize(server_key)
+    return ok(PgScramClientFinal(message, expected_server_signature))
+
+fn pg_scram_continue_message(final_message: PgScramClientFinal) -> Result[Bytes, Text]:
+    return pg_frontend_message("p", bytes_from_text(final_message.message))
+
+fn pg_scram_verify_server_final(final_message: PgScramClientFinal, server_final: Text) -> Result[Boolean, Text]:
+    if text_starts_with(server_final, "e="):
+        return err("SCRAM server rejected client authentication")
+    if not text_starts_with(server_final, "v="):
+        return err("SCRAM server-final message is malformed")
+    let signature_text: Text = text_slice(server_final, 2, text_length(server_final) - 2)
+    let signature_result: Result[Bytes, Text] = pg_scram_base64_decode(signature_text)
+    if not result_is_ok(signature_result):
+        return err("SCRAM server signature is malformed")
+    if not bytes_equal_constant_time(final_message.expected_server_signature, result_unwrap(signature_result)):
+        return err("SCRAM server signature verification failed")
+    return ok(true)

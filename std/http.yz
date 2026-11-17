@@ -1,0 +1,329 @@
+# Bounded HTTP/1.1 framing, parsing, and response generation for YAZA.
+
+use "std/json"
+use "std/ybif"
+
+shape HttpRequest:
+    method: Text
+    path: Text
+    query: Text
+    accept: Text
+    content_type: Text
+    authorization: Text
+    x_request_id: Text
+    content_length: Number
+    body: Bytes
+    body_text: Text
+
+shape HttpResponse:
+    status_code: Number
+    status_text: Text
+    content_type: Text
+    body: Bytes
+
+fn http_response_ok_json(body_json: Text) -> HttpResponse:
+    return HttpResponse(200, "OK", "application/json", bytes_from_text(body_json))
+
+fn http_response_created_json(body_json: Text) -> HttpResponse:
+    return HttpResponse(201, "Created", "application/json", bytes_from_text(body_json))
+
+fn http_response_ok_ybif(body_ybif: Bytes) -> HttpResponse:
+    return HttpResponse(200, "OK", "application/x-ybif", body_ybif)
+
+fn http_response_no_content() -> HttpResponse:
+    return HttpResponse(204, "No Content", "text/plain", bytes_empty())
+
+fn http_response_bad_request(message: Text, as_json: Boolean) -> HttpResponse:
+    if as_json:
+        let err_json: Text = "{\"error\":{\"code\":\"BAD_REQUEST\",\"message\":\"" + json_escape_text(message) + "\",\"status\":400}}"
+        return HttpResponse(400, "Bad Request", "application/json", bytes_from_text(err_json))
+    return HttpResponse(400, "Bad Request", "application/x-ybif", ybif_encode_error(400, message))
+
+fn http_response_unauthorized(message: Text, as_json: Boolean) -> HttpResponse:
+    if as_json:
+        let err_json: Text = "{\"error\":{\"code\":\"UNAUTHORIZED\",\"message\":\"" + json_escape_text(message) + "\",\"status\":401}}"
+        return HttpResponse(401, "Unauthorized", "application/json", bytes_from_text(err_json))
+    return HttpResponse(401, "Unauthorized", "application/x-ybif", ybif_encode_error(401, message))
+
+fn http_response_forbidden(message: Text, as_json: Boolean) -> HttpResponse:
+    if as_json:
+        let err_json: Text = "{\"error\":{\"code\":\"FORBIDDEN\",\"message\":\"" + json_escape_text(message) + "\",\"status\":403}}"
+        return HttpResponse(403, "Forbidden", "application/json", bytes_from_text(err_json))
+    return HttpResponse(403, "Forbidden", "application/x-ybif", ybif_encode_error(403, message))
+
+fn http_response_not_found(message: Text, as_json: Boolean) -> HttpResponse:
+    if as_json:
+        let err_json: Text = "{\"error\":{\"code\":\"NOT_FOUND\",\"message\":\"" + json_escape_text(message) + "\",\"status\":404}}"
+        return HttpResponse(404, "Not Found", "application/json", bytes_from_text(err_json))
+    return HttpResponse(404, "Not Found", "application/x-ybif", ybif_encode_error(404, message))
+
+fn http_response_method_not_allowed(message: Text, as_json: Boolean) -> HttpResponse:
+    if as_json:
+        let err_json: Text = "{\"error\":{\"code\":\"METHOD_NOT_ALLOWED\",\"message\":\"" + json_escape_text(message) + "\",\"status\":405}}"
+        return HttpResponse(405, "Method Not Allowed", "application/json", bytes_from_text(err_json))
+    return HttpResponse(405, "Method Not Allowed", "application/x-ybif", ybif_encode_error(405, message))
+
+fn http_response_not_acceptable(message: Text, as_json: Boolean) -> HttpResponse:
+    if as_json:
+        let err_json: Text = "{\"error\":{\"code\":\"NOT_ACCEPTABLE\",\"message\":\"" + json_escape_text(message) + "\",\"status\":406}}"
+        return HttpResponse(406, "Not Acceptable", "application/json", bytes_from_text(err_json))
+    return HttpResponse(406, "Not Acceptable", "application/x-ybif", ybif_encode_error(406, message))
+
+fn http_response_payload_too_large(message: Text, as_json: Boolean) -> HttpResponse:
+    if as_json:
+        let err_json: Text = "{\"error\":{\"code\":\"PAYLOAD_TOO_LARGE\",\"message\":\"" + json_escape_text(message) + "\",\"status\":413}}"
+        return HttpResponse(413, "Payload Too Large", "application/json", bytes_from_text(err_json))
+    return HttpResponse(413, "Payload Too Large", "application/x-ybif", ybif_encode_error(413, message))
+
+fn http_response_internal_error(message: Text, as_json: Boolean) -> HttpResponse:
+    if as_json:
+        let err_json: Text = "{\"error\":{\"code\":\"INTERNAL_ERROR\",\"message\":\"" + json_escape_text(message) + "\",\"status\":500}}"
+        return HttpResponse(500, "Internal Server Error", "application/json", bytes_from_text(err_json))
+    return HttpResponse(500, "Internal Server Error", "application/x-ybif", ybif_encode_error(500, message))
+
+fn http_response_service_unavailable(message: Text, as_json: Boolean) -> HttpResponse:
+    if as_json:
+        let err_json: Text = "{\"error\":{\"code\":\"OVERLOAD\",\"message\":\"" + json_escape_text(message) + "\",\"status\":503}}"
+        return HttpResponse(503, "Service Unavailable", "application/json", bytes_from_text(err_json))
+    return HttpResponse(503, "Service Unavailable", "application/x-ybif", ybif_encode_error(503, message))
+
+fn http_format_response_keep_alive(response: HttpResponse, request_id: Text, keep_alive: Boolean) -> Bytes:
+    var header_text: Text = "HTTP/1.1 " + number_text(response.status_code) + " " + response.status_text + "\r\n"
+    set header_text = header_text + "Content-Type: " + response.content_type + "\r\n"
+    set header_text = header_text + "Content-Length: " + number_text(bytes_length(response.body)) + "\r\n"
+    set header_text = header_text + "Access-Control-Allow-Origin: *\r\n"
+    set header_text = header_text + "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD\r\n"
+    set header_text = header_text + "Access-Control-Allow-Headers: Content-Type, Authorization, Accept, X-Request-Id\r\n"
+    set header_text = header_text + "X-Content-Type-Options: nosniff\r\n"
+    set header_text = header_text + "X-Frame-Options: DENY\r\n"
+    set header_text = header_text + "Content-Security-Policy: default-src 'none'; frame-ancestors 'none'\r\n"
+    set header_text = header_text + "Cache-Control: no-store\r\n"
+    if text_length(request_id) > 0:
+        set header_text = header_text + "X-Request-Id: " + request_id + "\r\n"
+    set header_text = header_text + "Vary: Accept\r\n"
+    if keep_alive:
+        set header_text = header_text + "Connection: keep-alive\r\nKeep-Alive: timeout=5, max=64\r\n\r\n"
+    else:
+        set header_text = header_text + "Connection: close\r\n\r\n"
+    let header_bytes: Bytes = bytes_from_text(header_text)
+    return bytes_concat(header_bytes, response.body)
+
+fn http_format_response_with_id(response: HttpResponse, request_id: Text) -> Bytes:
+    return http_format_response_keep_alive(response, request_id, false)
+
+fn http_format_response(response: HttpResponse) -> Bytes:
+    return http_format_response_with_id(response, "")
+
+fn http_query_param_text(query: Text, key: Text, default_val: Text) -> Text:
+    if query == "": return default_val
+    let needle: Text = key + "="
+    var search_start: Number = 0
+    let qlen: Number = text_length(query)
+    while search_start < qlen:
+        let pos: Number = text_find(text_slice(query, search_start, qlen - search_start), needle)
+        if pos < 0: return default_val
+        let actual_pos: Number = search_start + pos
+        if actual_pos == 0 or text_byte(query, actual_pos - 1) == 38:
+            let val_start: Number = actual_pos + text_length(needle)
+            var val_end: Number = val_start
+            while val_end < qlen and text_byte(query, val_end) != 38:
+                set val_end = val_end + 1
+            if val_end <= val_start: return default_val
+            return text_slice(query, val_start, val_end - val_start)
+        set search_start = actual_pos + 1
+    return default_val
+
+fn http_query_param_number(query: Text, key: Text, default_val: Number) -> Number:
+    let val_text: Text = http_query_param_text(query, key, "")
+    if val_text == "": return default_val
+    let parsed: Result[Number, Text] = number_try_parse(val_text)
+    if result_is_ok(parsed): return result_unwrap(parsed)
+    return default_val
+
+fn http_ascii_lower_header_name(name: Text) -> Text:
+    let lowered: Bytes = bytes_from_text(name)
+    var i: Number = 0
+    while i < bytes_length(lowered):
+        let value: Number = bytes_get(lowered, i)
+        if value >= 65 and value <= 90:
+            let _set: Boolean = bytes_try_set(lowered, i, value + 32)
+        set i = i + 1
+    return bytes_to_text(lowered)
+
+fn http_parse_content_length(value: Text) -> Result[Number, Text]:
+    let length: Number = text_length(value)
+    if length == 0: return err("empty Content-Length")
+    var parsed: Number = 0
+    var i: Number = 0
+    while i < length:
+        let digit: Number = text_byte(value, i) - 48
+        if digit < 0 or digit > 9: return err("invalid Content-Length")
+        if parsed > 6710886: return err("Content-Length exceeds the 64 MiB hard limit")
+        set parsed = parsed * 10 + digit
+        if parsed > 67108864: return err("Content-Length exceeds the 64 MiB hard limit")
+        set i = i + 1
+    return ok(parsed)
+
+fn http_parse_request(raw_bytes: Bytes) -> Result[HttpRequest, Text]:
+    if bytes_length(raw_bytes) == 0:
+        return err("empty HTTP request")
+    let raw_text: Text = bytes_to_text(raw_bytes)
+    let length: Number = text_length(raw_text)
+
+    # Require strict CRLF framing and exactly three request-line fields.
+    let line_end: Number = text_find(raw_text, "\r\n")
+    if line_end < 0: return err("malformed HTTP request line")
+    let request_line: Text = text_slice(raw_text, 0, line_end)
+    let first_space: Number = text_find(request_line, " ")
+    if first_space <= 0: return err("invalid HTTP request line format")
+    let after_method: Text = text_slice(request_line, first_space + 1, text_length(request_line) - first_space - 1)
+    let second_space: Number = text_find(after_method, " ")
+    if second_space <= 0 or text_find(text_slice(after_method, second_space + 1, text_length(after_method) - second_space - 1), " ") >= 0:
+        return err("invalid HTTP request line format")
+    let method: Text = text_slice(request_line, 0, first_space)
+    let full_target: Text = text_slice(after_method, 0, second_space)
+    let version: Text = text_slice(after_method, second_space + 1, text_length(after_method) - second_space - 1)
+    if version != "HTTP/1.0" and version != "HTTP/1.1": return err("unsupported HTTP version")
+    if full_target == "" or (not text_starts_with(full_target, "/") and full_target != "*"):
+        return err("request target must use origin form")
+
+    var path: Text = full_target
+    var query: Text = ""
+    let qpos: Number = text_find(full_target, "?")
+    if qpos >= 0:
+        set path = text_slice(full_target, 0, qpos)
+        set query = text_slice(full_target, qpos + 1, text_length(full_target) - qpos - 1)
+
+    let header_end: Number = text_find(raw_text, "\r\n\r\n")
+    if header_end < 0: return err("incomplete HTTP headers")
+    let body_start: Number = header_end + 4
+    let headers_len: Number = header_end - (line_end + 2)
+    if headers_len < 0: return err("malformed HTTP header boundary")
+    let headers_part: Text = text_slice(raw_text, line_end + 2, headers_len)
+    var accept: Text = ""
+    var content_type: Text = ""
+    var authorization: Text = ""
+    var x_request_id: Text = ""
+    var content_length: Number = 0
+    var saw_content_length: Boolean = false
+    var saw_transfer_encoding: Boolean = false
+    var saw_host: Boolean = false
+    var saw_authorization: Boolean = false
+    var saw_content_type: Boolean = false
+    var saw_request_id: Boolean = false
+
+    let header_lines: TextList = text_lines(headers_part)
+    var h: Number = 0
+    let hcount: Number = list_count(header_lines)
+    while h < hcount:
+        let hline: Text = list_get(header_lines, h)
+        if hline != "" and (text_byte(hline, 0) == 32 or text_byte(hline, 0) == 9):
+            return err("obsolete folded HTTP headers are not supported")
+        let colon: Number = text_find(hline, ":")
+        if colon <= 0: return err("malformed HTTP header line")
+        let raw_name: Text = text_slice(hline, 0, colon)
+        if text_trim(raw_name) != raw_name: return err("whitespace is not allowed in HTTP header names")
+        let hname: Text = http_ascii_lower_header_name(raw_name)
+        let hval: Text = text_trim(text_slice(hline, colon + 1, text_length(hline) - colon - 1))
+        var vi: Number = 0
+        while vi < text_length(hval):
+            let vb: Number = text_byte(hval, vi)
+            if (vb < 32 and vb != 9) or vb == 127: return err("control byte in HTTP header value")
+            set vi = vi + 1
+        if hname == "host":
+            if saw_host: return err("duplicate Host header")
+            set saw_host = true
+        elif hname == "accept":
+            if accept != "": set accept = accept + ","
+            set accept = accept + hval
+        elif hname == "content-type":
+            if saw_content_type: return err("duplicate Content-Type header")
+            set saw_content_type = true
+            set content_type = hval
+        elif hname == "authorization":
+            if saw_authorization: return err("duplicate Authorization header")
+            set saw_authorization = true
+            set authorization = hval
+        elif hname == "x-request-id":
+            if saw_request_id: return err("duplicate X-Request-Id header")
+            set saw_request_id = true
+            set x_request_id = hval
+        elif hname == "content-length":
+            if saw_content_length: return err("duplicate Content-Length header")
+            set saw_content_length = true
+            let parsed_len: Result[Number, Text] = http_parse_content_length(hval)
+            if not result_is_ok(parsed_len): return err(result_unwrap_error(parsed_len))
+            set content_length = result_unwrap(parsed_len)
+        elif hname == "transfer-encoding":
+            set saw_transfer_encoding = true
+        elif hname == "expect":
+            return err("Expect request headers are not supported")
+        set h = h + 1
+    if saw_transfer_encoding: return err("Transfer-Encoding is not supported; use Content-Length")
+    if version == "HTTP/1.1" and not saw_host: return err("HTTP/1.1 request requires Host")
+
+    var body_bytes: Bytes = bytes_empty()
+    var body_text: Text = ""
+    let received_body_length: Number = length - body_start
+    if received_body_length > content_length: return err("request contains bytes beyond the declared Content-Length")
+    if received_body_length > 0:
+        set body_bytes = bytes_slice(raw_bytes, body_start, received_body_length)
+        let body_text_res: Result[Text, Text] = bytes_try_to_text(body_bytes)
+        if result_is_ok(body_text_res):
+            set body_text = result_unwrap(body_text_res)
+
+    return ok(HttpRequest(method, path, query, accept, content_type, authorization, x_request_id, content_length, body_bytes, body_text))
+
+# --- File Upload & Multipart Handling ---
+
+shape HttpUploadedFile:
+    field_name: Text
+    filename: Text
+    content_type: Text
+    data: Bytes
+    size_bytes: Number
+
+fn http_extract_multipart_boundary(content_type: Text) -> Text:
+    let needle: Text = "boundary="
+    let pos: Number = text_find(content_type, needle)
+    if pos < 0: return ""
+    let start: Number = pos + text_length(needle)
+    var end: Number = start
+    let clen: Number = text_length(content_type)
+    while end < clen and text_byte(content_type, end) != 59:
+        set end = end + 1
+    return text_trim(text_slice(content_type, start, end - start))
+
+fn http_parse_uploaded_file(part_headers: Text, part_bytes: Bytes) -> HttpUploadedFile:
+    var field_name: Text = ""
+    var filename: Text = ""
+    var part_content_type: Text = "application/octet-stream"
+
+    let fn_pos: Number = text_find(part_headers, "filename=\"")
+    if fn_pos >= 0:
+        let fn_start: Number = fn_pos + 10
+        var fn_end: Number = fn_start
+        let hlen: Number = text_length(part_headers)
+        while fn_end < hlen and text_byte(part_headers, fn_end) != 34:
+            set fn_end = fn_end + 1
+        set filename = text_slice(part_headers, fn_start, fn_end - fn_start)
+
+    let name_pos: Number = text_find(part_headers, "name=\"")
+    if name_pos >= 0:
+        let name_start: Number = name_pos + 6
+        var name_end: Number = name_start
+        let hlen2: Number = text_length(part_headers)
+        while name_end < hlen2 and text_byte(part_headers, name_end) != 34:
+            set name_end = name_end + 1
+        set field_name = text_slice(part_headers, name_start, name_end - name_start)
+
+    let ct_pos: Number = text_find(part_headers, "Content-Type:")
+    if ct_pos >= 0:
+        let ct_start: Number = ct_pos + 13
+        var ct_end: Number = ct_start
+        let hlen3: Number = text_length(part_headers)
+        while ct_end < hlen3 and text_byte(part_headers, ct_end) != 13 and text_byte(part_headers, ct_end) != 10:
+            set ct_end = ct_end + 1
+        set part_content_type = text_trim(text_slice(part_headers, ct_start, ct_end - ct_start))
+
+    return HttpUploadedFile(field_name, filename, part_content_type, part_bytes, bytes_length(part_bytes))
