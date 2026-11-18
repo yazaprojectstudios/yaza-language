@@ -208,11 +208,14 @@ async function runCheck(document, key, state, generation) {
       : rawText;
     await fs.promises.writeFile(tempPath, checkText, { flag: "wx", mode: 0o600 });
     const env = { ...process.env };
+    if (!env.YAZA_RT_V1_PROCESS_LIMIT_BYTES) env.YAZA_RT_V1_PROCESS_LIMIT_BYTES = "34359738368";
+    if (!env.YAZA_RT_V1_MAX_LIST_VECTOR_BYTES) env.YAZA_RT_V1_MAX_LIST_VECTOR_BYTES = "34359738368";
+    if (!env.YAZA_RT_V1_MAX_LIST_ITEMS) env.YAZA_RT_V1_MAX_LIST_ITEMS = "32000000";
     const standardLibraryPath = settings.get("standardLibraryPath", "").trim();
     if (standardLibraryPath) env.YAZA_STDLIB_DIR = standardLibraryPath;
     const result = await execute(executable, ["check", "--format", "json", tempPath], {
       cwd: folder ? folder.uri.fsPath : path.dirname(filePath), env,
-      timeoutMs: settings.get("diagnosticsTimeoutMs", 10000),
+      timeoutMs: settings.get("diagnosticsTimeoutMs", 30000),
       onChild: child => {
         activeChild = child;
         if (state.generation === generation) state.child = child;
