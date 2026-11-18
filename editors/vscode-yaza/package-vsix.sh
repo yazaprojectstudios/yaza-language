@@ -61,9 +61,11 @@ cat << EOF > "$STAGING/extension.vsixmanifest"
 </PackageManifest>
 EOF
 
-# Create zip archive as .vsix
+# Create zip archive as .vsix without extra fields (required by Open VSX & Marketplace)
+rm -f "$OUTPUT_DIR/$VSIX_NAME" "$OUTPUT_DIR/yaza-latest.vsix"
+find "$STAGING" -name '.DS_Store' -type f -delete 2>/dev/null || true
 cd "$STAGING"
-zip -qr "$OUTPUT_DIR/$VSIX_NAME" "[Content_Types].xml" "extension.vsixmanifest" "extension"
+zip -X -qr "$OUTPUT_DIR/$VSIX_NAME" "[Content_Types].xml" "extension.vsixmanifest" "extension"
 cp "$OUTPUT_DIR/$VSIX_NAME" "$OUTPUT_DIR/yaza-latest.vsix"
 if [ -d "$SCRIPT_DIR/../../../website/public" ]; then
     mkdir -p "$WEB_RELEASES"
