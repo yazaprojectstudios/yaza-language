@@ -158,6 +158,40 @@ function scheduleCheck(document, delay) {
   }, delay);
 }
 
+function hasTopLevelStartBlock(source) {
+  return /^start\s*:/m.test(source);
+}
+
+function looksLikeLibraryModule(source) {
+  if (hasTopLevelStartBlock(source)) return false;
+  return /^(?:use\s+|(?:async\s+)?fn\s+|shape\s+|variant\s+|interface\s+|impl\s+|controller\s+|service\s+|repository\s+|model\s+)/m.test(source);
+}
+
+function parsePlaintextCompilerError(stderr, document) {
+  const clean = String(stderr || "").trim();
+  if (!clean) return undefined;
+  const lineMatch = clean.match(/\(line\s+(\d+),\s*column\s+(\d+)(?:\s*\(through\s+(\d+)\))?\)/i)
+    || clean.match(/\bline\s+(\d+)\b(?:,\s*|\s+)column\s+(\d+)\b/i);
+  let line = 0;
+  let startChar = 0;
+  let endChar = 1;
+  if (lineMatch) {
+    line = Math.max(0, Math.min(Number(lineMatch[1]) - 1, Math.max(0, document.lineCount - 1)));
+    const lineLen = document.lineAt(line).text.length;
+    startChar = Math.max(0, Math.min(Number(lineMatch[2]) - 1, lineLen));
+    const through = lineMatch[3] ? Number(lineMatch[3]) : startChar + 1;
+    endChar = Math.max(startChar, Math.min(through, lineLen));
+  }
+  const message = clean.replace(/^yaza:\s*/i, "");
+  const diag = new vscode.Diagnostic(
+    new vscode.Range(line, startChar, line, endChar),
+    message,
+    vscode.DiagnosticSeverity.Error
+  );
+  diag.source = "YAZA";
+  return diag;
+}
+
 async function runCheck(document, key, state, generation) {
   const filePath = document.uri.fsPath;
   const folder = vscode.workspace.getWorkspaceFolder(document.uri);
@@ -167,7 +201,12 @@ async function runCheck(document, key, state, generation) {
   state.tempPath = tempPath;
   let activeChild;
   try {
-    await fs.promises.writeFile(tempPath, document.getText(), { flag: "wx", mode: 0o600 });
+    const rawText = document.getText();
+    const isLibraryModule = looksLikeLibraryModule(rawText);
+    const checkText = isLibraryModule
+      ? `${rawText}\n\nstart:\n    let __yaza_module_check: Number = 0\n`
+      : rawText;
+    await fs.promises.writeFile(tempPath, checkText, { flag: "wx", mode: 0o600 });
     const env = { ...process.env };
     const standardLibraryPath = settings.get("standardLibraryPath", "").trim();
     if (standardLibraryPath) env.YAZA_STDLIB_DIR = standardLibraryPath;
@@ -181,6 +220,16 @@ async function runCheck(document, key, state, generation) {
       }
     });
     if (state.generation !== generation) return;
+    if (result.stdout.trim().length === 0 && result.stderr.trim().length > 0) {
+      for (const previousUri of state.publishedUris) diagnostics.delete(vscode.Uri.parse(previousUri));
+      state.publishedUris.clear();
+      const plainDiag = parsePlaintextCompilerError(result.stderr, document);
+      if (plainDiag) {
+        diagnostics.set(document.uri, [plainDiag]);
+        state.publishedUris.add(document.uri.toString());
+      }
+      return;
+    }
     const report = JSON.parse(result.stdout.trim());
     const ownDiagnostics = [];
     const otherDiagnostics = new Map();
@@ -272,7 +321,7 @@ function execute(command, args, options) {
       clearTimeout(timeout);
       if (overflow) reject(new Error("diagnostic output exceeded the 2 MiB safety limit"));
       else if (signal === "SIGTERM" && code === null) reject(new Error("diagnostics were cancelled or timed out"));
-      else if (stdout.trim().length === 0) reject(new Error(stderr.trim() || `compiler exited with status ${code}`));
+      else if (stdout.trim().length === 0 && stderr.trim().length === 0) reject(new Error(`compiler exited with status ${code}`));
       else resolve({ stdout, stderr, code });
     });
   });
