@@ -43,6 +43,20 @@ if [ -n "$LIB_SOURCE" ]; then
   cp "$LIB_SOURCE" "$INSTALL_DIR/lib/"
 fi
 
-printf 'Installed YazaBase to %s\n' "$INSTALL_DIR"
-printf 'Add it to PATH with:\n  export PATH="%s/bin:$PATH"\n' "$INSTALL_DIR"
+if [ -t 1 ]; then
+  C_MINT=$(printf '\033[1;36m')
+  C_WING=$(printf '\033[1;37m')
+  C_RESET=$(printf '\033[0m')
+else
+  C_MINT=""
+  C_WING=""
+  C_RESET=""
+fi
+
+printf '\n'
+printf '  %s███▄%s      %s▄███%s    Welcome to YazaBase (YAZA SQL Engine)!\n' "$C_MINT" "$C_RESET" "$C_WING" "$C_RESET"
+printf '   %s▀███▄%s  %s▄███▀%s     Clustered B+Tree · ARIES WAL · Embedded C ABI\n' "$C_MINT" "$C_RESET" "$C_WING" "$C_RESET"
+printf '     %s▀███▄%s %s▀█▀%s\n' "$C_MINT" "$C_RESET" "$C_WING" "$C_RESET"
+printf '     %s▄███▀%s          Installed to: %s\n' "$C_MINT" "$C_RESET" "$INSTALL_DIR"
+printf '   %s▄███▀%s            Add to PATH: export PATH="%s/bin:$PATH"\n\n' "$C_MINT" "$C_RESET" "$INSTALL_DIR"
 printf 'Try:\n  yazabase shell :memory:\n'

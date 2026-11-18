@@ -90,8 +90,23 @@ if command -v xattr >/dev/null 2>&1; then
     xattr -cr "$PAYLOAD" 2>/dev/null || true
 fi
 
+PKG_SCRIPTS="$STAGE_DIR/scripts"
+install -d "$PKG_SCRIPTS"
+cat <<'EOF' > "$PKG_SCRIPTS/postinstall"
+#!/bin/sh
+printf '\n'
+printf '  ███▄      ▄███    Welcome to YAZA Programming Language!\n'
+printf '   ▀███▄  ▄███▀     Version 1.0.0 · Zero-GC Arena · Native LLVM · YazaBase\n'
+printf '     ▀███▄ ▀█▀\n'
+printf '     ▄███▀          Installed CLI tools to: /usr/local/bin/yaza & yazabase\n'
+printf '   ▄███▀            Docs: https://yazastudios.id/docs/\n\n'
+exit 0
+EOF
+chmod 755 "$PKG_SCRIPTS/postinstall"
+
 pkgbuild \
     --root "$PAYLOAD" \
+    --scripts "$PKG_SCRIPTS" \
     --identifier "org.yaza-lang.cli" \
     --version "$VERSION" \
     --install-location "/" \
