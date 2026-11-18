@@ -1,0 +1,68 @@
+#include "yaza_runtime_v1.h"
+
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+extern int32_t yaza_export_try_bytes_primitives_request_v1(
+    const YazaModuleInputV1 *inputs,
+    uint64_t input_count,
+    YazaModuleResultV1 *out_result);
+
+static YazaModuleInputV1 make_input(uint32_t kind, const unsigned char *data, uint64_t length) {
+    return (YazaModuleInputV1){
+        YAZA_MODULE_INPUT_V1_ABI_VERSION,
+        sizeof(YazaModuleInputV1),
+        kind,
+        0,
+        data,
+        length
+    };
+}
+
+int main(void) {
+    yaza_rt_v1_init();
+    static const unsigned char payload[] = {0x11, 0x22, 0x33, 0x44};
+    static const char *const routes[] = {"number-oom", "slice-oom", "bounded-oom", "join-oom"};
+    static const char expected_error[] = "Could not allocate Bytes in the active arena";
+
+    YazaArenaV1 *parent = yaza_arena_v1_create(128ULL * 1024ULL);
+    assert(parent != NULL);
+    YazaArenaCycleV1 *cycle = yaza_arena_v1_cycle_create(parent, 64ULL * 1024ULL);
+    assert(cycle != NULL);
+
+    for (size_t index = 0; index < sizeof(routes) / sizeof(routes[0]); ++index) {
+        const unsigned char *route = (const unsigned char *)routes[index];
+        const YazaModuleInputV1 inputs[] = {
+            make_input(YAZA_MODULE_INPUT_V1_TEXT, route, strlen(routes[index])),
+            make_input(YAZA_MODULE_INPUT_V1_BYTES, payload, sizeof(payload))
+        };
+        YazaModuleResultV1 result = {
+            .abi_version = YAZA_MODULE_RESULT_V1_ABI_VERSION,
+            .struct_size = sizeof(YazaModuleResultV1)
+        };
+
+        assert(yaza_arena_v1_cycle_begin(cycle) == 1);
+        assert(yaza_export_try_bytes_primitives_request_v1(inputs, 2, &result) == YAZA_MODULE_RESULT_V1_OK);
+        assert(result.status == YAZA_MODULE_RESULT_V1_APPLICATION_ERROR);
+        assert(result.data != NULL);
+        if (result.length != sizeof(expected_error) - 1) {
+            fprintf(stderr, "route %s returned %.*s (%llu bytes)\n", routes[index],
+                (int)result.length, (const char *)result.data, (unsigned long long)result.length);
+        }
+        assert(result.length == sizeof(expected_error) - 1);
+        assert(memcmp(result.data, expected_error, sizeof(expected_error) - 1) == 0);
+
+        YazaArenaCycleMetricsV1 metrics = {.struct_size = sizeof(metrics)};
+        assert(yaza_arena_v1_cycle_end(cycle, &metrics) == 1);
+        assert(metrics.allocation_failures >= 2);
+    }
+
+    assert(yaza_arena_v1_cycle_destroy(cycle) == 1);
+    assert(yaza_arena_v1_destroy(parent) == 1);
+    assert(yaza_rt_v1_arena_used() == 0);
+    assert(yaza_rt_v1_arena_scope_count() == 0);
+    puts("arena-v1: request handlers recover Bytes number/slice/bounded/join allocation failures and close request cycles");
+    return 0;
+}

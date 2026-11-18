@@ -1,0 +1,470 @@
+#include "yaza_runtime_v1.h"
+
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+#define LARGE_ITEM_BYTES 8192U
+
+int main(void) {
+    yaza_rt_v1_init();
+    const uint64_t initial_scopes = yaza_rt_v1_arena_scope_count();
+    _Alignas(YAZA_RT_V1_SCOPE_INLINE_STORAGE_ALIGN)
+        unsigned char inline_scope_storage[YAZA_RT_V1_SCOPE_INLINE_STORAGE_BYTES] = {0};
+
+    yaza_rt_v1_test_fail_alloc_after(0);
+    assert(yaza_arena_v1_create(64ULL * 1024ULL) == NULL);
+    assert(yaza_rt_v1_arena_scope_count() == initial_scopes);
+
+    YazaArenaV1 *parent = yaza_arena_v1_create(256ULL * 1024ULL);
+    assert(parent != NULL);
+    const uint64_t parent_scopes = yaza_rt_v1_arena_scope_count();
+    yaza_rt_v1_test_fail_alloc_after(0);
+    assert(yaza_arena_v1_create_child(parent, 128ULL * 1024ULL) == NULL);
+    assert(yaza_rt_v1_arena_scope_count() == parent_scopes);
+    assert(yaza_arena_v1_destroy(parent) == 1);
+
+    yaza_rt_v1_test_fail_alloc_after(0);
+    assert(yaza_rt_v1_scope_enter(64ULL * 1024ULL) == NULL);
+    assert(yaza_rt_v1_arena_scope_count() == initial_scopes);
+    yaza_rt_v1_test_fail_alloc_after(1);
+    assert(yaza_rt_v1_scope_enter(64ULL * 1024ULL) == NULL);
+    assert(yaza_rt_v1_arena_scope_count() == initial_scopes);
+    const uint64_t failures_before_invalid_scope = yaza_rt_v1_arena_allocation_failures();
+    yaza_rt_v1_test_fail_alloc_after(0);
+    assert(yaza_rt_v1_scope_enter(0) == NULL);
+    assert(yaza_rt_v1_arena_allocation_failures() == failures_before_invalid_scope);
+    yaza_rt_v1_test_disable_alloc_failures();
+    yaza_rt_v1_test_fail_alloc_after(0);
+    YazaArenaScopeV1 *inline_scope = yaza_rt_v1_scope_enter_inplace(
+        64ULL * 1024ULL, inline_scope_storage, sizeof(inline_scope_storage));
+    assert(inline_scope != NULL);
+    assert(yaza_rt_v1_arena_scope_count() == initial_scopes + 1);
+    assert(yaza_rt_v1_scope_leave(inline_scope) == 1);
+    assert(yaza_rt_v1_arena_scope_count() == initial_scopes);
+    yaza_rt_v1_test_fail_alloc_after(1);
+    inline_scope = yaza_rt_v1_scope_enter_inplace(
+        64ULL * 1024ULL, inline_scope_storage, sizeof(inline_scope_storage));
+    assert(inline_scope != NULL);
+    assert(yaza_rt_v1_scope_leave(inline_scope) == 1);
+    assert(yaza_rt_v1_arena_scope_count() == initial_scopes);
+    yaza_rt_v1_test_disable_alloc_failures();
+    assert(yaza_rt_v1_arena_used() == 0);
+    assert(yaza_rt_v1_arena_reserved() == 0);
+
+    YazaArenaV1 *request_arena = yaza_arena_v1_create(256ULL * 1024ULL);
+    assert(request_arena != NULL);
+    YazaArenaContextV1 request_context = {0};
+    assert(yaza_arena_v1_scope_begin(request_arena, &request_context) == 1);
+    assert(yaza_arena_v1_alloc(request_arena, 24) != NULL);
+    yaza_rt_v1_test_fail_alloc_after(0);
+    assert(yaza_arena_v1_alloc(request_arena, 128ULL * 1024ULL) == NULL);
+    yaza_rt_v1_test_disable_alloc_failures();
+    assert(yaza_arena_v1_scope_end(&request_context) == 1);
+    YazaArenaCycleMetricsV1 cycle_metrics = {.struct_size = sizeof(cycle_metrics)};
+    assert(yaza_arena_v1_last_cycle_metrics(request_arena, &cycle_metrics) == 1);
+    assert(cycle_metrics.successful_allocations == 1);
+    assert(cycle_metrics.allocation_failures == 1);
+    assert(cycle_metrics.peak_used_bytes == 24);
+    assert(cycle_metrics.retained_reserved_bytes == 64ULL * 1024ULL);
+
+    assert(yaza_arena_v1_scope_begin(request_arena, &request_context) == 1);
+    yaza_rt_v1_test_fail_alloc_after(0);
+    assert(yaza_arena_v1_create_child(request_arena, 64ULL * 1024ULL) == NULL);
+    yaza_rt_v1_test_disable_alloc_failures();
+    assert(yaza_arena_v1_scope_end(&request_context) == 1);
+    cycle_metrics.struct_size = sizeof(cycle_metrics);
+    assert(yaza_arena_v1_last_cycle_metrics(request_arena, &cycle_metrics) == 1);
+    assert(cycle_metrics.successful_allocations == 0);
+    assert(cycle_metrics.allocation_failures == 1);
+    assert(cycle_metrics.retained_reserved_bytes == 64ULL * 1024ULL);
+
+    assert(yaza_arena_v1_scope_begin(request_arena, &request_context) == 1);
+    yaza_rt_v1_test_fail_alloc_after(0);
+    assert(yaza_arena_v1_cycle_create(request_arena, 64ULL * 1024ULL) == NULL);
+    yaza_rt_v1_test_disable_alloc_failures();
+    assert(yaza_arena_v1_scope_end(&request_context) == 1);
+    cycle_metrics.struct_size = sizeof(cycle_metrics);
+    assert(yaza_arena_v1_last_cycle_metrics(request_arena, &cycle_metrics) == 1);
+    assert(cycle_metrics.successful_allocations == 0);
+    assert(cycle_metrics.allocation_failures == 1);
+
+    assert(yaza_arena_v1_scope_begin(request_arena, &request_context) == 1);
+    yaza_rt_v1_test_fail_alloc_after(1);
+    assert(yaza_arena_v1_cycle_create(request_arena, 64ULL * 1024ULL) == NULL);
+    yaza_rt_v1_test_disable_alloc_failures();
+    assert(yaza_arena_v1_scope_end(&request_context) == 1);
+    cycle_metrics.struct_size = sizeof(cycle_metrics);
+    assert(yaza_arena_v1_last_cycle_metrics(request_arena, &cycle_metrics) == 1);
+    assert(cycle_metrics.successful_allocations == 0);
+    assert(cycle_metrics.allocation_failures == 1);
+    assert(yaza_arena_v1_destroy(request_arena) == 1);
+
+    YazaArenaV1 *arena = yaza_arena_v1_create(256ULL * 1024ULL);
+    assert(arena != NULL);
+    const uint64_t failures_before_chunk = yaza_rt_v1_arena_allocation_failures();
+    yaza_rt_v1_test_fail_alloc_after(0);
+    assert(yaza_arena_v1_alloc(arena, 32) == NULL);
+    assert(yaza_rt_v1_arena_allocation_failures() == failures_before_chunk + 1);
+    assert(yaza_arena_v1_used(arena) == 0);
+    assert(yaza_arena_v1_reserved(arena) == 0);
+    yaza_rt_v1_test_disable_alloc_failures();
+    assert(yaza_arena_v1_alloc(arena, 32) != NULL);
+    assert(yaza_arena_v1_reset(arena) == 1);
+    assert(yaza_arena_v1_destroy(arena) == 1);
+
+    arena = yaza_arena_v1_create(1024ULL * 1024ULL);
+    assert(arena != NULL);
+    YazaArenaContextV1 context = {0};
+    assert(yaza_arena_v1_enter(arena, &context) == 1);
+    void *list = yaza_list_v1_create_typed("List[FailureProbe]", LARGE_ITEM_BYTES);
+    assert(list != NULL);
+    unsigned char item[LARGE_ITEM_BYTES];
+    memset(item, 0x5a, sizeof(item));
+    for (uint64_t index = 0; index < 16; ++index) {
+        assert(yaza_list_v1_try_push_typed(list, item, "List[FailureProbe]", sizeof(item)) == 1);
+    }
+    assert(yaza_list_v1_count_typed(list, "List[FailureProbe]", sizeof(item)) == 16);
+    const uint64_t used_before_growth = yaza_arena_v1_used(arena);
+    const uint64_t reserved_before_growth = yaza_arena_v1_reserved(arena);
+    const uint64_t failures_before_growth = yaza_rt_v1_arena_allocation_failures();
+    yaza_rt_v1_test_fail_alloc_after(0);
+    assert(yaza_list_v1_try_push_typed(list, item, "List[FailureProbe]", sizeof(item)) == 0);
+    assert(yaza_list_v1_count_typed(list, "List[FailureProbe]", sizeof(item)) == 16);
+    assert(yaza_arena_v1_used(arena) == used_before_growth);
+    assert(yaza_arena_v1_reserved(arena) == reserved_before_growth);
+    assert(yaza_rt_v1_arena_allocation_failures() == failures_before_growth + 1);
+    yaza_rt_v1_test_disable_alloc_failures();
+    assert(yaza_list_v1_try_push_typed(list, item, "List[FailureProbe]", sizeof(item)) == 1);
+    assert(yaza_list_v1_count_typed(list, "List[FailureProbe]", sizeof(item)) == 17);
+    assert(yaza_arena_v1_leave(&context) == 1);
+    assert(yaza_arena_v1_reset(arena) == 1);
+    assert(yaza_arena_v1_destroy(arena) == 1);
+
+    YazaArenaV1 *list_create_arena = yaza_arena_v1_create(64ULL * 1024ULL);
+    assert(list_create_arena != NULL);
+    YazaArenaContextV1 list_create_context = {0};
+    assert(yaza_arena_v1_enter(list_create_arena, &list_create_context) == 1);
+    void *try_created_list = yaza_list_v1_try_create_typed("List[Number]", sizeof(uint64_t));
+    assert(try_created_list != NULL);
+    assert(yaza_list_v1_count_typed(try_created_list, "List[Number]", sizeof(uint64_t)) == 0);
+    assert(yaza_arena_v1_leave(&list_create_context) == 1);
+    assert(yaza_arena_v1_destroy(list_create_arena) == 1);
+
+    YazaArenaV1 *system_failure_list_arena = yaza_arena_v1_create(64ULL * 1024ULL);
+    assert(system_failure_list_arena != NULL);
+    YazaArenaContextV1 system_failure_list_context = {0};
+    assert(yaza_arena_v1_enter(system_failure_list_arena, &system_failure_list_context) == 1);
+    const uint64_t list_failures_before = yaza_rt_v1_arena_allocation_failures();
+    yaza_rt_v1_test_fail_alloc_after(0);
+    assert(yaza_list_v1_try_create_typed("List[Number]", sizeof(uint64_t)) == NULL);
+    yaza_rt_v1_test_disable_alloc_failures();
+    assert(yaza_arena_v1_used(system_failure_list_arena) == 0);
+    assert(yaza_arena_v1_reserved(system_failure_list_arena) == 0);
+    assert(yaza_rt_v1_arena_allocation_failures() == list_failures_before + 1);
+    assert(yaza_arena_v1_leave(&system_failure_list_context) == 1);
+    assert(yaza_arena_v1_destroy(system_failure_list_arena) == 1);
+
+    YazaArenaV1 *small_list_arena = yaza_arena_v1_create(8);
+    assert(small_list_arena != NULL);
+    YazaArenaContextV1 small_list_context = {0};
+    assert(yaza_arena_v1_enter(small_list_arena, &small_list_context) == 1);
+    const uint64_t small_list_failures_before = yaza_rt_v1_arena_allocation_failures();
+    assert(yaza_list_v1_try_create_typed("List[Number]", sizeof(uint64_t)) == NULL);
+    assert(yaza_arena_v1_used(small_list_arena) == 0);
+    assert(yaza_arena_v1_reserved(small_list_arena) == 0);
+    assert(yaza_rt_v1_arena_allocation_failures() == small_list_failures_before + 1);
+    const uint64_t list_error_allocations = yaza_rt_v1_arena_allocation_count();
+    const YazaTextV1 *list_error = yaza_rt_v1_list_allocation_error();
+    assert(list_error != NULL);
+    assert(list_error->length == strlen("Could not allocate List in the active arena"));
+    assert(memcmp(list_error->data, "Could not allocate List in the active arena", list_error->length) == 0);
+    assert(yaza_rt_v1_arena_allocation_count() == list_error_allocations);
+    assert(yaza_arena_v1_leave(&small_list_context) == 1);
+    assert(yaza_arena_v1_destroy(small_list_arena) == 1);
+
+    assert(yaza_rt_v1_arena_scope_count() == initial_scopes);
+    assert(yaza_rt_v1_arena_used() == 0);
+    assert(yaza_rt_v1_arena_reserved() == 0);
+
+    const uint64_t failures_before_try_api = yaza_rt_v1_arena_allocation_failures();
+    yaza_rt_v1_test_fail_alloc_after(0);
+    assert(yaza_rt_v1_try_alloc(16) == NULL);
+    yaza_rt_v1_test_fail_alloc_after(0);
+    assert(yaza_rt_v1_try_text_from_cstr("recoverable") == NULL);
+    assert(yaza_rt_v1_try_text_from_cstr(NULL) == NULL);
+    yaza_rt_v1_test_disable_alloc_failures();
+    assert(yaza_rt_v1_arena_allocation_failures() == failures_before_try_api + 2);
+    YazaTextV1 *try_text = yaza_rt_v1_try_text_from_cstr("recoverable");
+    assert(try_text != NULL);
+    assert(try_text->length == strlen("recoverable"));
+    assert(memcmp(try_text->data, "recoverable", try_text->length) == 0);
+
+    const YazaTextV1 left_text = {(const unsigned char *)"left\0part", 9};
+    const YazaTextV1 right_text = {(const unsigned char *)"-right", 6};
+    YazaArenaV1 *concat_arena = yaza_arena_v1_create(64ULL * 1024ULL);
+    assert(concat_arena != NULL);
+    YazaArenaContextV1 concat_context = {0};
+    assert(yaza_arena_v1_enter(concat_arena, &concat_context) == 1);
+    const uint64_t failures_before_numeric_text = yaza_rt_v1_arena_allocation_failures();
+    yaza_rt_v1_test_fail_alloc_after(0);
+    assert(yaza_rt_v1_try_number_text(INT64_MIN) == NULL);
+    yaza_rt_v1_test_fail_alloc_after(0);
+    assert(yaza_rt_v1_try_int32_text(INT32_MAX) == NULL);
+    yaza_rt_v1_test_fail_alloc_after(0);
+    assert(yaza_rt_v1_try_float64_text(1.25) == NULL);
+    yaza_rt_v1_test_disable_alloc_failures();
+    assert(yaza_rt_v1_arena_allocation_failures() == failures_before_numeric_text + 3);
+    const uint64_t failures_before_concat = yaza_rt_v1_arena_allocation_failures();
+    yaza_rt_v1_test_fail_alloc_after(0);
+    assert(yaza_rt_v1_try_text_concat(&left_text, &right_text) == NULL);
+    const YazaTextV1 repeat_source = {(const unsigned char *)"repeat", 6};
+    YazaTextV1 *repeat_output = (YazaTextV1 *)1;
+    yaza_rt_v1_test_fail_alloc_after(0);
+    assert(yaza_rt_v1_try_text_repeat(&repeat_source, 3, &repeat_output) == 0);
+    assert(repeat_output == NULL);
+    yaza_rt_v1_test_disable_alloc_failures();
+    assert(yaza_rt_v1_arena_allocation_failures() == failures_before_concat + 2);
+    const uint64_t concat_error_allocations = yaza_rt_v1_arena_allocation_count();
+    const YazaTextV1 *concat_error = yaza_rt_v1_text_allocation_error();
+    assert(concat_error != NULL);
+    assert(concat_error->length == strlen("Could not allocate Text in the active arena"));
+    assert(memcmp(concat_error->data, "Could not allocate Text in the active arena", concat_error->length) == 0);
+    assert(yaza_rt_v1_arena_allocation_count() == concat_error_allocations);
+    YazaTextV1 *try_concat = yaza_rt_v1_try_text_concat(&left_text, &right_text);
+    assert(try_concat != NULL && try_concat->length == 15);
+    assert(memcmp(try_concat->data, "left\0part-right", 15) == 0);
+    assert(try_concat->data[15] == '\0');
+    assert(yaza_arena_v1_leave(&concat_context) == 1);
+    assert(yaza_arena_v1_destroy(concat_arena) == 1);
+
+    YazaArenaV1 *bytes_concat_arena = yaza_arena_v1_create(64ULL * 1024ULL);
+    assert(bytes_concat_arena != NULL);
+    YazaArenaContextV1 bytes_concat_context = {0};
+    assert(yaza_arena_v1_enter(bytes_concat_arena, &bytes_concat_context) == 1);
+    const unsigned char left_bytes[] = {0x00, 0x80, 0xff};
+    const unsigned char right_bytes[] = {0x7f, 0x00};
+    YazaBytesV1 joined_bytes = {NULL, 0};
+    char *bytes_concat_error = NULL;
+    assert(yaza_bytes_v1_try_concat(left_bytes, sizeof(left_bytes), right_bytes, sizeof(right_bytes), &joined_bytes, &bytes_concat_error) == 1);
+    assert(bytes_concat_error == NULL && joined_bytes.length == 5);
+    assert(memcmp(joined_bytes.data, "\0\x80\xff\x7f\0", 5) == 0);
+    const uint64_t bytes_concat_used = yaza_arena_v1_used(bytes_concat_arena);
+    assert(yaza_bytes_v1_try_concat(NULL, 0, NULL, 0, &joined_bytes, &bytes_concat_error) == 1);
+    assert(bytes_concat_error == NULL && joined_bytes.data == NULL && joined_bytes.length == 0);
+    assert(yaza_arena_v1_used(bytes_concat_arena) == bytes_concat_used);
+    assert(yaza_arena_v1_leave(&bytes_concat_context) == 1);
+    assert(yaza_arena_v1_destroy(bytes_concat_arena) == 1);
+
+    YazaArenaV1 *bytes_concat_failure_arena = yaza_arena_v1_create(64ULL * 1024ULL);
+    assert(bytes_concat_failure_arena != NULL);
+    YazaArenaContextV1 bytes_concat_failure_context = {0};
+    assert(yaza_arena_v1_enter(bytes_concat_failure_arena, &bytes_concat_failure_context) == 1);
+    const uint64_t bytes_used_before_failure = yaza_arena_v1_used(bytes_concat_failure_arena);
+    const uint64_t bytes_reserved_before_failure = yaza_arena_v1_reserved(bytes_concat_failure_arena);
+    const uint64_t bytes_failures_before = yaza_rt_v1_arena_allocation_failures();
+    yaza_rt_v1_test_fail_alloc_after(0);
+    assert(yaza_bytes_v1_try_concat(left_bytes, sizeof(left_bytes), right_bytes, sizeof(right_bytes), &joined_bytes, &bytes_concat_error) == 0);
+    yaza_rt_v1_test_disable_alloc_failures();
+    assert(joined_bytes.data == NULL && joined_bytes.length == 0);
+    assert(bytes_concat_error != NULL && strcmp(bytes_concat_error, "Could not allocate concatenated Bytes in the active arena") == 0);
+    assert(yaza_arena_v1_used(bytes_concat_failure_arena) == bytes_used_before_failure);
+    assert(yaza_arena_v1_reserved(bytes_concat_failure_arena) == bytes_reserved_before_failure);
+    assert(yaza_rt_v1_arena_allocation_failures() == bytes_failures_before + 1);
+    assert(yaza_arena_v1_leave(&bytes_concat_failure_context) == 1);
+    assert(yaza_arena_v1_destroy(bytes_concat_failure_arena) == 1);
+
+    YazaArenaV1 *bytes_slice_failure_arena = yaza_arena_v1_create(64ULL * 1024ULL);
+    assert(bytes_slice_failure_arena != NULL);
+    YazaArenaContextV1 bytes_slice_failure_context = {0};
+    assert(yaza_arena_v1_enter(bytes_slice_failure_arena, &bytes_slice_failure_context) == 1);
+    const uint64_t slice_used_before_failure = yaza_arena_v1_used(bytes_slice_failure_arena);
+    const uint64_t slice_reserved_before_failure = yaza_arena_v1_reserved(bytes_slice_failure_arena);
+    const uint64_t slice_failures_before = yaza_rt_v1_arena_allocation_failures();
+    yaza_rt_v1_test_fail_alloc_after(0);
+    assert(yaza_bytes_v1_try_slice(left_bytes, sizeof(left_bytes), 0, sizeof(left_bytes), &joined_bytes, &bytes_concat_error) == 0);
+    yaza_rt_v1_test_disable_alloc_failures();
+    assert(joined_bytes.data == NULL && joined_bytes.length == 0);
+    assert(bytes_concat_error != NULL && strcmp(bytes_concat_error, "Could not allocate sliced Bytes in the active arena") == 0);
+    assert(yaza_arena_v1_used(bytes_slice_failure_arena) == slice_used_before_failure);
+    assert(yaza_arena_v1_reserved(bytes_slice_failure_arena) == slice_reserved_before_failure);
+    assert(yaza_rt_v1_arena_allocation_failures() == slice_failures_before + 1);
+    assert(yaza_arena_v1_leave(&bytes_slice_failure_context) == 1);
+    assert(yaza_arena_v1_destroy(bytes_slice_failure_arena) == 1);
+
+    YazaArenaV1 *text_slice_failure_arena = yaza_arena_v1_create(64ULL * 1024ULL);
+    assert(text_slice_failure_arena != NULL);
+    YazaArenaContextV1 text_slice_failure_context = {0};
+    assert(yaza_arena_v1_enter(text_slice_failure_arena, &text_slice_failure_context) == 1);
+    YazaTextV1 text_slice_source = {(const unsigned char *)"slice", 5};
+    YazaTextV1 *failed_text_slice = (YazaTextV1 *)1;
+    const uint64_t text_slice_used_before_failure = yaza_arena_v1_used(text_slice_failure_arena);
+    const uint64_t text_slice_reserved_before_failure = yaza_arena_v1_reserved(text_slice_failure_arena);
+    const uint64_t text_slice_failures_before = yaza_rt_v1_arena_allocation_failures();
+    yaza_rt_v1_test_fail_alloc_after(0);
+    assert(yaza_rt_v1_try_text_slice(&text_slice_source, 1, 3, &failed_text_slice) == 0);
+    yaza_rt_v1_test_disable_alloc_failures();
+    assert(failed_text_slice == NULL);
+    assert(yaza_arena_v1_used(text_slice_failure_arena) == text_slice_used_before_failure);
+    assert(yaza_arena_v1_reserved(text_slice_failure_arena) == text_slice_reserved_before_failure);
+    assert(yaza_rt_v1_arena_allocation_failures() == text_slice_failures_before + 1);
+    assert(yaza_arena_v1_leave(&text_slice_failure_context) == 1);
+    assert(yaza_arena_v1_destroy(text_slice_failure_arena) == 1);
+
+    YazaArenaV1 *bytes_number_failure_arena = yaza_arena_v1_create(64ULL * 1024ULL);
+    assert(bytes_number_failure_arena != NULL);
+    YazaArenaContextV1 bytes_number_failure_context = {0};
+    assert(yaza_arena_v1_enter(bytes_number_failure_arena, &bytes_number_failure_context) == 1);
+    const uint64_t number_used_before_failure = yaza_arena_v1_used(bytes_number_failure_arena);
+    const uint64_t number_reserved_before_failure = yaza_arena_v1_reserved(bytes_number_failure_arena);
+    const uint64_t number_failures_before = yaza_rt_v1_arena_allocation_failures();
+    yaza_rt_v1_test_fail_alloc_after(0);
+    assert(yaza_bytes_v1_try_from_number(255, &joined_bytes, &bytes_concat_error) == 0);
+    yaza_rt_v1_test_disable_alloc_failures();
+    assert(joined_bytes.data == NULL && joined_bytes.length == 0);
+    assert(bytes_concat_error != NULL && strcmp(bytes_concat_error, "Could not allocate Bytes in the active arena") == 0);
+    assert(yaza_arena_v1_used(bytes_number_failure_arena) == number_used_before_failure);
+    assert(yaza_arena_v1_reserved(bytes_number_failure_arena) == number_reserved_before_failure);
+    assert(yaza_rt_v1_arena_allocation_failures() == number_failures_before + 1);
+    assert(yaza_arena_v1_leave(&bytes_number_failure_context) == 1);
+    assert(yaza_arena_v1_destroy(bytes_number_failure_arena) == 1);
+
+    YazaArenaV1 *bytes_text_failure_arena = yaza_arena_v1_create(64ULL * 1024ULL);
+    assert(bytes_text_failure_arena != NULL);
+    YazaArenaContextV1 bytes_text_failure_context = {0};
+    assert(yaza_arena_v1_enter(bytes_text_failure_arena, &bytes_text_failure_context) == 1);
+    const YazaTextV1 bytes_text_source = {(const unsigned char *)"allocation", 10};
+    const uint64_t text_used_before_failure = yaza_arena_v1_used(bytes_text_failure_arena);
+    const uint64_t text_reserved_before_failure = yaza_arena_v1_reserved(bytes_text_failure_arena);
+    const uint64_t text_failures_before = yaza_rt_v1_arena_allocation_failures();
+    yaza_rt_v1_test_fail_alloc_after(0);
+    assert(yaza_bytes_v1_try_from_text(&bytes_text_source, &joined_bytes, &bytes_concat_error) == 0);
+    yaza_rt_v1_test_disable_alloc_failures();
+    assert(joined_bytes.data == NULL && joined_bytes.length == 0);
+    assert(bytes_concat_error != NULL && strcmp(bytes_concat_error, "Could not allocate Bytes in the active arena") == 0);
+    assert(yaza_arena_v1_used(bytes_text_failure_arena) == text_used_before_failure);
+    assert(yaza_arena_v1_reserved(bytes_text_failure_arena) == text_reserved_before_failure);
+    assert(yaza_rt_v1_arena_allocation_failures() == text_failures_before + 1);
+    assert(yaza_arena_v1_leave(&bytes_text_failure_context) == 1);
+    assert(yaza_arena_v1_destroy(bytes_text_failure_arena) == 1);
+
+    YazaArenaV1 *text_conversion_failure_arena = yaza_arena_v1_create(64ULL * 1024ULL);
+    assert(text_conversion_failure_arena != NULL);
+    YazaArenaContextV1 text_conversion_failure_context = {0};
+    assert(yaza_arena_v1_enter(text_conversion_failure_arena, &text_conversion_failure_context) == 1);
+    const uint64_t conversion_used_before_failure = yaza_arena_v1_used(text_conversion_failure_arena);
+    const uint64_t conversion_reserved_before_failure = yaza_arena_v1_reserved(text_conversion_failure_arena);
+    const uint64_t conversion_failures_before = yaza_rt_v1_arena_allocation_failures();
+    const unsigned char conversion_data[] = "valid";
+    YazaTextV1 *decoded_text = NULL;
+    char *conversion_error = NULL;
+    yaza_rt_v1_test_fail_alloc_after(0);
+    assert(yaza_bytes_v1_try_to_text(conversion_data, sizeof(conversion_data) - 1, &decoded_text, &conversion_error) == 0);
+    yaza_rt_v1_test_disable_alloc_failures();
+    assert(decoded_text == NULL);
+    assert(conversion_error != NULL && strcmp(conversion_error, "Could not allocate Text in the active arena") == 0);
+    assert(yaza_arena_v1_used(text_conversion_failure_arena) == conversion_used_before_failure);
+    assert(yaza_arena_v1_reserved(text_conversion_failure_arena) == conversion_reserved_before_failure);
+    assert(yaza_rt_v1_arena_allocation_failures() == conversion_failures_before + 1);
+    assert(yaza_arena_v1_leave(&text_conversion_failure_context) == 1);
+    assert(yaza_arena_v1_destroy(text_conversion_failure_arena) == 1);
+
+    const YazaTextV1 trim_input = {(const unsigned char *)" padded ", 8};
+    const YazaTextV1 split_input = {(const unsigned char *)"first:second", 12};
+    const YazaTextV1 split_delimiter = {(const unsigned char *)":", 1};
+    YazaArenaV1 *text_trim_failure_arena = yaza_arena_v1_create(16);
+    assert(text_trim_failure_arena != NULL);
+    YazaArenaContextV1 text_trim_failure_context = {0};
+    assert(yaza_arena_v1_enter(text_trim_failure_arena, &text_trim_failure_context) == 1);
+    assert(yaza_rt_v1_try_text_trim(&trim_input) == NULL);
+    assert(yaza_arena_v1_used(text_trim_failure_arena) == 0);
+    assert(yaza_arena_v1_leave(&text_trim_failure_context) == 1);
+    assert(yaza_arena_v1_destroy(text_trim_failure_arena) == 1);
+
+    YazaArenaV1 *text_list_create_failure_arena = yaza_arena_v1_create(16);
+    assert(text_list_create_failure_arena != NULL);
+    YazaArenaContextV1 text_list_create_failure_context = {0};
+    assert(yaza_arena_v1_enter(text_list_create_failure_arena, &text_list_create_failure_context) == 1);
+    void *failed_lines = (void *)1;
+    assert(yaza_rt_v1_try_text_lines(&trim_input, &failed_lines) == 0);
+    assert(failed_lines == NULL && yaza_arena_v1_used(text_list_create_failure_arena) == 0);
+    void *failed_parts = (void *)1;
+    assert(yaza_rt_v1_try_text_split(&split_input, &split_delimiter, &failed_parts) == 0);
+    assert(failed_parts == NULL && yaza_arena_v1_used(text_list_create_failure_arena) == 0);
+    assert(yaza_arena_v1_leave(&text_list_create_failure_context) == 1);
+    assert(yaza_arena_v1_destroy(text_list_create_failure_arena) == 1);
+
+    const unsigned char many_lines[] = "a\na\na\na\na\na\na\na\na\na\na\na\na\na\na\na\na\na\na\na";
+    const unsigned char many_parts[] = "a:a:a:a:a:a:a:a:a:a:a:a:a:a:a:a:a:a:a:a";
+    const YazaTextV1 lines_input = {many_lines, sizeof(many_lines) - 1};
+    const YazaTextV1 many_split_input = {many_parts, sizeof(many_parts) - 1};
+
+    YazaArenaV1 *text_lines_partial_failure_arena = yaza_arena_v1_create(256);
+    assert(text_lines_partial_failure_arena != NULL);
+    YazaArenaContextV1 text_lines_partial_failure_context = {0};
+    assert(yaza_arena_v1_enter(text_lines_partial_failure_arena, &text_lines_partial_failure_context) == 1);
+    failed_lines = (void *)1;
+    assert(yaza_rt_v1_try_text_lines(&lines_input, &failed_lines) == 0);
+    assert(failed_lines == NULL && yaza_arena_v1_used(text_lines_partial_failure_arena) > 0);
+    assert(yaza_arena_v1_leave(&text_lines_partial_failure_context) == 1);
+    assert(yaza_arena_v1_reset(text_lines_partial_failure_arena) == 1);
+    assert(yaza_arena_v1_used(text_lines_partial_failure_arena) == 0);
+    assert(yaza_arena_v1_destroy(text_lines_partial_failure_arena) == 1);
+
+    YazaArenaV1 *text_split_partial_failure_arena = yaza_arena_v1_create(256);
+    assert(text_split_partial_failure_arena != NULL);
+    YazaArenaContextV1 text_split_partial_failure_context = {0};
+    assert(yaza_arena_v1_enter(text_split_partial_failure_arena, &text_split_partial_failure_context) == 1);
+    failed_parts = (void *)1;
+    assert(yaza_rt_v1_try_text_split(&many_split_input, &split_delimiter, &failed_parts) == 0);
+    assert(failed_parts == NULL && yaza_arena_v1_used(text_split_partial_failure_arena) > 0);
+    assert(yaza_arena_v1_leave(&text_split_partial_failure_context) == 1);
+    assert(yaza_arena_v1_reset(text_split_partial_failure_arena) == 1);
+    assert(yaza_arena_v1_used(text_split_partial_failure_arena) == 0);
+    assert(yaza_arena_v1_destroy(text_split_partial_failure_arena) == 1);
+
+    YazaArenaV1 *secure_random_arena = yaza_arena_v1_create(64ULL * 1024ULL);
+    assert(secure_random_arena != NULL);
+    YazaArenaContextV1 secure_random_context = {0};
+    assert(yaza_arena_v1_enter(secure_random_arena, &secure_random_context) == 1);
+    YazaBytesV1 secure_random_bytes = {(unsigned char *)1, 99};
+    char *secure_random_error = NULL;
+    assert(yaza_bytes_v1_try_secure_random(-1, &secure_random_bytes, &secure_random_error) == 0);
+    assert(secure_random_bytes.data == NULL && secure_random_bytes.length == 0);
+    assert(secure_random_error != NULL && strcmp(secure_random_error, "secure random length must be between 0 and 64 MiB") == 0);
+    secure_random_error = NULL;
+    assert(yaza_bytes_v1_try_secure_random(64ULL * 1024ULL * 1024ULL + 1, &secure_random_bytes, &secure_random_error) == 0);
+    assert(secure_random_bytes.data == NULL && secure_random_bytes.length == 0);
+    assert(secure_random_error != NULL && strcmp(secure_random_error, "secure random length must be between 0 and 64 MiB") == 0);
+    const uint64_t random_empty_used = yaza_arena_v1_used(secure_random_arena);
+    secure_random_error = (char *)1;
+    assert(yaza_bytes_v1_try_secure_random(0, &secure_random_bytes, &secure_random_error) == 1);
+    assert(secure_random_bytes.data == NULL && secure_random_bytes.length == 0 && secure_random_error == NULL);
+    assert(yaza_arena_v1_used(secure_random_arena) == random_empty_used);
+    secure_random_error = NULL;
+    assert(yaza_bytes_v1_try_secure_random(32, &secure_random_bytes, &secure_random_error) == 1);
+    assert(secure_random_bytes.data != NULL && secure_random_bytes.length == 32 && secure_random_error == NULL);
+    assert(yaza_bytes_v1_zeroize(secure_random_bytes.data, secure_random_bytes.length) == 0);
+    assert(yaza_arena_v1_leave(&secure_random_context) == 1);
+    assert(yaza_arena_v1_destroy(secure_random_arena) == 1);
+
+    YazaArenaV1 *secure_random_failure_arena = yaza_arena_v1_create(64ULL * 1024ULL);
+    assert(secure_random_failure_arena != NULL);
+    YazaArenaContextV1 secure_random_failure_context = {0};
+    assert(yaza_arena_v1_enter(secure_random_failure_arena, &secure_random_failure_context) == 1);
+    const uint64_t random_failures_before = yaza_rt_v1_arena_allocation_failures();
+    yaza_rt_v1_test_fail_alloc_after(0);
+    assert(yaza_bytes_v1_try_secure_random(32, &secure_random_bytes, &secure_random_error) == 0);
+    yaza_rt_v1_test_disable_alloc_failures();
+    assert(secure_random_bytes.data == NULL && secure_random_bytes.length == 0);
+    assert(secure_random_error != NULL && strcmp(secure_random_error, "could not allocate secure random Bytes in the active arena") == 0);
+    assert(yaza_arena_v1_used(secure_random_failure_arena) == 0);
+    assert(yaza_arena_v1_reserved(secure_random_failure_arena) == 0);
+    assert(yaza_rt_v1_arena_allocation_failures() == random_failures_before + 1);
+    assert(yaza_arena_v1_leave(&secure_random_failure_context) == 1);
+    assert(yaza_arena_v1_destroy(secure_random_failure_arena) == 1);
+
+    puts("arena-v1: fallible allocation, Text/Bytes construction, secure random, slicing and concatenation/numeric formatting, typed List creation/growth, and injected failures roll back scopes and quotas");
+    return 0;
+}
