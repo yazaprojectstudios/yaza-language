@@ -118,3 +118,9 @@ Use short-lived pull-request branches from `main`: `feat/<topic>`, `fix/<topic>`
 ## Repository scope
 
 The compiler, runtime, standard library, YazaBase engine, project templates, bindings, editor support, and source examples are kept together so the CLI and release packages can be built and checked reproducibly. Generated binaries and build output belong in the ignored `build/` and `dist/` directories.
+
+## Contributing, security & license
+
+- Contributing guide: [CONTRIBUTING.md](CONTRIBUTING.md)
+- Security policy & reporting: [SECURITY.md](SECURITY.md)
+- License: [Apache License 2.0](LICENSE)

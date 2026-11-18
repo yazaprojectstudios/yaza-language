@@ -7,6 +7,11 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Publish GitHub Release for current VERSION tag when triggered manually"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -22,14 +27,15 @@ jobs:
     env:
       YAZA_COMPILER_PROCESS_LIMIT_BYTES: "25769803776"
       YAZA_COMPILER_LIST_VECTOR_LIMIT_BYTES: "25769803776"
+      YAZA_COMPILER_MAX_LIST_ITEMS: "32000000"
     strategy:
       fail-fast: false
       matrix:
         include:
           - platform: linux-x64
-            runner_label: yaza-linux-x64-32gb
+            runner_label: ubuntu-24.04
           - platform: linux-arm64
-            runner_label: yaza-linux-arm64-32gb
+            runner_label: ubuntu-24.04-arm
           - platform: darwin-arm64
             runner_label: macos-15
           - platform: darwin-x64
@@ -39,11 +45,24 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Install Linux build dependencies
+      - name: Install Linux build dependencies & configure swap
         if: startsWith(matrix.platform, 'linux-')
         run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
           sudo apt-get update
           sudo apt-get install -y clang xz-utils libargon2-dev file
+          sudo apt-get clean
+          free -h
+          df -h / /tmp
+          if [ ! -f /ci-swapfile ]; then
+            sudo fallocate -l 12G /ci-swapfile || sudo dd if=/dev/zero of=/ci-swapfile bs=1M count=12288 status=none
+            sudo chmod 600 /ci-swapfile
+            sudo mkswap /ci-swapfile
+            sudo swapon -p 200 /ci-swapfile
+            free -h
+            swapon --show
+            df -h /
+          fi
 
       - name: Install macOS build dependencies
         if: startsWith(matrix.platform, 'darwin-')
@@ -60,6 +79,7 @@ jobs:
           set -euo pipefail
           file build/yaza-llvm build/yazabase-cli
           build/yaza-llvm --version
+          build/yazabase-cli --version
 
           hello_output=$(YAZA_STDLIB_DIR="$PWD/std" YAZA_RUNTIME_DIR="$PWD/runtime" \
             build/yaza run examples/hello.yz)
@@ -88,32 +108,58 @@ jobs:
           fi
           YAZA_VERSION="$version" sh scripts/package-release-target.sh "${{ matrix.platform }}"
 
+      - name: Build macOS .pkg installer & VS Code VSIX
+        if: matrix.platform == 'darwin-arm64'
+        run: |
+          sh scripts/build-macos-pkg.sh
+          sh editors/vscode-yaza/package-vsix.sh
+
       - name: Upload platform archives
         uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.platform }}
-          path: dist/*.tar.gz
+          path: |
+            dist/*.tar.gz
+            dist/*.pkg
+            dist/*.vsix
           if-no-files-found: error
           retention-days: 14
 
   validate:
     name: Focused language, database, and API validation
-    runs-on: yaza-linux-x64-32gb
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
       YAZA_COMPILER_PROCESS_LIMIT_BYTES: "25769803776"
       YAZA_COMPILER_LIST_VECTOR_LIMIT_BYTES: "25769803776"
+      YAZA_COMPILER_MAX_LIST_ITEMS: "32000000"
     steps:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Install validation dependencies
+      - name: Install validation dependencies & configure swap
         run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
           sudo apt-get update
           sudo apt-get install -y clang xz-utils libargon2-dev
+          sudo apt-get clean
+          free -h
+          df -h / /tmp
+          if [ ! -f /ci-swapfile ]; then
+            sudo fallocate -l 12G /ci-swapfile || sudo dd if=/dev/zero of=/ci-swapfile bs=1M count=12288 status=none
+            sudo chmod 600 /ci-swapfile
+            sudo mkswap /ci-swapfile
+            sudo swapon -p 200 /ci-swapfile
+            free -h
+            swapon --show
+            df -h /
+          fi
 
       - name: Build host tools
         run: sh scripts/build-host.sh
+
+      - name: Validate Linux C runtime & sanitizers
+        run: CC=clang sh scripts/validate-runtime-v1-linux.sh
 
       - name: Validate Core 2 language features
         run: sh scripts/validate-core2-features.sh
@@ -152,12 +198,15 @@ jobs:
 
   publish:
     name: Publish verified release assets
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true)
     needs: [build, validate]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
+      - name: Check out release tag metadata
+        uses: actions/checkout@v4
+
       - name: Download exact platform build artifacts
         uses: actions/download-artifact@v4
         with:
@@ -166,20 +215,28 @@ jobs:
           merge-multiple: true
 
       - name: Check matrix completeness and generate checksums
+        id: release_meta
         working-directory: release-files
         shell: bash
         run: |
           set -euo pipefail
+          version=$(cat ../VERSION)
           test "$(find . -maxdepth 1 -name 'yaza-*.tar.gz' | wc -l | tr -d ' ')" = 4
           test "$(find . -maxdepth 1 -name 'yazabase-*.tar.gz' | wc -l | tr -d ' ')" = 4
-          sha256sum ./*.tar.gz > SHA256SUMS.txt
+          test -f "yaza-${version}-macos-arm64.pkg"
+          test -f "yaza-latest.vsix"
+          sha256sum ./*.tar.gz ./*.pkg ./*.vsix > SHA256SUMS.txt
           cat SHA256SUMS.txt
+          echo "tag_name=v${version}" >> "$GITHUB_OUTPUT"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: YAZA ${{ github.ref_name }}
+          tag_name: ${{ steps.release_meta.outputs.tag_name }}
+          name: YAZA ${{ steps.release_meta.outputs.tag_name }}
           generate_release_notes: true
           files: |
             release-files/*.tar.gz
+            release-files/*.pkg
+            release-files/*.vsix
             release-files/SHA256SUMS.txt

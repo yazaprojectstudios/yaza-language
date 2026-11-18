@@ -47,7 +47,7 @@ cat << EOF > "$STAGING/extension.vsixmanifest"
     <DisplayName>YAZA Language Support</DisplayName>
     <Description>YAZA syntax, formatting, compiler diagnostics, completion, navigation, and snippets.</Description>
     <Icon>extension/images/yaza-logo.png</Icon>
-    <License>UNLICENSED</License>
+    <License>Apache-2.0</License>
   </Metadata>
   <Installation>
     <InstallationTarget Id="Microsoft.VisualStudio.Code"/>
