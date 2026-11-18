@@ -1,37 +1,43 @@
-# {{project_name}} — Cloud-Native YAZA Microservice
+# {{project_name}} (Cloud-Native Microservice)
 
-High-performance, memory-bounded microservice built with the **YAZA LLVM toolchain**, **Core 2 Native Async/Await**, and the **YazaBase embedded engine**.
+Microservice berbasis **Hexagonal Architecture (Ports & Adapters)**, **YazaBase Embedded SQL Engine**, **Live HTTP/1.1 Keep-Alive Listener**, dan **Core 2 Async/Await (`spawn` & `await`)**.
 
-## Modern Architecture Pattern: Hexagonal (Ports & Adapters) + Async Concurrency
+## Struktur Arsitektur
+- `src/domain/`: Entitas murni & Domain Events (`Order`, `OrderCreatedEvent`) tanpa ketergantungan I/O.
+- `src/ports/`: Port Repository asinkron (`std/db/yazabase` parameterized SQL + `std/csv`).
+- `src/adapters/`: Inbound HTTP adapter (`GET /healthz`, `/readyz`, `/metrics`, `GET /api/v1/orders`, `GET /api/v1/orders/:id`, `POST /api/v1/orders`).
+- `src/main.yz`: Bootstrap HTTP/1.1 multi-worker server (`8` concurrent `spawn` accept workers + `arena_scope` per request) dan `YAZA_SELF_TEST=1` mode.
 
-- **Domain Layer (`src/domain/`)**: Pure business entities (`Order`), domain invariants (`order_is_valid`), and asynchronous domain events (`OrderCreatedEvent`).
-- **Ports Layer (`src/ports/`)**: Asynchronous interfaces for database persistence (`order_repository_find_async`, `order_repository_save_async`) returning `Task[T]`.
-- **Adapters Layer (`src/adapters/`)**: Concrete inbound HTTP adapter (`handle_microservice_request`) with asynchronous endpoint dispatching (`spawn` / `await`), Prometheus telemetry, and Kubernetes probes.
-- **Concurrency & Memory Model**: Native Core 2 `spawn` and `.await` running over multi-core worker threads with **Zero-GC Isolated Task Arenas** (`yaza_rt_v1_task_arena_handle`), preventing cross-task interference.
-- **Resource Profile (`yaza.toml`)**: Configured with `throughput` profile featuring Adaptive Query Budgeting (AQB) capped at 512 MiB with 64 concurrency slots.
+## Setup Database & Jalankan Layanan
 
-## Endpoints
-
-| Method | Path | Concurrency | Description |
-|---|---|---|---|
-| `GET` | `/healthz` | Async | Kubernetes liveness probe |
-| `GET` | `/readyz` | Async | Kubernetes readiness probe |
-| `GET` | `/metrics` | Async | Prometheus metrics scrape target |
-| `GET` | `/api/v1/orders` | Async | Non-blocking query order collection |
-| `POST` | `/api/v1/orders` | Async | Create order record & dispatch event |
-
-## Development & Run
-
+1. Provision YazaBase credentials:
 ```bash
-# Check syntax and typing
+mkdir -p data
+yaza db set-user ./data admin dev_secret_pass_change_me
+export YAZABASE_USER=admin
+export YAZABASE_PASSWORD=dev_secret_pass_change_me
+```
+
+2. Verifikasi type-check, build, dan self-test:
+```bash
 yaza check
+yaza build --release src/main.yz -o {{project_name}}
+YAZA_SELF_TEST=1 ./{{project_name}}
+```
 
-# Run locally in development mode
+3. Jalankan live TCP HTTP/1.1 server:
+```bash
 yaza run
+# Listening on http://0.0.0.0:8080
+```
 
-# Build release binary
-yaza build --release src/main.yz -o build/service
-
-# Build and run Docker container
-docker compose up --build
+## Contoh Request Live
+```bash
+curl -sf http://127.0.0.1:8080/healthz
+curl -sf http://127.0.0.1:8080/readyz
+curl -sf http://127.0.0.1:8080/metrics
+curl -sf http://127.0.0.1:8080/api/v1/orders
+curl -sf -X POST http://127.0.0.1:8080/api/v1/orders \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"ord_202","customer_id":"cust_7","total_cents":49000}'
 ```

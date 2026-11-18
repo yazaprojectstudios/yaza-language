@@ -1,21 +1,160 @@
-# Outbound Port: Repository interface (YazaBase default + Core 2 Async/Await)
+# Outbound Port: Transactional YazaBase SQL Order Repository + Core 2 Async/Await
 use "std/db/yazabase"
+use "std/csv"
+use "std/convert"
 use "../domain/entity"
 
 shape OrderQueryResult:
     order: Option[Order]
     found: Boolean
 
+fn order_db_dir() -> Text:
+    let env_dir: Text = env_get("YAZABASE_DATA_DIR")
+    if env_dir != "":
+        return env_dir
+    return "./data"
+
+fn order_parse_csv_rows(csv_text: Text) -> List[Order]:
+    let out: List[Order] = List[Order]()
+    let raw_bytes: Bytes = bytes_from_text(csv_text)
+    let total_len: Number = bytes_length(raw_bytes)
+    if total_len == 0:
+        return out
+    var offset: Number = 0
+    var row_idx: Number = 0
+    while offset < total_len:
+        let rec_res: Result[Option[CsvRecord], Text] = csv_read_record(raw_bytes, offset)
+        if not result_is_ok(rec_res):
+            break
+        let rec_opt: Option[CsvRecord] = result_unwrap(rec_res)
+        if not option_is_some(rec_opt):
+            break
+        let rec: CsvRecord = option_unwrap(rec_opt)
+        set offset = rec.next_offset
+        if row_idx > 0 and list_count(rec.fields) >= 6:
+            let oid: Text = list_get(rec.fields, 1)
+            let cust: Text = list_get(rec.fields, 2)
+            let status: Text = list_get(rec.fields, 3)
+            let cents_res: Result[Number, Text] = number_try_parse(list_get(rec.fields, 4))
+            var cents: Number = 0
+            if result_is_ok(cents_res):
+                set cents = result_unwrap(cents_res)
+            let created: Text = list_get(rec.fields, 5)
+            list_push(out, Order(oid, cust, status, cents, created))
+        set row_idx = row_idx + 1
+    return out
+
+fn order_insert_row(conn: YazaBaseConnection, row_id: Number, ord: Order) -> Result[Boolean, Text]:
+    let p: TextList = text_list()
+    list_push(p, "bigint:" + number_text(row_id))
+    list_push(p, "text:" + ord.id)
+    list_push(p, "text:" + ord.customer_id)
+    list_push(p, "text:" + ord.status)
+    list_push(p, "bigint:" + number_text(ord.total_cents))
+    list_push(p, "text:" + ord.created_at)
+    let res: Result[Text, Text] = yazabase_exec_params(conn, "INSERT INTO orders (row_id, id, customer_id, status, total_cents, created_at) VALUES ($1, $2, $3, $4, $5, $6)", p)
+    if not result_is_ok(res):
+        return err(result_unwrap_error(res))
+    return ok(true)
+
+fn order_connect_and_ready() -> Result[YazaBaseConnection, Text]:
+    let conn_res: Result[YazaBaseConnection, Text] = yazabase_connect_default(order_db_dir(), "orders")
+    if not result_is_ok(conn_res):
+        return err(result_unwrap_error(conn_res))
+    let conn: YazaBaseConnection = result_unwrap(conn_res)
+    let schema_marker: Text = conn.db_dir + "/.orders_sql_schema_v1"
+    if not file_exists(schema_marker):
+        let lock_dir: Text = conn.db_dir + "/.orders_schema.lock"
+        if directory_create(lock_dir) == 0:
+            let empty_p: TextList = text_list()
+            let probe: Result[Text, Text] = yazabase_query_csv(conn, "SELECT row_id FROM orders LIMIT 1", empty_p)
+            if not result_is_ok(probe):
+                let ddl: Result[Text, Text] = yazabase_exec_params(conn, "CREATE TABLE orders (row_id BIGINT PRIMARY KEY, id TEXT NOT NULL, customer_id TEXT NOT NULL, status TEXT NOT NULL, total_cents BIGINT NOT NULL, created_at TEXT NOT NULL)", empty_p)
+                if not result_is_ok(ddl):
+                    return err(result_unwrap_error(ddl))
+                let seed1: Order = Order("ord_1", "cust_99", "CONFIRMED", 12500, "2026-11-16T12:00:00Z")
+                let _s1: Boolean = order_insert_row(conn, 1, seed1)?
+            let _w: Number = file_write(schema_marker, "1\n")
+        else:
+            var waited: Number = 0
+            while waited < 100 and not file_exists(schema_marker):
+                let _sl: Boolean = sleep_ms(15)
+                set waited = waited + 1
+    return ok(conn)
+
+fn order_next_row_id(conn: YazaBaseConnection) -> Number:
+    let empty_p: TextList = text_list()
+    let q_res: Result[Text, Text] = yazabase_query_csv(conn, "SELECT row_id FROM orders ORDER BY row_id DESC LIMIT 1", empty_p)
+    var db_next: Number = 1
+    if result_is_ok(q_res):
+        let raw_bytes: Bytes = bytes_from_text(result_unwrap(q_res))
+        let total_len: Number = bytes_length(raw_bytes)
+        var offset: Number = 0
+        var row_idx: Number = 0
+        while offset < total_len:
+            let rec_res: Result[Option[CsvRecord], Text] = csv_read_record(raw_bytes, offset)
+            if not result_is_ok(rec_res): break
+            let rec_opt: Option[CsvRecord] = result_unwrap(rec_res)
+            if not option_is_some(rec_opt): break
+            let rec: CsvRecord = option_unwrap(rec_opt)
+            set offset = rec.next_offset
+            if row_idx == 1 and list_count(rec.fields) >= 1:
+                let n_res: Result[Number, Text] = number_try_parse(list_get(rec.fields, 0))
+                if result_is_ok(n_res):
+                    set db_next = result_unwrap(n_res) + 1
+                    break
+            set row_idx = row_idx + 1
+    let seq_path: Text = conn.db_dir + "/.orders_next_id"
+    var seq_next: Number = db_next
+    if file_exists(seq_path):
+        let s_res: Result[Number, Text] = number_try_parse(text_trim(file_read(seq_path)))
+        if result_is_ok(s_res):
+            let s_val: Number = result_unwrap(s_res)
+            if s_val > seq_next:
+                set seq_next = s_val
+    let _w: Number = file_write(seq_path, number_text(seq_next + 1))
+    return seq_next
+
+async fn order_repository_ping_async() -> Result[Boolean, Text]:
+    let conn: YazaBaseConnection = order_connect_and_ready()?
+    let empty_p: TextList = text_list()
+    let q_res: Result[Text, Text] = yazabase_query_csv(conn, "SELECT row_id FROM orders LIMIT 1", empty_p)
+    if not result_is_ok(q_res):
+        return err("yazabase readiness query failed")
+    return ok(true)
+
+async fn order_repository_list_async() -> Result[List[Order], Text]:
+    let conn: YazaBaseConnection = order_connect_and_ready()?
+    let empty_p: TextList = text_list()
+    let q_res: Result[Text, Text] = yazabase_query_csv(conn, "SELECT row_id, id, customer_id, status, total_cents, created_at FROM orders ORDER BY row_id ASC LIMIT 100", empty_p)
+    if not result_is_ok(q_res):
+        return err(result_unwrap_error(q_res))
+    return ok(order_parse_csv_rows(result_unwrap(q_res)))
+
 async fn order_repository_find_async(order_id: Text) -> OrderQueryResult:
-    let conn_res: Result[YazaBaseConnection, Text] = yazabase_connect_default("./data", "orders")
-    if result_is_ok(conn_res) and order_id == "ord_1":
-        return OrderQueryResult(some(Order("ord_1", "cust_99", "CONFIRMED", 12500, "2026-11-16T12:00:00Z")), true)
-    return OrderQueryResult(none, false)
+    let conn_res: Result[YazaBaseConnection, Text] = order_connect_and_ready()
+    if not result_is_ok(conn_res):
+        return OrderQueryResult(none, false)
+    let conn: YazaBaseConnection = result_unwrap(conn_res)
+    let p: TextList = text_list()
+    list_push(p, "text:" + order_id)
+    let q_res: Result[Text, Text] = yazabase_query_csv(conn, "SELECT row_id, id, customer_id, status, total_cents, created_at FROM orders WHERE id = $1 LIMIT 1", p)
+    if not result_is_ok(q_res):
+        return OrderQueryResult(none, false)
+    let rows: List[Order] = order_parse_csv_rows(result_unwrap(q_res))
+    if list_count(rows) == 0:
+        return OrderQueryResult(none, false)
+    return OrderQueryResult(some(list_get(rows, 0)), true)
 
 async fn order_repository_save_async(order: Order) -> Result[Order, Text]:
     if not order_is_valid(order):
         return err("invalid order payload")
-    let conn: YazaBaseConnection = yazabase_connect_default("./data", "orders")?
-    if not conn.connected:
-        return err("yazabase connection is not active")
+    let conn: YazaBaseConnection = order_connect_and_ready()?
+    let dup_p: TextList = text_list()
+    list_push(dup_p, "text:" + order.id)
+    let dup_res: Result[Text, Text] = yazabase_query_csv(conn, "SELECT row_id, id, customer_id, status, total_cents, created_at FROM orders WHERE id = $1 LIMIT 1", dup_p)
+    if result_is_ok(dup_res) and list_count(order_parse_csv_rows(result_unwrap(dup_res))) > 0:
+        return err("order id already exists")
+    let next_row: Number = order_next_row_id(conn)
+    let _ins: Boolean = order_insert_row(conn, next_row, order)?
     return ok(order)

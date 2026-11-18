@@ -1,50 +1,100 @@
-# Inbound HTTP Adapter: Cloud-native endpoints, Prometheus metrics, and Health probes.
+# Inbound HTTP Adapter: Cloud-native probes, Prometheus metrics, and Async Domain Endpoints.
 use "std/http"
+use "std/json"
+use "std/sync"
+use "std/time"
 use "../domain/entity"
 use "../ports/repository"
 use "../domain/event"
 
-# Sub-handlers using async/await (Core 2 Best Practice)
+fn serialize_order_json(ord: Order) -> Text:
+    return "{\"id\":\"" + json_escape_text(ord.id) + "\",\"customer_id\":\"" + json_escape_text(ord.customer_id) + "\",\"status\":\"" + json_escape_text(ord.status) + "\",\"total_cents\":" + number_text(ord.total_cents) + ",\"created_at\":\"" + json_escape_text(ord.created_at) + "\"}"
+
 async fn handle_healthz_async() -> HttpResponse:
-    return http_response_ok_json("{\"status\":\"UP\",\"check\":\"liveness\"}")
+    return http_response_ok_json("{\"status\":\"UP\",\"check\":\"liveness\",\"service\":\"{{project_name}}\"}")
 
-async fn handle_readyz_async() -> HttpResponse:
-    return http_response_ok_json("{\"status\":\"READY\",\"database\":\"connected\",\"pool_healthy\":true}")
+async fn handle_readyz_async(m_errors: AtomicNumber) -> HttpResponse:
+    let ping_task: Task[Result[Boolean, Text]] = spawn order_repository_ping_async()
+    let ping_res: Result[Boolean, Text] = await ping_task
+    if not result_is_ok(ping_res):
+        let _e: AtomicNumber = atomic_add(m_errors, 1)
+        return http_response_service_unavailable("yazabase database is not ready", true)
+    return http_response_ok_json("{\"status\":\"READY\",\"database\":\"yazabase\",\"pool_healthy\":true}")
 
-async fn handle_metrics_async() -> HttpResponse:
-    var m: Text = "# HELP http_requests_total Total incoming requests\n"
-    set m = m + "# TYPE http_requests_total counter\n"
-    set m = m + "http_requests_total{status=\"200\"} 1420\n"
-    set m = m + "# HELP yazabase_p50_latency_seconds Median point query latency\n"
-    set m = m + "# TYPE yazabase_p50_latency_seconds gauge\n"
-    set m = m + "yazabase_p50_latency_seconds 0.000048\n"
+async fn handle_metrics_async(m_total: AtomicNumber, m_errors: AtomicNumber) -> HttpResponse:
+    let tot: Number = atomic_load(m_total)
+    let errs: Number = atomic_load(m_errors)
+    var m: Text = "# HELP yaza_http_requests_total Total incoming HTTP requests\n"
+    set m = m + "# TYPE yaza_http_requests_total counter\n"
+    set m = m + "yaza_http_requests_total " + number_text(tot) + "\n"
+    set m = m + "# HELP yaza_http_errors_total Total 5xx or readiness errors\n"
+    set m = m + "# TYPE yaza_http_errors_total counter\n"
+    set m = m + "yaza_http_errors_total " + number_text(errs) + "\n"
     return HttpResponse(200, "OK", "text/plain; version=0.0.4", bytes_from_text(m))
 
 async fn handle_orders_get_async() -> HttpResponse:
-    let query_task: Task[OrderQueryResult] = spawn order_repository_find_async("ord_1")
+    let list_task: Task[Result[List[Order], Text]] = spawn order_repository_list_async()
+    let list_res: Result[List[Order], Text] = list_task.await
+    if not result_is_ok(list_res):
+        return http_response_service_unavailable(result_unwrap_error(list_res), true)
+    let orders: List[Order] = result_unwrap(list_res)
+    var json_arr: Text = "["
+    var i: Number = 0
+    while i < list_count(orders):
+        if i > 0:
+            set json_arr = json_arr + ","
+        set json_arr = json_arr + serialize_order_json(list_get(orders, i))
+        set i = i + 1
+    set json_arr = json_arr + "]"
+    return http_response_ok_json(json_arr)
+
+async fn handle_orders_find_async(order_id: Text) -> HttpResponse:
+    let query_task: Task[OrderQueryResult] = spawn order_repository_find_async(order_id)
     let result: OrderQueryResult = query_task.await
     if result.found:
         let ord: Order = option_unwrap(result.order)
-        return http_response_ok_json("[{\"id\":\"" + ord.id + "\",\"customer_id\":\"" + ord.customer_id + "\",\"total_cents\":" + number_text(ord.total_cents) + ",\"status\":\"" + ord.status + "\"}]")
-    return http_response_not_found("No orders found", true)
+        return http_response_ok_json(serialize_order_json(ord))
+    return http_response_not_found("Order not found", true)
 
 async fn handle_orders_post_async(body: Text) -> HttpResponse:
-    if text_length(body) == 0:
+    if text_length(text_trim(body)) == 0:
         return http_response_bad_request("Request body cannot be empty", true)
-    let new_order: Order = Order("ord_new", "cust_live", "CREATED", 15000, "2026-11-16T12:00:00Z")
+    let now_ms: Number = time_now_unix_ms()
+    var oid: Text = "ord-" + number_text(now_ms)
+    let id_opt: Option[Text] = json_extract_string(body, "id")
+    if option_is_some(id_opt) and option_unwrap(id_opt) != "":
+        set oid = option_unwrap(id_opt)
+    var cust_id: Text = "cust_live"
+    let cust_opt: Option[Text] = json_extract_string(body, "customer_id")
+    if option_is_some(cust_opt) and option_unwrap(cust_opt) != "":
+        set cust_id = option_unwrap(cust_opt)
+    var status: Text = "CREATED"
+    let status_opt: Option[Text] = json_extract_string(body, "status")
+    if option_is_some(status_opt) and option_unwrap(status_opt) != "":
+        set status = option_unwrap(status_opt)
+    var total_cents: Number = 15000
+    let cents_opt: Option[Number] = json_extract_number(body, "total_cents")
+    if option_is_some(cents_opt) and option_unwrap(cents_opt) >= 0:
+        set total_cents = option_unwrap(cents_opt)
+
+    let new_order: Order = Order(oid, cust_id, status, total_cents, "ms-" + number_text(now_ms))
     let save_task: Task[Result[Order, Text]] = spawn order_repository_save_async(new_order)
     let saved_result: Result[Order, Text] = await save_task
     if not result_is_ok(saved_result):
         return http_response_bad_request(result_unwrap_error(saved_result), true)
-    let event: OrderCreatedEvent = OrderCreatedEvent("evt_1", new_order.id, "2026-11-16T12:00:00Z", body)
+    let saved_ord: Order = result_unwrap(saved_result)
+    let event: OrderCreatedEvent = OrderCreatedEvent("evt-" + number_text(now_ms), saved_ord.id, saved_ord.created_at, body)
     let pub_task: Task[Boolean] = spawn event_publisher_dispatch_async(event)
     let pub_ok: Boolean = pub_task.await
     var pub_status: Text = "false"
     if pub_ok: set pub_status = "true"
-    return http_response_created_json("{\"id\":\"" + new_order.id + "\",\"status\":\"CREATED\",\"dispatched\":" + pub_status + "}")
+    return http_response_created_json("{\"order\":" + serialize_order_json(saved_ord) + ",\"dispatched\":" + pub_status + "}")
 
-# Main inbound request dispatcher (Asynchronous)
-async fn handle_microservice_request(method: Text, path: Text, body: Text) -> HttpResponse:
+async fn handle_microservice_request(method: Text, path: Text, body: Text, m_total: AtomicNumber, m_errors: AtomicNumber) -> HttpResponse:
+    let _t_inc: AtomicNumber = atomic_add(m_total, 1)
+    if method == "OPTIONS":
+        return http_response_no_content()
+
     # 1. Kubernetes Liveness Probe
     if path == "/healthz" or path == "/livez":
         let task: Task[HttpResponse] = spawn handle_healthz_async()
@@ -52,21 +102,28 @@ async fn handle_microservice_request(method: Text, path: Text, body: Text) -> Ht
 
     # 2. Kubernetes Readiness Probe
     if path == "/readyz":
-        let task: Task[HttpResponse] = spawn handle_readyz_async()
+        let task: Task[HttpResponse] = spawn handle_readyz_async(m_errors)
         return task.await
 
     # 3. Prometheus Metrics Endpoint
     if path == "/metrics":
-        let task: Task[HttpResponse] = spawn handle_metrics_async()
+        let task: Task[HttpResponse] = spawn handle_metrics_async(m_total, m_errors)
         return await task
 
     # 4. Domain Resource Endpoints
     if path == "/api/v1/orders":
-        if method == "GET":
+        if method == "GET" or method == "HEAD":
             let task: Task[HttpResponse] = spawn handle_orders_get_async()
             return task.await
         if method == "POST":
             let task: Task[HttpResponse] = spawn handle_orders_post_async(body)
+            return await task
+        return http_response_method_not_allowed("Method not allowed", true)
+
+    if text_starts_with(path, "/api/v1/orders/"):
+        let order_id: Text = text_slice(path, 15, text_length(path) - 15)
+        if method == "GET" or method == "HEAD":
+            let task: Task[HttpResponse] = spawn handle_orders_find_async(order_id)
             return await task
         return http_response_method_not_allowed("Method not allowed", true)
 

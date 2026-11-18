@@ -1,16 +1,143 @@
 # Cloud-Native Microservice: {{project_name}}
 # Architecture: Hexagonal (Ports & Adapters) + DDD
-# Profile: throughput (AQB arena mode, 512 MiB process cap, 64 in-flight concurrency)
-# Concurrency: Native Core 2 async fn, spawn, and await with isolated task arenas
+# Runtime: Live TCP HTTP/1.1 Keep-Alive Server + Core 2 async/await & spawn workers + YazaBase SQL
 use "adapters/http_handler"
+use "std/net"
+use "std/json"
+use "std/sync"
+use "std/log"
+use "std/time"
+use "std/config/api_config"
 
-async fn execute_service_smoke_async() -> Boolean:
+shape HttpReadOutcome:
+    ok_read: Boolean
+    raw: Bytes
+    error_response: Option[HttpResponse]
+
+fn header_end_index(raw_text: Text) -> Number:
+    let crlf: Number = text_find(raw_text, "\r\n\r\n")
+    if crlf >= 0: return crlf + 4
+    let lf: Number = text_find(raw_text, "\n\n")
+    if lf >= 0: return lf + 2
+    return -1
+
+fn request_wants_close(raw_text: Text) -> Boolean:
+    if text_find(raw_text, "Connection: close") >= 0 or text_find(raw_text, "connection: close") >= 0:
+        return true
+    if text_find(raw_text, "HTTP/1.0") >= 0 and text_find(raw_text, "keep-alive") < 0:
+        return true
+    return false
+
+fn read_bounded_http_request(client_fd: Number, max_body_bytes: Number) -> HttpReadOutcome:
+    var buf: Bytes = bytes_empty()
+    let header_limit: Number = 16384
+    var hdr_end: Number = -1
+    var content_len: Number = 0
+    var chunks: Number = 0
+
+    while chunks < 256:
+        let rd: Result[Bytes, Text] = tcp_read(client_fd, 16384, 5000)
+        if not result_is_ok(rd):
+            break
+        let chunk: Bytes = result_unwrap(rd)
+        if bytes_length(chunk) == 0:
+            break
+        set buf = bytes_concat(buf, chunk)
+        let cur_len: Number = bytes_length(buf)
+        if hdr_end < 0:
+            if cur_len > header_limit and header_end_index(bytes_to_text(buf)) < 0:
+                return HttpReadOutcome(false, bytes_empty(), some(http_response_payload_too_large("HTTP header exceeds 16 KiB limit", true)))
+            let txt: Text = bytes_to_text(buf)
+            set hdr_end = header_end_index(txt)
+            if hdr_end >= 0:
+                let hdr_req_res: Result[HttpRequest, Text] = http_parse_request(bytes_slice(buf, 0, hdr_end))
+                if result_is_ok(hdr_req_res):
+                    set content_len = result_unwrap(hdr_req_res).content_length
+                if content_len > max_body_bytes:
+                    return HttpReadOutcome(false, bytes_empty(), some(http_response_payload_too_large("request body exceeds configured limit", true)))
+        if hdr_end >= 0 and cur_len >= hdr_end + content_len:
+            return HttpReadOutcome(true, bytes_slice(buf, 0, hdr_end + content_len), none)
+        set chunks = chunks + 1
+
+    if bytes_length(buf) == 0:
+        return HttpReadOutcome(false, bytes_empty(), none)
+    return HttpReadOutcome(true, buf, none)
+
+fn dispatch_microservice_http_request(req: HttpRequest, m_total: AtomicNumber, m_errors: AtomicNumber) -> HttpResponse:
+    let h_task: Task[HttpResponse] = spawn handle_microservice_request(req.method, req.path, req.body_text, m_total, m_errors)
+    return await h_task
+
+fn handle_client_connection(client_fd: Number, max_body_bytes: Number, max_in_flight: Number, m_in_flight: AtomicNumber, m_total: AtomicNumber, m_errors: AtomicNumber, m_rate_limited: AtomicNumber, logger: Logger) -> Boolean:
+    var keep_alive: Boolean = true
+    var req_on_conn: Number = 0
+    while keep_alive and req_on_conn < 64:
+        var continue_conn: Boolean = false
+        arena_scope 1048576:
+            let rd_out: HttpReadOutcome = read_bounded_http_request(client_fd, max_body_bytes)
+            if not rd_out.ok_read:
+                if option_is_some(rd_out.error_response):
+                    let wire_err: Bytes = http_format_response_keep_alive(option_unwrap(rd_out.error_response), "req-limit", false)
+                    let _wr: Result[Number, Text] = tcp_write(client_fd, wire_err, 5000)
+            else:
+                set req_on_conn = req_on_conn + 1
+                let raw_text: Text = bytes_to_text(rd_out.raw)
+                if request_wants_close(raw_text):
+                    set keep_alive = false
+
+                let started_ns: Number = time_now_monotonic_ns()
+                let cur_in_flight: Number = atomic_fetch_add(m_in_flight, 1)
+                let req_res: Result[HttpRequest, Text] = http_parse_request(rd_out.raw)
+                var resp: HttpResponse = http_response_bad_request("malformed HTTP request", true)
+                var req_id: Text = "req-" + number_text(req_on_conn)
+                var log_method: Text = "UNKNOWN"
+                var log_path: Text = "/"
+
+                if result_is_ok(req_res):
+                    let req: HttpRequest = result_unwrap(req_res)
+                    set log_method = req.method
+                    set log_path = req.path
+                    if req.x_request_id != "":
+                        set req_id = req.x_request_id
+                    if cur_in_flight >= max_in_flight:
+                        let _rl: AtomicNumber = atomic_add(m_rate_limited, 1)
+                        set resp = http_response_service_unavailable("maximum in-flight concurrency limit reached", true)
+                    else:
+                        set resp = dispatch_microservice_http_request(req, m_total, m_errors)
+                let _dec: AtomicNumber = atomic_add(m_in_flight, -1)
+
+                if resp.status_code >= 500:
+                    let _er: AtomicNumber = atomic_add(m_errors, 1)
+
+                let wire: Bytes = http_format_response_keep_alive(resp, req_id, keep_alive)
+                let wr_res: Result[Number, Text] = tcp_write(client_fd, wire, 5000)
+                let elapsed_ms: Number = (time_now_monotonic_ns() - started_ns) / 1000000
+                let access_json: Text = "{\"method\":\"" + json_escape_text(log_method) + "\",\"path\":\"" + json_escape_text(log_path) + "\",\"status\":" + number_text(resp.status_code) + ",\"latency_ms\":" + number_text(elapsed_ms) + ",\"request_id\":\"" + json_escape_text(req_id) + "\"}"
+                let _li: Boolean = log_info(logger, "http_request", access_json)
+                if result_is_ok(wr_res):
+                    set continue_conn = true
+        if not continue_conn:
+            break
+
+    let _cl: Result[Boolean, Text] = tcp_close(client_fd)
+    return true
+
+async fn microservice_worker_loop(accept_lock: Mutex, listener: Number, max_body_bytes: Number, max_in_flight: Number, m_in_flight: AtomicNumber, m_total: AtomicNumber, m_errors: AtomicNumber, m_rate_limited: AtomicNumber, logger: Logger) -> Boolean:
+    while true:
+        let _lk: Boolean = mutex_lock(accept_lock)
+        let acc_res: Result[Number, Text] = tcp_accept(listener, 1000)
+        let _unlk: Boolean = mutex_unlock(accept_lock)
+        if result_is_ok(acc_res):
+            let client_fd: Number = result_unwrap(acc_res)
+            let _ok: Boolean = handle_client_connection(client_fd, max_body_bytes, max_in_flight, m_in_flight, m_total, m_errors, m_rate_limited, logger)
+    return true
+
+async fn execute_service_smoke_async(m_total: AtomicNumber, m_errors: AtomicNumber) -> Boolean:
     say "Executing async probe tasks concurrently..."
-    let t_live: Task[HttpResponse] = spawn handle_microservice_request("GET", "/healthz", "")
-    let t_ready: Task[HttpResponse] = spawn handle_microservice_request("GET", "/readyz", "")
-    let t_metrics: Task[HttpResponse] = spawn handle_microservice_request("GET", "/metrics", "")
-    let t_get_orders: Task[HttpResponse] = spawn handle_microservice_request("GET", "/api/v1/orders", "")
-    let t_post_orders: Task[HttpResponse] = spawn handle_microservice_request("POST", "/api/v1/orders", "{\"items\":[1]}")
+    let t_live: Task[HttpResponse] = spawn handle_microservice_request("GET", "/healthz", "", m_total, m_errors)
+    let t_ready: Task[HttpResponse] = spawn handle_microservice_request("GET", "/readyz", "", m_total, m_errors)
+    let t_metrics: Task[HttpResponse] = spawn handle_microservice_request("GET", "/metrics", "", m_total, m_errors)
+    let t_get_orders: Task[HttpResponse] = spawn handle_microservice_request("GET", "/api/v1/orders", "", m_total, m_errors)
+    let t_post_orders: Task[HttpResponse] = spawn handle_microservice_request("POST", "/api/v1/orders", "{\"id\":\"ord-smoke-1\",\"customer_id\":\"cust_smoke\",\"total_cents\":24900}", m_total, m_errors)
 
     let r_live: HttpResponse = await t_live
     let r_ready: HttpResponse = await t_ready
@@ -23,24 +150,64 @@ async fn execute_service_smoke_async() -> Boolean:
     assert(r_metrics.status_code == 200)
     assert(r_get.status_code == 200)
     assert(r_post.status_code == 201)
-    say "All concurrent microservice endpoints verified successfully (HTTP 200/201)."
+
+    let t_find: Task[HttpResponse] = spawn handle_microservice_request("GET", "/api/v1/orders/ord-smoke-1", "", m_total, m_errors)
+    let r_find: HttpResponse = await t_find
+    assert(r_find.status_code == 200)
     return true
 
+fn load_effective_service_config() -> ApiServiceConfig:
+    if file_exists("yaza.toml"):
+        let parsed: Result[ApiServiceConfig, Text] = api_config_parse(file_read("yaza.toml"))
+        if result_is_ok(parsed):
+            return result_unwrap(parsed)
+    return result_unwrap(api_config_parse("[project]\nname = \"{{project_name}}\"\n[api]\nbind = \"0.0.0.0:8080\"\n"))
+
 start:
+    let logger: Logger = logger_create("{{project_name}}", "INFO")
+    let cfg: ApiServiceConfig = load_effective_service_config()
+
+    let m_in_flight: AtomicNumber = atomic_create(0)
+    let m_total: AtomicNumber = atomic_create(0)
+    let m_errors: AtomicNumber = atomic_create(0)
+    let m_rate_limited: AtomicNumber = atomic_create(0)
+
+    let ping_task: Task[Result[Boolean, Text]] = spawn order_repository_ping_async()
+    let db_ready: Result[Boolean, Text] = await ping_task
+    if not result_is_ok(db_ready):
+        let _le: Boolean = log_error(logger, "startup_yazabase_failed", result_unwrap_error(db_ready) + " (Hint: provision ./data via 'yaza db set-user ./data admin <pass>' and set YAZABASE_USER / YAZABASE_PASSWORD)")
+        exit(1)
+
+    if env_get("YAZA_SELF_TEST") == "1":
+        let smoke_task: Task[Boolean] = spawn execute_service_smoke_async(m_total, m_errors)
+        let success: Boolean = smoke_task.await
+        assert(success)
+        say "MICROSERVICE_SELF_TEST: PASS"
+        exit(0)
+
+    let listener_res: Result[Number, Text] = tcp_listen(cfg.bind_host, cfg.bind_port, 128)
+    if not result_is_ok(listener_res):
+        let _le2: Boolean = log_error(logger, "tcp_listen_failed", result_unwrap_error(listener_res))
+        exit(1)
+    let listener: Number = result_unwrap(listener_res)
+
     say "=== {{project_name}} Cloud-Native Microservice ==="
-    say "Architecture : Hexagonal / Ports & Adapters"
-    say "Engine       : YazaBase Embedded Engine"
-    say "Concurrency  : Language-level async/await & spawn"
-    say "Probes & Telemetry:"
-    say "  Liveness   : http://0.0.0.0:8080/healthz"
-    say "  Readiness  : http://0.0.0.0:8080/readyz"
-    say "  Metrics    : http://0.0.0.0:8080/metrics (Prometheus format)"
-    say "  API Routes : http://0.0.0.0:8080/api/v1/orders"
+    say "Architecture : Hexagonal (Ports & Adapters) + YazaBase SQL (ACID)"
+    say "Concurrency  : Core 2 async/await & 8 spawn workers (" + cfg.resources.profile + ", max_in_flight = " + number_text(cfg.resources.max_in_flight) + ")"
+    say "Listening on : http://" + cfg.bind_host + ":" + number_text(cfg.bind_port)
+    say "Endpoints:"
+    say "  GET  /healthz | /readyz | /metrics"
+    say "  GET  /api/v1/orders"
+    say "  GET  /api/v1/orders/:id"
+    say "  POST /api/v1/orders"
 
-    let db_init_task: Task[Result[Order, Text]] = spawn order_repository_save_async(Order("ord_0", "cust_0", "INIT", 0, "2026-11-16T00:00:00Z"))
-    let _db_ready: Result[Order, Text] = await db_init_task
-    let smoke_task: Task[Boolean] = spawn execute_service_smoke_async()
-    let success: Boolean = smoke_task.await
-    assert(success)
-
-    say "Service initialized with 64 concurrent async task slots."
+    let accept_lock: Mutex = mutex_create(1)
+    let workers: List[Task[Boolean]] = List[Task[Boolean]]()
+    var wi: Number = 0
+    while wi < 8:
+        list_push(workers, spawn microservice_worker_loop(accept_lock, listener, cfg.max_request_body_bytes, cfg.resources.max_in_flight, m_in_flight, m_total, m_errors, m_rate_limited, logger))
+        set wi = wi + 1
+    var wj: Number = 0
+    while wj < list_count(workers):
+        let _done: Boolean = await list_get(workers, wj)
+        set wj = wj + 1
