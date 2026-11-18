@@ -21,6 +21,7 @@ cp extension.js "$STAGING/extension/"
 cp formatter.js "$STAGING/extension/"
 cp language-configuration.json "$STAGING/extension/"
 cp README.md "$STAGING/extension/"
+cp ../../LICENSE "$STAGING/extension/LICENSE.txt"
 cp -R snippets "$STAGING/extension/"
 cp -R syntaxes "$STAGING/extension/"
 cp -R images "$STAGING/extension/"
@@ -33,6 +34,7 @@ cat << 'EOF' > "$STAGING/[Content_Types].xml"
   <Default Extension="js" ContentType="application/javascript"/>
   <Default Extension="md" ContentType="text/markdown"/>
   <Default Extension="png" ContentType="image/png"/>
+  <Default Extension="txt" ContentType="text/plain"/>
   <Default Extension="vsixmanifest" ContentType="text/xml"/>
   <Default Extension="xml" ContentType="text/xml"/>
 </Types>
@@ -47,7 +49,7 @@ cat << EOF > "$STAGING/extension.vsixmanifest"
     <DisplayName>YAZA Language Support</DisplayName>
     <Description>YAZA syntax, formatting, compiler diagnostics, completion, navigation, and snippets.</Description>
     <Icon>extension/images/yaza-logo.png</Icon>
-    <License>Apache-2.0</License>
+    <License>extension/LICENSE.txt</License>
   </Metadata>
   <Installation>
     <InstallationTarget Id="Microsoft.VisualStudio.Code"/>
@@ -56,6 +58,7 @@ cat << EOF > "$STAGING/extension.vsixmanifest"
   <Assets>
     <Asset Type="Microsoft.VisualStudio.Code.Manifest" Path="extension/package.json" Addressable="true"/>
     <Asset Type="Microsoft.VisualStudio.Services.Content.Details" Path="extension/README.md" Addressable="true"/>
+    <Asset Type="Microsoft.VisualStudio.Services.Content.License" Path="extension/LICENSE.txt" Addressable="true"/>
     <Asset Type="Microsoft.VisualStudio.Services.Icons.Default" Path="extension/images/yaza-logo.png" Addressable="true"/>
   </Assets>
 </PackageManifest>
