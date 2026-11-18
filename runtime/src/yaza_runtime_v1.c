@@ -3491,6 +3491,18 @@ static uint32_t yaza_bytes_v1_crc_update(uint32_t crc, const unsigned char *data
         data += 8;
         length -= 8;
     }
+    while (length >= 8) {
+        crc = (crc >> 8) ^ table[(crc ^ data[0]) & 0xffU];
+        crc = (crc >> 8) ^ table[(crc ^ data[1]) & 0xffU];
+        crc = (crc >> 8) ^ table[(crc ^ data[2]) & 0xffU];
+        crc = (crc >> 8) ^ table[(crc ^ data[3]) & 0xffU];
+        crc = (crc >> 8) ^ table[(crc ^ data[4]) & 0xffU];
+        crc = (crc >> 8) ^ table[(crc ^ data[5]) & 0xffU];
+        crc = (crc >> 8) ^ table[(crc ^ data[6]) & 0xffU];
+        crc = (crc >> 8) ^ table[(crc ^ data[7]) & 0xffU];
+        data += 8;
+        length -= 8;
+    }
     for (uint64_t index = 0; index < length; ++index) {
         crc = (crc >> 8) ^ table[(crc ^ data[index]) & 0xffU];
     }

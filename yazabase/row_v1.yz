@@ -160,6 +160,15 @@ fn yaza_db_row_schema_valid_v1(columns: List[YazaSqlColumnSchemaV1]) -> Boolean:
     return true
 
 fn yaza_db_row_bit_mask_v1(bit_index: Number) -> Number:
+    if bit_index <= 0: return 1
+    if bit_index == 1: return 2
+    if bit_index == 2: return 4
+    if bit_index == 3: return 8
+    if bit_index == 4: return 16
+    if bit_index == 5: return 32
+    if bit_index == 6: return 64
+    if bit_index == 7: return 128
+    if bit_index == 8: return 256
     var mask: Number = 1
     var shift: Number = 0
     while shift < bit_index:
@@ -443,7 +452,7 @@ fn yaza_db_row_utf8_range_valid_v1(encoded: YazaDbRowByteViewV1, offset: Number,
 fn yaza_db_row_decode_view_with_buffers_v1(encoded: YazaDbRowByteViewV1, columns: List[YazaSqlColumnSchemaV1], current_schema_version: Number, reuse_output_buffers: Boolean, materialize_text: Boolean, schema_prevalidated: Boolean, skip_unmaterialized_text_values: Boolean, reusable_values: List[YazaSqlValueV1], reusable_nulls: List[Boolean], reusable_overflow_refs: List[YazaDbOverflowRefV1], output_columns: List[Boolean], capture_integer_key_ordinal: Number) -> Result[YazaDbRowScanDecodeV1, Text]:
     let total_size: Number = encoded.length
     let count: Number = list_count(columns)
-    if total_size < yaza_db_row_header_size_v1() or total_size > yaza_db_row_max_inline_size_v1() or (not schema_prevalidated and not yaza_db_row_schema_valid_v1(columns)): return err("YDBv1 row size or schema is invalid")
+    if total_size < yaza_db_row_header_size_v1() or total_size > yaza_db_row_max_inline_size_v1() or encoded.start < 0 or total_size > bytes_length(encoded.source) - encoded.start or (not schema_prevalidated and not yaza_db_row_schema_valid_v1(columns)): return err("YDBv1 row size or schema is invalid")
     if skip_unmaterialized_text_values and (not reuse_output_buffers or materialize_text): return err("YDBv1 scan may skip TEXT output only with reusable buffers and unmaterialized text")
     let has_output_column_mask: Boolean = list_count(output_columns) > 0
     if has_output_column_mask and (list_count(output_columns) != count or not reuse_output_buffers): return err("YDBv1 projected row decode requires a schema-width mask and reusable buffers")
@@ -515,6 +524,8 @@ fn yaza_db_row_decode_view_with_buffers_v1(encoded: YazaDbRowByteViewV1, columns
     var max_text_input_bytes: Number = 0
     var captured_integer_key: Number = 0
     var has_captured_integer_key: Boolean = false
+    let empty_sql_value: YazaSqlValueV1 = YazaSqlValueV1(0, 0, 0.0, false, "", bytes_empty(), false, -1, -1, true)
+    let empty_overflow_ref: YazaDbOverflowRefV1 = YazaDbOverflowRefV1(0, 0, 0, 0)
     set index = 0
     while index < stored_count:
         let column: YazaSqlColumnSchemaV1 = list_get(columns, index)
@@ -530,9 +541,9 @@ fn yaza_db_row_decode_view_with_buffers_v1(encoded: YazaDbRowByteViewV1, columns
         if reuse_output_buffers:
             if output_column_selected and not list_try_set(nulls, index, is_null): return err("YDBv1 reusable row NULL bitmap update failed")
         elif not list_try_push(nulls, is_null): return err("YDBv1 row NULL bitmap result growth failed")
-        var value: YazaSqlValueV1 = YazaSqlValueV1(0, 0, 0.0, false, "", bytes_empty(), false, -1, -1, true)
-        if output_column_selected: set value = yaza_db_row_null_placeholder_v1(type_id)
-        var overflow_ref: YazaDbOverflowRefV1 = YazaDbOverflowRefV1(0, 0, 0, 0)
+        var value: YazaSqlValueV1 = empty_sql_value
+        if output_column_selected: set value = YazaSqlValueV1(type_id, 0, 0.0, false, "", empty_sql_value.bytes_value, false, -1, -1, true)
+        var overflow_ref: YazaDbOverflowRefV1 = empty_overflow_ref
         var decoded_text_bytes: Number = 0
         if width > 0:
             if is_null and not yaza_db_row_range_is_zero_v1(encoded, fixed_offset, width): return err("YDBv1 NULL fixed column contains non-zero bytes")
@@ -542,8 +553,9 @@ fn yaza_db_row_decode_view_with_buffers_v1(encoded: YazaDbRowByteViewV1, columns
                     if boolean_byte > 1: return err("YDBv1 BOOLEAN column is not encoded as zero or one")
                     if output_column_selected: set value = yaza_sql_value_boolean_v1(boolean_byte == 1)
                 elif type_id == 6:
-                    let float_bits: Number = yaza_db_row_view_read_int_le_v1(encoded, fixed_offset, 8)?
-                    if output_column_selected: set value = yaza_sql_value_double_v1(float64_from_bits(float_bits))
+                    if output_column_selected:
+                        let float_bits: Number = yaza_db_row_view_read_int_le_v1(encoded, fixed_offset, 8)?
+                        set value = yaza_sql_value_double_v1(float64_from_bits(float_bits))
                 elif type_id == 10:
                     if output_column_selected:
                         let coefficient: Bytes = bytes_try_slice(encoded.source, encoded.start + fixed_offset, 16)?
@@ -555,18 +567,20 @@ fn yaza_db_row_decode_view_with_buffers_v1(encoded: YazaDbRowByteViewV1, columns
                         let uuid_bytes: Bytes = bytes_try_slice(encoded.source, encoded.start + fixed_offset, 16)?
                         let uuid_text: Text = yaza_sql_uuid_to_text_v1(uuid_bytes)?
                         set value = yaza_sql_value_uuid_v1(uuid_text)?
+                elif not output_column_selected and index != capture_integer_key_ordinal and (type_id == 2 or type_id == 3 or type_id == 4):
+                    set value = empty_sql_value
                 else:
                     let integer_value: Number = yaza_db_row_view_read_int_le_v1(encoded, fixed_offset, width)?
                     if index == capture_integer_key_ordinal:
                         set captured_integer_key = integer_value
                         set has_captured_integer_key = true
                     if not output_column_selected:
-                        set value = YazaSqlValueV1(0, 0, 0.0, false, "", bytes_empty(), false, -1, -1, true)
+                        set value = empty_sql_value
                     elif type_id == 4:
                         # BIGINT is already decoded from its canonical signed
                         # 64-bit storage width; no narrowing-range constructor
                         # is needed on this hot scan path.
-                        set value = yaza_sql_executor_value_v1(4, integer_value, 0.0, false, "")
+                        set value = YazaSqlValueV1(4, integer_value, 0.0, false, "", empty_sql_value.bytes_value, false, -1, -1, false)
                     elif type_id == 11:
                         let decoded_date: Result[YazaSqlValueV1, Text] = yaza_sql_value_integer_v1(11, integer_value)
                         if not result_is_ok(decoded_date): return err(result_unwrap_error(decoded_date))

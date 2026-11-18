@@ -107,7 +107,16 @@ fn yaza_db_read_uint_le_v1(input: Bytes, offset: Number, width: Number) -> Resul
     if width < 1 or width > 8: return err("YDBv1 integer width is invalid")
     let length: Number = bytes_length(input)
     if offset < 0 or length < width or offset > length - width: return err("YDBv1 integer range is outside the buffer")
-    if width == 8 and bytes_get(input, offset + 7) > 127: return err("YDBv1 u64 value exceeds the signed Number range")
+    if width == 2:
+        return ok(bytes_get(input, offset) + bytes_get(input, offset + 1) * 256)
+    if width == 4:
+        return ok(bytes_get(input, offset) + bytes_get(input, offset + 1) * 256 + bytes_get(input, offset + 2) * 65536 + bytes_get(input, offset + 3) * 16777216)
+    if width == 8:
+        let b7: Number = bytes_get(input, offset + 7)
+        if b7 > 127: return err("YDBv1 u64 value exceeds the signed Number range")
+        let lo: Number = bytes_get(input, offset) + bytes_get(input, offset + 1) * 256 + bytes_get(input, offset + 2) * 65536 + bytes_get(input, offset + 3) * 16777216
+        let hi: Number = bytes_get(input, offset + 4) + bytes_get(input, offset + 5) * 256 + bytes_get(input, offset + 6) * 65536 + b7 * 16777216
+        return ok(lo + hi * 4294967296)
     var result: Number = 0
     var multiplier: Number = 1
     var index: Number = 0
@@ -121,7 +130,16 @@ fn yaza_db_read_int_le_v1(input: Bytes, offset: Number, width: Number) -> Result
     if width != 2 and width != 4 and width != 8: return err("YDBv1 signed integer width must be 2, 4, or 8 bytes")
     let length: Number = bytes_length(input)
     if offset < 0 or length < width or offset > length - width: return err("YDBv1 signed integer range is outside the buffer")
-    let negative: Boolean = bytes_get(input, offset + width - 1) >= 128
+    let last_byte: Number = bytes_get(input, offset + width - 1)
+    if last_byte < 128:
+        if width == 8:
+            let lo: Number = bytes_get(input, offset) + bytes_get(input, offset + 1) * 256 + bytes_get(input, offset + 2) * 65536 + bytes_get(input, offset + 3) * 16777216
+            let hi: Number = bytes_get(input, offset + 4) + bytes_get(input, offset + 5) * 256 + bytes_get(input, offset + 6) * 65536 + last_byte * 16777216
+            return ok(lo + hi * 4294967296)
+        if width == 4:
+            return ok(bytes_get(input, offset) + bytes_get(input, offset + 1) * 256 + bytes_get(input, offset + 2) * 65536 + last_byte * 16777216)
+        return ok(bytes_get(input, offset) + last_byte * 256)
+    let negative: Boolean = true
     var result: Number = 0
     var multiplier: Number = 1
     var index: Number = 0
@@ -1073,23 +1091,26 @@ fn yaza_db_page_header_decode_v1(page: Bytes, expected_page_id: Number) -> Resul
     var previous_record_offset: Number = yaza_db_page_size_v1()
     var index: Number = 0
     while index < count:
-        let descriptor: Number = yaza_db_page_header_size_v1() + index * yaza_db_page_slot_size_v1()
-        let record_offset: Number = yaza_db_read_uint_le_v1(page, descriptor, 2)?
-        let key_len: Number = yaza_db_read_uint_le_v1(page, descriptor + 2, 2)?
-        let payload_len: Number = yaza_db_read_uint_le_v1(page, descriptor + 4, 2)?
-        let key_head: Number = yaza_db_read_uint_be32_v1(page, descriptor + 6)?
-        let slot_reserved: Number = yaza_db_read_uint_le_v1(page, descriptor + 10, 2)?
+        let descriptor: Number = 48 + index * 12
+        let record_offset: Number = bytes_get(page, descriptor) + bytes_get(page, descriptor + 1) * 256
+        let key_len: Number = bytes_get(page, descriptor + 2) + bytes_get(page, descriptor + 3) * 256
+        let payload_len: Number = bytes_get(page, descriptor + 4) + bytes_get(page, descriptor + 5) * 256
+        let key_head: Number = bytes_get(page, descriptor + 6) * 16777216 + bytes_get(page, descriptor + 7) * 65536 + bytes_get(page, descriptor + 8) * 256 + bytes_get(page, descriptor + 9)
+        let slot_reserved: Number = bytes_get(page, descriptor + 10) + bytes_get(page, descriptor + 11) * 256
         if slot_reserved != 0: return err("YDBv1 slot reserved bytes are non-zero")
         if key_len > 2048 or payload_len > 4096: return err("YDBv1 slot key or payload length is invalid")
         if key_len == 0 and prefix_len == 0: return err("YDBv1 slot has an empty key without a shared prefix")
-        if record_offset < data_start or record_offset > yaza_db_page_size_v1() - key_len - payload_len: return err("YDBv1 slot body is outside the page data area")
+        if record_offset < data_start or record_offset > 16384 - key_len - payload_len: return err("YDBv1 slot body is outside the page data area")
         if record_offset + key_len + payload_len > previous_record_offset: return err("YDBv1 slot bodies overlap or are not packed in reverse key order")
         var computed_head: Number = 0
-        var head_index: Number = 0
-        while head_index < 4:
-            set computed_head = computed_head * 256
-            if head_index < key_len: set computed_head = computed_head + bytes_get(page, record_offset + head_index)
-            set head_index = head_index + 1
+        if key_len >= 4:
+            set computed_head = bytes_get(page, record_offset) * 16777216 + bytes_get(page, record_offset + 1) * 65536 + bytes_get(page, record_offset + 2) * 256 + bytes_get(page, record_offset + 3)
+        else:
+            var head_index: Number = 0
+            while head_index < 4:
+                set computed_head = computed_head * 256
+                if head_index < key_len: set computed_head = computed_head + bytes_get(page, record_offset + head_index)
+                set head_index = head_index + 1
         if key_head != computed_head: return err("YDBv1 slot key_head does not match its key suffix")
         if index > 0:
             if key_head < previous_head: return err("YDBv1 slot keys are not ordered by key_head")
@@ -1147,13 +1168,13 @@ fn yaza_db_page_slot_key_from_validated_header_v1(page: Bytes, header: YazaDbPag
     return bytes_try_concat(prefix, slot.key_suffix)
 
 fn yaza_db_page_slot_span_from_validated_header_v1(page: Bytes, header: YazaDbPageHeaderV1, slot_index: Number) -> Result[YazaDbPageSlotSpanV1, Text]:
-    if slot_index < 0 or slot_index >= header.count: return err("YDBv1 slot index is outside the validated page")
-    let descriptor: Number = yaza_db_page_header_size_v1() + slot_index * yaza_db_page_slot_size_v1()
-    let offset: Number = yaza_db_read_uint_le_v1(page, descriptor, 2)?
-    let key_len: Number = yaza_db_read_uint_le_v1(page, descriptor + 2, 2)?
-    let payload_len: Number = yaza_db_read_uint_le_v1(page, descriptor + 4, 2)?
-    let key_head: Number = yaza_db_read_uint_be32_v1(page, descriptor + 6)?
     let page_length: Number = bytes_length(page)
+    if slot_index < 0 or slot_index >= header.count or page_length < 48 + header.count * 12: return err("YDBv1 slot index is outside the validated page")
+    let descriptor: Number = 48 + slot_index * 12
+    let offset: Number = bytes_get(page, descriptor) + bytes_get(page, descriptor + 1) * 256
+    let key_len: Number = bytes_get(page, descriptor + 2) + bytes_get(page, descriptor + 3) * 256
+    let payload_len: Number = bytes_get(page, descriptor + 4) + bytes_get(page, descriptor + 5) * 256
+    let key_head: Number = bytes_get(page, descriptor + 6) * 16777216 + bytes_get(page, descriptor + 7) * 65536 + bytes_get(page, descriptor + 8) * 256 + bytes_get(page, descriptor + 9)
     if offset < header.data_start or offset > page_length or key_len > page_length - offset or payload_len > page_length - offset - key_len:
         return err("YDBv1 validated slot span is outside the page payload area")
     return ok(YazaDbPageSlotSpanV1(offset, key_len, payload_len, key_head, offset + key_len))
