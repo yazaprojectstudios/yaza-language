@@ -196,10 +196,53 @@ jobs:
             YAZA_SELF_TEST=1 "$GITHUB_WORKSPACE/build/yaza" run src/main.yz
           )
 
+  build-windows:
+    name: Build and package (windows-x64 cross-build)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install MinGW cross-toolchain and static Argon2
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang lld gcc-mingw-w64-x86-64-posix binutils-mingw-w64-x86-64 mingw-w64-x86-64-dev \
+            xz-utils zip file curl ca-certificates
+          mkdir -p /tmp/argon2 /tmp/mingw-argon2/include /tmp/mingw-argon2/lib
+          curl -fsSL https://github.com/P-H-C/phc-winner-argon2/archive/refs/tags/20190702.tar.gz \
+            | tar -xz -C /tmp/argon2 --strip-components=1
+          (
+            cd /tmp/argon2
+            x86_64-w64-mingw32-gcc -std=c89 -O2 -Wall -pthread -Iinclude -Isrc -c \
+              src/argon2.c src/core.c src/blake2/blake2b.c src/thread.c src/encoding.c src/ref.c
+            x86_64-w64-mingw32-ar rcs /tmp/mingw-argon2/lib/libargon2.a \
+              argon2.o core.o blake2b.o thread.o encoding.o ref.o
+            cp include/argon2.h /tmp/mingw-argon2/include/
+          )
+          rm -rf /tmp/argon2
+
+      - name: Cross-build & package windows-x64 release ZIPs
+        run: |
+          set -euo pipefail
+          YAZA_WINDOWS_ARGON2_ROOT=/tmp/mingw-argon2 YAZA_VERSION="$(cat VERSION)" \
+            sh scripts/package-windows-release.sh
+          file dist/*.zip build/win64/*.exe build/win64/*.dll
+
+      - name: Upload Windows archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-x64
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
   publish:
     name: Publish verified release assets
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true)
-    needs: [build, validate]
+    needs: [build, build-windows, validate]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -223,9 +266,11 @@ jobs:
           version=$(cat ../VERSION)
           test "$(find . -maxdepth 1 -name 'yaza-*.tar.gz' | wc -l | tr -d ' ')" = 4
           test "$(find . -maxdepth 1 -name 'yazabase-*.tar.gz' | wc -l | tr -d ' ')" = 4
+          test -f "yaza-${version}-windows-x64.zip"
+          test -f "yazabase-${version}-windows-x64.zip"
           test -f "yaza-${version}-macos-arm64.pkg"
           test -f "yaza-latest.vsix"
-          sha256sum ./*.tar.gz ./*.pkg ./*.vsix > SHA256SUMS.txt
+          sha256sum ./*.tar.gz ./*.zip ./*.pkg ./*.vsix > SHA256SUMS.txt
           cat SHA256SUMS.txt
           echo "tag_name=v${version}" >> "$GITHUB_OUTPUT"
 
@@ -237,6 +282,7 @@ jobs:
           generate_release_notes: true
           files: |
             release-files/*.tar.gz
+            release-files/*.zip
             release-files/*.pkg
             release-files/*.vsix
             release-files/SHA256SUMS.txt

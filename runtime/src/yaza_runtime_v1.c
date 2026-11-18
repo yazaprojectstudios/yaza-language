@@ -19,6 +19,41 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <bcrypt.h>
+#include <io.h>
+#include <direct.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <limits.h>
+#include <pthread.h>
+#include <sched.h>
+#include <time.h>
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+#ifndef SSIZE_MAX
+#define SSIZE_MAX INTPTR_MAX
+#endif
+#ifndef STDIN_FILENO
+#define STDIN_FILENO 0
+#endif
+typedef SOCKET yaza_net_sock_t;
+#define YAZA_NET_INVALID_SOCKET INVALID_SOCKET
+typedef struct _stat64 yaza_stat_t;
+static int yaza_fstat64(int fd, yaza_stat_t *st) { return _fstat64(fd, st); }
+static int yaza_stat64(const char *path, yaza_stat_t *st) { return _stat64(path, st); }
+#else
 #include <fcntl.h>
 #include <unistd.h>
 #include <spawn.h>
@@ -37,6 +72,12 @@
 #include <signal.h>
 #include <sched.h>
 #include <termios.h>
+typedef int yaza_net_sock_t;
+#define YAZA_NET_INVALID_SOCKET (-1)
+typedef struct stat yaza_stat_t;
+static int yaza_fstat64(int fd, yaza_stat_t *st) { return fstat(fd, st); }
+static int yaza_stat64(const char *path, yaza_stat_t *st) { return stat(path, st); }
+#endif
 
 #if defined(YAZA_RT_V1_WITH_ARGON2)
 #include <argon2.h>
@@ -50,7 +91,9 @@
 #include <CommonCrypto/CommonKeyDerivation.h>
 #endif
 
+#if !defined(_WIN32)
 extern char **environ;
+#endif
 
 struct YazaThreadV1 {
     pthread_t native_thread;
@@ -2448,13 +2491,27 @@ void yaza_bytes_v1_secure_random(int64_t requested_length, YazaBytesV1 *out_byte
         return;
     }
 
+    result.data = (unsigned char *)yaza_rt_v1_alloc(length);
+#if defined(_WIN32)
+    uint64_t offset = 0;
+    while (offset < length) {
+        ULONG chunk = (length - offset) > 0x7fffffffULL ? 0x7fffffffUL : (ULONG)(length - offset);
+        if (BCryptGenRandom(NULL, result.data + (size_t)offset, chunk, BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+            volatile unsigned char *wipe = result.data;
+            for (uint64_t index = 0; index < length; ++index) wipe[index] = 0;
+            fprintf(stderr, "yaza: operating-system random source failed\n");
+            exit(1);
+        }
+        offset += (uint64_t)chunk;
+    }
+    *out_bytes = result;
+#else
     const int random_fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
     if (random_fd < 0) {
         fprintf(stderr, "yaza: operating-system random source is unavailable: %s\n", strerror(errno));
         exit(1);
     }
 
-    result.data = (unsigned char *)yaza_rt_v1_alloc(length);
     uint64_t offset = 0;
     while (offset < length) {
         const ssize_t received = read(random_fd, result.data + (size_t)offset, (size_t)(length - offset));
@@ -2480,6 +2537,7 @@ void yaza_bytes_v1_secure_random(int64_t requested_length, YazaBytesV1 *out_byte
         exit(1);
     }
     *out_bytes = result;
+#endif
 }
 
 int32_t yaza_bytes_v1_try_secure_random(int64_t requested_length, YazaBytesV1 *out_bytes, char **out_error) {
@@ -2499,6 +2557,26 @@ int32_t yaza_bytes_v1_try_secure_random(int64_t requested_length, YazaBytesV1 *o
         return 1;
     }
 
+#if defined(_WIN32)
+    unsigned char *data = (unsigned char *)yaza_rt_v1_try_alloc(length);
+    if (data == NULL) {
+        *out_error = (char *)"could not allocate secure random Bytes in the active arena";
+        return 0;
+    }
+    uint64_t offset = 0;
+    while (offset < length) {
+        ULONG chunk = (length - offset) > 0x7fffffffULL ? 0x7fffffffUL : (ULONG)(length - offset);
+        if (BCryptGenRandom(NULL, data + (size_t)offset, chunk, BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+            volatile unsigned char *wipe = data;
+            for (uint64_t index = 0; index < length; ++index) wipe[index] = 0;
+            *out_error = (char *)"operating-system random source failed";
+            return 0;
+        }
+        offset += (uint64_t)chunk;
+    }
+    *out_bytes = (YazaBytesV1){data, length};
+    return 1;
+#else
     const int random_fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
     if (random_fd < 0) {
         *out_error = (char *)"operating-system random source is unavailable";
@@ -2537,6 +2615,7 @@ int32_t yaza_bytes_v1_try_secure_random(int64_t requested_length, YazaBytesV1 *o
 
     *out_bytes = (YazaBytesV1){data, length};
     return 1;
+#endif
 }
 
 #if !defined(__APPLE__) || defined(YAZA_TEST_SOFTWARE_SHA256)
@@ -3023,6 +3102,14 @@ static int yaza_bytes_v1_is_valid_text(const unsigned char *data, uint64_t lengt
     return 1;
 }
 
+#if defined(_WIN32)
+static int yaza_console_read_tty_line(unsigned char *buffer, size_t capacity, size_t *out_len) {
+    (void)buffer;
+    (void)capacity;
+    (void)out_len;
+    return -1;
+}
+#else
 #define YAZA_CONSOLE_HISTORY_MAX 64
 
 static char *yaza_console_history_entries[YAZA_CONSOLE_HISTORY_MAX];
@@ -3228,6 +3315,7 @@ static int yaza_console_read_tty_line(unsigned char *buffer, size_t capacity, si
     *out_len = length;
     return 1;
 }
+#endif
 
 YazaTextV1 *yaza_rt_v1_console_read_line(void) {
     if (fflush(stdout) != 0) {
@@ -3242,7 +3330,11 @@ YazaTextV1 *yaza_rt_v1_console_read_line(void) {
     }
 
     size_t length = 0;
+#if !defined(_WIN32)
     if (isatty(STDIN_FILENO)) {
+#else
+    if (0) {
+#endif
         int tty_res = yaza_console_read_tty_line(buffer, capacity, &length);
         if (tty_res == 0) {
             free(buffer);
@@ -4911,14 +5003,18 @@ YazaTextV1 *yaza_rt_v1_env_get(const YazaTextV1 *name) {
 
 int32_t yaza_rt_v1_file_exists(const YazaTextV1 *path) {
     if (!yaza_rt_v1_path_text(path, "file_exists")) return 0;
-    struct stat status;
-    return stat((const char *)path->data, &status) == 0;
+    yaza_stat_t status;
+    return yaza_stat64((const char *)path->data, &status) == 0;
 }
 
 int32_t yaza_rt_v1_is_directory(const YazaTextV1 *path) {
     if (!yaza_rt_v1_path_text(path, "is_directory")) return 0;
-    struct stat status;
-    return stat((const char *)path->data, &status) == 0 && S_ISDIR(status.st_mode);
+    yaza_stat_t status;
+#if defined(_WIN32)
+    return yaza_stat64((const char *)path->data, &status) == 0 && (status.st_mode & _S_IFDIR) != 0;
+#else
+    return yaza_stat64((const char *)path->data, &status) == 0 && S_ISDIR(status.st_mode);
+#endif
 }
 
 YazaTextV1 *yaza_rt_v1_file_read(const YazaTextV1 *path) {
@@ -4926,40 +5022,70 @@ YazaTextV1 *yaza_rt_v1_file_read(const YazaTextV1 *path) {
         yaza_rt_v1_fail("file_read path is invalid or exceeds 4096 bytes");
         return NULL;
     }
+#if defined(_WIN32)
+    const int descriptor = _open((const char *)path->data, _O_RDONLY | _O_BINARY);
+#else
     const int descriptor = open((const char *)path->data, O_RDONLY | O_CLOEXEC);
+#endif
     if (descriptor < 0) {
         const int error = errno == 0 ? EIO : errno;
         yaza_rt_v1_file_read_open_fail(path, error);
         return NULL;
     }
-    struct stat status;
-    if (fstat(descriptor, &status) != 0 || !S_ISREG(status.st_mode) || status.st_size < 0 ||
-        (uint64_t)status.st_size > YAZA_RT_V1_BYTES_MAX_BYTES) {
+    yaza_stat_t status;
+#if defined(_WIN32)
+    const int valid_regular = yaza_fstat64(descriptor, &status) == 0 && (status.st_mode & _S_IFREG) != 0;
+#else
+    const int valid_regular = yaza_fstat64(descriptor, &status) == 0 && S_ISREG(status.st_mode);
+#endif
+    if (!valid_regular || status.st_size < 0 || (uint64_t)status.st_size > YAZA_RT_V1_BYTES_MAX_BYTES) {
+#if defined(_WIN32)
+        (void)_close(descriptor);
+#else
         (void)close(descriptor);
+#endif
         yaza_rt_v1_fail("file_read requires a regular file no larger than 64 MiB");
         return NULL;
     }
     const uint64_t capacity = (uint64_t)status.st_size;
     unsigned char *buffer = capacity == 0 ? NULL : (unsigned char *)malloc((size_t)capacity);
     if (capacity > 0 && buffer == NULL) {
+#if defined(_WIN32)
+        (void)_close(descriptor);
+#else
         (void)close(descriptor);
+#endif
         yaza_rt_v1_fail("file_read could not allocate its bounded input buffer");
         return NULL;
     }
     uint64_t length = 0;
     while (length < capacity) {
+#if defined(_WIN32)
+        size_t want = capacity - length;
+        unsigned int chunk = want > (size_t)INT_MAX ? (unsigned int)INT_MAX : (unsigned int)want;
+        int amount = _read(descriptor, buffer + length, chunk);
+#else
         ssize_t amount = read(descriptor, buffer + length, (size_t)(capacity - length));
+#endif
         if (amount < 0 && errno == EINTR) continue;
         if (amount < 0) {
             free(buffer);
+#if defined(_WIN32)
+            (void)_close(descriptor);
+#else
             (void)close(descriptor);
+#endif
             yaza_rt_v1_fail("file_read failed while reading the requested file");
             return NULL;
         }
         if (amount == 0) break;
         length += (uint64_t)amount;
     }
+#if defined(_WIN32)
+    (void)_close(descriptor);
+#else
     (void)close(descriptor);
+#endif
     if (!yaza_bytes_v1_is_valid_text(buffer, length)) {
         free(buffer);
         yaza_rt_v1_fail("file_read input is not valid NUL-free UTF-8 Text");
@@ -4980,46 +5106,108 @@ int64_t yaza_rt_v1_file_write(const YazaTextV1 *path, const YazaTextV1 *contents
         (contents->length > 0 && memchr(contents->data, '\0', (size_t)contents->length) != NULL)) {
         return EINVAL;
     }
+#if defined(_WIN32)
+    const int descriptor = _open((const char *)path->data, _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, _S_IREAD | _S_IWRITE);
+#else
     const int descriptor = open((const char *)path->data, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+#endif
     if (descriptor < 0) return errno == 0 ? EIO : errno;
     uint64_t written = 0;
     while (written < contents->length) {
+#if defined(_WIN32)
+        size_t left = (size_t)(contents->length - written);
+        unsigned int chunk = left > (size_t)INT_MAX ? (unsigned int)INT_MAX : (unsigned int)left;
+        int amount = _write(descriptor, contents->data + written, chunk);
+#else
         ssize_t amount = write(descriptor, contents->data + written, (size_t)(contents->length - written));
+#endif
         if (amount < 0 && errno == EINTR) continue;
         if (amount <= 0) {
             const int error = errno == 0 ? EIO : errno;
+#if defined(_WIN32)
+            (void)_close(descriptor);
+#else
             (void)close(descriptor);
+#endif
             return error;
         }
         written += (uint64_t)amount;
     }
+#if defined(_WIN32)
+    if (_close(descriptor) != 0) return errno == 0 ? EIO : errno;
+#else
     if (close(descriptor) != 0) return errno == 0 ? EIO : errno;
+#endif
     return 0;
 }
 
 int64_t yaza_rt_v1_file_remove(const YazaTextV1 *path) {
     if (!yaza_rt_v1_path_text(path, "file_remove")) return EINVAL;
+#if defined(_WIN32)
+    if (_unlink((const char *)path->data) == 0) return 0;
+#else
     if (unlink((const char *)path->data) == 0) return 0;
+#endif
     return errno == 0 ? EIO : errno;
 }
 
 int64_t yaza_rt_v1_env_set(const YazaTextV1 *name, const YazaTextV1 *value) {
     if (!yaza_rt_v1_path_text(name, "env_set") || value == NULL || value->data == NULL) return 1;
+#if defined(_WIN32)
+    return _putenv_s((const char *)name->data, (const char *)value->data) == 0 ? 0 : 1;
+#else
     return setenv((const char *)name->data, (const char *)value->data, 1) == 0 ? 0 : 1;
+#endif
 }
 
 int64_t yaza_rt_v1_directory_create(const YazaTextV1 *path) {
     if (!yaza_rt_v1_path_text(path, "directory_create")) return 1;
+#if defined(_WIN32)
+    if (_mkdir((const char *)path->data) == 0) return 0;
+    if (errno == EEXIST) {
+        yaza_stat_t details;
+        if (yaza_stat64((const char *)path->data, &details) == 0 && (details.st_mode & _S_IFDIR) != 0) return 0;
+    }
+#else
     if (mkdir((const char *)path->data, 0755) == 0) return 0;
     if (errno == EEXIST) {
-        struct stat details;
-        if (stat((const char *)path->data, &details) == 0 && S_ISDIR(details.st_mode)) return 0;
+        yaza_stat_t details;
+        if (yaza_stat64((const char *)path->data, &details) == 0 && S_ISDIR(details.st_mode)) return 0;
     }
+#endif
     return 1;
 }
 
 void *yaza_rt_v1_directory_list(const YazaTextV1 *path) {
     if (!yaza_rt_v1_path_text(path, "directory_list")) return NULL;
+#if defined(_WIN32)
+    size_t plen = strlen((const char *)path->data);
+    if (plen + 3 > 4096) return NULL;
+    char pattern[4096];
+    memcpy(pattern, path->data, plen);
+    if (plen > 0 && pattern[plen - 1] != '/' && pattern[plen - 1] != '\\') {
+        pattern[plen++] = '\\';
+    }
+    pattern[plen++] = '*';
+    pattern[plen] = '\0';
+    WIN32_FIND_DATAA find_data;
+    HANDLE find_handle = FindFirstFileA(pattern, &find_data);
+    if (find_handle == INVALID_HANDLE_VALUE) {
+        return NULL;
+    }
+    void *entries = yaza_list_v1_try_create_typed("TextList", sizeof(char *));
+    if (entries == NULL) {
+        FindClose(find_handle);
+        return NULL;
+    }
+    do {
+        if (strcmp(find_data.cFileName, ".") != 0 && strcmp(find_data.cFileName, "..") != 0) {
+            yaza_list_v1_try_push_text_slice(entries, (const unsigned char *)find_data.cFileName, strlen(find_data.cFileName));
+        }
+    } while (FindNextFileA(find_handle, &find_data));
+    FindClose(find_handle);
+    return entries;
+#else
     DIR *directory = opendir((const char *)path->data);
     if (directory == NULL) {
         return NULL;
@@ -5037,20 +5225,131 @@ void *yaza_rt_v1_directory_list(const YazaTextV1 *path) {
     }
     closedir(directory);
     return entries;
+#endif
 }
 
 YazaTextV1 *yaza_rt_v1_temp_directory(void) {
+#if defined(_WIN32)
+    char temp_base[4096];
+    DWORD base_len = GetTempPathA((DWORD)sizeof(temp_base), temp_base);
+    if (base_len == 0 || base_len >= sizeof(temp_base) - 64) {
+        return NULL;
+    }
+    uint64_t seed = (uint64_t)GetCurrentProcessId() * 2654435761ULL ^ (uint64_t)GetTickCount64();
+    unsigned char rand_bytes[4] = {0};
+    if (BCryptGenRandom(NULL, rand_bytes, sizeof(rand_bytes), BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0) {
+        uint32_t r = ((uint32_t)rand_bytes[0] << 24) | ((uint32_t)rand_bytes[1] << 16) |
+                     ((uint32_t)rand_bytes[2] << 8) | (uint32_t)rand_bytes[3];
+        seed ^= (uint64_t)r;
+    }
+    for (int attempt = 0; attempt < 64; attempt++) {
+        char candidate[4096];
+        int written = snprintf(candidate, sizeof(candidate), "%syaza-run-%08llx",
+                               temp_base, (unsigned long long)((seed + (uint64_t)attempt) & 0xffffffffULL));
+        if (written > 0 && (size_t)written < sizeof(candidate)) {
+            if (CreateDirectoryA(candidate, NULL)) {
+                return yaza_rt_v1_text_from_cstr(candidate);
+            }
+            if (GetLastError() != ERROR_ALREADY_EXISTS) {
+                return NULL;
+            }
+        }
+    }
+    return NULL;
+#else
     char path[] = "/tmp/yaza-run.XXXXXX";
     char *created = mkdtemp(path);
     if (created == NULL) {
         return NULL;
     }
     return yaza_rt_v1_text_from_cstr(created);
+#endif
 }
 
 #define YAZA_REMOVE_TREE_MAX_DEPTH 64U
 #define YAZA_REMOVE_TREE_MAX_ENTRIES 100000U
 
+#if defined(_WIN32)
+static int64_t yaza_win32_remove_tree_recursive(const char *dir_path, size_t depth, size_t *entries) {
+    DWORD attrs = GetFileAttributesA(dir_path);
+    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+        (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        return 1;
+    }
+    size_t len = strlen(dir_path);
+    if (len + 3 > 4096) return 1;
+    char pattern[4096];
+    memcpy(pattern, dir_path, len);
+    if (len > 0 && pattern[len - 1] != '\\' && pattern[len - 1] != '/') pattern[len++] = '\\';
+    pattern[len++] = '*';
+    pattern[len] = '\0';
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        return GetLastError() == ERROR_FILE_NOT_FOUND ? 0 : 1;
+    }
+    int64_t result = 0;
+    do {
+        if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
+        *entries += 1;
+        if (*entries > YAZA_REMOVE_TREE_MAX_ENTRIES) {
+            result = 1;
+            break;
+        }
+        size_t name_len = strlen(fd.cFileName);
+        if (len + name_len >= 4096) {
+            result = 1;
+            break;
+        }
+        char child[4096];
+        memcpy(child, pattern, len - 1);
+        memcpy(child + len - 1, fd.cFileName, name_len + 1);
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+                if (!RemoveDirectoryA(child)) { result = 1; break; }
+            } else {
+                if (!DeleteFileA(child)) { result = 1; break; }
+            }
+        } else if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            if (depth >= YAZA_REMOVE_TREE_MAX_DEPTH) { result = 1; break; }
+            result = yaza_win32_remove_tree_recursive(child, depth + 1, entries);
+            if (result != 0) break;
+            if (!RemoveDirectoryA(child)) { result = 1; break; }
+        } else {
+            if (!DeleteFileA(child)) { result = 1; break; }
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    return result;
+}
+
+static bool yaza_is_managed_test_temp_path(const char *path) {
+    char temp_base[4096];
+    DWORD base_len = GetTempPathA((DWORD)sizeof(temp_base), temp_base);
+    if (base_len == 0 || base_len >= sizeof(temp_base) || path == NULL) return false;
+    static const char prefix[] = "yaza-run-";
+    if (strncmp(path, temp_base, (size_t)base_len) != 0) return false;
+    const char *rest = path + (size_t)base_len;
+    if (strncmp(rest, prefix, sizeof(prefix) - 1) != 0) return false;
+    const char *suffix = rest + sizeof(prefix) - 1;
+    if (strlen(suffix) != 8) return false;
+    for (size_t i = 0; i < 8; i++) {
+        char c = suffix[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    }
+    return true;
+}
+
+int64_t yaza_rt_v1_test_temp_directory_remove(const YazaTextV1 *path) {
+    if (!yaza_rt_v1_path_text(path, "test_temp_directory_remove")) return 1;
+    const char *c_path = (const char *)path->data;
+    if (!yaza_is_managed_test_temp_path(c_path)) return 1;
+    size_t entries = 0;
+    int64_t result = yaza_win32_remove_tree_recursive(c_path, 0, &entries);
+    if (result != 0) return result;
+    return RemoveDirectoryA(c_path) ? 0 : 1;
+}
+#else
 static int64_t yaza_remove_tree_contents(int directory_fd, size_t depth, size_t *entries,
                                          dev_t root_device, const char *root_path) {
     int scan_fd = dup(directory_fd);
@@ -5152,6 +5451,7 @@ int64_t yaza_rt_v1_test_temp_directory_remove(const YazaTextV1 *path) {
     if (rmdir(c_path) != 0) return 1;
     return 0;
 }
+#endif
 
 static void yaza_vfs_v1_lock(void) {
     while (atomic_flag_test_and_set_explicit(&yaza_vfs_v1_registry_lock, memory_order_acquire)) {
@@ -5196,10 +5496,17 @@ static int yaza_vfs_v1_name(const YazaTextV1 *name, char buffer[YAZA_VFS_V1_MAX_
     if (!yaza_vfs_v1_valid_text(name, YAZA_VFS_V1_MAX_NAME_BYTES, 0) ||
         (name->length == 1 && name->data[0] == '.') ||
         (name->length == 2 && name->data[0] == '.' && name->data[1] == '.')) return 0;
+#if defined(_WIN32)
+    for (uint64_t index = 0; index < name->length; ++index) {
+        const unsigned char byte = name->data[index];
+        if (byte == '/' || byte == '\\' || byte == ':' || byte < 0x20U || byte == 0x7fU) return 0;
+    }
+#else
     for (uint64_t index = 0; index < name->length; ++index) {
         const unsigned char byte = name->data[index];
         if (byte == '/' || byte == '\\' || byte < 0x20U || byte == 0x7fU) return 0;
     }
+#endif
     memcpy(buffer, name->data, (size_t)name->length);
     buffer[name->length] = '\0';
     return 1;
@@ -5333,92 +5640,364 @@ static size_t yaza_vfs_v1_test_limit_io_chunk(size_t requested) {
     const uint64_t maximum = atomic_load_explicit(&yaza_vfs_v1_test_max_io_chunk_bytes, memory_order_relaxed);
     return maximum > 0 && (uint64_t)requested > maximum ? (size_t)maximum : requested;
 }
+#endif
+
+#if defined(_WIN32)
+#ifndef O_DIRECTORY
+#define O_DIRECTORY 0x100000
+#endif
+#ifndef O_NOFOLLOW
+#define O_NOFOLLOW 0x200000
+#endif
+#ifndef O_NONBLOCK
+#define O_NONBLOCK 0x400000
+#endif
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0x800000
+#endif
+#ifndef LOCK_EX
+#define LOCK_EX 2
+#endif
+#ifndef LOCK_NB
+#define LOCK_NB 4
+#endif
+typedef int yaza_vfs_mode_t;
+typedef int64_t yaza_vfs_off_t;
+
+static int yaza_win32_dir_child_path(int dir_fd, const char *child, char *out, size_t out_cap) {
+    HANDLE h = (HANDLE)_get_osfhandle(dir_fd);
+    if (h == INVALID_HANDLE_VALUE) { errno = EBADF; return 0; }
+    char dir_path[4096];
+    DWORD n = GetFinalPathNameByHandleA(h, dir_path, (DWORD)(sizeof(dir_path) - 1U), FILE_NAME_NORMALIZED);
+    if (n == 0 || (size_t)n >= sizeof(dir_path) - 1U) { errno = EIO; return 0; }
+    dir_path[n] = '\0';
+    DWORD dir_attrs = GetFileAttributesA(dir_path);
+    if (dir_attrs == INVALID_FILE_ATTRIBUTES || (dir_attrs & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+        (dir_attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        errno = ENOTDIR;
+        return 0;
+    }
+    if (child == NULL || strcmp(child, ".") == 0) {
+        if ((size_t)n >= out_cap) { errno = ENAMETOOLONG; return 0; }
+        memcpy(out, dir_path, (size_t)n + 1U);
+        return 1;
+    }
+    size_t clen = strlen(child);
+    int need_sep = (n > 0 && dir_path[n - 1] != '\\' && dir_path[n - 1] != '/');
+    if ((size_t)n + (need_sep ? 1U : 0U) + clen + 1U > out_cap) { errno = ENAMETOOLONG; return 0; }
+    memcpy(out, dir_path, (size_t)n);
+    size_t pos = (size_t)n;
+    if (need_sep) out[pos++] = '\\';
+    memcpy(out + pos, child, clen + 1U);
+    return 1;
+}
+
+static int yaza_vfs_v1_open_os(const char *path, int flags) {
+    (void)flags;
+    HANDLE h = CreateFileA(path, GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING,
+                           FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        errno = GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND ? ENOENT : EACCES;
+        return -1;
+    }
+    BY_HANDLE_FILE_INFORMATION info;
+    if (!GetFileInformationByHandle(h, &info) ||
+        (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+        (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+        CloseHandle(h);
+        errno = ENOTDIR;
+        return -1;
+    }
+    int fd = _open_osfhandle((intptr_t)h, _O_RDONLY | _O_BINARY);
+    if (fd < 0) CloseHandle(h);
+    return fd;
+}
+
+static int yaza_vfs_v1_openat_os(int directory, const char *path, int flags, yaza_vfs_mode_t mode) {
+    (void)mode;
+    char full[4096];
+    if (!yaza_win32_dir_child_path(directory, path, full, sizeof(full))) return -1;
+    if ((flags & O_DIRECTORY) != 0) {
+        return yaza_vfs_v1_open_os(full, flags);
+    }
+    int acc = flags & (_O_RDONLY | _O_WRONLY | _O_RDWR);
+    DWORD desired = (acc == _O_RDONLY) ? GENERIC_READ : (GENERIC_READ | GENERIC_WRITE);
+    DWORD disp = OPEN_EXISTING;
+    if ((flags & _O_CREAT) != 0) disp = (flags & _O_EXCL) != 0 ? CREATE_NEW : OPEN_ALWAYS;
+    HANDLE h = CreateFileA(full, desired,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, disp,
+                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        DWORD err = GetLastError();
+        if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) errno = ENOENT;
+        else if (err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS) errno = EEXIST;
+        else errno = EACCES;
+        return -1;
+    }
+    BY_HANDLE_FILE_INFORMATION info;
+    if (!GetFileInformationByHandle(h, &info) ||
+        (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DEVICE)) != 0) {
+        CloseHandle(h);
+        errno = ELOOP;
+        return -1;
+    }
+    int fd = _open_osfhandle((intptr_t)h, (acc == _O_RDONLY ? _O_RDONLY : _O_RDWR) | _O_BINARY);
+    if (fd < 0) CloseHandle(h);
+    return fd;
+}
+
+static int yaza_vfs_v1_mkdirat_os(int directory, const char *path, yaza_vfs_mode_t mode) {
+    (void)mode;
+    char full[4096];
+    if (!yaza_win32_dir_child_path(directory, path, full, sizeof(full))) return -1;
+    if (CreateDirectoryA(full, NULL)) return 0;
+    errno = GetLastError() == ERROR_ALREADY_EXISTS ? EEXIST : EIO;
+    return -1;
+}
+
+static int yaza_vfs_v1_fstat_os(int descriptor, yaza_stat_t *status) {
+    HANDLE h = (HANDLE)_get_osfhandle(descriptor);
+    if (h == INVALID_HANDLE_VALUE) { errno = EBADF; return -1; }
+    BY_HANDLE_FILE_INFORMATION info;
+    if (!GetFileInformationByHandle(h, &info)) { errno = EBADF; return -1; }
+    if ((info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) { errno = ELOOP; return -1; }
+    memset(status, 0, sizeof(*status));
+    status->st_mode = (unsigned short)((info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ? _S_IFDIR : _S_IFREG);
+    status->st_nlink = (short)(info.nNumberOfLinks > SHRT_MAX ? SHRT_MAX : info.nNumberOfLinks);
+    uint64_t fsize = ((uint64_t)info.nFileSizeHigh << 32) | (uint64_t)info.nFileSizeLow;
+    status->st_size = fsize > (uint64_t)INT64_MAX ? -1 : (__int64)fsize;
+    return 0;
+}
+
+static int yaza_vfs_v1_fsync_os(int descriptor) {
+    HANDLE h = (HANDLE)_get_osfhandle(descriptor);
+    if (h == INVALID_HANDLE_VALUE) { errno = EBADF; return -1; }
+    BY_HANDLE_FILE_INFORMATION info;
+    if (GetFileInformationByHandle(h, &info) && (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        return 0;
+    }
+    if (!FlushFileBuffers(h)) { errno = EIO; return -1; }
+    return 0;
+}
+
+static int yaza_vfs_v1_ftruncate_os(int descriptor, yaza_vfs_off_t length) {
+    HANDLE h = (HANDLE)_get_osfhandle(descriptor);
+    if (h == INVALID_HANDLE_VALUE || length < 0) { errno = EBADF; return -1; }
+    LARGE_INTEGER li;
+    li.QuadPart = (LONGLONG)length;
+    if (!SetFilePointerEx(h, li, NULL, FILE_BEGIN) || !SetEndOfFile(h)) {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
+static int yaza_vfs_v1_unlinkat_os(int directory, const char *path, int flags) {
+    (void)flags;
+    char full[4096];
+    if (!yaza_win32_dir_child_path(directory, path, full, sizeof(full))) return -1;
+    DWORD attrs = GetFileAttributesA(full);
+    if (attrs == INVALID_FILE_ATTRIBUTES) { errno = ENOENT; return -1; }
+    if ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 || (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        errno = EPERM;
+        return -1;
+    }
+    if (!DeleteFileA(full)) { errno = EIO; return -1; }
+    return 0;
+}
+
+static int yaza_vfs_v1_renameat_os(int old_directory, const char *old_path,
+                                   int new_directory, const char *new_path) {
+    char old_full[4096];
+    char new_full[4096];
+    if (!yaza_win32_dir_child_path(old_directory, old_path, old_full, sizeof(old_full))) return -1;
+    if (!yaza_win32_dir_child_path(new_directory, new_path, new_full, sizeof(new_full))) return -1;
+    if (!MoveFileExA(old_full, new_full, MOVEFILE_REPLACE_EXISTING)) {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
+static int yaza_vfs_v1_flock_os(int descriptor, int operation) {
+    (void)operation;
+    HANDLE h = (HANDLE)_get_osfhandle(descriptor);
+    if (h == INVALID_HANDLE_VALUE) { errno = EBADF; return -1; }
+    OVERLAPPED ov;
+    memset(&ov, 0, sizeof(ov));
+    if (!LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &ov)) {
+        DWORD err = GetLastError();
+        errno = (err == ERROR_LOCK_VIOLATION) ? EWOULDBLOCK : EIO;
+        return -1;
+    }
+    return 0;
+}
+
+static int yaza_vfs_v1_close_os(int descriptor) {
+    return _close(descriptor);
+}
+
+static ssize_t yaza_vfs_v1_pread_os(int descriptor, void *buffer, size_t length, yaza_vfs_off_t offset) {
+    HANDLE h = (HANDLE)_get_osfhandle(descriptor);
+    if (h == INVALID_HANDLE_VALUE || offset < 0) { errno = EBADF; return -1; }
+    OVERLAPPED ov;
+    memset(&ov, 0, sizeof(ov));
+    ov.Offset = (DWORD)((uint64_t)offset & 0xffffffffULL);
+    ov.OffsetHigh = (DWORD)((uint64_t)offset >> 32);
+    DWORD chunk = length > 0x7fffffffULL ? 0x7fffffffUL : (DWORD)length;
+    DWORD done = 0;
+    if (!ReadFile(h, buffer, chunk, &done, &ov)) {
+        if (GetLastError() == ERROR_HANDLE_EOF) return 0;
+        errno = EIO;
+        return -1;
+    }
+    return (ssize_t)done;
+}
+
+static ssize_t yaza_vfs_v1_pwrite_os(int descriptor, const void *buffer, size_t length, yaza_vfs_off_t offset) {
+    HANDLE h = (HANDLE)_get_osfhandle(descriptor);
+    if (h == INVALID_HANDLE_VALUE || offset < 0) { errno = EBADF; return -1; }
+    OVERLAPPED ov;
+    memset(&ov, 0, sizeof(ov));
+    ov.Offset = (DWORD)((uint64_t)offset & 0xffffffffULL);
+    ov.OffsetHigh = (DWORD)((uint64_t)offset >> 32);
+    DWORD chunk = length > 0x7fffffffULL ? 0x7fffffffUL : (DWORD)length;
+    DWORD done = 0;
+    if (!WriteFile(h, buffer, chunk, &done, &ov)) {
+        errno = EIO;
+        return -1;
+    }
+    return (ssize_t)done;
+}
+#else
+typedef mode_t yaza_vfs_mode_t;
+typedef off_t yaza_vfs_off_t;
+#define yaza_vfs_v1_open_os open
+#define yaza_vfs_v1_openat_os openat
+#define yaza_vfs_v1_mkdirat_os mkdirat
+#define yaza_vfs_v1_fstat_os fstat
+#define yaza_vfs_v1_fsync_os fsync
+#define yaza_vfs_v1_ftruncate_os ftruncate
+#define yaza_vfs_v1_unlinkat_os unlinkat
+#define yaza_vfs_v1_renameat_os renameat
+#define yaza_vfs_v1_flock_os flock
+#define yaza_vfs_v1_close_os close
+#define yaza_vfs_v1_pread_os pread
+#define yaza_vfs_v1_pwrite_os pwrite
+#endif
 
 static int yaza_vfs_v1_open(const char *path, int flags) {
+#if defined(YAZA_VFS_V1_TESTING)
     if (yaza_vfs_v1_test_consume_failure(YAZA_VFS_V1_TEST_FAIL_OPEN)) {
         errno = EIO;
         return -1;
     }
-    return open(path, flags);
+#endif
+    return yaza_vfs_v1_open_os(path, flags);
 }
 
-static int yaza_vfs_v1_openat(int directory, const char *path, int flags, mode_t mode) {
+static int yaza_vfs_v1_openat(int directory, const char *path, int flags, yaza_vfs_mode_t mode) {
+#if defined(YAZA_VFS_V1_TESTING)
     if (yaza_vfs_v1_test_consume_failure(YAZA_VFS_V1_TEST_FAIL_OPENAT)) {
         errno = EIO;
         return -1;
     }
-    return openat(directory, path, flags, mode);
+#endif
+    return yaza_vfs_v1_openat_os(directory, path, flags, mode);
 }
 
-static int yaza_vfs_v1_fstat(int descriptor, struct stat *status) {
+static int yaza_vfs_v1_fstat(int descriptor, yaza_stat_t *status) {
+#if defined(YAZA_VFS_V1_TESTING)
     if (yaza_vfs_v1_test_consume_failure(YAZA_VFS_V1_TEST_FAIL_FSTAT)) {
         errno = EIO;
         return -1;
     }
-    return fstat(descriptor, status);
+#endif
+    return yaza_vfs_v1_fstat_os(descriptor, status);
 }
 
 static int yaza_vfs_v1_fsync(int descriptor) {
+#if defined(YAZA_VFS_V1_TESTING)
     if (yaza_vfs_v1_test_consume_failure(YAZA_VFS_V1_TEST_FAIL_FSYNC)) {
         errno = EIO;
         return -1;
     }
-    const int result = fsync(descriptor);
+#endif
+    const int result = yaza_vfs_v1_fsync_os(descriptor);
+#if defined(YAZA_VFS_V1_TESTING)
     if (result == 0) yaza_vfs_v1_test_after_fsync();
+#endif
     return result;
 }
 
-static int yaza_vfs_v1_ftruncate(int descriptor, off_t length) {
+static int yaza_vfs_v1_ftruncate(int descriptor, yaza_vfs_off_t length) {
+#if defined(YAZA_VFS_V1_TESTING)
     if (yaza_vfs_v1_test_consume_failure(YAZA_VFS_V1_TEST_FAIL_FTRUNCATE)) {
         errno = EIO;
         return -1;
     }
-    return ftruncate(descriptor, length);
+#endif
+    return yaza_vfs_v1_ftruncate_os(descriptor, length);
 }
 
 static int yaza_vfs_v1_unlinkat(int directory, const char *path, int flags) {
+#if defined(YAZA_VFS_V1_TESTING)
     if (yaza_vfs_v1_test_consume_failure(YAZA_VFS_V1_TEST_FAIL_UNLINKAT)) {
         errno = EIO;
         return -1;
     }
-    return unlinkat(directory, path, flags);
+#endif
+    return yaza_vfs_v1_unlinkat_os(directory, path, flags);
 }
 
 static int yaza_vfs_v1_renameat(int old_directory, const char *old_path,
                                 int new_directory, const char *new_path) {
+#if defined(YAZA_VFS_V1_TESTING)
     if (yaza_vfs_v1_test_consume_failure(YAZA_VFS_V1_TEST_FAIL_RENAMEAT)) {
         errno = EIO;
         return -1;
     }
-    return renameat(old_directory, old_path, new_directory, new_path);
+#endif
+    return yaza_vfs_v1_renameat_os(old_directory, old_path, new_directory, new_path);
 }
 
 static int yaza_vfs_v1_flock_descriptor(int descriptor, int operation) {
+#if defined(YAZA_VFS_V1_TESTING)
     if (yaza_vfs_v1_test_consume_failure(YAZA_VFS_V1_TEST_FAIL_FLOCK)) {
         errno = EIO;
         return -1;
     }
-    return flock(descriptor, operation);
+#endif
+    return yaza_vfs_v1_flock_os(descriptor, operation);
 }
 
 static int yaza_vfs_v1_close_descriptor(int descriptor) {
-    const int result = close(descriptor);
+    const int result = yaza_vfs_v1_close_os(descriptor);
+#if defined(YAZA_VFS_V1_TESTING)
     if (result == 0 && yaza_vfs_v1_test_consume_failure(YAZA_VFS_V1_TEST_FAIL_CLOSE)) {
         errno = EIO;
         return -1;
     }
+#endif
     return result;
 }
 
-static ssize_t yaza_vfs_v1_pread(int descriptor, void *buffer, size_t length, off_t offset) {
+static ssize_t yaza_vfs_v1_pread(int descriptor, void *buffer, size_t length, yaza_vfs_off_t offset) {
+#if defined(YAZA_VFS_V1_TESTING)
     if (yaza_vfs_v1_test_consume_eintr(&yaza_vfs_v1_test_pread_eintr_count)) {
         errno = EINTR;
         return -1;
     }
-    return pread(descriptor, buffer, yaza_vfs_v1_test_limit_io_chunk(length), offset);
+    length = yaza_vfs_v1_test_limit_io_chunk(length);
+#endif
+    return yaza_vfs_v1_pread_os(descriptor, buffer, length, offset);
 }
 
-static ssize_t yaza_vfs_v1_pwrite(int descriptor, const void *buffer, size_t length, off_t offset) {
+static ssize_t yaza_vfs_v1_pwrite(int descriptor, const void *buffer, size_t length, yaza_vfs_off_t offset) {
+#if defined(YAZA_VFS_V1_TESTING)
     if (yaza_vfs_v1_test_consume_eintr(&yaza_vfs_v1_test_pwrite_eintr_count)) {
         errno = EINTR;
         return -1;
@@ -5433,27 +6012,17 @@ static ssize_t yaza_vfs_v1_pwrite(int descriptor, const void *buffer, size_t len
     if (remaining_before_failure > 0 && (uint64_t)limited_length > (uint64_t)remaining_before_failure) {
         limited_length = (size_t)remaining_before_failure;
     }
-    const ssize_t amount = pwrite(descriptor, buffer, limited_length, offset);
+    const ssize_t amount = yaza_vfs_v1_pwrite_os(descriptor, buffer, limited_length, offset);
     if (amount > 0 && remaining_before_failure > 0) {
         atomic_fetch_sub_explicit(&yaza_vfs_v1_test_pwrite_fail_after_bytes, amount, memory_order_relaxed);
     }
     return amount;
-}
 #else
-#define yaza_vfs_v1_open open
-#define yaza_vfs_v1_openat openat
-#define yaza_vfs_v1_fstat fstat
-#define yaza_vfs_v1_fsync fsync
-#define yaza_vfs_v1_ftruncate ftruncate
-#define yaza_vfs_v1_unlinkat unlinkat
-#define yaza_vfs_v1_renameat renameat
-#define yaza_vfs_v1_flock_descriptor flock
-#define yaza_vfs_v1_close_descriptor close
-#define yaza_vfs_v1_pread pread
-#define yaza_vfs_v1_pwrite pwrite
+    return yaza_vfs_v1_pwrite_os(descriptor, buffer, length, offset);
 #endif
+}
 
-static int yaza_vfs_v1_preallocate_descriptor(int descriptor, off_t minimum_size) {
+static int yaza_vfs_v1_preallocate_descriptor(int descriptor, yaza_vfs_off_t minimum_size) {
 #if defined(YAZA_VFS_V1_TESTING)
     if (yaza_vfs_v1_test_consume_failure(YAZA_VFS_V1_TEST_FAIL_PREALLOCATE)) {
         errno = EIO;
@@ -5461,7 +6030,12 @@ static int yaza_vfs_v1_preallocate_descriptor(int descriptor, off_t minimum_size
     }
 #endif
     if (minimum_size == 0) return 0;
-#if defined(__APPLE__)
+#if defined(_WIN32)
+    yaza_stat_t status;
+    if (yaza_vfs_v1_fstat_os(descriptor, &status) != 0) return -1;
+    if (status.st_size < minimum_size) return yaza_vfs_v1_ftruncate(descriptor, minimum_size);
+    return 0;
+#elif defined(__APPLE__)
     fstore_t allocation;
     memset(&allocation, 0, sizeof(allocation));
     allocation.fst_flags = F_ALLOCATECONTIG;
@@ -5472,8 +6046,8 @@ static int yaza_vfs_v1_preallocate_descriptor(int descriptor, off_t minimum_size
         allocation.fst_flags = F_ALLOCATEALL;
         if (fcntl(descriptor, F_PREALLOCATE, &allocation) == -1) return -1;
     }
-    struct stat status;
-    if (fstat(descriptor, &status) != 0) return -1;
+    yaza_stat_t status;
+    if (yaza_vfs_v1_fstat_os(descriptor, &status) != 0) return -1;
     if (status.st_size < minimum_size) return yaza_vfs_v1_ftruncate(descriptor, minimum_size);
     return 0;
 #else
@@ -5500,7 +6074,10 @@ int32_t yaza_vfs_v1_root_open(const YazaTextV1 *path, int64_t *out_handle, char 
     memcpy(path_buffer, path->data, (size_t)path->length);
     path_buffer[path->length] = '\0';
     uint64_t path_length = path->length;
-    while (path_length > 1 && path_buffer[path_length - 1] == '/') {
+    while (path_length > 1 && (path_buffer[path_length - 1] == '/' || path_buffer[path_length - 1] == '\\')) {
+#if defined(_WIN32)
+        if (path_length == 3 && path_buffer[1] == ':') break;
+#endif
         path_length -= 1;
         path_buffer[path_length] = '\0';
     }
@@ -5509,14 +6086,19 @@ int32_t yaza_vfs_v1_root_open(const YazaTextV1 *path, int64_t *out_handle, char 
         *out_error = (char *)"VFS root could not be opened as a non-symlink directory";
         return 0;
     }
-    struct stat status;
-    if (yaza_vfs_v1_fstat(descriptor, &status) != 0 || !S_ISDIR(status.st_mode)) {
-        (void)close(descriptor);
+    yaza_stat_t status;
+#if defined(_WIN32)
+    const int is_dir = yaza_vfs_v1_fstat(descriptor, &status) == 0 && (status.st_mode & _S_IFDIR) != 0;
+#else
+    const int is_dir = yaza_vfs_v1_fstat(descriptor, &status) == 0 && S_ISDIR(status.st_mode);
+#endif
+    if (!is_dir) {
+        (void)yaza_vfs_v1_close_os(descriptor);
         *out_error = (char *)"VFS root is not a directory";
         return 0;
     }
     if (!yaza_vfs_v1_register(descriptor, YAZA_VFS_V1_KIND_DIRECTORY, 0, UINT32_MAX, 0, out_handle, out_error)) {
-        (void)close(descriptor);
+        (void)yaza_vfs_v1_close_os(descriptor);
         return 0;
     }
     return 1;
@@ -5530,7 +6112,7 @@ static int32_t yaza_vfs_v1_open_child(int64_t root, const YazaTextV1 *name, int 
     *out_handle = 0;
     *out_error = NULL;
     char name_buffer[YAZA_VFS_V1_MAX_NAME_BYTES + 1U];
-    if (!yaza_vfs_v1_name(name, name_buffer)) {
+    if (yaza_vfs_v1_name(name, name_buffer) == 0) {
         *out_error = (char *)"VFS file name must be one safe UTF-8 path component";
         return 0;
     }
@@ -5545,11 +6127,17 @@ static int32_t yaza_vfs_v1_open_child(int64_t root, const YazaTextV1 *name, int 
         *out_error = (char *)"VFS file could not be opened relative to its root";
         return 0;
     }
-    struct stat status;
-    if (yaza_vfs_v1_fstat(descriptor, &status) != 0 || !S_ISREG(status.st_mode) || status.st_size < 0 ||
-        (uint64_t)status.st_size > YAZA_VFS_V1_MAX_FILE_BYTES || status.st_uid != geteuid() ||
-        (status.st_mode & 077U) != 0) {
-        (void)close(descriptor);
+    yaza_stat_t status;
+#if defined(_WIN32)
+    const int child_ok = yaza_vfs_v1_fstat(descriptor, &status) == 0 && (status.st_mode & _S_IFREG) != 0 &&
+        status.st_size >= 0 && (uint64_t)status.st_size <= YAZA_VFS_V1_MAX_FILE_BYTES;
+#else
+    const int child_ok = yaza_vfs_v1_fstat(descriptor, &status) == 0 && S_ISREG(status.st_mode) &&
+        status.st_size >= 0 && (uint64_t)status.st_size <= YAZA_VFS_V1_MAX_FILE_BYTES &&
+        status.st_uid == geteuid() && (status.st_mode & 077U) == 0;
+#endif
+    if (!child_ok) {
+        (void)yaza_vfs_v1_close_os(descriptor);
         yaza_vfs_v1_release(root_slot, root_generation);
         *out_error = (char *)"VFS child must be a private regular file owned by the current user and no larger than 1 TiB";
         return 0;
@@ -5557,7 +6145,7 @@ static int32_t yaza_vfs_v1_open_child(int64_t root, const YazaTextV1 *name, int 
     const int32_t registered = yaza_vfs_v1_register(descriptor, YAZA_VFS_V1_KIND_FILE, access,
                                                      root_slot, root_generation, out_handle, out_error);
     yaza_vfs_v1_release(root_slot, root_generation);
-    if (!registered) (void)close(descriptor);
+    if (!registered) (void)yaza_vfs_v1_close_os(descriptor);
     return registered;
 }
 
@@ -5581,6 +6169,22 @@ int32_t yaza_vfs_v1_list_names(int64_t root, YazaBytesV1 *out_bytes, char **out_
     uint32_t slot = 0;
     int descriptor = -1;
     if (!yaza_vfs_v1_acquire(root, YAZA_VFS_V1_KIND_DIRECTORY, 0, &slot, &descriptor, out_error)) return 0;
+#if defined(_WIN32)
+    char dir_pattern[4096];
+    if (!yaza_win32_dir_child_path(descriptor, "*", dir_pattern, sizeof(dir_pattern))) {
+        yaza_vfs_v1_release(slot, (uint64_t)root >> 8);
+        *out_error = (char *)"VFS directory-list descriptor open failed";
+        return 0;
+    }
+    WIN32_FIND_DATAA find_data;
+    HANDLE find_handle = FindFirstFileA(dir_pattern, &find_data);
+    int find_first = 1;
+    if (find_handle == INVALID_HANDLE_VALUE) {
+        yaza_vfs_v1_release(slot, (uint64_t)root >> 8);
+        *out_error = (char *)"VFS directory-list stream could not be opened";
+        return 0;
+    }
+#else
     const int duplicate = yaza_vfs_v1_openat(descriptor, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW, 0);
     if (duplicate < 0) {
         yaza_vfs_v1_release(slot, (uint64_t)root >> 8);
@@ -5589,11 +6193,12 @@ int32_t yaza_vfs_v1_list_names(int64_t root, YazaBytesV1 *out_bytes, char **out_
     }
     DIR *directory = fdopendir(duplicate);
     if (directory == NULL) {
-        (void)close(duplicate);
+        (void)yaza_vfs_v1_close_os(duplicate);
         yaza_vfs_v1_release(slot, (uint64_t)root >> 8);
         *out_error = (char *)"VFS directory-list stream could not be opened";
         return 0;
     }
+#endif
     size_t capacity = 4096U;
     size_t length = 0;
     uint64_t reserved = 0;
@@ -5603,15 +6208,29 @@ int32_t yaza_vfs_v1_list_names(int64_t root, YazaBytesV1 *out_bytes, char **out_
     if (temporary == NULL) failed = 1;
     int iteration_error = 0;
     while (!failed) {
+        const char *entry_name = NULL;
+#if defined(_WIN32)
+        if (find_first) {
+            find_first = 0;
+            entry_name = find_data.cFileName;
+        } else if (FindNextFileA(find_handle, &find_data)) {
+            entry_name = find_data.cFileName;
+        } else {
+            if (GetLastError() != ERROR_NO_MORE_FILES) iteration_error = EIO;
+            break;
+        }
+#else
         errno = 0;
         struct dirent *entry = readdir(directory);
         if (entry == NULL) {
             iteration_error = errno;
             break;
         }
-        if ((entry->d_name[0] == '.' && entry->d_name[1] == '\0') ||
-            (entry->d_name[0] == '.' && entry->d_name[1] == '.' && entry->d_name[2] == '\0')) continue;
-        const size_t name_length = strlen(entry->d_name);
+        entry_name = entry->d_name;
+#endif
+        if ((entry_name[0] == '.' && entry_name[1] == '\0') ||
+            (entry_name[0] == '.' && entry_name[1] == '.' && entry_name[2] == '\0')) continue;
+        const size_t name_length = strlen(entry_name);
         if (name_length == 0 || name_length > YAZA_VFS_V1_MAX_NAME_BYTES ||
             name_length + 1U > YAZA_VFS_V1_MAX_DIRECTORY_LIST_BYTES - length) {
             failed = 1;
@@ -5636,11 +6255,15 @@ int32_t yaza_vfs_v1_list_names(int64_t root, YazaBytesV1 *out_bytes, char **out_
             temporary = grown;
             capacity = new_capacity;
         }
-        memcpy(temporary + length, entry->d_name, name_length);
+        memcpy(temporary + length, entry_name, name_length);
         temporary[length + name_length] = 0;
         length = required;
     }
+#if defined(_WIN32)
+    const int close_status = FindClose(find_handle) ? 0 : -1;
+#else
     const int close_status = closedir(directory);
+#endif
     yaza_vfs_v1_release(slot, (uint64_t)root >> 8);
     if (failed || iteration_error != 0 || close_status != 0) {
         free(temporary);
@@ -5682,9 +6305,14 @@ int32_t yaza_vfs_v1_lock_exclusive(int64_t root, const YazaTextV1 *name, int64_t
     int root_descriptor = -1;
     if (!yaza_vfs_v1_acquire(root, YAZA_VFS_V1_KIND_DIRECTORY, 0, &root_slot, &root_descriptor, out_error)) return 0;
     const uint64_t root_generation = (uint64_t)root >> 8;
-    struct stat root_status;
-    if (yaza_vfs_v1_fstat(root_descriptor, &root_status) != 0 || !S_ISDIR(root_status.st_mode) ||
-        root_status.st_uid != geteuid() || (root_status.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+    yaza_stat_t root_status;
+#if defined(_WIN32)
+    const int root_ok = yaza_vfs_v1_fstat(root_descriptor, &root_status) == 0 && (root_status.st_mode & _S_IFDIR) != 0;
+#else
+    const int root_ok = yaza_vfs_v1_fstat(root_descriptor, &root_status) == 0 && S_ISDIR(root_status.st_mode) &&
+        root_status.st_uid == geteuid() && (root_status.st_mode & (S_IWGRP | S_IWOTH)) == 0;
+#endif
+    if (!root_ok) {
         yaza_vfs_v1_release(root_slot, root_generation);
         *out_error = (char *)"VFS database root must be owned by this user and not group/world writable";
         return 0;
@@ -5694,7 +6322,7 @@ int32_t yaza_vfs_v1_lock_exclusive(int64_t root, const YazaTextV1 *name, int64_t
     int lock_directory = yaza_vfs_v1_openat(root_descriptor, lock_directory_name,
         O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW, 0);
     if (lock_directory < 0 && errno == ENOENT) {
-        if (mkdirat(root_descriptor, lock_directory_name, 0700) != 0 && errno != EEXIST) {
+        if (yaza_vfs_v1_mkdirat_os(root_descriptor, lock_directory_name, 0700) != 0 && errno != EEXIST) {
             yaza_vfs_v1_release(root_slot, root_generation);
             *out_error = (char *)"VFS lock directory could not be created";
             return 0;
@@ -5707,34 +6335,47 @@ int32_t yaza_vfs_v1_lock_exclusive(int64_t root, const YazaTextV1 *name, int64_t
         *out_error = (char *)"VFS lock directory is missing or is not a safe directory";
         return 0;
     }
-    struct stat lock_directory_status;
-    if (yaza_vfs_v1_fstat(lock_directory, &lock_directory_status) != 0 || !S_ISDIR(lock_directory_status.st_mode) ||
-        lock_directory_status.st_uid != geteuid() || (lock_directory_status.st_mode & 077U) != 0) {
-        (void)close(lock_directory);
+    yaza_stat_t lock_directory_status;
+#if defined(_WIN32)
+    const int lock_dir_ok = yaza_vfs_v1_fstat(lock_directory, &lock_directory_status) == 0 &&
+        (lock_directory_status.st_mode & _S_IFDIR) != 0;
+#else
+    const int lock_dir_ok = yaza_vfs_v1_fstat(lock_directory, &lock_directory_status) == 0 &&
+        S_ISDIR(lock_directory_status.st_mode) && lock_directory_status.st_uid == geteuid() &&
+        (lock_directory_status.st_mode & 077U) == 0;
+#endif
+    if (!lock_dir_ok) {
+        (void)yaza_vfs_v1_close_os(lock_directory);
         yaza_vfs_v1_release(root_slot, root_generation);
         *out_error = (char *)"VFS lock directory must be owned by this user and not group/world writable";
         return 0;
     }
     const int descriptor = yaza_vfs_v1_openat(lock_directory, name_buffer,
         O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600);
-    (void)close(lock_directory);
+    (void)yaza_vfs_v1_close_os(lock_directory);
     if (descriptor < 0) {
         yaza_vfs_v1_release(root_slot, root_generation);
         *out_error = (char *)"VFS lock file could not be opened safely";
         return 0;
     }
-    struct stat lock_file_status;
-    if (yaza_vfs_v1_fstat(descriptor, &lock_file_status) != 0 || !S_ISREG(lock_file_status.st_mode) ||
-        lock_file_status.st_uid != geteuid() || (lock_file_status.st_mode & 077U) != 0 ||
-        lock_file_status.st_nlink != 1) {
-        (void)close(descriptor);
+    yaza_stat_t lock_file_status;
+#if defined(_WIN32)
+    const int lock_file_ok = yaza_vfs_v1_fstat(descriptor, &lock_file_status) == 0 &&
+        (lock_file_status.st_mode & _S_IFREG) != 0 && lock_file_status.st_nlink == 1;
+#else
+    const int lock_file_ok = yaza_vfs_v1_fstat(descriptor, &lock_file_status) == 0 &&
+        S_ISREG(lock_file_status.st_mode) && lock_file_status.st_uid == geteuid() &&
+        (lock_file_status.st_mode & 077U) == 0 && lock_file_status.st_nlink == 1;
+#endif
+    if (!lock_file_ok) {
+        (void)yaza_vfs_v1_close_os(descriptor);
         yaza_vfs_v1_release(root_slot, root_generation);
         *out_error = (char *)"VFS lock file must be a private regular file owned by this user";
         return 0;
     }
     if (yaza_vfs_v1_flock_descriptor(descriptor, LOCK_EX | LOCK_NB) != 0) {
         const int lock_error = errno;
-        (void)close(descriptor);
+        (void)yaza_vfs_v1_close_os(descriptor);
         yaza_vfs_v1_release(root_slot, root_generation);
         *out_error = (char *)(lock_error == EWOULDBLOCK || lock_error == EAGAIN ?
             "database is already locked by another owner" : "VFS exclusive lock operation failed");
@@ -5743,7 +6384,7 @@ int32_t yaza_vfs_v1_lock_exclusive(int64_t root, const YazaTextV1 *name, int64_t
     const int32_t registered = yaza_vfs_v1_register(descriptor, YAZA_VFS_V1_KIND_FILE, 0,
         root_slot, root_generation, out_handle, out_error);
     yaza_vfs_v1_release(root_slot, root_generation);
-    if (!registered) (void)close(descriptor);
+    if (!registered) (void)yaza_vfs_v1_close_os(descriptor);
     return registered;
 }
 
@@ -5755,9 +6396,14 @@ int32_t yaza_vfs_v1_file_size(int64_t file, int64_t *out_size, char **out_error)
     uint32_t slot = 0;
     int descriptor = -1;
     if (!yaza_vfs_v1_acquire(file, YAZA_VFS_V1_KIND_FILE, 0, &slot, &descriptor, out_error)) return 0;
-    struct stat status;
-    const int ok = yaza_vfs_v1_fstat(descriptor, &status) == 0 && S_ISREG(status.st_mode) && status.st_size >= 0 &&
-        (uint64_t)status.st_size <= YAZA_VFS_V1_MAX_FILE_BYTES;
+    yaza_stat_t status;
+#if defined(_WIN32)
+    const int ok = yaza_vfs_v1_fstat(descriptor, &status) == 0 && (status.st_mode & _S_IFREG) != 0 &&
+        status.st_size >= 0 && (uint64_t)status.st_size <= YAZA_VFS_V1_MAX_FILE_BYTES;
+#else
+    const int ok = yaza_vfs_v1_fstat(descriptor, &status) == 0 && S_ISREG(status.st_mode) &&
+        status.st_size >= 0 && (uint64_t)status.st_size <= YAZA_VFS_V1_MAX_FILE_BYTES;
+#endif
     const uint64_t generation = (uint64_t)file >> 8;
     yaza_vfs_v1_release(slot, generation);
     if (!ok) {
@@ -5800,7 +6446,7 @@ int32_t yaza_vfs_v1_read_exact(int64_t file, int64_t offset, int64_t length, Yaz
     while (received < (uint64_t)length) {
         const uint64_t current_offset = (uint64_t)offset + received;
         const size_t chunk = (size_t)(((uint64_t)length - received) > (uint64_t)SSIZE_MAX ? (uint64_t)SSIZE_MAX : (uint64_t)length - received);
-        const ssize_t amount = yaza_vfs_v1_pread(descriptor, temporary + received, chunk, (off_t)current_offset);
+        const ssize_t amount = yaza_vfs_v1_pread(descriptor, temporary + received, chunk, (yaza_vfs_off_t)current_offset);
         if (amount < 0 && errno == EINTR) continue;
         if (amount <= 0) {
             free(temporary);
@@ -5846,7 +6492,7 @@ int32_t yaza_vfs_v1_write_exact(int64_t file, int64_t offset, const YazaBytesV1 
     while (written < bytes->length) {
         const uint64_t current_offset = (uint64_t)offset + written;
         const size_t chunk = (size_t)((bytes->length - written) > (uint64_t)SSIZE_MAX ? (uint64_t)SSIZE_MAX : bytes->length - written);
-        const ssize_t amount = yaza_vfs_v1_pwrite(descriptor, bytes->data + written, chunk, (off_t)current_offset);
+        const ssize_t amount = yaza_vfs_v1_pwrite(descriptor, bytes->data + written, chunk, (yaza_vfs_off_t)current_offset);
         if (amount < 0 && errno == EINTR) continue;
         if (amount <= 0) {
             *out_written = (int64_t)written;
@@ -5871,7 +6517,7 @@ int32_t yaza_vfs_v1_truncate(int64_t file, int64_t size, char **out_error) {
     uint32_t slot = 0;
     int descriptor = -1;
     if (!yaza_vfs_v1_acquire(file, YAZA_VFS_V1_KIND_FILE, YAZA_VFS_V1_ACCESS_WRITE, &slot, &descriptor, out_error)) return 0;
-    const int result = yaza_vfs_v1_ftruncate(descriptor, (off_t)size);
+    const int result = yaza_vfs_v1_ftruncate(descriptor, (yaza_vfs_off_t)size);
     yaza_vfs_v1_release(slot, (uint64_t)file >> 8);
     if (result != 0) {
         *out_error = (char *)"VFS truncate failed";
@@ -5891,14 +6537,20 @@ int32_t yaza_vfs_v1_preallocate(int64_t file, int64_t minimum_size, char **out_e
     uint32_t slot = 0;
     int descriptor = -1;
     if (!yaza_vfs_v1_acquire(file, YAZA_VFS_V1_KIND_FILE, YAZA_VFS_V1_ACCESS_WRITE, &slot, &descriptor, out_error)) return 0;
-    struct stat status;
-    if (yaza_vfs_v1_fstat(descriptor, &status) != 0 || !S_ISREG(status.st_mode) || status.st_size < 0 ||
-        (uint64_t)status.st_size > YAZA_VFS_V1_MAX_FILE_BYTES) {
+    yaza_stat_t status;
+#if defined(_WIN32)
+    const int prealloc_ok = yaza_vfs_v1_fstat(descriptor, &status) == 0 && (status.st_mode & _S_IFREG) != 0 &&
+        status.st_size >= 0 && (uint64_t)status.st_size <= YAZA_VFS_V1_MAX_FILE_BYTES;
+#else
+    const int prealloc_ok = yaza_vfs_v1_fstat(descriptor, &status) == 0 && S_ISREG(status.st_mode) &&
+        status.st_size >= 0 && (uint64_t)status.st_size <= YAZA_VFS_V1_MAX_FILE_BYTES;
+#endif
+    if (!prealloc_ok) {
         yaza_vfs_v1_release(slot, (uint64_t)file >> 8);
         *out_error = (char *)"VFS preallocation could not inspect the regular file";
         return 0;
     }
-    const int result = yaza_vfs_v1_preallocate_descriptor(descriptor, (off_t)minimum_size);
+    const int result = yaza_vfs_v1_preallocate_descriptor(descriptor, (yaza_vfs_off_t)minimum_size);
     yaza_vfs_v1_release(slot, (uint64_t)file >> 8);
     if (result != 0) {
         *out_error = (char *)"VFS preallocation failed or the filesystem could not reserve the requested space";
@@ -6033,7 +6685,7 @@ int32_t yaza_vfs_v1_close(int64_t handle, char **out_error) {
 #endif
 
 typedef struct YazaNetV1Slot {
-    int descriptor;
+    yaza_net_sock_t descriptor;
     uint32_t kind;
     uint32_t flags;
     uint32_t peer_slot;
@@ -6050,6 +6702,60 @@ enum {
 static atomic_flag yaza_net_v1_registry_lock = ATOMIC_FLAG_INIT;
 static YazaNetV1Slot yaza_net_v1_slots[YAZA_NET_V1_MAX_HANDLES];
 static uint64_t yaza_net_v1_next_generation = 1;
+
+#if defined(_WIN32)
+static pthread_once_t yaza_net_v1_wsa_once = PTHREAD_ONCE_INIT;
+static void yaza_net_v1_wsa_init(void) {
+    WSADATA wsa;
+    (void)WSAStartup(MAKEWORD(2, 2), &wsa);
+}
+static void yaza_net_v1_ensure_init(void) {
+    (void)pthread_once(&yaza_net_v1_wsa_once, yaza_net_v1_wsa_init);
+}
+static void yaza_net_v1_close_sock(yaza_net_sock_t s) {
+    (void)closesocket(s);
+}
+static void yaza_net_v1_set_nonblocking(yaza_net_sock_t s) {
+    u_long mode = 1;
+    (void)ioctlsocket(s, FIONBIO, &mode);
+}
+static int yaza_net_v1_last_wouldblock(void) {
+    int err = WSAGetLastError();
+    return err == WSAEWOULDBLOCK;
+}
+static int yaza_net_v1_last_eintr(void) {
+    return WSAGetLastError() == WSAEINTR;
+}
+static int yaza_net_v1_poll_one(yaza_net_sock_t s, short events, int timeout_ms) {
+    WSAPOLLFD pfd;
+    pfd.fd = s;
+    pfd.events = events;
+    pfd.revents = 0;
+    return WSAPoll(&pfd, 1, timeout_ms);
+}
+#else
+static void yaza_net_v1_ensure_init(void) {}
+static void yaza_net_v1_close_sock(yaza_net_sock_t s) {
+    (void)close(s);
+}
+static void yaza_net_v1_set_nonblocking(yaza_net_sock_t s) {
+    int fl = fcntl(s, F_GETFL, 0);
+    if (fl >= 0) (void)fcntl(s, F_SETFL, fl | O_NONBLOCK);
+}
+static int yaza_net_v1_last_wouldblock(void) {
+    return errno == EAGAIN || errno == EWOULDBLOCK;
+}
+static int yaza_net_v1_last_eintr(void) {
+    return errno == EINTR;
+}
+static int yaza_net_v1_poll_one(yaza_net_sock_t s, short events, int timeout_ms) {
+    struct pollfd pfd;
+    pfd.fd = s;
+    pfd.events = events;
+    pfd.revents = 0;
+    return poll(&pfd, 1, timeout_ms);
+}
+#endif
 
 static void yaza_net_v1_lock(void) {
     while (atomic_flag_test_and_set_explicit(&yaza_net_v1_registry_lock, memory_order_acquire)) {
@@ -6075,22 +6781,19 @@ int32_t yaza_net_v1_listen(const YazaTextV1 *host, int64_t port, int64_t backlog
     if (listen_backlog <= 0) listen_backlog = 128;
     if (listen_backlog > 1024) listen_backlog = 1024;
 
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
+    yaza_net_v1_ensure_init();
+    yaza_net_sock_t fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == YAZA_NET_INVALID_SOCKET) {
         *out_error = (char *)"network socket creation failed";
         return 0;
     }
 
     int opt = 1;
-    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt));
 #if defined(SO_NOSIGPIPE)
-    (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
+    (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, (const char *)&opt, sizeof(opt));
 #endif
-
-    int fl = fcntl(fd, F_GETFL, 0);
-    if (fl >= 0) {
-        (void)fcntl(fd, F_SETFL, fl | O_NONBLOCK);
-    }
+    yaza_net_v1_set_nonblocking(fd);
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -6100,7 +6803,7 @@ int32_t yaza_net_v1_listen(const YazaTextV1 *host, int64_t port, int64_t backlog
     char host_buf[256];
     if (host != NULL && host->data != NULL && host->length > 0) {
         if (host->length >= sizeof(host_buf)) {
-            close(fd);
+            yaza_net_v1_close_sock(fd);
             *out_error = (char *)"network listen host address too long";
             return 0;
         }
@@ -6112,7 +6815,7 @@ int32_t yaza_net_v1_listen(const YazaTextV1 *host, int64_t port, int64_t backlog
             addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         } else {
             if (inet_pton(AF_INET, host_buf, &addr.sin_addr) <= 0) {
-                close(fd);
+                yaza_net_v1_close_sock(fd);
                 *out_error = (char *)"network listen host address is invalid IPv4";
                 return 0;
             }
@@ -6122,13 +6825,13 @@ int32_t yaza_net_v1_listen(const YazaTextV1 *host, int64_t port, int64_t backlog
     }
 
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        close(fd);
+        yaza_net_v1_close_sock(fd);
         *out_error = (char *)"network listen bind failed";
         return 0;
     }
 
     if (listen(fd, listen_backlog) != 0) {
-        close(fd);
+        yaza_net_v1_close_sock(fd);
         *out_error = (char *)"network listen failed";
         return 0;
     }
@@ -6143,7 +6846,7 @@ int32_t yaza_net_v1_listen(const YazaTextV1 *host, int64_t port, int64_t backlog
     }
     if (chosen >= YAZA_NET_V1_MAX_HANDLES) {
         yaza_net_v1_unlock();
-        close(fd);
+        yaza_net_v1_close_sock(fd);
         *out_error = (char *)"network handle table exhausted";
         return 0;
     }
@@ -6172,21 +6875,18 @@ int32_t yaza_net_v1_connect(const YazaTextV1 *host, int64_t port, int64_t timeou
     int effective_timeout = (int)timeout_ms;
     if (effective_timeout <= 0) effective_timeout = 5000;
 
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
+    yaza_net_v1_ensure_init();
+    yaza_net_sock_t fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == YAZA_NET_INVALID_SOCKET) {
         *out_error = (char *)"network socket creation failed";
         return 0;
     }
 
 #if defined(SO_NOSIGPIPE)
     int opt = 1;
-    (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
+    (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, (const char *)&opt, sizeof(opt));
 #endif
-
-    int fl = fcntl(fd, F_GETFL, 0);
-    if (fl >= 0) {
-        (void)fcntl(fd, F_SETFL, fl | O_NONBLOCK);
-    }
+    yaza_net_v1_set_nonblocking(fd);
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -6196,7 +6896,7 @@ int32_t yaza_net_v1_connect(const YazaTextV1 *host, int64_t port, int64_t timeou
     char host_buf[256];
     if (host != NULL && host->data != NULL && host->length > 0) {
         if (host->length >= sizeof(host_buf)) {
-            close(fd);
+            yaza_net_v1_close_sock(fd);
             *out_error = (char *)"network connect host address too long";
             return 0;
         }
@@ -6206,7 +6906,7 @@ int32_t yaza_net_v1_connect(const YazaTextV1 *host, int64_t port, int64_t timeou
             addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         } else {
             if (inet_pton(AF_INET, host_buf, &addr.sin_addr) <= 0) {
-                close(fd);
+                yaza_net_v1_close_sock(fd);
                 *out_error = (char *)"network connect host address is invalid IPv4";
                 return 0;
             }
@@ -6217,26 +6917,27 @@ int32_t yaza_net_v1_connect(const YazaTextV1 *host, int64_t port, int64_t timeou
 
     int rc = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
     if (rc != 0) {
-        if (errno == EINPROGRESS) {
-            struct pollfd pfd;
-            pfd.fd = fd;
-            pfd.events = POLLOUT;
-            pfd.revents = 0;
-            int pr = poll(&pfd, 1, effective_timeout);
+#if defined(_WIN32)
+        const int in_progress = (WSAGetLastError() == WSAEWOULDBLOCK || WSAGetLastError() == WSAEINPROGRESS);
+#else
+        const int in_progress = (errno == EINPROGRESS);
+#endif
+        if (in_progress) {
+            int pr = yaza_net_v1_poll_one(fd, POLLOUT, effective_timeout);
             if (pr <= 0) {
-                close(fd);
+                yaza_net_v1_close_sock(fd);
                 *out_error = pr == 0 ? (char *)"network connect timed out" : (char *)"network connect poll failed";
                 return 0;
             }
             int sock_err = 0;
             socklen_t err_len = sizeof(sock_err);
-            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &sock_err, &err_len) != 0 || sock_err != 0) {
-                close(fd);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *)&sock_err, &err_len) != 0 || sock_err != 0) {
+                yaza_net_v1_close_sock(fd);
                 *out_error = (char *)"network connection refused or unreachable";
                 return 0;
             }
         } else {
-            close(fd);
+            yaza_net_v1_close_sock(fd);
             *out_error = (char *)"network connect failed immediately";
             return 0;
         }
@@ -6252,7 +6953,7 @@ int32_t yaza_net_v1_connect(const YazaTextV1 *host, int64_t port, int64_t timeou
     }
     if (chosen >= YAZA_NET_V1_MAX_HANDLES) {
         yaza_net_v1_unlock();
-        close(fd);
+        yaza_net_v1_close_sock(fd);
         *out_error = (char *)"network handle table exhausted";
         return 0;
     }
@@ -6290,27 +6991,24 @@ int32_t yaza_net_v1_accept(int64_t listener, int64_t timeout_ms, int64_t *out_ha
 
     yaza_net_v1_lock();
     YazaNetV1Slot *slot = &yaza_net_v1_slots[index];
-    if (slot->kind != YAZA_NET_V1_KIND_LISTENER || slot->generation != generation || slot->descriptor < 0) {
+    if (slot->kind != YAZA_NET_V1_KIND_LISTENER || slot->generation != generation ||
+        slot->descriptor == YAZA_NET_INVALID_SOCKET) {
         yaza_net_v1_unlock();
         *out_error = (char *)"invalid or closed network listener";
         return 0;
     }
-    const int server_fd = slot->descriptor;
+    const yaza_net_sock_t server_fd = slot->descriptor;
     yaza_net_v1_unlock();
 
     if (timeout_ms >= 0) {
-        struct pollfd pfd;
-        pfd.fd = server_fd;
-        pfd.events = POLLIN;
-        pfd.revents = 0;
         int poll_timeout = timeout_ms > 60000 ? 60000 : (int)timeout_ms;
-        int pr = poll(&pfd, 1, poll_timeout);
+        int pr = yaza_net_v1_poll_one(server_fd, POLLIN, poll_timeout);
         if (pr == 0) {
             *out_error = (char *)"network accept timed out";
             return 0;
         }
         if (pr < 0) {
-            if (errno == EINTR) {
+            if (yaza_net_v1_last_eintr()) {
                 *out_error = (char *)"network accept interrupted";
             } else {
                 *out_error = (char *)"network accept poll failed";
@@ -6321,9 +7019,9 @@ int32_t yaza_net_v1_accept(int64_t listener, int64_t timeout_ms, int64_t *out_ha
 
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
-    int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
-    if (client_fd < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+    yaza_net_sock_t client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+    if (client_fd == YAZA_NET_INVALID_SOCKET) {
+        if (yaza_net_v1_last_wouldblock()) {
             *out_error = (char *)"network accept timed out";
         } else {
             *out_error = (char *)"network accept failed";
@@ -6332,14 +7030,11 @@ int32_t yaza_net_v1_accept(int64_t listener, int64_t timeout_ms, int64_t *out_ha
     }
 
     int opt = 1;
-    (void)setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+    (void)setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&opt, sizeof(opt));
 #if defined(SO_NOSIGPIPE)
-    (void)setsockopt(client_fd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
+    (void)setsockopt(client_fd, SOL_SOCKET, SO_NOSIGPIPE, (const char *)&opt, sizeof(opt));
 #endif
-    int fl = fcntl(client_fd, F_GETFL, 0);
-    if (fl >= 0) {
-        (void)fcntl(client_fd, F_SETFL, fl | O_NONBLOCK);
-    }
+    yaza_net_v1_set_nonblocking(client_fd);
 
     yaza_net_v1_lock();
     uint32_t chosen = YAZA_NET_V1_MAX_HANDLES;
@@ -6351,7 +7046,7 @@ int32_t yaza_net_v1_accept(int64_t listener, int64_t timeout_ms, int64_t *out_ha
     }
     if (chosen >= YAZA_NET_V1_MAX_HANDLES) {
         yaza_net_v1_unlock();
-        close(client_fd);
+        yaza_net_v1_close_sock(client_fd);
         *out_error = (char *)"network handle table exhausted";
         return 0;
     }
@@ -6365,8 +7060,6 @@ int32_t yaza_net_v1_accept(int64_t listener, int64_t timeout_ms, int64_t *out_ha
     yaza_net_v1_unlock();
     return 1;
 }
-
-
 
 int32_t yaza_net_v1_read(int64_t connection, int64_t max_bytes, int64_t timeout_ms, YazaBytesV1 *out_bytes, char **out_error) {
     if (out_error == NULL) return 0;
@@ -6390,12 +7083,13 @@ int32_t yaza_net_v1_read(int64_t connection, int64_t max_bytes, int64_t timeout_
 
     yaza_net_v1_lock();
     YazaNetV1Slot *slot = &yaza_net_v1_slots[index];
-    if (slot->kind != YAZA_NET_V1_KIND_CONNECTION || slot->generation != generation || slot->descriptor < 0) {
+    if (slot->kind != YAZA_NET_V1_KIND_CONNECTION || slot->generation != generation ||
+        slot->descriptor == YAZA_NET_INVALID_SOCKET) {
         yaza_net_v1_unlock();
         *out_error = (char *)"invalid or closed network connection";
         return 0;
     }
-    const int fd = slot->descriptor;
+    const yaza_net_sock_t fd = slot->descriptor;
     yaza_net_v1_unlock();
 
     if (max_bytes <= 0) {
@@ -6406,18 +7100,14 @@ int32_t yaza_net_v1_read(int64_t connection, int64_t max_bytes, int64_t timeout_
     }
 
     if (timeout_ms >= 0) {
-        struct pollfd pfd;
-        pfd.fd = fd;
-        pfd.events = POLLIN;
-        pfd.revents = 0;
         int poll_timeout = timeout_ms > 60000 ? 60000 : (int)timeout_ms;
-        int pr = poll(&pfd, 1, poll_timeout);
+        int pr = yaza_net_v1_poll_one(fd, POLLIN, poll_timeout);
         if (pr == 0) {
             *out_error = (char *)"network read timed out";
             return 0;
         }
         if (pr < 0) {
-            if (errno == EINTR) {
+            if (yaza_net_v1_last_eintr()) {
                 *out_error = (char *)"network read interrupted";
             } else {
                 *out_error = (char *)"network read poll failed";
@@ -6432,9 +7122,9 @@ int32_t yaza_net_v1_read(int64_t connection, int64_t max_bytes, int64_t timeout_
         return 0;
     }
 
-    ssize_t bytes_read = read(fd, buffer, (size_t)max_bytes);
+    ssize_t bytes_read = (ssize_t)recv(fd, (char *)buffer, (int)max_bytes, 0);
     if (bytes_read < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        if (yaza_net_v1_last_wouldblock()) {
             *out_error = (char *)"network read timed out";
         } else {
             *out_error = (char *)"network read failed";
@@ -6468,12 +7158,13 @@ int32_t yaza_net_v1_write(int64_t connection, const YazaBytesV1 *bytes, int64_t 
 
     yaza_net_v1_lock();
     YazaNetV1Slot *slot = &yaza_net_v1_slots[index];
-    if (slot->kind != YAZA_NET_V1_KIND_CONNECTION || slot->generation != generation || slot->descriptor < 0) {
+    if (slot->kind != YAZA_NET_V1_KIND_CONNECTION || slot->generation != generation ||
+        slot->descriptor == YAZA_NET_INVALID_SOCKET) {
         yaza_net_v1_unlock();
         *out_error = (char *)"invalid or closed network connection";
         return 0;
     }
-    const int fd = slot->descriptor;
+    const yaza_net_sock_t fd = slot->descriptor;
     yaza_net_v1_unlock();
 
     if (bytes == NULL || bytes->data == NULL || bytes->length == 0) {
@@ -6489,29 +7180,27 @@ int32_t yaza_net_v1_write(int64_t connection, const YazaBytesV1 *bytes, int64_t 
 
     while (total_written < total_to_write) {
         if (timeout_ms >= 0) {
-            struct pollfd pfd;
-            pfd.fd = fd;
-            pfd.events = POLLOUT;
-            pfd.revents = 0;
             int poll_timeout = timeout_ms > 60000 ? 60000 : (int)timeout_ms;
-            int pr = poll(&pfd, 1, poll_timeout);
+            int pr = yaza_net_v1_poll_one(fd, POLLOUT, poll_timeout);
             if (pr == 0) {
                 *out_error = (char *)"network write timed out";
                 *out_written = (int64_t)total_written;
                 return 0;
             }
             if (pr < 0) {
-                if (errno == EINTR) continue;
+                if (yaza_net_v1_last_eintr()) continue;
                 *out_error = (char *)"network write poll failed";
                 *out_written = (int64_t)total_written;
                 return 0;
             }
         }
 
-        ssize_t n = send(fd, bytes->data + total_written, total_to_write - total_written, MSG_NOSIGNAL);
+        size_t chunk = total_to_write - total_written;
+        if (chunk > (size_t)INT_MAX) chunk = (size_t)INT_MAX;
+        ssize_t n = (ssize_t)send(fd, (const char *)(bytes->data + total_written), (int)chunk, MSG_NOSIGNAL);
         if (n < 0) {
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            if (yaza_net_v1_last_eintr()) continue;
+            if (yaza_net_v1_last_wouldblock()) continue;
             *out_error = (char *)"network write failed";
             *out_written = (int64_t)total_written;
             return 0;
@@ -6542,21 +7231,29 @@ int32_t yaza_net_v1_close(int64_t handle, char **out_error) {
 
     yaza_net_v1_lock();
     YazaNetV1Slot *slot = &yaza_net_v1_slots[index];
-    if (slot->kind == YAZA_NET_V1_KIND_FREE || slot->generation != generation || slot->descriptor < 0) {
+    if (slot->kind == YAZA_NET_V1_KIND_FREE || slot->generation != generation ||
+        slot->descriptor == YAZA_NET_INVALID_SOCKET) {
         yaza_net_v1_unlock();
         *out_error = (char *)"invalid or closed network handle";
         return 0;
     }
-    const int fd = slot->descriptor;
-    slot->descriptor = -1;
+    const yaza_net_sock_t fd = slot->descriptor;
+    slot->descriptor = YAZA_NET_INVALID_SOCKET;
     slot->kind = YAZA_NET_V1_KIND_FREE;
     slot->flags = 0;
     yaza_net_v1_unlock();
 
+#if defined(_WIN32)
+    if (closesocket(fd) != 0) {
+        *out_error = (char *)"network close reported operating-system error";
+        return 0;
+    }
+#else
     if (close(fd) != 0) {
         *out_error = (char *)"network close reported operating-system error";
         return 0;
     }
+#endif
     *out_error = NULL;
     return 1;
 }
@@ -6568,18 +7265,54 @@ int32_t yaza_net_v1_pair_create(int64_t *out_handle, char **out_error) {
     *out_handle = 0;
     *out_error = NULL;
 
-    int fds[2];
+    yaza_net_v1_ensure_init();
+    yaza_net_sock_t fds[2];
+#if defined(_WIN32)
+    yaza_net_sock_t listener = socket(AF_INET, SOCK_STREAM, 0);
+    if (listener == YAZA_NET_INVALID_SOCKET) {
+        *out_error = (char *)"socketpair creation failed";
+        return 0;
+    }
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    socklen_t addr_len = sizeof(addr);
+    if (bind(listener, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        listen(listener, 1) != 0 ||
+        getsockname(listener, (struct sockaddr *)&addr, &addr_len) != 0) {
+        yaza_net_v1_close_sock(listener);
+        *out_error = (char *)"socketpair creation failed";
+        return 0;
+    }
+    fds[0] = socket(AF_INET, SOCK_STREAM, 0);
+    if (fds[0] == YAZA_NET_INVALID_SOCKET ||
+        connect(fds[0], (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        if (fds[0] != YAZA_NET_INVALID_SOCKET) yaza_net_v1_close_sock(fds[0]);
+        yaza_net_v1_close_sock(listener);
+        *out_error = (char *)"socketpair creation failed";
+        return 0;
+    }
+    fds[1] = accept(listener, NULL, NULL);
+    yaza_net_v1_close_sock(listener);
+    if (fds[1] == YAZA_NET_INVALID_SOCKET) {
+        yaza_net_v1_close_sock(fds[0]);
+        *out_error = (char *)"socketpair creation failed";
+        return 0;
+    }
+#else
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
         *out_error = (char *)"socketpair creation failed";
         return 0;
     }
+#endif
 
     for (int i = 0; i < 2; i++) {
-        int fl = fcntl(fds[i], F_GETFL, 0);
-        if (fl >= 0) (void)fcntl(fds[i], F_SETFL, fl | O_NONBLOCK);
+        yaza_net_v1_set_nonblocking(fds[i]);
 #if defined(SO_NOSIGPIPE)
         int opt = 1;
-        (void)setsockopt(fds[i], SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
+        (void)setsockopt(fds[i], SOL_SOCKET, SO_NOSIGPIPE, (const char *)&opt, sizeof(opt));
 #endif
     }
 
@@ -6594,8 +7327,8 @@ int32_t yaza_net_v1_pair_create(int64_t *out_handle, char **out_error) {
     }
     if (slot_a == YAZA_NET_V1_MAX_HANDLES || slot_b == YAZA_NET_V1_MAX_HANDLES) {
         yaza_net_v1_unlock();
-        close(fds[0]);
-        close(fds[1]);
+        yaza_net_v1_close_sock(fds[0]);
+        yaza_net_v1_close_sock(fds[1]);
         *out_error = (char *)"network handle table exhausted";
         return 0;
     }
@@ -6645,7 +7378,8 @@ int32_t yaza_net_v1_pair_peer(int64_t handle, int64_t *out_peer_handle, char **o
 
     yaza_net_v1_lock();
     YazaNetV1Slot *slot = &yaza_net_v1_slots[index];
-    if (slot->kind != YAZA_NET_V1_KIND_CONNECTION || slot->generation != generation || slot->descriptor < 0) {
+    if (slot->kind != YAZA_NET_V1_KIND_CONNECTION || slot->generation != generation ||
+        slot->descriptor == YAZA_NET_INVALID_SOCKET) {
         yaza_net_v1_unlock();
         *out_error = (char *)"invalid or closed network handle";
         return 0;
@@ -6654,6 +7388,52 @@ int32_t yaza_net_v1_pair_peer(int64_t handle, int64_t *out_peer_handle, char **o
     yaza_net_v1_unlock();
     return 1;
 }
+
+#if defined(_WIN32)
+static int yaza_win32_append_quoted_arg(char **buf, size_t *len, size_t *cap, const char *arg, int add_space) {
+    size_t arg_len = strlen(arg);
+    int needs_quotes = (arg_len == 0);
+    for (size_t i = 0; i < arg_len && !needs_quotes; i++) {
+        if (arg[i] == ' ' || arg[i] == '\t' || arg[i] == '"') needs_quotes = 1;
+    }
+    size_t worst_case = *len + (add_space ? 1U : 0U) + (arg_len * 2U) + 4U;
+    if (worst_case > *cap) {
+        size_t new_cap = *cap == 0 ? 1024U : *cap * 2U;
+        while (new_cap < worst_case) new_cap *= 2U;
+        char *grown = (char *)realloc(*buf, new_cap);
+        if (grown == NULL) return 0;
+        *buf = grown;
+        *cap = new_cap;
+    }
+    if (add_space) (*buf)[(*len)++] = ' ';
+    if (!needs_quotes) {
+        memcpy(*buf + *len, arg, arg_len);
+        *len += arg_len;
+        (*buf)[*len] = '\0';
+        return 1;
+    }
+    (*buf)[(*len)++] = '"';
+    size_t backslashes = 0;
+    for (size_t i = 0; i < arg_len; i++) {
+        char c = arg[i];
+        if (c == '\\') {
+            backslashes++;
+        } else if (c == '"') {
+            for (size_t b = 0; b < backslashes * 2U + 1U; b++) (*buf)[(*len)++] = '\\';
+            (*buf)[(*len)++] = '"';
+            backslashes = 0;
+        } else {
+            for (size_t b = 0; b < backslashes; b++) (*buf)[(*len)++] = '\\';
+            (*buf)[(*len)++] = c;
+            backslashes = 0;
+        }
+    }
+    for (size_t b = 0; b < backslashes * 2U; b++) (*buf)[(*len)++] = '\\';
+    (*buf)[(*len)++] = '"';
+    (*buf)[*len] = '\0';
+    return 1;
+}
+#endif
 
 int64_t yaza_rt_v1_process(const YazaTextV1 *command, void *typed_text_list) {
     if (command == NULL || command->data == NULL || command->length == 0 || command->length > 4096 ||
@@ -6678,6 +7458,38 @@ int64_t yaza_rt_v1_process(const YazaTextV1 *command, void *typed_text_list) {
         total_bytes += argument->length;
         arguments[index + 1] = (char *)argument->data;
     }
+#if defined(_WIN32)
+    char *cmdline = NULL;
+    size_t cmdlen = 0;
+    size_t cmdcap = 0;
+    int ok = 1;
+    for (uint64_t index = 0; index <= argument_count; ++index) {
+        if (!yaza_win32_append_quoted_arg(&cmdline, &cmdlen, &cmdcap,
+                                          arguments[index] == NULL ? "" : arguments[index], index > 0)) {
+            ok = 0;
+            break;
+        }
+    }
+    free(arguments);
+    if (!ok || cmdline == NULL) {
+        free(cmdline);
+        return 127;
+    }
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof(si));
+    memset(&pi, 0, sizeof(pi));
+    si.cb = sizeof(si);
+    BOOL created = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
+    free(cmdline);
+    if (!created) return 127;
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exit_code = 127;
+    if (!GetExitCodeProcess(pi.hProcess, &exit_code)) exit_code = 127;
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return (int64_t)exit_code;
+#else
     pid_t child = 0;
     const int spawn_status = posix_spawnp(&child, (const char *)command->data, NULL, NULL, arguments, environ);
     free(arguments);
@@ -6690,6 +7502,7 @@ int64_t yaza_rt_v1_process(const YazaTextV1 *command, void *typed_text_list) {
     if (WIFEXITED(wait_status)) return WEXITSTATUS(wait_status);
     if (WIFSIGNALED(wait_status)) return 128 + WTERMSIG(wait_status);
     return 127;
+#endif
 }
 
 #if defined(__linux__)
@@ -6789,11 +7602,17 @@ int64_t yaza_rt_v1_processor_count(void) {
             count = logical;
         }
     }
+#elif defined(_WIN32)
+    SYSTEM_INFO sys_info;
+    GetSystemInfo(&sys_info);
+    if (sys_info.dwNumberOfProcessors > 0) count = (uint64_t)sys_info.dwNumberOfProcessors;
 #endif
+#if !defined(_WIN32)
     if (count == 0) {
         const long online = sysconf(_SC_NPROCESSORS_ONLN);
         if (online > 0) count = (uint64_t)online;
     }
+#endif
 #if defined(__linux__)
     const uint64_t quota_limit = yaza_rt_v1_cpu_quota_limit();
     if (quota_limit > 0 && (count == 0 || quota_limit < count)) count = quota_limit;
@@ -6943,7 +7762,16 @@ int64_t yaza_rt_v1_monotonic_ns(void) {
 YazaTextV1 *yaza_rt_v1_executable_path(void) {
     char path[PATH_MAX];
     size_t length = 0;
-#if defined(__APPLE__)
+#if defined(_WIN32)
+    DWORD win_len = GetModuleFileNameA(NULL, path, (DWORD)(sizeof(path) - 1U));
+    if (win_len == 0 || (size_t)win_len >= sizeof(path) - 1U) {
+        yaza_rt_v1_fail("executable_path could not read the executable path");
+        return NULL;
+    }
+    length = (size_t)win_len;
+    path[length] = '\0';
+    return yaza_text_v1_copy_to_arena(yaza_arena_v1_current(), (const unsigned char *)path, length);
+#elif defined(__APPLE__)
     uint32_t path_size = (uint32_t)sizeof(path);
     if (_NSGetExecutablePath(path, &path_size) != 0) {
         yaza_rt_v1_fail("executable_path could not read the executable path");
