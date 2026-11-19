@@ -1,0 +1,330 @@
+# YAZA Data Science Engine — Native Zero-GC Machine Learning (OLS, Ridge Regression, Logistic Regression & K-Means).
+# Uses centered one-pass moments, partial-pivoting normal equation solver, and overflow-proof sigmoid.
+
+use "std/math"
+use "std/data/stats"
+use "std/data/matrix"
+
+shape OlsModel:
+    slope: Float64
+    intercept: Float64
+    r_squared: Float64
+    rmse: Float64
+    mae: Float64
+    std_err_slope: Float64
+
+shape MultipleOlsModel:
+    intercept: Float64
+    weights: List[Float64]
+    r_squared: Float64
+    adjusted_r_squared: Float64
+    rmse: Float64
+
+shape LogisticModel:
+    intercept: Float64
+    weights: List[Float64]
+    accuracy: Float64
+    log_loss: Float64
+
+shape KMeans1DResult:
+    centroids: List[Float64]
+    assignments: List[Number]
+    inertia: Float64
+
+# Numerically stable one-pass Simple Linear Regression (y = intercept + slope * x)
+fn ml_ols_fit(xs: List[Float64], ys: List[Float64]) -> Result[OlsModel, Text]:
+    let n: Number = list_count(xs)
+    if n != list_count(ys):
+        return err("ml_ols_fit requires equal-length x and y vectors")
+    if n < 2:
+        return err("ml_ols_fit requires at least 2 observations")
+
+    var mean_x: Float64 = 0.0
+    var mean_y: Float64 = 0.0
+    var s_xx: Float64 = 0.0
+    var s_yy: Float64 = 0.0
+    var s_xy: Float64 = 0.0
+    var i: Number = 0
+    while i < n:
+        let x: Float64 = list_get(xs, i)
+        let y: Float64 = list_get(ys, i)
+        let nf: Float64 = float64_from_number(i + 1)
+        let dx1: Float64 = x - mean_x
+        let dy1: Float64 = y - mean_y
+        set mean_x = mean_x + (dx1 / nf)
+        set mean_y = mean_y + (dy1 / nf)
+        let dx2: Float64 = x - mean_x
+        let dy2: Float64 = y - mean_y
+        set s_xx = s_xx + dx1 * dx2
+        set s_yy = s_yy + dy1 * dy2
+        set s_xy = s_xy + dx1 * dy2
+        set i = i + 1
+
+    if s_xx == 0.0:
+        return err("ml_ols_fit predictor x has zero variance")
+
+    let slope: Float64 = s_xy / s_xx
+    let intercept: Float64 = mean_y - slope * mean_x
+
+    var ss_res: Float64 = 0.0
+    var abs_err_sum: Float64 = 0.0
+    var j: Number = 0
+    while j < n:
+        let pred: Float64 = intercept + slope * list_get(xs, j)
+        let resid: Float64 = list_get(ys, j) - pred
+        set ss_res = ss_res + resid * resid
+        set abs_err_sum = abs_err_sum + math_abs_float64(resid)
+        set j = j + 1
+
+    let nf_total: Float64 = float64_from_number(n)
+    let rmse: Float64 = math_sqrt_float64(ss_res / nf_total)
+    let mae: Float64 = abs_err_sum / nf_total
+    var r2: Float64 = 1.0
+    if s_yy > 0.0:
+        set r2 = 1.0 - (ss_res / s_yy)
+    var se_slope: Float64 = 0.0
+    if n > 2:
+        set se_slope = math_sqrt_float64((ss_res / float64_from_number(n - 2)) / s_xx)
+
+    return ok(OlsModel(slope, intercept, r2, rmse, mae, se_slope))
+
+fn ml_ols_predict(model: OlsModel, x: Float64) -> Float64:
+    return model.intercept + model.slope * x
+
+# Multiple Linear & Ridge Regression: y = b0 + b1*x1 + ... + bp*xp via (X^T X + lambda*I) beta = X^T y
+fn ml_multiple_ols_fit(features: DenseMatrix, targets: List[Float64], ridge_lambda: Float64) -> Result[MultipleOlsModel, Text]:
+    let n: Number = features.rows
+    let p: Number = features.cols
+    if n == 0 or p == 0 or list_count(targets) != n:
+        return err("ml_multiple_ols_fit invalid feature matrix or target vector dimensions")
+    if n <= p:
+        return err("ml_multiple_ols_fit requires more observations than features (n > p)")
+    if ridge_lambda < 0.0:
+        return err("ml_multiple_ols_fit ridge_lambda must be >= 0.0")
+
+    let dim: Number = p + 1
+    let xtx: DenseMatrix = mat_zeros(dim, dim)
+    let xty: List[Float64] = vec_zeros(dim)
+
+    var r: Number = 0
+    while r < n:
+        let y: Float64 = list_get(targets, r)
+        var i: Number = 0
+        while i < dim:
+            var xi: Float64 = 1.0
+            if i > 0:
+                set xi = mat_get(features, r, i - 1)
+            list_set(xty, i, list_get(xty, i) + xi * y)
+            var j: Number = i
+            while j < dim:
+                var xj: Float64 = 1.0
+                if j > 0:
+                    set xj = mat_get(features, r, j - 1)
+                let cur: Float64 = mat_get(xtx, i, j) + xi * xj
+                let _s1: Boolean = mat_set(xtx, i, j, cur)
+                if i != j:
+                    let _s2: Boolean = mat_set(xtx, j, i, cur)
+                set j = j + 1
+            set i = i + 1
+        set r = r + 1
+
+    # Apply L2 Ridge penalty to feature weights (excluding intercept beta_0)
+    if ridge_lambda > 0.0:
+        var d: Number = 1
+        while d < dim:
+            let _sr: Boolean = mat_set(xtx, d, d, mat_get(xtx, d, d) + ridge_lambda)
+            set d = d + 1
+
+    let beta: List[Float64] = mat_solve_linear(xtx, xty)?
+    let intercept: Float64 = list_get(beta, 0)
+    let weights: List[Float64] = List[Float64]()
+    var w: Number = 1
+    while w < dim:
+        list_push(weights, list_get(beta, w))
+        set w = w + 1
+
+    let y_mean: Float64 = stats_mean_compensated(targets)
+    var ss_tot: Float64 = 0.0
+    var ss_res: Float64 = 0.0
+    var row: Number = 0
+    while row < n:
+        var pred: Float64 = intercept
+        var col: Number = 0
+        while col < p:
+            set pred = pred + list_get(weights, col) * mat_get(features, row, col)
+            set col = col + 1
+        let y_actual: Float64 = list_get(targets, row)
+        let err_v: Float64 = y_actual - pred
+        let tot_v: Float64 = y_actual - y_mean
+        set ss_res = ss_res + err_v * err_v
+        set ss_tot = ss_tot + tot_v * tot_v
+        set row = row + 1
+
+    var r2: Float64 = 1.0
+    if ss_tot > 0.0:
+        set r2 = 1.0 - (ss_res / ss_tot)
+    var adj_r2: Float64 = r2
+    if n > p + 1:
+        set adj_r2 = 1.0 - ((1.0 - r2) * float64_from_number(n - 1) / float64_from_number(n - p - 1))
+    let rmse: Float64 = math_sqrt_float64(ss_res / float64_from_number(n))
+    return ok(MultipleOlsModel(intercept, weights, r2, adj_r2, rmse))
+
+fn ml_multiple_ols_predict(model: MultipleOlsModel, x_row: List[Float64]) -> Result[Float64, Text]:
+    let p: Number = list_count(model.weights)
+    if list_count(x_row) != p:
+        return err("ml_multiple_ols_predict feature vector length mismatch")
+    let dot: Float64 = vec_dot_compensated(model.weights, x_row)?
+    return ok(model.intercept + dot)
+
+# Overflow-proof logistic sigmoid: 1 / (1 + exp(-z))
+fn ml_sigmoid(z: Float64) -> Float64:
+    if z >= 0.0:
+        let ez: Float64 = math_exp_float64(0.0 - z)
+        return 1.0 / (1.0 + ez)
+    let ez2: Float64 = math_exp_float64(z)
+    return ez2 / (1.0 + ez2)
+
+# L2-Regularized Binary Logistic Regression trained via batch Gradient Descent
+fn ml_logistic_fit(features: DenseMatrix, labels: List[Float64], learning_rate: Float64, epochs: Number, l2_lambda: Float64) -> Result[LogisticModel, Text]:
+    let n: Number = features.rows
+    let p: Number = features.cols
+    if n == 0 or p == 0 or list_count(labels) != n:
+        return err("ml_logistic_fit dimension mismatch")
+    if learning_rate <= 0.0 or epochs <= 0:
+        return err("ml_logistic_fit requires positive learning_rate and epochs")
+
+    var b0: Float64 = 0.0
+    let w: List[Float64] = vec_zeros(p)
+    let inv_n: Float64 = 1.0 / float64_from_number(n)
+
+    var ep: Number = 0
+    while ep < epochs:
+        var grad_b0: Float64 = 0.0
+        let grad_w: List[Float64] = vec_zeros(p)
+        var r: Number = 0
+        while r < n:
+            var z: Float64 = b0
+            var c: Number = 0
+            while c < p:
+                set z = z + list_get(w, c) * mat_get(features, r, c)
+                set c = c + 1
+            let prob: Float64 = ml_sigmoid(z)
+            let diff: Float64 = prob - list_get(labels, r)
+            set grad_b0 = grad_b0 + diff
+            var c2: Number = 0
+            while c2 < p:
+                list_set(grad_w, c2, list_get(grad_w, c2) + diff * mat_get(features, r, c2))
+                set c2 = c2 + 1
+            set r = r + 1
+
+        set b0 = b0 - learning_rate * (grad_b0 * inv_n)
+        var c3: Number = 0
+        while c3 < p:
+            let reg: Float64 = l2_lambda * list_get(w, c3)
+            let gw: Float64 = (list_get(grad_w, c3) * inv_n) + reg
+            list_set(w, c3, list_get(w, c3) - learning_rate * gw)
+            set c3 = c3 + 1
+        set ep = ep + 1
+
+    # Compute final training accuracy and cross-entropy log-loss
+    var correct: Number = 0
+    var loss_sum: Float64 = 0.0
+    let eps: Float64 = 0.000000000001
+    var r2: Number = 0
+    while r2 < n:
+        var z2: Float64 = b0
+        var c4: Number = 0
+        while c4 < p:
+            set z2 = z2 + list_get(w, c4) * mat_get(features, r2, c4)
+            set c4 = c4 + 1
+        var pr: Float64 = ml_sigmoid(z2)
+        if pr < eps: set pr = eps
+        if pr > 1.0 - eps: set pr = 1.0 - eps
+        let y_true: Float64 = list_get(labels, r2)
+        var pred_cls: Float64 = 0.0
+        if pr >= 0.5: set pred_cls = 1.0
+        if pred_cls == y_true:
+            set correct = correct + 1
+        set loss_sum = loss_sum - (y_true * math_ln_float64(pr) + (1.0 - y_true) * math_ln_float64(1.0 - pr))
+        set r2 = r2 + 1
+
+    let acc: Float64 = float64_from_number(correct) * inv_n
+    let log_loss: Float64 = loss_sum * inv_n
+    return ok(LogisticModel(b0, w, acc, log_loss))
+
+fn ml_logistic_predict_proba(model: LogisticModel, x_row: List[Float64]) -> Result[Float64, Text]:
+    if list_count(x_row) != list_count(model.weights):
+        return err("ml_logistic_predict_proba feature dimension mismatch")
+    let dot: Float64 = vec_dot_compensated(model.weights, x_row)?
+    return ok(ml_sigmoid(model.intercept + dot))
+
+# 1D K-Means Clustering with quantile-spaced initialization (deterministic, zero-GC)
+fn ml_kmeans_1d(xs: List[Float64], k: Number, max_iters: Number) -> Result[KMeans1DResult, Text]:
+    let n: Number = list_count(xs)
+    if n == 0 or k <= 0 or k > n:
+        return err("ml_kmeans_1d requires 0 < k <= count(xs)")
+    let sorted_xs: List[Float64] = stats_sort_asc(xs)
+    let centroids: List[Float64] = List[Float64]()
+    var c: Number = 0
+    while c < k:
+        let q_prob: Float64 = (float64_from_number(c) + 0.5) / float64_from_number(k)
+        let q_val: Float64 = stats_quantile_sorted(sorted_xs, q_prob)?
+        list_push(centroids, q_val)
+        set c = c + 1
+
+    let assignments: List[Number] = List[Number]()
+    var i: Number = 0
+    while i < n:
+        list_push(assignments, 0)
+        set i = i + 1
+
+    var iter: Number = 0
+    while iter < max_iters:
+        var changed: Boolean = false
+        var idx: Number = 0
+        while idx < n:
+            let x: Float64 = list_get(xs, idx)
+            var best_c: Number = 0
+            var best_dist: Float64 = math_abs_float64(x - list_get(centroids, 0))
+            var cj: Number = 1
+            while cj < k:
+                let d: Float64 = math_abs_float64(x - list_get(centroids, cj))
+                if d < best_dist:
+                    set best_dist = d
+                    set best_c = cj
+                set cj = cj + 1
+            if list_get(assignments, idx) != best_c:
+                list_set(assignments, idx, best_c)
+                set changed = true
+            set idx = idx + 1
+
+        if not changed and iter > 0:
+            break
+
+        let sums: List[Float64] = vec_zeros(k)
+        let counts: List[Number] = List[Number]()
+        var z: Number = 0
+        while z < k:
+            list_push(counts, 0)
+            set z = z + 1
+        var m: Number = 0
+        while m < n:
+            let cl: Number = list_get(assignments, m)
+            list_set(sums, cl, list_get(sums, cl) + list_get(xs, m))
+            list_set(counts, cl, list_get(counts, cl) + 1)
+            set m = m + 1
+        var u: Number = 0
+        while u < k:
+            let cnt: Number = list_get(counts, u)
+            if cnt > 0:
+                list_set(centroids, u, list_get(sums, u) / float64_from_number(cnt))
+            set u = u + 1
+        set iter = iter + 1
+
+    var inertia: Float64 = 0.0
+    var fi: Number = 0
+    while fi < n:
+        let diff: Float64 = list_get(xs, fi) - list_get(centroids, list_get(assignments, fi))
+        set inertia = inertia + diff * diff
+        set fi = fi + 1
+    return ok(KMeans1DResult(centroids, assignments, inertia))

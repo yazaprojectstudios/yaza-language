@@ -1,0 +1,244 @@
+# YAZA Data Science Engine — Columnar Arena DataFrame (Pandas / Polars / R data.frame Alternative).
+# Stores columns contiguously in the active arena_scope with automatic CSV type inference, filtering, GroupBy & describe().
+
+use "std/csv"
+use "std/math"
+use "std/data/stats"
+
+shape DataColumn:
+    name: Text
+    is_numeric: Boolean
+    numbers: List[Float64]
+    texts: TextList
+
+shape DataFrame:
+    row_count: Number
+    columns: List[DataColumn]
+
+shape GroupBySummaryRow:
+    group_key: Text
+    count: Number
+    sum: Float64
+    mean: Float64
+    std_dev: Float64
+    min: Float64
+    max: Float64
+
+fn df_empty() -> DataFrame:
+    return DataFrame(0, List[DataColumn]())
+
+fn df_column_count(df: DataFrame) -> Number:
+    return list_count(df.columns)
+
+fn df_add_numeric_column(df: DataFrame, name: Text, values: List[Float64]) -> Result[DataFrame, Text]:
+    let n: Number = list_count(values)
+    if list_count(df.columns) > 0 and n != df.row_count:
+        return err("df_add_numeric_column length mismatch with existing DataFrame row_count")
+    let cols: List[DataColumn] = List[DataColumn]()
+    var i: Number = 0
+    while i < list_count(df.columns):
+        list_push(cols, list_get(df.columns, i))
+        set i = i + 1
+    list_push(cols, DataColumn(name, true, values, text_list()))
+    return ok(DataFrame(n, cols))
+
+fn df_add_text_column(df: DataFrame, name: Text, values: TextList) -> Result[DataFrame, Text]:
+    let n: Number = list_count(values)
+    if list_count(df.columns) > 0 and n != df.row_count:
+        return err("df_add_text_column length mismatch with existing DataFrame row_count")
+    let cols: List[DataColumn] = List[DataColumn]()
+    var i: Number = 0
+    while i < list_count(df.columns):
+        list_push(cols, list_get(df.columns, i))
+        set i = i + 1
+    list_push(cols, DataColumn(name, false, List[Float64](), values))
+    return ok(DataFrame(n, cols))
+
+fn df_find_column_index(df: DataFrame, name: Text) -> Number:
+    var i: Number = 0
+    while i < list_count(df.columns):
+        if list_get(df.columns, i).name == name:
+            return i
+        set i = i + 1
+    return -1
+
+fn df_get_numeric(df: DataFrame, name: Text) -> Result[List[Float64], Text]:
+    let idx: Number = df_find_column_index(df, name)
+    if idx < 0:
+        return err("DataFrame column not found: " + name)
+    let col: DataColumn = list_get(df.columns, idx)
+    if not col.is_numeric:
+        return err("DataFrame column is not numeric: " + name)
+    return ok(col.numbers)
+
+fn df_get_text(df: DataFrame, name: Text) -> Result[TextList, Text]:
+    let idx: Number = df_find_column_index(df, name)
+    if idx < 0:
+        return err("DataFrame column not found: " + name)
+    let col: DataColumn = list_get(df.columns, idx)
+    if col.is_numeric:
+        return err("DataFrame column is numeric, not text: " + name)
+    return ok(col.texts)
+
+fn df_split_csv_line(line: Text) -> TextList:
+    let out: TextList = text_list()
+    let len: Number = text_length(line)
+    var i: Number = 0
+    var field_start: Number = 0
+    var in_quotes: Boolean = false
+    while i < len:
+        let b: Number = text_byte(line, i)
+        if b == 34:
+            set in_quotes = not in_quotes
+        elif b == 44 and not in_quotes:
+            var raw_f: Text = text_trim(text_slice(line, field_start, i - field_start))
+            let flen: Number = text_length(raw_f)
+            if flen >= 2 and text_byte(raw_f, 0) == 34 and text_byte(raw_f, flen - 1) == 34:
+                set raw_f = text_slice(raw_f, 1, flen - 2)
+            list_push(out, raw_f)
+            set field_start = i + 1
+        set i = i + 1
+    var last_f: Text = text_trim(text_slice(line, field_start, len - field_start))
+    let lflen: Number = text_length(last_f)
+    if lflen >= 2 and text_byte(last_f, 0) == 34 and text_byte(last_f, lflen - 1) == 34:
+        set last_f = text_slice(last_f, 1, lflen - 2)
+    list_push(out, last_f)
+    return out
+
+# Parses CSV (supporting both Unix LF and RFC-4180 CRLF) into a columnar DataFrame with automatic Float64 vs Text column type inference
+fn df_from_csv(csv_text: Text) -> Result[DataFrame, Text]:
+    let trimmed: Text = text_trim(csv_text)
+    if text_length(trimmed) == 0:
+        return err("df_from_csv received empty CSV text")
+    let raw_lines: TextList = text_lines(trimmed)
+    let line_count: Number = list_count(raw_lines)
+    if line_count == 0:
+        return err("df_from_csv missing header row")
+    let headers: TextList = df_split_csv_line(text_trim(list_get(raw_lines, 0)))
+    let col_count: Number = list_count(headers)
+    if col_count == 0:
+        return err("df_from_csv header has zero columns")
+
+    let rows: List[TextList] = List[TextList]()
+    var li: Number = 1
+    while li < line_count:
+        let row_line: Text = text_trim(list_get(raw_lines, li))
+        if text_length(row_line) > 0:
+            let fields: TextList = df_split_csv_line(row_line)
+            if list_count(fields) == col_count:
+                list_push(rows, fields)
+        set li = li + 1
+
+    let row_count: Number = list_count(rows)
+    let cols: List[DataColumn] = List[DataColumn]()
+    var c: Number = 0
+    while c < col_count:
+        let col_name: Text = text_trim(list_get(headers, c))
+        var all_numeric: Boolean = row_count > 0
+        let parsed_nums: List[Float64] = List[Float64]()
+        let raw_texts: TextList = text_list()
+        var r: Number = 0
+        while r < row_count:
+            let cell: Text = text_trim(list_get(list_get(rows, r), c))
+            list_push(raw_texts, cell)
+            if all_numeric:
+                let num_res: Result[Float64, Text] = float64_try_parse(cell)
+                if result_is_ok(num_res):
+                    list_push(parsed_nums, result_unwrap(num_res))
+                else:
+                    set all_numeric = false
+            set r = r + 1
+        if all_numeric:
+            list_push(cols, DataColumn(col_name, true, parsed_nums, text_list()))
+        else:
+            list_push(cols, DataColumn(col_name, false, List[Float64](), raw_texts))
+        set c = c + 1
+
+    return ok(DataFrame(row_count, cols))
+
+# Vectorized predicate filter: returns a new DataFrame keeping rows where col_name > threshold
+fn df_filter_gt(df: DataFrame, col_name: Text, threshold: Float64) -> Result[DataFrame, Text]:
+    let target_col: List[Float64] = df_get_numeric(df, col_name)?
+    let keep_indices: List[Number] = List[Number]()
+    var r: Number = 0
+    while r < df.row_count:
+        if list_get(target_col, r) > threshold:
+            list_push(keep_indices, r)
+        set r = r + 1
+
+    let new_row_count: Number = list_count(keep_indices)
+    let new_cols: List[DataColumn] = List[DataColumn]()
+    var c: Number = 0
+    while c < list_count(df.columns):
+        let old_col: DataColumn = list_get(df.columns, c)
+        if old_col.is_numeric:
+            let nums: List[Float64] = List[Float64]()
+            var k: Number = 0
+            while k < new_row_count:
+                list_push(nums, list_get(old_col.numbers, list_get(keep_indices, k)))
+                set k = k + 1
+            list_push(new_cols, DataColumn(old_col.name, true, nums, text_list()))
+        else:
+            let txts: TextList = text_list()
+            var k2: Number = 0
+            while k2 < new_row_count:
+                list_push(txts, list_get(old_col.texts, list_get(keep_indices, k2)))
+                set k2 = k2 + 1
+            list_push(new_cols, DataColumn(old_col.name, false, List[Float64](), txts))
+        set c = c + 1
+
+    return ok(DataFrame(new_row_count, new_cols))
+
+# GroupBy aggregation: groups by a Text column and computes compensated sum, mean, Welford std_dev, min, max on a numeric column
+fn df_groupby_agg(df: DataFrame, group_col_name: Text, value_col_name: Text) -> Result[List[GroupBySummaryRow], Text]:
+    let keys_col: TextList = df_get_text(df, group_col_name)?
+    let vals_col: List[Float64] = df_get_numeric(df, value_col_name)?
+
+    let distinct_keys: TextList = text_list()
+    let buckets: List[List[Float64]] = List[List[Float64]]()
+
+    var r: Number = 0
+    while r < df.row_count:
+        let k: Text = list_get(keys_col, r)
+        let v: Float64 = list_get(vals_col, r)
+        var found_idx: Number = -1
+        var g: Number = 0
+        while g < list_count(distinct_keys):
+            if list_get(distinct_keys, g) == k:
+                set found_idx = g
+                break
+            set g = g + 1
+        if found_idx < 0:
+            list_push(distinct_keys, k)
+            let b: List[Float64] = List[Float64]()
+            list_push(b, v)
+            list_push(buckets, b)
+        else:
+            list_push(list_get(buckets, found_idx), v)
+        set r = r + 1
+
+    let out: List[GroupBySummaryRow] = List[GroupBySummaryRow]()
+    var gi: Number = 0
+    while gi < list_count(distinct_keys):
+        let key_name: Text = list_get(distinct_keys, gi)
+        let bvals: List[Float64] = list_get(buckets, gi)
+        let desc: StatsSummary = stats_describe(bvals)?
+        list_push(out, GroupBySummaryRow(key_name, desc.count, desc.sum, desc.mean, desc.std_dev_sample, desc.min, desc.max))
+        set gi = gi + 1
+    return ok(out)
+
+# R summary(df) / Pandas df.describe() text summary for all numeric columns
+fn df_describe_text(df: DataFrame) -> Text:
+    let lines: TextList = text_list()
+    list_push(lines, "DataFrame (" + number_text(df.row_count) + " rows x " + number_text(list_count(df.columns)) + " cols)")
+    var c: Number = 0
+    while c < list_count(df.columns):
+        let col: DataColumn = list_get(df.columns, c)
+        if col.is_numeric and list_count(col.numbers) > 0:
+            let d: StatsSummary = result_unwrap(stats_describe(col.numbers))
+            let q: FiveNumberSummary = result_unwrap(stats_five_number_summary(col.numbers))
+            list_push(lines, "  - " + col.name + " [Float64]: count=" + number_text(d.count) + " mean=" + float64_text(d.mean) + " sd=" + float64_text(d.std_dev_sample) + " min=" + float64_text(q.min) + " median=" + float64_text(q.median) + " max=" + float64_text(q.max))
+        else:
+            list_push(lines, "  - " + col.name + " [Text]: count=" + number_text(list_count(col.texts)))
+        set c = c + 1
+    return text_join(lines, "\n")

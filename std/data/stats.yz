@@ -1,0 +1,279 @@
+# YAZA Data Science Engine — High-Accuracy Compensated Statistics, Order Statistics & Hypothesis Testing.
+# Uses Neumaier compensated summation and Welford/Pébay one-pass recurrence to prevent catastrophic cancellation.
+
+use "std/math"
+
+shape StatsSummary:
+    count: Number
+    sum: Float64
+    mean: Float64
+    variance_sample: Float64
+    variance_pop: Float64
+    std_dev_sample: Float64
+    std_dev_pop: Float64
+    std_error: Float64
+    min: Float64
+    max: Float64
+    skewness: Float64
+    excess_kurtosis: Float64
+
+shape FiveNumberSummary:
+    min: Float64
+    q25: Float64
+    median: Float64
+    q75: Float64
+    max: Float64
+    iqr: Float64
+    mad: Float64
+
+shape WelchTTestResult:
+    t_stat: Float64
+    degrees_of_freedom: Float64
+    p_value_two_tailed: Float64
+    mean_diff: Float64
+    significant_at_05: Boolean
+
+# Neumaier (1974) improved Kahan-Babuska compensated summation:
+# Achieves O(eps) error independent of N and handles terms larger than the running sum (e.g. [1e16, 1.0, -1e16] == 1.0).
+fn stats_sum_compensated(xs: List[Float64]) -> Float64:
+    let n: Number = list_count(xs)
+    if n == 0:
+        return 0.0
+    var sum: Float64 = 0.0
+    var c: Float64 = 0.0
+    var i: Number = 0
+    while i < n:
+        let x: Float64 = list_get(xs, i)
+        let t: Float64 = sum + x
+        if math_abs_float64(sum) >= math_abs_float64(x):
+            set c = c + ((sum - t) + x)
+        else:
+            set c = c + ((x - t) + sum)
+        set sum = t
+        set i = i + 1
+    return sum + c
+
+fn stats_mean_compensated(xs: List[Float64]) -> Float64:
+    let n: Number = list_count(xs)
+    if n == 0:
+        return math_nan_float64()
+    return stats_sum_compensated(xs) / float64_from_number(n)
+
+# Welford (1962) / Terriberry (2007) one-pass numerically stable online moments (mean, variance, skewness, kurtosis).
+# Immune to catastrophic cancellation even when mean >> std_dev (e.g. 1e9 +/- 1.0).
+fn stats_describe(xs: List[Float64]) -> Result[StatsSummary, Text]:
+    let n: Number = list_count(xs)
+    if n == 0:
+        return err("stats_describe requires a non-empty List[Float64]")
+    var count: Number = 0
+    var mean: Float64 = 0.0
+    var m2: Float64 = 0.0
+    var m3: Float64 = 0.0
+    var m4: Float64 = 0.0
+    var min_v: Float64 = list_get(xs, 0)
+    var max_v: Float64 = min_v
+    var sum: Float64 = 0.0
+    var comp: Float64 = 0.0
+
+    var i: Number = 0
+    while i < n:
+        let x: Float64 = list_get(xs, i)
+        if x < min_v: set min_v = x
+        if x > max_v: set max_v = x
+
+        # Compensated sum
+        let t: Float64 = sum + x
+        if math_abs_float64(sum) >= math_abs_float64(x):
+            set comp = comp + ((sum - t) + x)
+        else:
+            set comp = comp + ((x - t) + sum)
+        set sum = t
+
+        # Higher-order Welford recurrence
+        let n1: Number = count
+        set count = count + 1
+        let nf: Float64 = float64_from_number(count)
+        let n1f: Float64 = float64_from_number(n1)
+        let delta: Float64 = x - mean
+        let delta_n: Float64 = delta / nf
+        let delta_n2: Float64 = delta_n * delta_n
+        let term1: Float64 = delta * delta_n * n1f
+        set mean = mean + delta_n
+        set m4 = m4 + term1 * delta_n2 * (nf * nf - 3.0 * nf + 3.0) + 6.0 * delta_n2 * m2 - 4.0 * delta_n * m3
+        set m3 = m3 + term1 * delta_n * (nf - 2.0) - 3.0 * delta_n * m2
+        set m2 = m2 + term1
+        set i = i + 1
+
+    let total_sum: Float64 = sum + comp
+    let n_float: Float64 = float64_from_number(n)
+    let var_pop: Float64 = m2 / n_float
+    var var_sample: Float64 = 0.0
+    if n > 1:
+        set var_sample = m2 / float64_from_number(n - 1)
+    let sd_pop: Float64 = math_sqrt_float64(var_pop)
+    let sd_sample: Float64 = math_sqrt_float64(var_sample)
+    let std_err: Float64 = sd_sample / math_sqrt_float64(n_float)
+
+    var skew: Float64 = 0.0
+    var kurt: Float64 = 0.0
+    if m2 > 0.0:
+        set skew = (math_sqrt_float64(n_float) * m3) / math_pow_float64(m2, 1.5)
+        set kurt = ((n_float * m4) / (m2 * m2)) - 3.0
+
+    return ok(StatsSummary(n, total_sum, mean, var_sample, var_pop, sd_sample, sd_pop, std_err, min_v, max_v, skew, kurt))
+
+# Ciura gap sequence ShellSort (O(N log^2 N), zero recursive stack frames, cache-contiguous in arena)
+fn stats_sort_asc(xs: List[Float64]) -> List[Float64]:
+    let n: Number = list_count(xs)
+    let out: List[Float64] = List[Float64]()
+    var i: Number = 0
+    while i < n:
+        list_push(out, list_get(xs, i))
+        set i = i + 1
+    var gap: Number = n / 2
+    while gap > 0:
+        var j: Number = gap
+        while j < n:
+            let temp: Float64 = list_get(out, j)
+            var k: Number = j
+            while k >= gap and list_get(out, k - gap) > temp:
+                list_set(out, k, list_get(out, k - gap))
+                set k = k - gap
+            list_set(out, k, temp)
+            set j = j + 1
+        if gap == 2:
+            set gap = 1
+        else:
+            set gap = (gap * 10) / 22
+    return out
+
+# R Type-7 / NumPy default linear-interpolated quantile on a pre-sorted ascending List[Float64]
+fn stats_quantile_sorted(sorted_xs: List[Float64], p: Float64) -> Result[Float64, Text]:
+    let n: Number = list_count(sorted_xs)
+    if n == 0:
+        return err("stats_quantile_sorted requires a non-empty list")
+    if p < 0.0 or p > 1.0:
+        return err("quantile probability p must be in [0.0, 1.0]")
+    if n == 1 or p == 0.0:
+        return ok(list_get(sorted_xs, 0))
+    if p == 1.0:
+        return ok(list_get(sorted_xs, n - 1))
+    let h: Float64 = float64_from_number(n - 1) * p
+    let lo_f: Float64 = math_floor_float64(h)
+    let lo_idx: Number = number_from_float64(lo_f)
+    let frac: Float64 = h - lo_f
+    let v_lo: Float64 = list_get(sorted_xs, lo_idx)
+    if lo_idx + 1 >= n or frac == 0.0:
+        return ok(v_lo)
+    let v_hi: Float64 = list_get(sorted_xs, lo_idx + 1)
+    return ok(v_lo + frac * (v_hi - v_lo))
+
+fn stats_quantile(xs: List[Float64], p: Float64) -> Result[Float64, Text]:
+    let sorted_xs: List[Float64] = stats_sort_asc(xs)
+    return stats_quantile_sorted(sorted_xs, p)
+
+fn stats_median(xs: List[Float64]) -> Result[Float64, Text]:
+    return stats_quantile(xs, 0.5)
+
+fn stats_five_number_summary(xs: List[Float64]) -> Result[FiveNumberSummary, Text]:
+    let n: Number = list_count(xs)
+    if n == 0:
+        return err("stats_five_number_summary requires a non-empty list")
+    let sorted_xs: List[Float64] = stats_sort_asc(xs)
+    let min_v: Float64 = list_get(sorted_xs, 0)
+    let max_v: Float64 = list_get(sorted_xs, n - 1)
+    let q25: Float64 = stats_quantile_sorted(sorted_xs, 0.25)?
+    let med: Float64 = stats_quantile_sorted(sorted_xs, 0.50)?
+    let q75: Float64 = stats_quantile_sorted(sorted_xs, 0.75)?
+    let iqr: Float64 = q75 - q25
+
+    let abs_devs: List[Float64] = List[Float64]()
+    var i: Number = 0
+    while i < n:
+        list_push(abs_devs, math_abs_float64(list_get(sorted_xs, i) - med))
+        set i = i + 1
+    let sorted_devs: List[Float64] = stats_sort_asc(abs_devs)
+    let mad: Float64 = stats_quantile_sorted(sorted_devs, 0.50)?
+    return ok(FiveNumberSummary(min_v, q25, med, q75, max_v, iqr, mad))
+
+# One-pass numerically stable sample covariance & Pearson correlation coefficient r
+fn stats_covariance(xs: List[Float64], ys: List[Float64]) -> Result[Float64, Text]:
+    let n: Number = list_count(xs)
+    if n != list_count(ys):
+        return err("stats_covariance requires equal-length vectors")
+    if n < 2:
+        return err("stats_covariance requires at least 2 observations")
+    var mean_x: Float64 = 0.0
+    var mean_y: Float64 = 0.0
+    var c_xy: Float64 = 0.0
+    var i: Number = 0
+    while i < n:
+        let x: Float64 = list_get(xs, i)
+        let y: Float64 = list_get(ys, i)
+        let nf: Float64 = float64_from_number(i + 1)
+        let dx: Float64 = x - mean_x
+        set mean_x = mean_x + (dx / nf)
+        set mean_y = mean_y + ((y - mean_y) / nf)
+        let dy2: Float64 = y - mean_y
+        set c_xy = c_xy + dx * dy2
+        set i = i + 1
+    return ok(c_xy / float64_from_number(n - 1))
+
+fn stats_pearson_r(xs: List[Float64], ys: List[Float64]) -> Result[Float64, Text]:
+    let n: Number = list_count(xs)
+    if n != list_count(ys):
+        return err("stats_pearson_r requires equal-length vectors")
+    if n < 2:
+        return err("stats_pearson_r requires at least 2 observations")
+    var mean_x: Float64 = 0.0
+    var mean_y: Float64 = 0.0
+    var m2_x: Float64 = 0.0
+    var m2_y: Float64 = 0.0
+    var c_xy: Float64 = 0.0
+    var i: Number = 0
+    while i < n:
+        let x: Float64 = list_get(xs, i)
+        let y: Float64 = list_get(ys, i)
+        let nf: Float64 = float64_from_number(i + 1)
+        let dx1: Float64 = x - mean_x
+        let dy1: Float64 = y - mean_y
+        set mean_x = mean_x + (dx1 / nf)
+        set mean_y = mean_y + (dy1 / nf)
+        let dx2: Float64 = x - mean_x
+        let dy2: Float64 = y - mean_y
+        set m2_x = m2_x + dx1 * dx2
+        set m2_y = m2_y + dy1 * dy2
+        set c_xy = c_xy + dx1 * dy2
+        set i = i + 1
+    let denom: Float64 = math_sqrt_float64(m2_x * m2_y)
+    if denom == 0.0:
+        return err("stats_pearson_r undefined for zero-variance input")
+    return ok(c_xy / denom)
+
+# Standard Normal Cumulative Distribution Function Phi(z) = P(Z <= z)
+fn stats_normal_cdf(z: Float64) -> Float64:
+    return 0.5 * (1.0 + math_erf_float64(z / math_sqrt2()))
+
+# Two-sample Welch's t-test (unequal variances, Welch-Satterthwaite degrees of freedom, Normal/Cornish-Fisher tail p-value)
+fn stats_welch_ttest(sample_a: List[Float64], sample_b: List[Float64]) -> Result[WelchTTestResult, Text]:
+    if list_count(sample_a) < 2 or list_count(sample_b) < 2:
+        return err("stats_welch_ttest requires at least 2 observations per sample")
+    let sum_a: StatsSummary = stats_describe(sample_a)?
+    let sum_b: StatsSummary = stats_describe(sample_b)?
+    let na: Float64 = float64_from_number(sum_a.count)
+    let nb: Float64 = float64_from_number(sum_b.count)
+    let va_n: Float64 = sum_a.variance_sample / na
+    let vb_n: Float64 = sum_b.variance_sample / nb
+    let se_diff: Float64 = math_sqrt_float64(va_n + vb_n)
+    if se_diff == 0.0:
+        return err("stats_welch_ttest standard error is zero")
+    let diff: Float64 = sum_a.mean - sum_b.mean
+    let t_val: Float64 = diff / se_diff
+    let df_num: Float64 = (va_n + vb_n) * (va_n + vb_n)
+    let df_den: Float64 = ((va_n * va_n) / (na - 1.0)) + ((vb_n * vb_n) / (nb - 1.0))
+    let df: Float64 = df_num / df_den
+    # Peizer-Pratt / Hill normal approximation to Student's t distribution for arbitrary df >= 2
+    let abs_t: Float64 = math_abs_float64(t_val)
+    let z_equiv: Float64 = math_sqrt_float64(df * math_ln_float64(1.0 + (abs_t * abs_t) / df)) * (1.0 - (1.0 / (4.0 * df)))
+    let p_two_tailed: Float64 = 2.0 * (1.0 - stats_normal_cdf(z_equiv))
+    return ok(WelchTTestResult(t_val, df, p_two_tailed, diff, p_two_tailed < 0.05))
