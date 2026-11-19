@@ -1,7 +1,8 @@
 # RFC 0009: YAZA Fullstack Monolith Architecture (Arena-SSR MVC + Hypermedia Fragments)
 
-- **Status:** Proposed — Active Design Branch (`feat/fullstack-mvc-monolith`)
-- **Target CLI:** `yaza new --fullstack <name>` (and planned alias `yaza new --mvc <name>`)
+- **Status:** Implemented on `feat/fullstack-mvc-monolith` (Phases 1–4 Verified)
+- **Target CLI:** `yaza new --fullstack <name>` / `yaza new --mvc <name>`
+- **Validation & Benchmarks:** `scripts/validate-std-web.sh`, `scripts/validate-fullstack-mvc.sh`, `docs/benchmarks/fullstack-ssr-2026-11-19.md`
 - **Depends On:** `std/http.yz`, `std/html.yz`, `std/fsroot.yz`, `std/url.yz`, `std/jwt.yz`, `std/crypto/hash.yz`, `std/crypto/password.yz`, `std/config/api_config.yz`, `std/db/yazabase.yz` (and `postgres` / `mysql` / `mssql`)
 - **Related Proposals:** `yaza-data-media-web-modules.md` (`std.web`), `yaza-ui-design-system.md` (YAZA UI / "YAZA Current")
 
