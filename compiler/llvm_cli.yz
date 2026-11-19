@@ -437,7 +437,7 @@ fn template_choice(value: Text) -> Text:
     if value == "--minimal-api" or value == "minimal-api": return "minimal-api"
     if value == "--microservice" or value == "microservice": return "microservice"
     if value == "--web" or value == "web": return "web"
-    if value == "--fullstack" or value == "fullstack": return "fullstack"
+    if value == "--fullstack" or value == "fullstack" or value == "--mvc" or value == "mvc": return "fullstack"
     if value == "--mobile" or value == "mobile": return "mobile"
     return ""
 
@@ -518,7 +518,7 @@ fn new_from_arguments() -> Number:
             set project_name = arg(2)
             set template_name = template_choice(arg(3))
     if template_name == "":
-        fail("Usage: yaza new --api <name> | --minimal-api <name> | --microservice <name> | --web <name> | --fullstack <name> | --mobile <name>")
+        fail("Usage: yaza new --api <name> | --minimal-api <name> | --microservice <name> | --fullstack <name> | --mvc <name> | --web <name> | --mobile <name>")
     return create_project(project_name, template_name)
 
 fn is_test_source(path: Text) -> Boolean:
@@ -698,6 +698,10 @@ fn audit_scan_path(path: Text, findings: TextList, counters: TextList, depth: Nu
                         audit_add_finding(findings, "YZA-SEC-003", "high", "medium", path, number_text(line_number), "TLS verification appears disabled.")
                     if text_ends_with(path, ".yz") and text_find(line, "pg_query" + "(") >= 0 and text_find(line, "+") >= 0:
                         audit_add_finding(findings, "YZA-SEC-004", "medium", "low", path, number_text(line_number), "Raw pg_query execution shares this line with string concatenation; verify request-derived values use bound parameters.")
+                    if text_ends_with(path, ".yz") and (text_find(line, "unsafe-" + "inline") >= 0 or text_find(line, "unsafe-" + "eval") >= 0):
+                        audit_add_finding(findings, "YZA-SEC-005", "high", "high", path, number_text(line_number), "Weak Content-Security-Policy directive (unsafe-inline / unsafe-eval) detected.")
+                    if text_ends_with(path, ".yz") and text_find(path, "/views/") >= 0 and text_find(line, "java" + "script:") >= 0:
+                        audit_add_finding(findings, "YZA-SEC-006", "high", "high", path, number_text(line_number), "Raw javascript: URI detected inside a view module; use view_safe_href() instead.")
                 set line_index = line_index + 1
     return 0
 
@@ -793,6 +797,65 @@ fn architecture_layer_for_path(path: Text, source_root: Text, layers: TextList) 
         fail("yaza arch: source layer '" + layer + "' is missing from [architecture].layers")
     return layer
 
+fn arch_extract_use_target(clean_line: Text) -> Text:
+    if not text_starts_with(clean_line, "use \""):
+        return ""
+    let rest: Text = text_slice(clean_line, 5, text_length(clean_line) - 5)
+    let quote_end: Number = text_find(rest, "\"")
+    if quote_end <= 0:
+        return ""
+    return text_slice(rest, 0, quote_end)
+
+fn arch_check_forbidden_import(layer: Text, target: Text) -> Text:
+    if layer == "views":
+        if text_starts_with(target, "std/db/") or text_find(target, "repositories") >= 0 or text_find(target, "_repository") >= 0:
+            return "views layer must not import database or repository modules directly"
+        if text_find(target, "controllers/") >= 0 or target == "controllers":
+            return "views layer must not import controllers"
+    if layer == "models":
+        if text_find(target, "views/") >= 0 or text_find(target, "controllers/") >= 0 or text_starts_with(target, "std/web/"):
+            return "models layer must not depend on views, controllers, or std/web"
+    if layer == "services":
+        if text_find(target, "views/") >= 0 or text_find(target, "controllers/") >= 0 or text_starts_with(target, "std/web/"):
+            return "services layer must remain UI/HTTP-agnostic (cannot import views, controllers, or std/web)"
+    return ""
+
+fn arch_layer_for_rel(path: Text, source_root: Text) -> Text:
+    let prefix: Text = source_root + "/"
+    if not text_starts_with(path, prefix):
+        return "root"
+    let rel: Text = text_slice(path, text_length(prefix), text_length(path) - text_length(prefix))
+    let slash: Number = text_find(rel, "/")
+    if slash < 0:
+        return "root"
+    return text_slice(rel, 0, slash)
+
+fn arch_scan_source_path(path: Text, source_root: Text, violations: TextList, counters: TextList, depth: Number) -> Number:
+    if depth > 16:
+        return 0
+    if is_directory(path):
+        let entries: TextList = yaza_fs_list_directory(path)
+        var i: Number = 0
+        while i < list_count(entries):
+            let entry: Text = list_get(entries, i)
+            if entry != ".git" and entry != "build" and entry != "dist":
+                arch_scan_source_path(path_join(path, entry), source_root, violations, counters, depth + 1)
+            set i = i + 1
+    elif text_ends_with(path, ".yz"):
+        list_set(counters, 0, number_text(number_parse(list_get(counters, 0)) + 1))
+        let layer: Text = arch_layer_for_rel(path, source_root)
+        let lines: TextList = text_lines(file_read(path))
+        var li: Number = 0
+        while li < list_count(lines):
+            let clean: Text = text_trim(list_get(lines, li))
+            let target: Text = arch_extract_use_target(clean)
+            if text_length(target) > 0:
+                let reason: Text = arch_check_forbidden_import(layer, target)
+                if text_length(reason) > 0:
+                    list_push(violations, path + ":" + number_text(li + 1) + ": [layer=" + layer + "] forbidden import '" + target + "' (" + reason + ")")
+            set li = li + 1
+    return 0
+
 fn architecture_from_arguments() -> Number:
     if arg_count() < 2 or arg_count() > 3 or arg(2) != "check":
         fail("Usage: yaza arch check [project]")
@@ -812,8 +875,20 @@ fn architecture_from_arguments() -> Number:
         set manifest_index = manifest_index + 1
     if not architecture_configured:
         fail("yaza arch: yaza.toml has no [architecture] policy")
+    let violations: TextList = text_list()
+    let counters: TextList = text_list()
+    list_push(counters, "0")
+    arch_scan_source_path(source_root, source_root, violations, counters, 0)
     say "YAZA architecture check"
     say "  Source root     : " + source_root
+    say "  Files scanned   : " + list_get(counters, 0)
+    if list_count(violations) > 0:
+        var vi: Number = 0
+        while vi < list_count(violations):
+            say "  VIOLATION       : " + list_get(violations, vi)
+            set vi = vi + 1
+        say "  Result          : " + number_text(list_count(violations)) + " forbidden module dependency violation(s) found"
+        return 1
     say "  Result          : no forbidden module dependencies found"
     return 0
 
@@ -1618,7 +1693,7 @@ fn print_yaza_llvm_help() -> Number:
     say "  new --minimal-api <name> Create minimal API starter in src/main.yz"
     say "  new --microservice <name> Create cloud-native microservice starter"
     say "  new --web <name>         Create web starter"
-    say "  new --fullstack <name>   Create full-stack starter"
+    say "  new --fullstack <name>   Create full-stack Arena-SSR MVC monolith (alias: --mvc)"
     say "  new --mobile <name>      Create mobile starter layout"
     say ""
     say "DEVELOPMENT"
