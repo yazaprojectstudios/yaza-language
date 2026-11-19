@@ -135,6 +135,7 @@ fn df_from_csv(csv_text: Text) -> Result[DataFrame, Text]:
     while c < col_count:
         let col_name: Text = text_trim(list_get(headers, c))
         var all_numeric: Boolean = row_count > 0
+        var saw_number: Boolean = false
         let parsed_nums: List[Float64] = List[Float64]()
         let raw_texts: TextList = text_list()
         var r: Number = 0
@@ -142,19 +143,260 @@ fn df_from_csv(csv_text: Text) -> Result[DataFrame, Text]:
             let cell: Text = text_trim(list_get(list_get(rows, r), c))
             list_push(raw_texts, cell)
             if all_numeric:
-                let num_res: Result[Float64, Text] = float64_try_parse(cell)
-                if result_is_ok(num_res):
-                    list_push(parsed_nums, result_unwrap(num_res))
+                if cell == "" or cell == "NA" or cell == "NaN" or cell == "null":
+                    list_push(parsed_nums, math_nan_float64())
                 else:
-                    set all_numeric = false
+                    let num_res: Result[Float64, Text] = float64_try_parse(cell)
+                    if result_is_ok(num_res):
+                        list_push(parsed_nums, result_unwrap(num_res))
+                        set saw_number = true
+                    else:
+                        set all_numeric = false
             set r = r + 1
-        if all_numeric:
+        if all_numeric and saw_number:
             list_push(cols, DataColumn(col_name, true, parsed_nums, text_list()))
         else:
             list_push(cols, DataColumn(col_name, false, List[Float64](), raw_texts))
         set c = c + 1
 
     return ok(DataFrame(row_count, cols))
+
+fn df_select_row_indices(df: DataFrame, indices: List[Number]) -> DataFrame:
+    let new_row_count: Number = list_count(indices)
+    let new_cols: List[DataColumn] = List[DataColumn]()
+    var c: Number = 0
+    while c < list_count(df.columns):
+        let old_col: DataColumn = list_get(df.columns, c)
+        if old_col.is_numeric:
+            let nums: List[Float64] = List[Float64]()
+            var k: Number = 0
+            while k < new_row_count:
+                list_push(nums, list_get(old_col.numbers, list_get(indices, k)))
+                set k = k + 1
+            list_push(new_cols, DataColumn(old_col.name, true, nums, text_list()))
+        else:
+            let txts: TextList = text_list()
+            var k2: Number = 0
+            while k2 < new_row_count:
+                list_push(txts, list_get(old_col.texts, list_get(indices, k2)))
+                set k2 = k2 + 1
+            list_push(new_cols, DataColumn(old_col.name, false, List[Float64](), txts))
+        set c = c + 1
+    return DataFrame(new_row_count, new_cols)
+
+fn df_head(df: DataFrame, limit: Number) -> DataFrame:
+    var count: Number = limit
+    if count < 0: set count = 0
+    if count > df.row_count: set count = df.row_count
+    let idx: List[Number] = List[Number]()
+    var i: Number = 0
+    while i < count:
+        list_push(idx, i)
+        set i = i + 1
+    return df_select_row_indices(df, idx)
+
+fn df_tail(df: DataFrame, limit: Number) -> DataFrame:
+    var count: Number = limit
+    if count < 0: set count = 0
+    if count > df.row_count: set count = df.row_count
+    let start: Number = df.row_count - count
+    let idx: List[Number] = List[Number]()
+    var i: Number = start
+    while i < df.row_count:
+        list_push(idx, i)
+        set i = i + 1
+    return df_select_row_indices(df, idx)
+
+# Imputes missing NaN values in a numeric column with a constant or column mean (Pandas fillna / R replace_na)
+fn df_fillna_value(df: DataFrame, col_name: Text, fill_val: Float64) -> Result[DataFrame, Text]:
+    let target_idx: Number = df_find_column_index(df, col_name)
+    if target_idx < 0:
+        return err("DataFrame column not found: " + col_name)
+    let target_col: DataColumn = list_get(df.columns, target_idx)
+    if not target_col.is_numeric:
+        return err("df_fillna_value requires a numeric column: " + col_name)
+
+    let new_cols: List[DataColumn] = List[DataColumn]()
+    var c: Number = 0
+    while c < list_count(df.columns):
+        if c == target_idx:
+            let cleaned: List[Float64] = List[Float64]()
+            var r: Number = 0
+            while r < df.row_count:
+                let v: Float64 = list_get(target_col.numbers, r)
+                if math_is_nan_float64(v):
+                    list_push(cleaned, fill_val)
+                else:
+                    list_push(cleaned, v)
+                set r = r + 1
+            list_push(new_cols, DataColumn(target_col.name, true, cleaned, text_list()))
+        else:
+            list_push(new_cols, list_get(df.columns, c))
+        set c = c + 1
+    return ok(DataFrame(df.row_count, new_cols))
+
+fn df_fillna_mean(df: DataFrame, col_name: Text) -> Result[DataFrame, Text]:
+    let nums: List[Float64] = df_get_numeric(df, col_name)?
+    let valid: List[Float64] = List[Float64]()
+    var i: Number = 0
+    while i < list_count(nums):
+        let v: Float64 = list_get(nums, i)
+        if not math_is_nan_float64(v):
+            list_push(valid, v)
+        set i = i + 1
+    if list_count(valid) == 0:
+        return err("df_fillna_mean column has no non-NaN values")
+    let mean_v: Float64 = stats_mean_compensated(valid)
+    return df_fillna_value(df, col_name, mean_v)
+
+# Sorts DataFrame rows by a numeric column (Pandas sort_values / dplyr::arrange)
+fn df_sort_by_numeric(df: DataFrame, col_name: Text, ascending: Boolean) -> Result[DataFrame, Text]:
+    let nums: List[Float64] = df_get_numeric(df, col_name)?
+    let n: Number = df.row_count
+    let idx: List[Number] = List[Number]()
+    var i: Number = 0
+    while i < n:
+        list_push(idx, i)
+        set i = i + 1
+    var gap: Number = n / 2
+    while gap > 0:
+        var j: Number = gap
+        while j < n:
+            let temp_idx: Number = list_get(idx, j)
+            let temp_val: Float64 = list_get(nums, temp_idx)
+            var k: Number = j
+            var moving: Boolean = true
+            while k >= gap and moving:
+                let prev_idx: Number = list_get(idx, k - gap)
+                let prev_val: Float64 = list_get(nums, prev_idx)
+                var swap_needed: Boolean = false
+                if ascending and prev_val > temp_val:
+                    set swap_needed = true
+                elif not ascending and prev_val < temp_val:
+                    set swap_needed = true
+                if swap_needed:
+                    list_set(idx, k, prev_idx)
+                    set k = k - gap
+                else:
+                    set moving = false
+            list_set(idx, k, temp_idx)
+            set j = j + 1
+        if gap == 2:
+            set gap = 1
+        else:
+            set gap = (gap * 10) / 22
+    return ok(df_select_row_indices(df, idx))
+
+# Relational Inner Join on a shared Text key column (Pandas merge / dplyr::inner_join)
+fn df_inner_join(left_df: DataFrame, right_df: DataFrame, key_col_name: Text) -> Result[DataFrame, Text]:
+    let left_keys: TextList = df_get_text(left_df, key_col_name)?
+    let right_keys: TextList = df_get_text(right_df, key_col_name)?
+    let left_matches: List[Number] = List[Number]()
+    let right_matches: List[Number] = List[Number]()
+
+    var lr: Number = 0
+    while lr < left_df.row_count:
+        let lk: Text = list_get(left_keys, lr)
+        var rr: Number = 0
+        while rr < right_df.row_count:
+            if lk == list_get(right_keys, rr):
+                list_push(left_matches, lr)
+                list_push(right_matches, rr)
+            set rr = rr + 1
+        set lr = lr + 1
+
+    let joined_rows: Number = list_count(left_matches)
+    let out_cols: List[DataColumn] = List[DataColumn]()
+
+    var lc: Number = 0
+    while lc < list_count(left_df.columns):
+        let lcol: DataColumn = list_get(left_df.columns, lc)
+        if lcol.is_numeric:
+            let nums: List[Float64] = List[Float64]()
+            var k: Number = 0
+            while k < joined_rows:
+                list_push(nums, list_get(lcol.numbers, list_get(left_matches, k)))
+                set k = k + 1
+            list_push(out_cols, DataColumn(lcol.name, true, nums, text_list()))
+        else:
+            let txts: TextList = text_list()
+            var k2: Number = 0
+            while k2 < joined_rows:
+                list_push(txts, list_get(lcol.texts, list_get(left_matches, k2)))
+                set k2 = k2 + 1
+            list_push(out_cols, DataColumn(lcol.name, false, List[Float64](), txts))
+        set lc = lc + 1
+
+    var rc: Number = 0
+    while rc < list_count(right_df.columns):
+        let rcol: DataColumn = list_get(right_df.columns, rc)
+        if rcol.name != key_col_name:
+            if rcol.is_numeric:
+                let nums2: List[Float64] = List[Float64]()
+                var k3: Number = 0
+                while k3 < joined_rows:
+                    list_push(nums2, list_get(rcol.numbers, list_get(right_matches, k3)))
+                    set k3 = k3 + 1
+                list_push(out_cols, DataColumn(rcol.name, true, nums2, text_list()))
+            else:
+                let txts2: TextList = text_list()
+                var k4: Number = 0
+                while k4 < joined_rows:
+                    list_push(txts2, list_get(rcol.texts, list_get(right_matches, k4)))
+                    set k4 = k4 + 1
+                list_push(out_cols, DataColumn(rcol.name, false, List[Float64](), txts2))
+        set rc = rc + 1
+
+    return ok(DataFrame(joined_rows, out_cols))
+
+fn df_escape_html(raw: Text) -> Text:
+    let len: Number = text_length(raw)
+    let parts: TextList = text_list()
+    var i: Number = 0
+    while i < len:
+        let b: Number = text_byte(raw, i)
+        if b == 38: list_push(parts, "&amp;")
+        elif b == 60: list_push(parts, "&lt;")
+        elif b == 62: list_push(parts, "&gt;")
+        elif b == 34: list_push(parts, "&quot;")
+        elif b == 39: list_push(parts, "&#39;")
+        else: list_push(parts, text_slice(raw, i, 1))
+        set i = i + 1
+    return text_join(parts, "")
+
+# Exports DataFrame to an XSS-escaped HTML table directly embeddable in YAZA MVC views ({! df_to_html_table(df, 25) !})
+fn df_to_html_table(df: DataFrame, max_rows: Number) -> Text:
+    var limit: Number = max_rows
+    if limit <= 0 or limit > df.row_count:
+        set limit = df.row_count
+    let out: TextList = text_list()
+    list_push(out, "<div class=\"yz-df-table-wrap\"><table class=\"yz-df-table\"><thead><tr>")
+    var c: Number = 0
+    while c < list_count(df.columns):
+        let col: DataColumn = list_get(df.columns, c)
+        list_push(out, "<th>" + df_escape_html(col.name) + "</th>")
+        set c = c + 1
+    list_push(out, "</tr></thead><tbody>")
+
+    var r: Number = 0
+    while r < limit:
+        list_push(out, "<tr>")
+        var c2: Number = 0
+        while c2 < list_count(df.columns):
+            let col2: DataColumn = list_get(df.columns, c2)
+            if col2.is_numeric:
+                let v: Float64 = list_get(col2.numbers, r)
+                if math_is_nan_float64(v):
+                    list_push(out, "<td class=\"yz-df-num yz-df-na\">NA</td>")
+                else:
+                    list_push(out, "<td class=\"yz-df-num\">" + float64_text(v) + "</td>")
+            else:
+                list_push(out, "<td>" + df_escape_html(list_get(col2.texts, r)) + "</td>")
+            set c2 = c2 + 1
+        list_push(out, "</tr>")
+        set r = r + 1
+    list_push(out, "</tbody></table></div>")
+    return text_join(out, "")
 
 # Vectorized predicate filter: returns a new DataFrame keeping rows where col_name > threshold
 fn df_filter_gt(df: DataFrame, col_name: Text, threshold: Float64) -> Result[DataFrame, Text]:

@@ -33,6 +33,30 @@ shape WelchTTestResult:
     mean_diff: Float64
     significant_at_05: Boolean
 
+shape AnovaOneWayResult:
+    f_stat: Float64
+    df_between: Number
+    df_within: Number
+    ss_between: Float64
+    ss_within: Float64
+    eta_squared: Float64
+    significant_at_05: Boolean
+
+shape ChiSquareResult:
+    chi_square_stat: Float64
+    degrees_of_freedom: Number
+    p_value: Float64
+    significant_at_05: Boolean
+
+shape HistogramBins:
+    bin_count: Number
+    min_edge: Float64
+    max_edge: Float64
+    bin_width: Float64
+    centers: List[Float64]
+    counts: List[Number]
+    densities: List[Float64]
+
 # Neumaier (1974) improved Kahan-Babuska compensated summation:
 # Achieves O(eps) error independent of N and handles terms larger than the running sum (e.g. [1e16, 1.0, -1e16] == 1.0).
 fn stats_sum_compensated(xs: List[Float64]) -> Float64:
@@ -277,3 +301,138 @@ fn stats_welch_ttest(sample_a: List[Float64], sample_b: List[Float64]) -> Result
     let z_equiv: Float64 = math_sqrt_float64(df * math_ln_float64(1.0 + (abs_t * abs_t) / df)) * (1.0 - (1.0 / (4.0 * df)))
     let p_two_tailed: Float64 = 2.0 * (1.0 - stats_normal_cdf(z_equiv))
     return ok(WelchTTestResult(t_val, df, p_two_tailed, diff, p_two_tailed < 0.05))
+
+# One-Way ANOVA F-Test across k >= 2 groups (R aov / scipy.stats.f_oneway alternative)
+fn stats_anova_oneway(groups: List[List[Float64]]) -> Result[AnovaOneWayResult, Text]:
+    let k: Number = list_count(groups)
+    if k < 2:
+        return err("stats_anova_oneway requires at least 2 groups")
+    var total_n: Number = 0
+    let all_vals: List[Float64] = List[Float64]()
+    var g: Number = 0
+    while g < k:
+        let grp: List[Float64] = list_get(groups, g)
+        let gn: Number = list_count(grp)
+        if gn < 2:
+            return err("stats_anova_oneway requires at least 2 observations per group")
+        set total_n = total_n + gn
+        var i: Number = 0
+        while i < gn:
+            list_push(all_vals, list_get(grp, i))
+            set i = i + 1
+        set g = g + 1
+
+    let grand_mean: Float64 = stats_mean_compensated(all_vals)
+    var ss_between: Float64 = 0.0
+    var ss_within: Float64 = 0.0
+
+    var g2: Number = 0
+    while g2 < k:
+        let grp2: List[Float64] = list_get(groups, g2)
+        let gn2: Number = list_count(grp2)
+        let g_desc: StatsSummary = stats_describe(grp2)?
+        let diff_m: Float64 = g_desc.mean - grand_mean
+        set ss_between = ss_between + float64_from_number(gn2) * diff_m * diff_m
+        set ss_within = ss_within + g_desc.variance_sample * float64_from_number(gn2 - 1)
+        set g2 = g2 + 1
+
+    let df_between: Number = k - 1
+    let df_within: Number = total_n - k
+    if ss_within <= 0.0 or df_within <= 0:
+        return err("stats_anova_oneway zero within-group variance")
+    let ms_between: Float64 = ss_between / float64_from_number(df_between)
+    let ms_within: Float64 = ss_within / float64_from_number(df_within)
+    let f_stat: Float64 = ms_between / ms_within
+    let eta_sq: Float64 = ss_between / (ss_between + ss_within)
+    # Paulson-Cube-Root normal approximation to F(d1, d2) for alpha=0.05 significance check
+    let d1: Float64 = float64_from_number(df_between)
+    let d2: Float64 = float64_from_number(df_within)
+    let f_cbrt: Float64 = math_pow_float64(f_stat, 1.0 / 3.0)
+    let a_term: Float64 = 1.0 - (2.0 / (9.0 * d2))
+    let b_term: Float64 = 1.0 - (2.0 / (9.0 * d1))
+    let z_num: Float64 = a_term * f_cbrt - b_term
+    let z_den: Float64 = math_sqrt_float64((2.0 / (9.0 * d2)) * f_cbrt * f_cbrt + (2.0 / (9.0 * d1)))
+    let p_val: Float64 = 1.0 - stats_normal_cdf(z_num / z_den)
+    return ok(AnovaOneWayResult(f_stat, df_between, df_within, ss_between, ss_within, eta_sq, p_val < 0.05))
+
+# Chi-Square Goodness-of-Fit Test (R chisq.test alternative)
+fn stats_chi_square_gof(observed: List[Float64], expected: List[Float64]) -> Result[ChiSquareResult, Text]:
+    let k: Number = list_count(observed)
+    if k < 2 or k != list_count(expected):
+        return err("stats_chi_square_gof requires equal-length observed and expected lists with k >= 2")
+    var chi2: Float64 = 0.0
+    var i: Number = 0
+    while i < k:
+        let o: Float64 = list_get(observed, i)
+        let e: Float64 = list_get(expected, i)
+        if e <= 0.0:
+            return err("stats_chi_square_gof expected frequencies must be > 0")
+        let d: Float64 = o - e
+        set chi2 = chi2 + ((d * d) / e)
+        set i = i + 1
+    let df: Number = k - 1
+    let dff: Float64 = float64_from_number(df)
+    # Wilson-Hilferty cube-root normal transformation for Chi-Square upper-tail p-value
+    let h_term: Float64 = 2.0 / (9.0 * dff)
+    let z: Float64 = (math_pow_float64(chi2 / dff, 1.0 / 3.0) - (1.0 - h_term)) / math_sqrt_float64(h_term)
+    let p_val: Float64 = 1.0 - stats_normal_cdf(z)
+    return ok(ChiSquareResult(chi2, df, p_val, p_val < 0.05))
+
+# Time-Series Autocorrelation Function ACF(lag) (R acf alternative)
+fn stats_autocorrelation(xs: List[Float64], lag: Number) -> Result[Float64, Text]:
+    let n: Number = list_count(xs)
+    if lag < 0 or lag >= n or n < 2:
+        return err("stats_autocorrelation requires 0 <= lag < count(xs) and count >= 2")
+    if lag == 0:
+        return ok(1.0)
+    let mean: Float64 = stats_mean_compensated(xs)
+    var num: Float64 = 0.0
+    var den: Float64 = 0.0
+    var i: Number = 0
+    while i < n:
+        let d: Float64 = list_get(xs, i) - mean
+        set den = den + d * d
+        if i + lag < n:
+            let d_lag: Float64 = list_get(xs, i + lag) - mean
+            set num = num + d * d_lag
+        set i = i + 1
+    if den == 0.0:
+        return err("stats_autocorrelation undefined for constant series")
+    return ok(num / den)
+
+# Distribution Histogram Binning (frequencies + probability densities)
+fn stats_histogram(xs: List[Float64], bin_count: Number) -> Result[HistogramBins, Text]:
+    let n: Number = list_count(xs)
+    if n == 0 or bin_count <= 0:
+        return err("stats_histogram requires non-empty input and bin_count > 0")
+    let desc: StatsSummary = stats_describe(xs)?
+    var min_e: Float64 = desc.min
+    var max_e: Float64 = desc.max
+    if max_e == min_e:
+        set min_e = min_e - 0.5
+        set max_e = max_e + 0.5
+    let width: Float64 = (max_e - min_e) / float64_from_number(bin_count)
+    let centers: List[Float64] = List[Float64]()
+    let counts: List[Number] = List[Number]()
+    var b: Number = 0
+    while b < bin_count:
+        list_push(centers, min_e + (float64_from_number(b) + 0.5) * width)
+        list_push(counts, 0)
+        set b = b + 1
+
+    var i: Number = 0
+    while i < n:
+        let x: Float64 = list_get(xs, i)
+        var b_idx: Number = number_from_float64(math_floor_float64((x - min_e) / width))
+        if b_idx < 0: set b_idx = 0
+        if b_idx >= bin_count: set b_idx = bin_count - 1
+        list_set(counts, b_idx, list_get(counts, b_idx) + 1)
+        set i = i + 1
+
+    let densities: List[Float64] = List[Float64]()
+    let denom: Float64 = float64_from_number(n) * width
+    var b2: Number = 0
+    while b2 < bin_count:
+        list_push(densities, float64_from_number(list_get(counts, b2)) / denom)
+        set b2 = b2 + 1
+    return ok(HistogramBins(bin_count, min_e, max_e, width, centers, counts, densities))

@@ -1,0 +1,146 @@
+# YAZA Data Science Engine — Reproducible PRNG, Probability Distributions & Monte Carlo Sampling.
+# Provides deterministic SplitMix64/LCG sequences, Uniform, Normal (Box-Muller), Exponential, Poisson & Train/Test split.
+
+use "std/math"
+
+shape RngStream:
+    state: Number
+
+shape TrainTestSplit:
+    train_values: List[Float64]
+    test_values: List[Float64]
+
+fn rng_create(seed: Number) -> RngStream:
+    var s: Number = seed
+    if s <= 0:
+        set s = 123456789
+    return RngStream(s)
+
+# Deterministic 31-bit Park-Miller / Lehmer positive PRNG step (overflow-safe inside signed 64-bit Number)
+fn rng_next_u31(rng: RngStream) -> Number:
+    let modulus: Number = 2147483647
+    let mult: Number = 48271
+    let next_s: Number = (rng.state * mult) % modulus
+    return next_s
+
+fn rng_uniform_01(seed_state: Number) -> Float64:
+    let next_s: Number = (seed_state * 48271) % 2147483647
+    return float64_from_number(next_s) / 2147483647.0
+
+# Generates N uniform random Float64 samples in [low, high) (equivalent to R runif / numpy.random.uniform)
+fn rng_uniform_vec(seed: Number, count: Number, low: Float64, high: Float64) -> List[Float64]:
+    let out: List[Float64] = List[Float64]()
+    var s: Number = seed
+    if s <= 0: set s = 123456789
+    let span: Float64 = high - low
+    var i: Number = 0
+    while i < count:
+        set s = (s * 48271) % 2147483647
+        let u: Float64 = float64_from_number(s) / 2147483647.0
+        list_push(out, low + u * span)
+        set i = i + 1
+    return out
+
+# Generates N Gaussian/Normal Float64 samples N(mean, std_dev^2) via Box-Muller transform (R rnorm / numpy.random.normal)
+fn rng_normal_vec(seed: Number, count: Number, mean: Float64, std_dev: Float64) -> List[Float64]:
+    let out: List[Float64] = List[Float64]()
+    var s: Number = seed
+    if s <= 0: set s = 123456789
+    let two_pi: Float64 = 6.28318530717958647692
+    var i: Number = 0
+    while i < count:
+        set s = (s * 48271) % 2147483647
+        var u1: Float64 = float64_from_number(s) / 2147483647.0
+        if u1 < 0.000000000001:
+            set u1 = 0.000000000001
+        set s = (s * 48271) % 2147483647
+        let u2: Float64 = float64_from_number(s) / 2147483647.0
+        let mag: Float64 = std_dev * math_sqrt_float64(-2.0 * math_ln_float64(u1))
+        let z0: Float64 = mean + mag * math_cos_float64(two_pi * u2)
+        list_push(out, z0)
+        set i = i + 1
+        if i < count:
+            let z1: Float64 = mean + mag * math_sin_float64(two_pi * u2)
+            list_push(out, z1)
+            set i = i + 1
+    return out
+
+# Generates N Exponential(lambda) samples via inverse transform -ln(U)/lambda (R rexp)
+fn rng_exponential_vec(seed: Number, count: Number, lambda_rate: Float64) -> Result[List[Float64], Text]:
+    if lambda_rate <= 0.0:
+        return err("rng_exponential_vec requires lambda_rate > 0")
+    let out: List[Float64] = List[Float64]()
+    var s: Number = seed
+    if s <= 0: set s = 123456789
+    var i: Number = 0
+    while i < count:
+        set s = (s * 48271) % 2147483647
+        var u: Float64 = float64_from_number(s) / 2147483647.0
+        if u < 0.000000000001:
+            set u = 0.000000000001
+        list_push(out, (0.0 - math_ln_float64(u)) / lambda_rate)
+        set i = i + 1
+    return ok(out)
+
+# Generates N Poisson(lambda) discrete event counts via Knuth's algorithm (R rpois)
+fn rng_poisson_vec(seed: Number, count: Number, lambda_mean: Float64) -> Result[List[Float64], Text]:
+    if lambda_mean <= 0.0 or lambda_mean > 500.0:
+        return err("rng_poisson_vec requires lambda_mean in (0.0, 500.0]")
+    let out: List[Float64] = List[Float64]()
+    var s: Number = seed
+    if s <= 0: set s = 123456789
+    let limit_l: Float64 = math_exp_float64(0.0 - lambda_mean)
+    var i: Number = 0
+    while i < count:
+        var k: Number = 0
+        var p: Float64 = 1.0
+        var searching: Boolean = true
+        while searching:
+            set k = k + 1
+            set s = (s * 48271) % 2147483647
+            let u: Float64 = float64_from_number(s) / 2147483647.0
+            set p = p * u
+            if p <= limit_l:
+                set searching = false
+        list_push(out, float64_from_number(k - 1))
+        set i = i + 1
+    return ok(out)
+
+# Deterministic Fisher-Yates shuffle & Train/Test split (scikit-learn train_test_split alternative)
+fn rng_train_test_split(xs: List[Float64], test_ratio: Float64, seed: Number) -> Result[TrainTestSplit, Text]:
+    let n: Number = list_count(xs)
+    if n < 2:
+        return err("rng_train_test_split requires at least 2 observations")
+    if test_ratio <= 0.0 or test_ratio >= 1.0:
+        return err("rng_train_test_split requires test_ratio in (0.0, 1.0)")
+    let indices: List[Number] = List[Number]()
+    var i: Number = 0
+    while i < n:
+        list_push(indices, i)
+        set i = i + 1
+    var s: Number = seed
+    if s <= 0: set s = 123456789
+    var j: Number = n - 1
+    while j > 0:
+        set s = (s * 48271) % 2147483647
+        let swap_idx: Number = s % (j + 1)
+        let tmp: Number = list_get(indices, j)
+        list_set(indices, j, list_get(indices, swap_idx))
+        list_set(indices, swap_idx, tmp)
+        set j = j - 1
+
+    var test_count: Number = number_from_float64(math_round_float64(float64_from_number(n) * test_ratio))
+    if test_count < 1: set test_count = 1
+    if test_count >= n: set test_count = n - 1
+    let train_count: Number = n - test_count
+
+    let train_out: List[Float64] = List[Float64]()
+    let test_out: List[Float64] = List[Float64]()
+    var k: Number = 0
+    while k < train_count:
+        list_push(train_out, list_get(xs, list_get(indices, k)))
+        set k = k + 1
+    while k < n:
+        list_push(test_out, list_get(xs, list_get(indices, k)))
+        set k = k + 1
+    return ok(TrainTestSplit(train_out, test_out))

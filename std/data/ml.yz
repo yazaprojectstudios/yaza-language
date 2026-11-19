@@ -31,6 +31,22 @@ shape KMeans1DResult:
     assignments: List[Number]
     inertia: Float64
 
+shape ClassificationMetrics:
+    true_positives: Number
+    false_positives: Number
+    true_negatives: Number
+    false_negatives: Number
+    accuracy: Float64
+    precision: Float64
+    recall: Float64
+    f1_score: Float64
+
+shape PcaComponentResult:
+    eigenvalue: Float64
+    explained_variance_ratio: Float64
+    eigenvector: List[Float64]
+    projected_scores: List[Float64]
+
 # Numerically stable one-pass Simple Linear Regression (y = intercept + slope * x)
 fn ml_ols_fit(xs: List[Float64], ys: List[Float64]) -> Result[OlsModel, Text]:
     let n: Number = list_count(xs)
@@ -328,3 +344,187 @@ fn ml_kmeans_1d(xs: List[Float64], k: Number, max_iters: Number) -> Result[KMean
         set inertia = inertia + diff * diff
         set fi = fi + 1
     return ok(KMeans1DResult(centroids, assignments, inertia))
+
+# Binary Classification Confusion Matrix, Accuracy, Precision, Recall & F1-Score (scikit-learn classification_report)
+fn ml_binary_metrics(y_true: List[Float64], y_scores: List[Float64], threshold: Float64) -> Result[ClassificationMetrics, Text]:
+    let n: Number = list_count(y_true)
+    if n == 0 or n != list_count(y_scores):
+        return err("ml_binary_metrics requires equal-length non-empty y_true and y_scores")
+    var tp: Number = 0
+    var fp: Number = 0
+    var tn: Number = 0
+    var fn_cnt: Number = 0
+    var i: Number = 0
+    while i < n:
+        let actual_pos: Boolean = list_get(y_true, i) >= 0.5
+        let pred_pos: Boolean = list_get(y_scores, i) >= threshold
+        if actual_pos and pred_pos:
+            set tp = tp + 1
+        elif not actual_pos and pred_pos:
+            set fp = fp + 1
+        elif not actual_pos and not pred_pos:
+            set tn = tn + 1
+        else:
+            set fn_cnt = fn_cnt + 1
+        set i = i + 1
+
+    let acc: Float64 = float64_from_number(tp + tn) / float64_from_number(n)
+    var prec: Float64 = 0.0
+    if tp + fp > 0:
+        set prec = float64_from_number(tp) / float64_from_number(tp + fp)
+    var rec: Float64 = 0.0
+    if tp + fn_cnt > 0:
+        set rec = float64_from_number(tp) / float64_from_number(tp + fn_cnt)
+    var f1: Float64 = 0.0
+    if prec + rec > 0.0:
+        set f1 = (2.0 * prec * rec) / (prec + rec)
+    return ok(ClassificationMetrics(tp, fp, tn, fn_cnt, acc, prec, rec, f1))
+
+# Exact ROC-AUC via Mann-Whitney U / Wilcoxon rank statistic with tie handling (scikit-learn roc_auc_score)
+fn ml_roc_auc(y_true: List[Float64], y_scores: List[Float64]) -> Result[Float64, Text]:
+    let n: Number = list_count(y_true)
+    if n < 2 or n != list_count(y_scores):
+        return err("ml_roc_auc requires equal-length vectors with count >= 2")
+    let pos_scores: List[Float64] = List[Float64]()
+    let neg_scores: List[Float64] = List[Float64]()
+    var i: Number = 0
+    while i < n:
+        if list_get(y_true, i) >= 0.5:
+            list_push(pos_scores, list_get(y_scores, i))
+        else:
+            list_push(neg_scores, list_get(y_scores, i))
+        set i = i + 1
+    let n_pos: Number = list_count(pos_scores)
+    let n_neg: Number = list_count(neg_scores)
+    if n_pos == 0 or n_neg == 0:
+        return err("ml_roc_auc requires both positive and negative ground-truth examples")
+    var concordant: Float64 = 0.0
+    var p: Number = 0
+    while p < n_pos:
+        let ps: Float64 = list_get(pos_scores, p)
+        var q: Number = 0
+        while q < n_neg:
+            let ns: Float64 = list_get(neg_scores, q)
+            if ps > ns:
+                set concordant = concordant + 1.0
+            elif ps == ns:
+                set concordant = concordant + 0.5
+            set q = q + 1
+        set p = p + 1
+    return ok(concordant / (float64_from_number(n_pos) * float64_from_number(n_neg)))
+
+# Multi-dimensional K-Nearest Neighbors (KNN) Classifier using Euclidean distance
+fn ml_knn_classify(train_x: DenseMatrix, train_y: List[Float64], query_x: List[Float64], k: Number) -> Result[Float64, Text]:
+    let n: Number = train_x.rows
+    let d: Number = train_x.cols
+    if n == 0 or d == 0 or list_count(train_y) != n or list_count(query_x) != d:
+        return err("ml_knn_classify dimension mismatch")
+    if k <= 0 or k > n:
+        return err("ml_knn_classify requires 0 < k <= train_x.rows")
+
+    let dists: List[Float64] = List[Float64]()
+    let used: List[Boolean] = List[Boolean]()
+    var r: Number = 0
+    while r < n:
+        var sum_sq: Float64 = 0.0
+        var c: Number = 0
+        while c < d:
+            let diff: Float64 = mat_get(train_x, r, c) - list_get(query_x, c)
+            set sum_sq = sum_sq + diff * diff
+            set c = c + 1
+        list_push(dists, sum_sq)
+        list_push(used, false)
+        set r = r + 1
+
+    var pos_votes: Number = 0
+    var ki: Number = 0
+    while ki < k:
+        var best_idx: Number = -1
+        var best_dist: Float64 = math_positive_infinity_float64()
+        var j: Number = 0
+        while j < n:
+            if not list_get(used, j) and list_get(dists, j) < best_dist:
+                set best_dist = list_get(dists, j)
+                set best_idx = j
+            set j = j + 1
+        if best_idx >= 0:
+            list_set(used, best_idx, true)
+            if list_get(train_y, best_idx) >= 0.5:
+                set pos_votes = pos_votes + 1
+        set ki = ki + 1
+
+    if pos_votes * 2 >= k:
+        return ok(1.0)
+    return ok(0.0)
+
+# Principal Component Analysis (PCA Top Component via Covariance Matrix & Power Iteration)
+fn ml_pca_first_component(features: DenseMatrix, iterations: Number) -> Result[PcaComponentResult, Text]:
+    let n: Number = features.rows
+    let d: Number = features.cols
+    if n < 2 or d < 1:
+        return err("ml_pca_first_component requires at least 2 rows and 1 column")
+
+    # 1. Compute column means and centered feature matrix X_c
+    let means: List[Float64] = vec_zeros(d)
+    var c: Number = 0
+    while c < d:
+        var col_sum: Float64 = 0.0
+        var r: Number = 0
+        while r < n:
+            set col_sum = col_sum + mat_get(features, r, c)
+            set r = r + 1
+        list_set(means, c, col_sum / float64_from_number(n))
+        set c = c + 1
+
+    let xc: DenseMatrix = mat_zeros(n, d)
+    var r2: Number = 0
+    while r2 < n:
+        var c2: Number = 0
+        while c2 < d:
+            let _sc: Boolean = mat_set(xc, r2, c2, mat_get(features, r2, c2) - list_get(means, c2))
+            set c2 = c2 + 1
+        set r2 = r2 + 1
+
+    # 2. Sample Covariance Matrix Sigma = (1 / (n - 1)) * X_c^T * X_c
+    let xct: DenseMatrix = mat_transpose(xc)
+    let xtx: DenseMatrix = mat_matmul(xct, xc)?
+    let inv_nm1: Float64 = 1.0 / float64_from_number(n - 1)
+    var total_var: Float64 = 0.0
+    var i: Number = 0
+    while i < d:
+        var j: Number = 0
+        while j < d:
+            let cov_ij: Float64 = mat_get(xtx, i, j) * inv_nm1
+            let _sm: Boolean = mat_set(xtx, i, j, cov_ij)
+            if i == j:
+                set total_var = total_var + cov_ij
+            set j = j + 1
+        set i = i + 1
+
+    if total_var <= 0.0:
+        return err("ml_pca_first_component features have zero total variance")
+
+    # 3. Power Iteration for dominant eigenvector v1 (asymmetric seed avoids orthogonal symmetry traps)
+    var v: List[Float64] = List[Float64]()
+    var si: Number = 0
+    while si < d:
+        list_push(v, 1.0 + 0.314159 * float64_from_number(si * si + 1))
+        set si = si + 1
+    let init_norm: Float64 = vec_l2_norm(v)
+    if init_norm > 0.0:
+        set v = vec_scale(v, 1.0 / init_norm)
+    var it: Number = 0
+    var max_it: Number = iterations
+    if max_it <= 0: set max_it = 32
+    while it < max_it:
+        let mv: List[Float64] = mat_matvec(xtx, v)?
+        let norm: Float64 = vec_l2_norm(mv)
+        if norm > 0.0:
+            set v = vec_scale(mv, 1.0 / norm)
+        set it = it + 1
+
+    let sv: List[Float64] = mat_matvec(xtx, v)?
+    let eig_val: Float64 = vec_dot_compensated(v, sv)?
+    let explained_ratio: Float64 = eig_val / total_var
+    let projected: List[Float64] = mat_matvec(xc, v)?
+    return ok(PcaComponentResult(eig_val, explained_ratio, v, projected))
