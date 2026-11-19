@@ -166,6 +166,8 @@ YazaTextV1 *yaza_rt_v1_arg(int64_t index);
 YazaTextV1 *yaza_rt_v1_console_read_line(void);
 YazaTextV1 *yaza_rt_v1_env_get(const YazaTextV1 *name);
 int64_t yaza_rt_v1_env_set(const YazaTextV1 *name, const YazaTextV1 *value);
+YazaTextV1 *yaza_rt_v1_os_platform(void);
+YazaTextV1 *yaza_rt_v1_os_arch(void);
 int32_t yaza_rt_v1_file_exists(const YazaTextV1 *path);
 int32_t yaza_rt_v1_is_directory(const YazaTextV1 *path);
 YazaTextV1 *yaza_rt_v1_file_read(const YazaTextV1 *path);
@@ -184,6 +186,7 @@ int64_t yaza_rt_v1_test_temp_directory_remove(const YazaTextV1 *path);
 #define YAZA_VFS_V1_MAX_TEMPORARY_BYTES (64ULL * 1024ULL * 1024ULL)
 int32_t yaza_vfs_v1_root_open(const YazaTextV1 *path, int64_t *out_handle, char **out_error);
 int32_t yaza_vfs_v1_open_read(int64_t root, const YazaTextV1 *name, int64_t *out_handle, char **out_error);
+int32_t yaza_vfs_v1_open_read_public(int64_t root, const YazaTextV1 *name, int64_t *out_handle, char **out_error);
 int32_t yaza_vfs_v1_open_rw(int64_t root, const YazaTextV1 *name, int64_t *out_handle, char **out_error);
 int32_t yaza_vfs_v1_create_exclusive(int64_t root, const YazaTextV1 *name, int64_t *out_handle, char **out_error);
 /* Returns bounded root-child names as NUL-separated bytes; the final name is also NUL-terminated. */

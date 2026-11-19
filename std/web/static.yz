@@ -51,13 +51,18 @@ fn static_compute_etag(data: Bytes) -> Text:
         set i = i + step
     return "\"v1-" + number_text(len) + "-" + number_text(h) + "\""
 
-fn static_serve_vfs(vfs_root_handle: Number, url_path: Text, mount_prefix: Text, if_none_match: Text, max_bytes: Number) -> Result[WebResponse, Text]:
+fn static_serve_vfs_mode(vfs_root_handle: Number, url_path: Text, mount_prefix: Text, if_none_match: Text, max_bytes: Number, allow_public_mode: Boolean) -> Result[WebResponse, Text]:
     let filename: Text = static_normalize_child_name(url_path, mount_prefix)?
     let mime_opt: Option[Text] = static_mime_for_path(filename)
     if not option_is_some(mime_opt):
         return err("disallowed static asset extension")
     let mime: Text = option_unwrap(mime_opt)
-    let file_handle: Number = vfs_open_read(vfs_root_handle, filename)?
+    var open_res: Result[Number, Text] = err("static asset open failed")
+    if allow_public_mode:
+        set open_res = vfs_open_read_public(vfs_root_handle, filename)
+    else:
+        set open_res = vfs_open_read(vfs_root_handle, filename)
+    let file_handle: Number = open_res?
     let size_res: Result[Number, Text] = vfs_file_size(file_handle)
     if not result_is_ok(size_res):
         let _c1: Result[Boolean, Text] = vfs_close(file_handle)
@@ -81,52 +86,13 @@ fn static_serve_vfs(vfs_root_handle: Number, url_path: Text, mount_prefix: Text,
         return ok(web_not_modified(etag, cache_ctrl))
     return ok(web_static_ok(mime, data, etag, cache_ctrl))
 
-fn static_is_utf8_text_mime(mime: Text) -> Boolean:
-    if text_starts_with(mime, "text/"): return true
-    if text_starts_with(mime, "application/javascript"): return true
-    if text_starts_with(mime, "application/json"): return true
-    if mime == "image/svg+xml": return true
-    return false
+fn static_serve_vfs(vfs_root_handle: Number, url_path: Text, mount_prefix: Text, if_none_match: Text, max_bytes: Number) -> Result[WebResponse, Text]:
+    return static_serve_vfs_mode(vfs_root_handle, url_path, mount_prefix, if_none_match, max_bytes, false)
 
 fn static_serve_public_dir(public_dir: Text, url_path: Text, mount_prefix: Text, if_none_match: Text, max_bytes: Number) -> Result[WebResponse, Text]:
-    # Prefer capability-rooted yaza_vfs_v1 (supports binary PNG/JPG/WOFF2/MP4 + blocks symlinks) when directory is 0700
-    let vfs_root: Result[Number, Text] = vfs_root_open(public_dir)
-    if result_is_ok(vfs_root):
-        let root_fd: Number = result_unwrap(vfs_root)
-        let res: Result[WebResponse, Text] = static_serve_vfs(root_fd, url_path, mount_prefix, if_none_match, max_bytes)
-        let _cl: Result[Boolean, Text] = vfs_close(root_fd)
-        if result_is_ok(res):
-            return res
-
-    # Fallback for standard 0755/0644 public directories: restrict to UTF-8 text assets so binary files never abort file_read
-    let filename: Text = static_normalize_child_name(url_path, mount_prefix)?
-    let mime_opt: Option[Text] = static_mime_for_path(filename)
-    if not option_is_some(mime_opt):
-        return err("disallowed static asset extension")
-    let mime: Text = option_unwrap(mime_opt)
-    if not static_is_utf8_text_mime(mime):
-        return err("binary static assets require a 0700 VFS root or /media/ route")
-    if not is_directory(public_dir):
-        return err("static root directory not found")
-    let entries: TextList = directory_list(public_dir)
-    var found: Boolean = false
-    var ei: Number = 0
-    while ei < list_count(entries):
-        if list_get(entries, ei) == filename:
-            set found = true
-            break
-        set ei = ei + 1
-    if not found:
-        return err("static asset not found")
-    let full_path: Text = public_dir + "/" + filename
-    if is_directory(full_path) or not file_exists(full_path):
-        return err("static path is not a readable regular file")
-    let raw_text: Text = file_read(full_path)
-    let data: Bytes = bytes_from_text(raw_text)
-    if bytes_length(data) > max_bytes:
-        return err("static asset exceeds configured byte limit")
-    let etag: Text = static_compute_etag(data)
-    let cache_ctrl: Text = "public, max-age=300, must-revalidate"
-    if if_none_match == etag:
-        return ok(web_not_modified(etag, cache_ctrl))
-    return ok(web_static_ok(mime, data, etag, cache_ctrl))
+    # Always serve through capability-rooted yaza_vfs_v1 (O_NOFOLLOW + openat + raw Bytes):
+    # immune to ../ traversal, symlinks, and UTF-8/NUL panics for both 0600 and 0644 assets.
+    let root_fd: Number = vfs_root_open(public_dir)?
+    let res: Result[WebResponse, Text] = static_serve_vfs_mode(root_fd, url_path, mount_prefix, if_none_match, max_bytes, true)
+    let _cl: Result[Boolean, Text] = vfs_close(root_fd)
+    return res

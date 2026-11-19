@@ -25,6 +25,12 @@ chmod 600 "$WORK_DIR/public/config.env"
 ln -s "$WORK_DIR/secret.txt" "$WORK_DIR/public/link.css"
 
 printf ':root { --brand: #00e5a8; }\n' > "$WORK_DIR/std_public/yaza-ui.css"
+chmod 644 "$WORK_DIR/std_public/yaza-ui.css"
+printf '\211PNG\r\n\032\n\000\000\000\rIHDR' > "$WORK_DIR/std_public/pixel.png"
+chmod 644 "$WORK_DIR/std_public/pixel.png"
+printf '/*\377\376\000*/console.log(1);\n' > "$WORK_DIR/std_public/nonutf8.js"
+chmod 644 "$WORK_DIR/std_public/nonutf8.js"
+ln -s "$WORK_DIR/secret.txt" "$WORK_DIR/std_public/link.css"
 printf 'SECRET=3\n' > "$WORK_DIR/std_public/config.env"
 
 cd "$PROJECT_DIR"

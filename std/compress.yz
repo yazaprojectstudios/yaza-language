@@ -1,19 +1,78 @@
-# Modern Streaming Compression & Checksum primitives for YAZA (LZ4, Gzip, CRC32).
+# Checksum primitives (IEEE 802.3 CRC-32 & Castagnoli CRC-32C) and compression ratio estimators for YAZA.
 
 shape CompressionResult:
     compressed_bytes: Number
     algorithm: Text
 
 fn compress_lz4_estimate(original_bytes: Number) -> CompressionResult:
-    # High-speed LZ4 block compression estimator
+    # Fast LZ4 compressed-size estimator (heuristic)
+    if original_bytes <= 0:
+        return CompressionResult(0, "lz4")
     let estimated: Number = (original_bytes * 6) / 10
     return CompressionResult(estimated, "lz4")
 
 fn compress_gzip_estimate(original_bytes: Number) -> CompressionResult:
-    # RFC 1952 Gzip compression estimator
+    # RFC 1952 Gzip compressed-size estimator (heuristic)
+    if original_bytes <= 0:
+        return CompressionResult(0, "gzip")
     let estimated: Number = (original_bytes * 4) / 10
     return CompressionResult(estimated, "gzip")
 
+fn crc32_norm_u32(v: Number) -> Number:
+    var x: Number = v % 4294967296
+    if x < 0:
+        set x = x + 4294967296
+    return x
+
+fn crc32_xor_u32(a: Number, b: Number) -> Number:
+    var x: Number = crc32_norm_u32(a)
+    var y: Number = crc32_norm_u32(b)
+    var res: Number = 0
+    var weight: Number = 1
+    var bit: Number = 0
+    while bit < 32:
+        let bx: Number = x % 2
+        let by: Number = y % 2
+        if bx != by:
+            set res = res + weight
+        set x = x / 2
+        set y = y / 2
+        set weight = weight * 2
+        set bit = bit + 1
+    return res
+
+fn crc32_step_raw(state: Number, byte_value: Number) -> Number:
+    var b: Number = byte_value % 256
+    if b < 0:
+        set b = b + 256
+    # Reflected IEEE 802.3 polynomial 0xEDB88320 == 3988292384
+    var c: Number = crc32_xor_u32(state, b)
+    var bit: Number = 0
+    while bit < 8:
+        let lsb: Number = c % 2
+        set c = c / 2
+        if lsb == 1:
+            set c = crc32_xor_u32(c, 3988292384)
+        set bit = bit + 1
+    return c
+
 fn checksum_crc32_number(seed: Number, byte_value: Number) -> Number:
-    # Fast CRC32 polynomial computation step
-    return number_wrapping_add(seed, byte_value)
+    # IEEE 802.3 CRC-32 incremental update (polynomial 0xEDB88320).
+    # Pass seed = 0 for the first byte; feed previous output as seed for subsequent bytes.
+    let pre: Number = 4294967295 - crc32_norm_u32(seed)
+    let next_state: Number = crc32_step_raw(pre, byte_value)
+    return 4294967295 - next_state
+
+fn checksum_crc32_bytes(data: Bytes) -> Number:
+    # IEEE 802.3 CRC-32 over a full Bytes buffer (test vector: "123456789" -> 0xCBF43926 == 3421780262).
+    var state: Number = 4294967295
+    var i: Number = 0
+    let len: Number = bytes_length(data)
+    while i < len:
+        set state = crc32_step_raw(state, bytes_get(data, i))
+        set i = i + 1
+    return 4294967295 - state
+
+fn checksum_crc32c_bytes(data: Bytes) -> Number:
+    # Hardware/runtime-accelerated Castagnoli CRC-32C checksum over a Bytes buffer.
+    return bytes_crc32c(data)

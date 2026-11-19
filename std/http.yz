@@ -97,14 +97,16 @@ fn http_sanitize_header_value(value: Text) -> Text:
         set i = i + 1
     return value
 
-fn http_format_response_keep_alive(response: HttpResponse, request_id: Text, keep_alive: Boolean) -> Bytes:
+fn http_format_response_with_cors(response: HttpResponse, request_id: Text, keep_alive: Boolean, allow_origin: Text) -> Bytes:
     let p: TextList = text_list()
     list_push(p, "HTTP/1.1 " + number_text(response.status_code) + " " + response.status_text + "\r\n")
     list_push(p, "Content-Type: " + response.content_type + "\r\n")
     list_push(p, "Content-Length: " + number_text(bytes_length(response.body)) + "\r\n")
-    list_push(p, "Access-Control-Allow-Origin: *\r\n")
-    list_push(p, "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD\r\n")
-    list_push(p, "Access-Control-Allow-Headers: Content-Type, Authorization, Accept, X-Request-Id\r\n")
+    let safe_origin: Text = http_sanitize_header_value(allow_origin)
+    if text_length(safe_origin) > 0:
+        list_push(p, "Access-Control-Allow-Origin: " + safe_origin + "\r\n")
+        list_push(p, "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD\r\n")
+        list_push(p, "Access-Control-Allow-Headers: Content-Type, Authorization, Accept, X-Request-Id\r\n")
     list_push(p, "X-Content-Type-Options: nosniff\r\n")
     list_push(p, "X-Frame-Options: DENY\r\n")
     list_push(p, "Content-Security-Policy: default-src 'none'; frame-ancestors 'none'\r\n")
@@ -119,6 +121,9 @@ fn http_format_response_keep_alive(response: HttpResponse, request_id: Text, kee
         list_push(p, "Connection: close\r\n\r\n")
     let header_bytes: Bytes = bytes_from_text(text_join(p, ""))
     return bytes_concat(header_bytes, response.body)
+
+fn http_format_response_keep_alive(response: HttpResponse, request_id: Text, keep_alive: Boolean) -> Bytes:
+    return http_format_response_with_cors(response, request_id, keep_alive, "")
 
 fn http_format_response_with_id(response: HttpResponse, request_id: Text) -> Bytes:
     return http_format_response_keep_alive(response, request_id, false)
@@ -191,7 +196,7 @@ fn http_find_header_end_bytes(raw_bytes: Bytes) -> Number:
         set i = i + 1
     return -1
 
-fn http_parse_request(raw_bytes: Bytes) -> Result[HttpRequest, Text]:
+fn http_parse_request_internal(raw_bytes: Bytes, require_complete_body: Boolean) -> Result[HttpRequest, Text]:
     let total_bytes: Number = bytes_length(raw_bytes)
     if total_bytes == 0:
         return err("empty HTTP request")
@@ -298,6 +303,8 @@ fn http_parse_request(raw_bytes: Bytes) -> Result[HttpRequest, Text]:
     var body_text: Text = ""
     let received_body_length: Number = total_bytes - body_start
     if received_body_length > content_length: return err("request contains bytes beyond the declared Content-Length")
+    if require_complete_body and received_body_length < content_length:
+        return err("incomplete HTTP request body: received fewer bytes than declared Content-Length")
     if received_body_length > 0:
         set body_bytes = bytes_slice(raw_bytes, body_start, received_body_length)
         if text_find(content_type, "multipart/form-data") < 0 and received_body_length <= 4194304:
@@ -306,6 +313,12 @@ fn http_parse_request(raw_bytes: Bytes) -> Result[HttpRequest, Text]:
                 set body_text = result_unwrap(body_text_res)
 
     return ok(HttpRequest(method, path, query, accept, content_type, authorization, x_request_id, content_length, body_bytes, body_text))
+
+fn http_parse_request(raw_bytes: Bytes) -> Result[HttpRequest, Text]:
+    return http_parse_request_internal(raw_bytes, true)
+
+fn http_parse_request_headers(raw_bytes: Bytes) -> Result[HttpRequest, Text]:
+    return http_parse_request_internal(raw_bytes, false)
 
 # --- File Upload & Multipart Handling ---
 

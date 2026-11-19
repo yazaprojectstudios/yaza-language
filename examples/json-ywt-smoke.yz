@@ -76,7 +76,7 @@ start:
     assert(jc.subject == evil_exp_sub and jc.expiry_s == 2000 and jc.role == "user")
     assert(not result_is_ok(jwt_verify_hs256(jwt_evil, "yazabase", "api", 2500, secret)))
 
-    # 10. HTTP parse test
+    # 10. HTTP parse test (exact Content-Length, truncated body rejection, header pre-parse, safe default CORS)
     let raw_http: Text = "POST /api/v1/sql HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: 18\r\n\r\n{\"sql\":\"SELECT 1\"}"
     let req_res: Result[HttpRequest, Text] = http_parse_request(bytes_from_text(raw_http))
     assert(result_is_ok(req_res))
@@ -85,4 +85,18 @@ start:
     say "HTTP path: " + req.path
     say "HTTP accept: " + req.accept
     say "HTTP body: " + req.body_text
+
+    # Truncated body (received < Content-Length) MUST be rejected by http_parse_request, allowed by http_parse_request_headers
+    let truncated_http: Text = "POST /api/v1/sql HTTP/1.1\r\nHost: localhost\r\nContent-Length: 18\r\n\r\n{\"sql\":"
+    assert(not result_is_ok(http_parse_request(bytes_from_text(truncated_http))))
+    let hdr_only_res: Result[HttpRequest, Text] = http_parse_request_headers(bytes_from_text(truncated_http))
+    assert(result_is_ok(hdr_only_res) and result_unwrap(hdr_only_res).content_length == 18)
+
+    # Default HTTP response MUST NOT emit wildcard CORS; opt-in helper MUST emit explicit sanitized origin
+    let default_wire: Text = bytes_to_text(http_format_response_keep_alive(http_response_ok_json("{}"), "req-1", false))
+    assert(text_find(default_wire, "Access-Control-Allow-Origin") < 0)
+    let cors_wire: Text = bytes_to_text(http_format_response_with_cors(http_response_ok_json("{}"), "req-2", false, "https://trusted.example"))
+    assert(text_find(cors_wire, "Access-Control-Allow-Origin: https://trusted.example\r\n") >= 0)
+    let crlf_cors: Text = bytes_to_text(http_format_response_with_cors(http_response_ok_json("{}"), "req-3", false, "https://evil\r\nX-Injected: 1"))
+    assert(text_find(crlf_cors, "Access-Control-Allow-Origin") < 0 and text_find(crlf_cors, "X-Injected") < 0)
     say "JSON-YWT-HTTP SMOKE PASS"

@@ -6104,8 +6104,8 @@ int32_t yaza_vfs_v1_root_open(const YazaTextV1 *path, int64_t *out_handle, char 
     return 1;
 }
 
-static int32_t yaza_vfs_v1_open_child(int64_t root, const YazaTextV1 *name, int flags, uint32_t access,
-                                     int64_t *out_handle, char **out_error) {
+static int32_t yaza_vfs_v1_open_child_mode(int64_t root, const YazaTextV1 *name, int flags, uint32_t access,
+                                           int require_private, int64_t *out_handle, char **out_error) {
     if (out_error == NULL) return 0;
     *out_error = (char *)"invalid VFS open arguments";
     if (out_handle == NULL) return 0;
@@ -6129,17 +6129,20 @@ static int32_t yaza_vfs_v1_open_child(int64_t root, const YazaTextV1 *name, int 
     }
     yaza_stat_t status;
 #if defined(_WIN32)
+    (void)require_private;
     const int child_ok = yaza_vfs_v1_fstat(descriptor, &status) == 0 && (status.st_mode & _S_IFREG) != 0 &&
         status.st_size >= 0 && (uint64_t)status.st_size <= YAZA_VFS_V1_MAX_FILE_BYTES;
 #else
-    const int child_ok = yaza_vfs_v1_fstat(descriptor, &status) == 0 && S_ISREG(status.st_mode) &&
-        status.st_size >= 0 && (uint64_t)status.st_size <= YAZA_VFS_V1_MAX_FILE_BYTES &&
-        status.st_uid == geteuid() && (status.st_mode & 077U) == 0;
+    const int base_ok = yaza_vfs_v1_fstat(descriptor, &status) == 0 && S_ISREG(status.st_mode) &&
+        status.st_size >= 0 && (uint64_t)status.st_size <= YAZA_VFS_V1_MAX_FILE_BYTES;
+    const int child_ok = base_ok && (!require_private || (status.st_uid == geteuid() && (status.st_mode & 077U) == 0));
 #endif
     if (!child_ok) {
         (void)yaza_vfs_v1_close_os(descriptor);
         yaza_vfs_v1_release(root_slot, root_generation);
-        *out_error = (char *)"VFS child must be a private regular file owned by the current user and no larger than 1 TiB";
+        *out_error = require_private
+            ? (char *)"VFS child must be a private regular file owned by the current user and no larger than 1 TiB"
+            : (char *)"VFS child must be a regular file no larger than 1 TiB";
         return 0;
     }
     const int32_t registered = yaza_vfs_v1_register(descriptor, YAZA_VFS_V1_KIND_FILE, access,
@@ -6149,8 +6152,17 @@ static int32_t yaza_vfs_v1_open_child(int64_t root, const YazaTextV1 *name, int 
     return registered;
 }
 
+static int32_t yaza_vfs_v1_open_child(int64_t root, const YazaTextV1 *name, int flags, uint32_t access,
+                                     int64_t *out_handle, char **out_error) {
+    return yaza_vfs_v1_open_child_mode(root, name, flags, access, 1, out_handle, out_error);
+}
+
 int32_t yaza_vfs_v1_open_read(int64_t root, const YazaTextV1 *name, int64_t *out_handle, char **out_error) {
     return yaza_vfs_v1_open_child(root, name, O_RDONLY, YAZA_VFS_V1_ACCESS_READ, out_handle, out_error);
+}
+
+int32_t yaza_vfs_v1_open_read_public(int64_t root, const YazaTextV1 *name, int64_t *out_handle, char **out_error) {
+    return yaza_vfs_v1_open_child_mode(root, name, O_RDONLY, YAZA_VFS_V1_ACCESS_READ, 0, out_handle, out_error);
 }
 
 int32_t yaza_vfs_v1_open_rw(int64_t root, const YazaTextV1 *name, int64_t *out_handle, char **out_error) {
@@ -7591,6 +7603,38 @@ static uint64_t yaza_rt_v1_cpu_quota_limit(void) {
     return 0;
 }
 #endif
+
+YazaTextV1 *yaza_rt_v1_os_platform(void) {
+#if defined(__APPLE__)
+    static const unsigned char platform[] = "macos";
+#elif defined(_WIN32)
+    static const unsigned char platform[] = "windows";
+#elif defined(__linux__)
+    static const unsigned char platform[] = "linux";
+#else
+    static const unsigned char platform[] = "unknown";
+#endif
+    YazaTextV1 *result = yaza_text_v1_copy_to_arena(yaza_arena_v1_current(), platform, sizeof(platform) - 1U);
+    if (result == NULL) yaza_rt_v1_fail("rt_os_platform exceeded the active arena allocation limit");
+    return result;
+}
+
+YazaTextV1 *yaza_rt_v1_os_arch(void) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    static const unsigned char arch[] = "arm64";
+#elif defined(__x86_64__) || defined(_M_X64)
+    static const unsigned char arch[] = "x86_64";
+#elif defined(__i386__) || defined(_M_IX86)
+    static const unsigned char arch[] = "x86";
+#elif defined(__arm__) || defined(_M_ARM)
+    static const unsigned char arch[] = "arm";
+#else
+    static const unsigned char arch[] = "unknown";
+#endif
+    YazaTextV1 *result = yaza_text_v1_copy_to_arena(yaza_arena_v1_current(), arch, sizeof(arch) - 1U);
+    if (result == NULL) yaza_rt_v1_fail("rt_os_arch exceeded the active arena allocation limit");
+    return result;
+}
 
 int64_t yaza_rt_v1_processor_count(void) {
     uint64_t count = 0;
