@@ -14,6 +14,7 @@ const MAX_CHECK_OUTPUT = 2 * 1024 * 1024;
 
 const completionNames = [
   ["start", "Program entry block"], ["fn", "Declare a typed function"],
+  ["view", "Declare a compiled Arena-SSR HTML view (returns Text)"],
   ["shape", "Declare a product data type"], ["variant", "Declare a tagged variant"],
   ["impl", "Implement a conversion or interface"], ["if", "Start a conditional block"],
   ["elif", "Add a conditional branch"], ["else", "Add a fallback branch"],
@@ -44,6 +45,7 @@ const hoverText = new Map([
   ["set", "Updates a mutable binding declared with `var`."],
   ["match", "Checks all cases of a tagged variant, `Option`, or `Result`. Every case must be covered."],
   ["async", "Marks a function as asynchronous so callers can run it concurrently with `spawn`."],
+  ["view", "Declares a compiled Arena-SSR HTML view returning `Text`. Use `{{ expr }}` for auto-escaped XSS-safe output and `{! expr !}` for trusted HTML/component composition."],
   ["spawn", "Launches an asynchronous function on the YAZA task runtime with an isolated arena and returns `Task[T]`."],
   ["await", "Waits for a `Task[T]` handle produced by `spawn` and returns its result."],
   ["borrow", "Creates a non-owning reference (`borrow x` or `borrow mut x`)."],
@@ -91,11 +93,11 @@ function activate(context) {
     provideDocumentSymbols(document) {
       const lines = document.getText().split(/\r?\n/);
       const declarations = [];
-      const declarationPattern = /^(?:async\s+)?(fn|shape|variant|interface|controller|service|repository|model)\s+([A-Za-z_][A-Za-z0-9_]*)/;
+      const declarationPattern = /^(?:async\s+)?(fn|view|shape|variant|interface|controller|service|repository|model)\s+([A-Za-z_][A-Za-z0-9_]*)/;
       for (let line = 0; line < lines.length; line += 1) {
         const match = lines[line].match(declarationPattern);
         if (!match) continue;
-        const kind = ({ fn: vscode.SymbolKind.Function, shape: vscode.SymbolKind.Struct, variant: vscode.SymbolKind.Enum,
+        const kind = ({ fn: vscode.SymbolKind.Function, view: vscode.SymbolKind.Function, shape: vscode.SymbolKind.Struct, variant: vscode.SymbolKind.Enum,
           interface: vscode.SymbolKind.Interface, controller: vscode.SymbolKind.Class, service: vscode.SymbolKind.Class,
           repository: vscode.SymbolKind.Class, model: vscode.SymbolKind.Struct })[match[1]];
         const range = new vscode.Range(line, 0, line, lines[line].length);
@@ -111,7 +113,7 @@ function activate(context) {
       if (!wordRange) return undefined;
       const word = document.getText(wordRange);
       const lines = document.getText().split(/\r?\n/);
-      const declarationPattern = new RegExp("^(?:fn|shape|variant|interface|controller|service|repository|model)\\s+" + escapeRegExp(word) + "\\b");
+      const declarationPattern = new RegExp("^(?:(?:async\\s+)?fn|view|shape|variant|interface|controller|service|repository|model)\\s+" + escapeRegExp(word) + "\\b");
       for (let line = 0; line < lines.length; line += 1) {
         if (declarationPattern.test(lines[line])) return new vscode.Location(document.uri, new vscode.Position(line, lines[line].indexOf(word)));
       }
@@ -164,7 +166,7 @@ function hasTopLevelStartBlock(source) {
 
 function looksLikeLibraryModule(source) {
   if (hasTopLevelStartBlock(source)) return false;
-  return /^(?:use\s+|(?:async\s+)?fn\s+|shape\s+|variant\s+|interface\s+|impl\s+|controller\s+|service\s+|repository\s+|model\s+)/m.test(source);
+  return /^(?:use\s+|(?:async\s+)?fn\s+|view\s+|shape\s+|variant\s+|interface\s+|impl\s+|controller\s+|service\s+|repository\s+|model\s+)/m.test(source);
 }
 
 function parsePlaintextCompilerError(stderr, document) {

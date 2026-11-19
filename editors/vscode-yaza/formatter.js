@@ -31,7 +31,7 @@ function visualIndent(line, tabSize) {
 function blockHeader(line) {
   const code = codeBeforeComment(line).trim();
   if (!code.endsWith(":")) return false;
-  return /^(?:start|api|fn|shape|variant|impl|controller|service|repository|model|interface|if|elif|else|while|for|match)\b/.test(code) ||
+  return /^(?:start|api|(?:async\s+)?fn|view|shape|variant|impl|controller|service|repository|model|interface|if|elif|else|while|for|match)\b/.test(code) ||
     /^[A-Za-z_][A-Za-z0-9_]*(?:\([^\n]*\))?:$/.test(code);
 }
 
@@ -42,6 +42,7 @@ function formatYaza(source, options = {}) {
   const blocks = [];
   const inputLines = source.replace(/\r\n?/g, "\n").split("\n");
   const outputLines = [];
+  let inViewBlock = false;
 
   for (const rawLine of inputLines) {
     const content = rawLine.trim();
@@ -50,7 +51,17 @@ function formatYaza(source, options = {}) {
       continue;
     }
 
-    const sourceDepth = Math.round(visualIndent(rawLine, tabSize) / tabSize);
+    const rawVisual = visualIndent(rawLine, tabSize);
+    if (rawVisual === 0 && !content.startsWith("#")) {
+      inViewBlock = /^view\s+/.test(content);
+    }
+
+    if (inViewBlock && rawVisual > 0) {
+      outputLines.push(" ".repeat(rawVisual) + content);
+      continue;
+    }
+
+    const sourceDepth = Math.round(rawVisual / tabSize);
     while (blocks.length > sourceDepth) blocks.pop();
     outputLines.push(indent.repeat(blocks.length) + content);
     if (blockHeader(content)) blocks.push(content);
