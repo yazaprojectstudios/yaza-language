@@ -45,39 +45,60 @@ fn request_wants_close(raw_text: Text) -> Boolean:
     return false
 
 fn read_bounded_http_request(client_fd: Number, max_body_bytes: Number) -> HttpReadOutcome:
-    var buf: Bytes = bytes_empty()
+    var header_buf: Bytes = bytes_empty()
+    let body_chunks: List[Bytes] = List[Bytes]()
     let header_limit: Number = 16384
     var hdr_end: Number = -1
     var content_len: Number = 0
+    var total_read: Number = 0
     var chunks: Number = 0
 
-    while chunks < 512:
-        let rd: Result[Bytes, Text] = tcp_read(client_fd, 16384, 5000)
-        if not result_is_ok(rd):
-            break
+    while chunks < 2048:
+        var ask: Number = 65536
+        if hdr_end >= 0:
+            let rem: Number = (hdr_end + content_len) - total_read
+            if rem <= 0:
+                break
+            set ask = rem
+            if ask > 262144:
+                set ask = 262144
+        let rd: Result[Bytes, Text] = tcp_read(client_fd, ask, 5000)
+        if not result_is_ok(rd): break
         let chunk: Bytes = result_unwrap(rd)
-        if bytes_length(chunk) == 0:
-            break
-        set buf = bytes_concat(buf, chunk)
-        let cur_len: Number = bytes_length(buf)
+        let clen: Number = bytes_length(chunk)
+        if clen == 0: break
+        set total_read = total_read + clen
         if hdr_end < 0:
-            let raw_hdr_pos: Number = http_find_header_end_bytes(buf)
-            if cur_len > header_limit and raw_hdr_pos < 0:
+            set header_buf = bytes_concat(header_buf, chunk)
+            let cur_hdr_len: Number = bytes_length(header_buf)
+            let raw_hdr_pos: Number = http_find_header_end_bytes(header_buf)
+            if cur_hdr_len > header_limit and raw_hdr_pos < 0:
                 return HttpReadOutcome(false, bytes_empty(), some(http_response_payload_too_large("HTTP header exceeds 16 KiB limit", true)))
             if raw_hdr_pos >= 0:
                 set hdr_end = raw_hdr_pos + 4
-                let hdr_req_res: Result[HttpRequest, Text] = http_parse_request(bytes_slice(buf, 0, hdr_end))
+                let hdr_req_res: Result[HttpRequest, Text] = http_parse_request(bytes_slice(header_buf, 0, hdr_end))
                 if result_is_ok(hdr_req_res):
                     set content_len = result_unwrap(hdr_req_res).content_length
                 if content_len > max_body_bytes:
                     return HttpReadOutcome(false, bytes_empty(), some(http_response_payload_too_large("request body exceeds configured limit", true)))
-        if hdr_end >= 0 and cur_len >= hdr_end + content_len:
-            return HttpReadOutcome(true, bytes_slice(buf, 0, hdr_end + content_len), none)
+                list_push(body_chunks, header_buf)
+        else:
+            list_push(body_chunks, chunk)
+        if hdr_end >= 0 and total_read >= hdr_end + content_len:
+            let joined_res: Result[Bytes, Text] = bytes_join(body_chunks)
+            if not result_is_ok(joined_res):
+                return HttpReadOutcome(false, bytes_empty(), some(http_response_payload_too_large("request body exceeds arena limit", true)))
+            let joined: Bytes = result_unwrap(joined_res)
+            return HttpReadOutcome(true, bytes_slice(joined, 0, hdr_end + content_len), none)
         set chunks = chunks + 1
 
-    if bytes_length(buf) == 0:
+    if total_read == 0:
         return HttpReadOutcome(false, bytes_empty(), none)
-    return HttpReadOutcome(true, buf, none)
+    if list_count(body_chunks) > 0:
+        let j_res: Result[Bytes, Text] = bytes_join(body_chunks)
+        if result_is_ok(j_res):
+            return HttpReadOutcome(true, result_unwrap(j_res), none)
+    return HttpReadOutcome(true, header_buf, none)
 
 fn api_media_dir() -> Text:
     let env_dir: Text = env_get("YAZA_UPLOADS_DIR")
@@ -92,7 +113,7 @@ fn dispatch_api_media(wreq: WebRequest) -> Option[WebResponse]:
         let auth_ctx: MiddlewareContext = api_middleware_pipeline_auth(wreq.http, "admin,editor")
         if auth_ctx.rejected:
             return some(web_from_http_response(auth_ctx.reject_response))
-        let mp_res: Result[MultipartForm, Text] = multipart_parse(wreq.http.content_type, wreq.http.body, 16, 4194304)
+        let mp_res: Result[MultipartForm, Text] = multipart_parse(wreq.http.content_type, wreq.http.body, 16, 16777216)
         if not result_is_ok(mp_res):
             return some(web_from_http_response(http_response_bad_request(result_unwrap_error(mp_res), true)))
         let mform: MultipartForm = result_unwrap(mp_res)
@@ -167,7 +188,7 @@ fn handle_client_connection(client_fd: Number, max_body_bytes: Number, max_in_fl
     var req_on_conn: Number = 0
     while keep_alive and req_on_conn < 64:
         var continue_conn: Boolean = false
-        arena_scope 4194304:
+        arena_scope 67108864:
             let rd_out: HttpReadOutcome = read_bounded_http_request(client_fd, max_body_bytes)
             if not rd_out.ok_read:
                 if option_is_some(rd_out.error_response):

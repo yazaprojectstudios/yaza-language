@@ -7116,14 +7116,19 @@ int32_t yaza_net_v1_read(int64_t connection, int64_t max_bytes, int64_t timeout_
         }
     }
 
-    unsigned char *buffer = (unsigned char *)yaza_rt_v1_alloc((uint64_t)max_bytes);
-    if (buffer == NULL) {
-        *out_error = (char *)"network read buffer allocation failed";
-        return 0;
+    unsigned char stack_buf[65536];
+    unsigned char *temp_buf = stack_buf;
+    if ((uint64_t)max_bytes > sizeof(stack_buf)) {
+        temp_buf = (unsigned char *)malloc((size_t)max_bytes);
+        if (temp_buf == NULL) {
+            *out_error = (char *)"network read buffer allocation failed";
+            return 0;
+        }
     }
 
-    ssize_t bytes_read = (ssize_t)recv(fd, (char *)buffer, (int)max_bytes, 0);
+    ssize_t bytes_read = (ssize_t)recv(fd, (char *)temp_buf, (int)max_bytes, 0);
     if (bytes_read < 0) {
+        if (temp_buf != stack_buf) free(temp_buf);
         if (yaza_net_v1_last_wouldblock()) {
             *out_error = (char *)"network read timed out";
         } else {
@@ -7131,6 +7136,22 @@ int32_t yaza_net_v1_read(int64_t connection, int64_t max_bytes, int64_t timeout_
         }
         return 0;
     }
+
+    if (bytes_read == 0) {
+        if (temp_buf != stack_buf) free(temp_buf);
+        out_bytes->data = NULL;
+        out_bytes->length = 0;
+        return 1;
+    }
+
+    unsigned char *buffer = (unsigned char *)yaza_rt_v1_alloc((uint64_t)bytes_read);
+    if (buffer == NULL) {
+        if (temp_buf != stack_buf) free(temp_buf);
+        *out_error = (char *)"network read buffer allocation failed";
+        return 0;
+    }
+    memcpy(buffer, temp_buf, (size_t)bytes_read);
+    if (temp_buf != stack_buf) free(temp_buf);
 
     out_bytes->data = buffer;
     out_bytes->length = (uint64_t)bytes_read;
