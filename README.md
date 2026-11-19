@@ -15,7 +15,8 @@
 
 - **Self-Hosted Compiler & Native LLVM Backend:** Generates optimized binaries for macOS (`arm64`, `x86_64`), Linux (`x86_64`, `aarch64`), and Windows (`x86_64 PE32+`).
 - **Zero-GC Scoped Arena Architecture:** Replaces global garbage collection with bounded `arena_scope` blocks. Allocate with $O(1)$ bump pointers, rewind memory in a single step upon request exit (1,000,000 scopes reclaimed in 521 ms, 1.56 MB Peak RSS).
-- **Single-Binary Fullstack MVC (`--mvc` / `--fullstack` & `--web`):** Built-in `std/web/*` stack (compiled type-safe HTML5 Arena-SSR views, Hypermedia Fragments via `X-Yaza-Fragment`, YAZA UI v1.0 design system, signed `HttpOnly` cookies, constant-time CSRF, strict Web CSP, and safe ETag static file serving) with compile-time layer boundary enforcement (`yaza arch check`).
+- **Single-Binary Fullstack MVC (`--mvc` / `--fullstack` & `--web`):** Built-in `std/web/*` stack (compiled type-safe HTML5 Arena-SSR views, Hypermedia Fragments via `X-Yaza-Fragment`, YAZA UI v1.0 design system, binary `multipart/form-data` media upload with magic-byte validation, HTTP 206 seekable video streaming, signed `HttpOnly` cookies, constant-time CSRF, strict Web CSP, and safe ETag static file serving) with compile-time layer boundary enforcement (`yaza arch check`).
+- **Zero-GC Data Science, Statistical Computing, ML & Visualization (`std/data/*`):** Built-in R/Python alternative combining Neumaier (1974) compensated summation, Welford 1-pass moments, partial-pivoting Gaussian matrix linear algebra, Columnar Arena DataFrame (`df_from_csv`, `df_fillna_mean`, `df_inner_join`, `df_groupby_agg`, `df_to_html_table`), 30+ parametric/non-parametric/Bayesian statistical methods, ML (`ml_ols_fit`, `ml_multiple_ols_fit`, `ml_logistic_fit`, `ml_pca_first_component`, `ml_knn_classify`, `ml_kmeans_1d`, `ml_roc_auc`), **18 zero-JS Frontend SVG chart types**, and **6 Terminal CLI chart types**.
 - **Embedded ACID SQL Engine (YazaBase):** Built-in B+Tree indexed storage with ARIES WAL recovery, parameterized query binding, non-reparse VFS path confinement, and zero external database dependencies.
 - **Pluggable Database Adapters:** Native wire-protocol clients for **PostgreSQL** (v3 + SCRAM-SHA-256), **MySQL** (v10 + caching_sha2_password), **MSSQL** (TDS), and **NoSQL** (Redis RESP / MongoDB BSON).
 - **Hardware-Aware API Resource Profiles:** Tune memory ceilings and concurrency per deployment target (`low_memory`, `balanced`, `throughput`) with Adaptive Query Budgeting (AQB) verified at boot.
@@ -303,6 +304,28 @@ Reproducible **8-framework HTTP/1.1 SSR & Web benchmark** (`darwin arm64`, `c = 
 *Static asset delivery (`20,158 B` YAZA UI v1.0 CSS): YAZA **`63,268 req/s`** (`200 OK`) & **`82,539 req/s`** (`304 ETag`).*
 
 See [docs/benchmarks/fullstack-ssr-2026-11-19.md](docs/benchmarks/fullstack-ssr-2026-11-19.md), `scripts/bench-web-frameworks.mjs`, and [yazastudios.id/benchmarks](https://yazastudios.id/benchmarks/#fullstack-ssr) for full methodology and reproduction steps.
+
+### Data Science, Statistical Computing & Numerical Accuracy (`std/data/*`, 19 Nov 2026)
+
+Executed via `scripts/bench-data-science.sh` and `scripts/validate-data-science.sh` on `darwin arm64` (`-O2`, `debug`, and `ASan+UBSan`):
+
+| Data Science Workload & IEEE-754 Accuracy Torture Test | YAZA v1.0 (`-O2` · `std/data/*`) | Python 3.14 (`statistics` / Standard IEEE-754) | YAZA Advantage |
+| :--- | :--- | :--- | :--- |
+| **Welford 4-Moment Statistics (Mean, StdDev, Skewness, Kurtosis · 1,000,000 pts)** | **`5.45–15.15 ms`** | `330.47–410.66 ms` | **`21.8×–75.4× faster`** |
+| **Centered 1-Pass OLS Linear Regression + R² + RMSE (1,000,000 pts)** | **`4.96–9.90 ms`** | `162.26–177.95 ms` | **`16.4×–35.9× faster`** |
+| **Silverman Gaussian KDE Density Estimation (5,000 obs × 64 grid = 320,000 evals)** | **`20.52 ms`** | `86.03 ms` | **`4.2× faster`** |
+| **Vector Z-Score Normalization + EWMA Time-Series + Compensated Dot (100,000 pts)** | **`3.78–6.03 ms`** | `16.65–23.22 ms` | **`3.9×–4.4× faster`** |
+| **Peak Memory Footprint (RSS · 100K Vector Pipeline)** | **`9.20–9.73 MB`** (0 GC pauses) | `26.03–27.75 MB` | **`2.8× lower RAM`** |
+| **Accuracy Torture #1: Ill-Conditioned Sum `[10¹⁶, 1.0 × 10,000, -10¹⁶]` (True = `10000.0`)** | **`10000.0`** (**0.0% error** · Neumaier) | `0.0` (100% error · naive `sum()`) | **Exact 53-bit compensation** |
+| **Accuracy Torture #2: 10⁹-Shifted Sample Variance `[10⁹+1, 10⁹+2, 10⁹+3]` (True = `1.0`)** | **`1.0`** (**0.0% error** · Welford 1-pass) | `0.0` (100% error · 2-term formula) | **Immune to cancellation** |
+| **Accuracy Torture #3: 10⁹-Shifted OLS Regression Slope (True = `2.0`, R² = `1.0`)** | **`2.0`** (**0.0% error** · Centered co-moments) | `NaN` (division by 0.0 in uncentered normal eq) | **Shift-invariant OLS** |
+
+Run the terminal CLI chart showcase or full validation suite directly:
+```sh
+yaza run examples/data-science-cli-charts.yz
+sh scripts/validate-data-science.sh
+sh scripts/bench-data-science.sh
+```
 
 ---
 

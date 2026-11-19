@@ -57,6 +57,51 @@ shape HistogramBins:
     counts: List[Number]
     densities: List[Float64]
 
+shape ConfidenceInterval:
+    mean: Float64
+    lower_bound: Float64
+    upper_bound: Float64
+    margin_of_error: Float64
+    confidence_level: Float64
+
+shape NormalityTestResult:
+    statistic: Float64
+    p_value: Float64
+    is_normal_at_05: Boolean
+
+shape MannWhitneyResult:
+    u_statistic: Float64
+    z_score: Float64
+    p_value_two_tailed: Float64
+    significant_at_05: Boolean
+
+shape KruskalWallisResult:
+    h_statistic: Float64
+    degrees_of_freedom: Number
+    p_value: Float64
+    significant_at_05: Boolean
+
+shape BayesBetaPosterior:
+    alpha_post: Float64
+    beta_post: Float64
+    posterior_mean: Float64
+    posterior_mode: Float64
+    posterior_variance: Float64
+    ci95_lower: Float64
+    ci95_upper: Float64
+
+shape BayesNormalPosterior:
+    posterior_mean: Float64
+    posterior_variance: Float64
+    posterior_std_dev: Float64
+    ci95_lower: Float64
+    ci95_upper: Float64
+
+shape KdeCurve:
+    bandwidth: Float64
+    grid_x: List[Float64]
+    density_y: List[Float64]
+
 # Neumaier (1974) improved Kahan-Babuska compensated summation:
 # Achieves O(eps) error independent of N and handles terms larger than the running sum (e.g. [1e16, 1.0, -1e16] == 1.0).
 fn stats_sum_compensated(xs: List[Float64]) -> Float64:
@@ -436,3 +481,528 @@ fn stats_histogram(xs: List[Float64], bin_count: Number) -> Result[HistogramBins
         list_push(densities, float64_from_number(list_get(counts, b2)) / denom)
         set b2 = b2 + 1
     return ok(HistogramBins(bin_count, min_e, max_e, width, centers, counts, densities))
+
+# --- Generalized Means & Robust Location/Scale Estimators ---
+
+# Geometric Mean: exp((1/n) * sum(ln(x_i))) — immune to product overflow
+fn stats_geometric_mean(xs: List[Float64]) -> Result[Float64, Text]:
+    let n: Number = list_count(xs)
+    if n == 0:
+        return err("stats_geometric_mean requires non-empty input")
+    let logs: List[Float64] = List[Float64]()
+    var i: Number = 0
+    while i < n:
+        let v: Float64 = list_get(xs, i)
+        if v <= 0.0:
+            return err("stats_geometric_mean requires strictly positive values")
+        list_push(logs, math_ln_float64(v))
+        set i = i + 1
+    return ok(math_exp_float64(stats_mean_compensated(logs)))
+
+# Harmonic Mean: n / sum(1 / x_i)
+fn stats_harmonic_mean(xs: List[Float64]) -> Result[Float64, Text]:
+    let n: Number = list_count(xs)
+    if n == 0:
+        return err("stats_harmonic_mean requires non-empty input")
+    let invs: List[Float64] = List[Float64]()
+    var i: Number = 0
+    while i < n:
+        let v: Float64 = list_get(xs, i)
+        if v <= 0.0:
+            return err("stats_harmonic_mean requires strictly positive values")
+        list_push(invs, 1.0 / v)
+        set i = i + 1
+    let inv_sum: Float64 = stats_sum_compensated(invs)
+    if inv_sum == 0.0:
+        return err("stats_harmonic_mean zero reciprocal sum")
+    return ok(float64_from_number(n) / inv_sum)
+
+# Trimmed Mean: drops trim_fraction (in [0.0, 0.5)) from both lower and upper tails (R mean(x, trim=...))
+fn stats_trimmed_mean(xs: List[Float64], trim_fraction: Float64) -> Result[Float64, Text]:
+    let n: Number = list_count(xs)
+    if n == 0:
+        return err("stats_trimmed_mean requires non-empty input")
+    if trim_fraction < 0.0 or trim_fraction >= 0.5:
+        return err("stats_trimmed_mean requires trim_fraction in [0.0, 0.5)")
+    let sorted_xs: List[Float64] = stats_sort_asc(xs)
+    let cut: Number = number_from_float64(math_floor_float64(float64_from_number(n) * trim_fraction))
+    let trimmed: List[Float64] = List[Float64]()
+    var i: Number = cut
+    while i < n - cut:
+        list_push(trimmed, list_get(sorted_xs, i))
+        set i = i + 1
+    return ok(stats_mean_compensated(trimmed))
+
+# Winsorized Mean: clamps extreme lower/upper tail values to the cut boundary values
+fn stats_winsorized_mean(xs: List[Float64], limit_fraction: Float64) -> Result[Float64, Text]:
+    let n: Number = list_count(xs)
+    if n == 0:
+        return err("stats_winsorized_mean requires non-empty input")
+    if limit_fraction < 0.0 or limit_fraction >= 0.5:
+        return err("stats_winsorized_mean requires limit_fraction in [0.0, 0.5)")
+    let sorted_xs: List[Float64] = stats_sort_asc(xs)
+    let cut: Number = number_from_float64(math_floor_float64(float64_from_number(n) * limit_fraction))
+    let low_val: Float64 = list_get(sorted_xs, cut)
+    let high_val: Float64 = list_get(sorted_xs, n - 1 - cut)
+    let win: List[Float64] = List[Float64]()
+    var i: Number = 0
+    while i < n:
+        if i < cut:
+            list_push(win, low_val)
+        elif i >= n - cut:
+            list_push(win, high_val)
+        else:
+            list_push(win, list_get(sorted_xs, i))
+        set i = i + 1
+    return ok(stats_mean_compensated(win))
+
+fn stats_coefficient_of_variation(xs: List[Float64]) -> Result[Float64, Text]:
+    let d: StatsSummary = stats_describe(xs)?
+    if d.mean == 0.0:
+        return err("stats_coefficient_of_variation undefined when mean is 0")
+    return ok(d.std_dev_sample / math_abs_float64(d.mean))
+
+# --- Inverse Normal Quantile (qnorm / norm.ppf) & Confidence Intervals ---
+
+# Winitzki (2008) / Newton-refined Inverse Standard Normal CDF Phi^-1(p) (R qnorm / scipy.stats.norm.ppf)
+fn stats_normal_ppf(p: Float64) -> Result[Float64, Text]:
+    if p <= 0.0 or p >= 1.0:
+        return err("stats_normal_ppf probability p must be strictly in (0.0, 1.0)")
+    if p == 0.5:
+        return ok(0.0)
+    # Rational initial approximation (Abramowitz & Stegun 26.2.23) + 2 Halley/Newton refinements using stats_normal_cdf
+    var tail_p: Float64 = p
+    var sign: Float64 = -1.0
+    if p > 0.5:
+        set tail_p = 1.0 - p
+        set sign = 1.0
+    let t: Float64 = math_sqrt_float64(-2.0 * math_ln_float64(tail_p))
+    let c0: Float64 = 2.515517
+    let c1: Float64 = 0.802853
+    let c2: Float64 = 0.010328
+    let d1: Float64 = 1.432788
+    let d2: Float64 = 0.189269
+    let d3: Float64 = 0.001308
+    let num: Float64 = c0 + c1 * t + c2 * t * t
+    let den: Float64 = 1.0 + d1 * t + d2 * t * t + d3 * t * t * t
+    var z: Float64 = sign * (t - (num / den))
+    # 2 Newton-Raphson steps: z <- z - (Phi(z) - p) / phi(z)
+    let inv_sqrt_2pi: Float64 = 0.3989422804014327
+    var step: Number = 0
+    while step < 2:
+        let cdf_err: Float64 = stats_normal_cdf(z) - p
+        let pdf_z: Float64 = inv_sqrt_2pi * math_exp_float64(-0.5 * z * z)
+        if pdf_z > 0.000000000001:
+            set z = z - (cdf_err / pdf_z)
+        set step = step + 1
+    return ok(z)
+
+fn stats_confidence_interval(xs: List[Float64], confidence_level: Float64) -> Result[ConfidenceInterval, Text]:
+    if confidence_level <= 0.0 or confidence_level >= 1.0:
+        return err("stats_confidence_interval requires confidence_level in (0.0, 1.0)")
+    let d: StatsSummary = stats_describe(xs)?
+    let upper_p: Float64 = 0.5 + (confidence_level * 0.5)
+    let z_crit: Float64 = stats_normal_ppf(upper_p)?
+    let moe: Float64 = z_crit * d.std_error
+    return ok(ConfidenceInterval(d.mean, d.mean - moe, d.mean + moe, moe, confidence_level))
+
+# --- One-Sample & Paired t-Tests, Effect Sizes (Cohen's d, Hedges' g) & Normality Tests ---
+
+fn stats_one_sample_ttest(xs: List[Float64], pop_mean_h0: Float64) -> Result[WelchTTestResult, Text]:
+    let n: Number = list_count(xs)
+    if n < 2:
+        return err("stats_one_sample_ttest requires at least 2 observations")
+    let d: StatsSummary = stats_describe(xs)?
+    if d.std_error == 0.0:
+        return err("stats_one_sample_ttest standard error is zero")
+    let diff: Float64 = d.mean - pop_mean_h0
+    let t_val: Float64 = diff / d.std_error
+    let df: Float64 = float64_from_number(n - 1)
+    let abs_t: Float64 = math_abs_float64(t_val)
+    let z_equiv: Float64 = math_sqrt_float64(df * math_ln_float64(1.0 + (abs_t * abs_t) / df)) * (1.0 - (1.0 / (4.0 * df)))
+    let p_two_tailed: Float64 = 2.0 * (1.0 - stats_normal_cdf(z_equiv))
+    return ok(WelchTTestResult(t_val, df, p_two_tailed, diff, p_two_tailed < 0.05))
+
+fn stats_paired_ttest(before_xs: List[Float64], after_xs: List[Float64]) -> Result[WelchTTestResult, Text]:
+    let n: Number = list_count(before_xs)
+    if n < 2 or n != list_count(after_xs):
+        return err("stats_paired_ttest requires equal-length vectors with count >= 2")
+    let diffs: List[Float64] = List[Float64]()
+    var i: Number = 0
+    while i < n:
+        list_push(diffs, list_get(after_xs, i) - list_get(before_xs, i))
+        set i = i + 1
+    return stats_one_sample_ttest(diffs, 0.0)
+
+# Standardized Effect Size: Pooled-SD Cohen's d & small-sample bias-corrected Hedges' g
+fn stats_cohens_d(sample_a: List[Float64], sample_b: List[Float64]) -> Result[Float64, Text]:
+    if list_count(sample_a) < 2 or list_count(sample_b) < 2:
+        return err("stats_cohens_d requires at least 2 observations per group")
+    let da: StatsSummary = stats_describe(sample_a)?
+    let db: StatsSummary = stats_describe(sample_b)?
+    let na1: Float64 = float64_from_number(da.count - 1)
+    let nb1: Float64 = float64_from_number(db.count - 1)
+    let pooled_var: Float64 = (na1 * da.variance_sample + nb1 * db.variance_sample) / (na1 + nb1)
+    if pooled_var <= 0.0:
+        return err("stats_cohens_d pooled variance is zero")
+    return ok((da.mean - db.mean) / math_sqrt_float64(pooled_var))
+
+fn stats_hedges_g(sample_a: List[Float64], sample_b: List[Float64]) -> Result[Float64, Text]:
+    let d_val: Float64 = stats_cohens_d(sample_a, sample_b)?
+    let df_total: Float64 = float64_from_number(list_count(sample_a) + list_count(sample_b) - 2)
+    let j_corr: Float64 = 1.0 - (3.0 / (4.0 * df_total - 1.0))
+    return ok(d_val * j_corr)
+
+# Jarque-Bera Normality Test: JB = (n/6) * (S^2 + (K^2)/4) ~ Chi2(df=2), where survival function is exp(-JB/2)
+fn stats_jarque_bera_normality(xs: List[Float64]) -> Result[NormalityTestResult, Text]:
+    let n: Number = list_count(xs)
+    if n < 4:
+        return err("stats_jarque_bera_normality requires at least 4 observations")
+    let d: StatsSummary = stats_describe(xs)?
+    let nf: Float64 = float64_from_number(n)
+    let s2: Float64 = d.skewness * d.skewness
+    let k2: Float64 = d.excess_kurtosis * d.excess_kurtosis
+    let jb: Float64 = (nf / 6.0) * (s2 + 0.25 * k2)
+    # Exact survival function of Chi-Square with df = 2 is exp(-x / 2)
+    let p_val: Float64 = math_exp_float64(-0.5 * jb)
+    return ok(NormalityTestResult(jb, p_val, p_val >= 0.05))
+
+# Kolmogorov-Smirnov (KS) Normality Goodness-of-Fit D-statistic against fitted N(mean, sd^2)
+fn stats_kolmogorov_smirnov_normal(xs: List[Float64]) -> Result[NormalityTestResult, Text]:
+    let n: Number = list_count(xs)
+    if n < 3:
+        return err("stats_kolmogorov_smirnov_normal requires at least 3 observations")
+    let d: StatsSummary = stats_describe(xs)?
+    if d.std_dev_sample <= 0.0:
+        return err("stats_kolmogorov_smirnov_normal requires non-zero variance")
+    let sorted_xs: List[Float64] = stats_sort_asc(xs)
+    let nf: Float64 = float64_from_number(n)
+    var max_d: Float64 = 0.0
+    var i: Number = 0
+    while i < n:
+        let z: Float64 = (list_get(sorted_xs, i) - d.mean) / d.std_dev_sample
+        let cdf_v: Float64 = stats_normal_cdf(z)
+        let fn_upper: Float64 = float64_from_number(i + 1) / nf
+        let fn_lower: Float64 = float64_from_number(i) / nf
+        let d1: Float64 = math_abs_float64(fn_upper - cdf_v)
+        let d2: Float64 = math_abs_float64(cdf_v - fn_lower)
+        if d1 > max_d: set max_d = d1
+        if d2 > max_d: set max_d = d2
+        set i = i + 1
+    let sqrt_n: Float64 = math_sqrt_float64(nf)
+    let lambda_ks: Float64 = (sqrt_n + 0.12 + (0.11 / sqrt_n)) * max_d
+    var p_val: Float64 = 2.0 * math_exp_float64(-2.0 * lambda_ks * lambda_ks)
+    if p_val > 1.0: set p_val = 1.0
+    if p_val < 0.0: set p_val = 0.0
+    return ok(NormalityTestResult(max_d, p_val, p_val >= 0.05))
+
+# --- Non-Parametric & Rank Statistics (Spearman rho, Kendall tau, Mann-Whitney U, Kruskal-Wallis H) ---
+
+# Average-tie fractional ranking (1-based: [10, 20, 20, 30] -> [1.0, 2.5, 2.5, 4.0])
+fn stats_ranks(xs: List[Float64]) -> List[Float64]:
+    let n: Number = list_count(xs)
+    let out: List[Float64] = List[Float64]()
+    var i: Number = 0
+    while i < n:
+        let xi: Float64 = list_get(xs, i)
+        var less_cnt: Number = 0
+        var eq_cnt: Number = 0
+        var j: Number = 0
+        while j < n:
+            let xj: Float64 = list_get(xs, j)
+            if xj < xi:
+                set less_cnt = less_cnt + 1
+            elif xj == xi:
+                set eq_cnt = eq_cnt + 1
+            set j = j + 1
+        let avg_rank: Float64 = float64_from_number(less_cnt) + (float64_from_number(eq_cnt + 1) * 0.5)
+        list_push(out, avg_rank)
+        set i = i + 1
+    return out
+
+# Spearman's Rank Correlation Coefficient rho (R cor(..., method="spearman"))
+fn stats_spearman_rho(xs: List[Float64], ys: List[Float64]) -> Result[Float64, Text]:
+    if list_count(xs) != list_count(ys) or list_count(xs) < 2:
+        return err("stats_spearman_rho requires equal-length vectors with count >= 2")
+    let rx: List[Float64] = stats_ranks(xs)
+    let ry: List[Float64] = stats_ranks(ys)
+    return stats_pearson_r(rx, ry)
+
+# Kendall's Rank Correlation Coefficient tau-b (R cor(..., method="kendall"))
+fn stats_kendall_tau(xs: List[Float64], ys: List[Float64]) -> Result[Float64, Text]:
+    let n: Number = list_count(xs)
+    if n != list_count(ys) or n < 2:
+        return err("stats_kendall_tau requires equal-length vectors with count >= 2")
+    var concordant: Number = 0
+    var discordant: Number = 0
+    var ties_x: Number = 0
+    var ties_y: Number = 0
+    var i: Number = 0
+    while i < n:
+        var j: Number = i + 1
+        while j < n:
+            let dx: Float64 = list_get(xs, i) - list_get(xs, j)
+            let dy: Float64 = list_get(ys, i) - list_get(ys, j)
+            if dx == 0.0 and dy == 0.0:
+                set ties_x = ties_x + 1
+                set ties_y = ties_y + 1
+            elif dx == 0.0:
+                set ties_x = ties_x + 1
+            elif dy == 0.0:
+                set ties_y = ties_y + 1
+            elif (dx > 0.0 and dy > 0.0) or (dx < 0.0 and dy < 0.0):
+                set concordant = concordant + 1
+            else:
+                set discordant = discordant + 1
+            set j = j + 1
+        set i = i + 1
+    let c_plus_d: Float64 = float64_from_number(concordant + discordant)
+    let denom: Float64 = math_sqrt_float64((c_plus_d + float64_from_number(ties_x)) * (c_plus_d + float64_from_number(ties_y)))
+    if denom == 0.0:
+        return err("stats_kendall_tau undefined for all-tied input")
+    return ok(float64_from_number(concordant - discordant) / denom)
+
+# Mann-Whitney U / Wilcoxon Rank-Sum Non-Parametric Two-Sample Test (R wilcox.test)
+fn stats_mann_whitney_u(sample_a: List[Float64], sample_b: List[Float64]) -> Result[MannWhitneyResult, Text]:
+    let na: Number = list_count(sample_a)
+    let nb: Number = list_count(sample_b)
+    if na < 2 or nb < 2:
+        return err("stats_mann_whitney_u requires at least 2 observations per sample")
+    let combined: List[Float64] = List[Float64]()
+    var i: Number = 0
+    while i < na:
+        list_push(combined, list_get(sample_a, i))
+        set i = i + 1
+    var j: Number = 0
+    while j < nb:
+        list_push(combined, list_get(sample_b, j))
+        set j = j + 1
+    let ranks: List[Float64] = stats_ranks(combined)
+    var r_a: Float64 = 0.0
+    var k: Number = 0
+    while k < na:
+        set r_a = r_a + list_get(ranks, k)
+        set k = k + 1
+    let naf: Float64 = float64_from_number(na)
+    let nbf: Float64 = float64_from_number(nb)
+    let u_a: Float64 = r_a - (naf * (naf + 1.0) * 0.5)
+    let u_b: Float64 = (naf * nbf) - u_a
+    let u_stat: Float64 = math_min_float64(u_a, u_b)
+    let mean_u: Float64 = 0.5 * naf * nbf
+    let sd_u: Float64 = math_sqrt_float64((naf * nbf * (naf + nbf + 1.0)) / 12.0)
+    if sd_u == 0.0:
+        return err("stats_mann_whitney_u zero rank variance")
+    let z: Float64 = (u_a - mean_u) / sd_u
+    let p_two_tailed: Float64 = 2.0 * (1.0 - stats_normal_cdf(math_abs_float64(z)))
+    return ok(MannWhitneyResult(u_stat, z, p_two_tailed, p_two_tailed < 0.05))
+
+# Kruskal-Wallis Non-Parametric One-Way ANOVA by Ranks (R kruskal.test)
+fn stats_kruskal_wallis(groups: List[List[Float64]]) -> Result[KruskalWallisResult, Text]:
+    let k: Number = list_count(groups)
+    if k < 2:
+        return err("stats_kruskal_wallis requires at least 2 groups")
+    let combined: List[Float64] = List[Float64]()
+    var g: Number = 0
+    while g < k:
+        let grp: List[Float64] = list_get(groups, g)
+        if list_count(grp) < 1:
+            return err("stats_kruskal_wallis groups must be non-empty")
+        var i: Number = 0
+        while i < list_count(grp):
+            list_push(combined, list_get(grp, i))
+            set i = i + 1
+        set g = g + 1
+    let total_n: Number = list_count(combined)
+    let ranks: List[Float64] = stats_ranks(combined)
+    var sum_r2_n: Float64 = 0.0
+    var offset: Number = 0
+    var g2: Number = 0
+    while g2 < k:
+        let gn: Number = list_count(list_get(groups, g2))
+        var r_sum: Float64 = 0.0
+        var j: Number = 0
+        while j < gn:
+            set r_sum = r_sum + list_get(ranks, offset + j)
+            set j = j + 1
+        set sum_r2_n = sum_r2_n + ((r_sum * r_sum) / float64_from_number(gn))
+        set offset = offset + gn
+        set g2 = g2 + 1
+    let nf: Float64 = float64_from_number(total_n)
+    let h_stat: Float64 = ((12.0 / (nf * (nf + 1.0))) * sum_r2_n) - (3.0 * (nf + 1.0))
+    let df: Number = k - 1
+    let dff: Float64 = float64_from_number(df)
+    let h_term: Float64 = 2.0 / (9.0 * dff)
+    var p_val: Float64 = 1.0
+    if h_stat > 0.0:
+        let z: Float64 = (math_pow_float64(h_stat / dff, 1.0 / 3.0) - (1.0 - h_term)) / math_sqrt_float64(h_term)
+        set p_val = 1.0 - stats_normal_cdf(z)
+    return ok(KruskalWallisResult(h_stat, df, p_val, p_val < 0.05))
+
+# --- Information Theory (Shannon Entropy, KL Divergence, Jensen-Shannon Divergence) ---
+
+fn stats_shannon_entropy(probs: List[Float64]) -> Result[Float64, Text]:
+    let n: Number = list_count(probs)
+    if n == 0:
+        return err("stats_shannon_entropy requires non-empty probability distribution")
+    let total: Float64 = stats_sum_compensated(probs)
+    if total <= 0.0:
+        return err("stats_shannon_entropy probabilities must sum to > 0")
+    var h: Float64 = 0.0
+    var i: Number = 0
+    while i < n:
+        let p: Float64 = list_get(probs, i) / total
+        if p < 0.0:
+            return err("stats_shannon_entropy negative probability")
+        if p > 0.0:
+            set h = h - (p * math_ln_float64(p))
+        set i = i + 1
+    return ok(h)
+
+fn stats_kl_divergence(p_dist: List[Float64], q_dist: List[Float64]) -> Result[Float64, Text]:
+    let n: Number = list_count(p_dist)
+    if n == 0 or n != list_count(q_dist):
+        return err("stats_kl_divergence requires equal-length non-empty distributions")
+    let sum_p: Float64 = stats_sum_compensated(p_dist)
+    let sum_q: Float64 = stats_sum_compensated(q_dist)
+    if sum_p <= 0.0 or sum_q <= 0.0:
+        return err("stats_kl_divergence distribution sum must be > 0")
+    var kl: Float64 = 0.0
+    var i: Number = 0
+    while i < n:
+        let p: Float64 = list_get(p_dist, i) / sum_p
+        let q: Float64 = list_get(q_dist, i) / sum_q
+        if p > 0.0:
+            if q <= 0.0:
+                return err("stats_kl_divergence q_i is zero where p_i > 0")
+            set kl = kl + p * math_ln_float64(p / q)
+        set i = i + 1
+    return ok(kl)
+
+fn stats_jensen_shannon_divergence(p_dist: List[Float64], q_dist: List[Float64]) -> Result[Float64, Text]:
+    let n: Number = list_count(p_dist)
+    if n == 0 or n != list_count(q_dist):
+        return err("stats_jensen_shannon_divergence requires equal-length non-empty distributions")
+    let sum_p: Float64 = stats_sum_compensated(p_dist)
+    let sum_q: Float64 = stats_sum_compensated(q_dist)
+    if sum_p <= 0.0 or sum_q <= 0.0:
+        return err("stats_jensen_shannon_divergence distribution sum must be > 0")
+    let m_dist: List[Float64] = List[Float64]()
+    var i: Number = 0
+    while i < n:
+        let p: Float64 = list_get(p_dist, i) / sum_p
+        let q: Float64 = list_get(q_dist, i) / sum_q
+        list_push(m_dist, 0.5 * (p + q))
+        set i = i + 1
+    let kl_pm: Float64 = stats_kl_divergence(p_dist, m_dist)?
+    let kl_qm: Float64 = stats_kl_divergence(q_dist, m_dist)?
+    return ok(0.5 * (kl_pm + kl_qm))
+
+# --- Bayesian Conjugate Inference (Beta-Binomial A/B Testing & Normal-Normal Updating) ---
+
+fn stats_bayes_beta_binomial(prior_alpha: Float64, prior_beta: Float64, successes: Number, trials: Number) -> Result[BayesBetaPosterior, Text]:
+    if prior_alpha <= 0.0 or prior_beta <= 0.0 or successes < 0 or trials < successes:
+        return err("stats_bayes_beta_binomial invalid prior or trial counts")
+    let a_post: Float64 = prior_alpha + float64_from_number(successes)
+    let b_post: Float64 = prior_beta + float64_from_number(trials - successes)
+    let total: Float64 = a_post + b_post
+    let mean: Float64 = a_post / total
+    var mode: Float64 = mean
+    if a_post > 1.0 and b_post > 1.0:
+        set mode = (a_post - 1.0) / (total - 2.0)
+    let variance: Float64 = (a_post * b_post) / (total * total * (total + 1.0))
+    let sd: Float64 = math_sqrt_float64(variance)
+    var lo: Float64 = mean - 1.95996398454 * sd
+    var hi: Float64 = mean + 1.95996398454 * sd
+    if lo < 0.0: set lo = 0.0
+    if hi > 1.0: set hi = 1.0
+    return ok(BayesBetaPosterior(a_post, b_post, mean, mode, variance, lo, hi))
+
+fn stats_bayes_normal_update(prior_mean: Float64, prior_variance: Float64, sample_xs: List[Float64]) -> Result[BayesNormalPosterior, Text]:
+    if prior_variance <= 0.0 or list_count(sample_xs) < 2:
+        return err("stats_bayes_normal_update requires prior_variance > 0 and at least 2 sample points")
+    let d: StatsSummary = stats_describe(sample_xs)?
+    if d.variance_sample <= 0.0:
+        return err("stats_bayes_normal_update sample variance must be > 0")
+    let prec_prior: Float64 = 1.0 / prior_variance
+    let prec_like: Float64 = float64_from_number(d.count) / d.variance_sample
+    let post_var: Float64 = 1.0 / (prec_prior + prec_like)
+    let post_mean: Float64 = post_var * (prec_prior * prior_mean + prec_like * d.mean)
+    let post_sd: Float64 = math_sqrt_float64(post_var)
+    let moe: Float64 = 1.95996398454 * post_sd
+    return ok(BayesNormalPosterior(post_mean, post_var, post_sd, post_mean - moe, post_mean + moe))
+
+# --- Time-Series Forecasting & Gaussian Kernel Density Estimation (KDE) ---
+
+fn stats_acf_vector(xs: List[Float64], max_lag: Number) -> Result[List[Float64], Text]:
+    let n: Number = list_count(xs)
+    if max_lag < 0 or max_lag >= n or n < 2:
+        return err("stats_acf_vector requires 0 <= max_lag < count(xs)")
+    let out: List[Float64] = List[Float64]()
+    var k: Number = 0
+    while k <= max_lag:
+        let r_k: Float64 = stats_autocorrelation(xs, k)?
+        list_push(out, r_k)
+        set k = k + 1
+    return ok(out)
+
+# Holt's Double Exponential Smoothing (Level + Trend Time-Series Forecasting for horizon steps ahead)
+fn stats_holt_linear_forecast(xs: List[Float64], alpha_level: Float64, beta_trend: Float64, horizon: Number) -> Result[List[Float64], Text]:
+    let n: Number = list_count(xs)
+    if n < 2 or horizon <= 0:
+        return err("stats_holt_linear_forecast requires at least 2 observations and horizon > 0")
+    if alpha_level <= 0.0 or alpha_level > 1.0 or beta_trend <= 0.0 or beta_trend > 1.0:
+        return err("stats_holt_linear_forecast smoothing parameters must be in (0.0, 1.0]")
+    var level: Float64 = list_get(xs, 0)
+    var trend: Float64 = list_get(xs, 1) - list_get(xs, 0)
+    var i: Number = 1
+    while i < n:
+        let x: Float64 = list_get(xs, i)
+        let prev_level: Float64 = level
+        set level = alpha_level * x + (1.0 - alpha_level) * (level + trend)
+        set trend = beta_trend * (level - prev_level) + (1.0 - beta_trend) * trend
+        set i = i + 1
+    let forecasts: List[Float64] = List[Float64]()
+    var h: Number = 1
+    while h <= horizon:
+        list_push(forecasts, level + float64_from_number(h) * trend)
+        set h = h + 1
+    return ok(forecasts)
+
+# Gaussian Kernel Density Estimation (KDE) with Silverman's Rule-of-Thumb Bandwidth (R density(x) / seaborn.kdeplot)
+fn stats_kde_gaussian(xs: List[Float64], grid_count: Number) -> Result[KdeCurve, Text]:
+    let n: Number = list_count(xs)
+    if n < 2 or grid_count < 4:
+        return err("stats_kde_gaussian requires at least 2 observations and grid_count >= 4")
+    let d: StatsSummary = stats_describe(xs)?
+    let fns: FiveNumberSummary = stats_five_number_summary(xs)?
+    var spread: Float64 = d.std_dev_sample
+    let iqr_scaled: Float64 = fns.iqr / 1.34
+    if iqr_scaled > 0.0 and iqr_scaled < spread:
+        set spread = iqr_scaled
+    if spread <= 0.0:
+        set spread = 1.0
+    # Silverman's (1986) rule-of-thumb bandwidth: h = 0.9 * min(sd, IQR/1.34) * n^(-1/5)
+    let nf: Float64 = float64_from_number(n)
+    let bw: Float64 = 0.9 * spread * math_pow_float64(nf, -0.2)
+    let pad: Float64 = 2.5 * bw
+    let x_start: Float64 = d.min - pad
+    let x_end: Float64 = d.max + pad
+    let step: Float64 = (x_end - x_start) / float64_from_number(grid_count - 1)
+    let inv_sqrt_2pi: Float64 = 0.3989422804014327
+    let scale_factor: Float64 = inv_sqrt_2pi / (nf * bw)
+
+    let gx: List[Float64] = List[Float64]()
+    let gy: List[Float64] = List[Float64]()
+    var g: Number = 0
+    while g < grid_count:
+        let xq: Float64 = x_start + float64_from_number(g) * step
+        var k_sum: Float64 = 0.0
+        var i: Number = 0
+        while i < n:
+            let u: Float64 = (xq - list_get(xs, i)) / bw
+            set k_sum = k_sum + math_exp_float64(-0.5 * u * u)
+            set i = i + 1
+        list_push(gx, xq)
+        list_push(gy, k_sum * scale_factor)
+        set g = g + 1
+    return ok(KdeCurve(bw, gx, gy))

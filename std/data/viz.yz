@@ -41,8 +41,25 @@ fn viz_escape(raw: Text) -> Text:
 fn viz_fmt_num(v: Float64) -> Text:
     if not math_is_finite_float64(v):
         return "NaN"
-    let rounded: Float64 = math_round_float64(v * 100.0) / 100.0
-    return float64_text(rounded)
+    var sign_prefix: Text = ""
+    var abs_v: Float64 = v
+    if v < 0.0:
+        set sign_prefix = "-"
+        set abs_v = 0.0 - v
+    if abs_v > 90000000000000.0:
+        return float64_text(v)
+    let scaled: Number = number_from_float64(math_round_float64(abs_v * 100.0))
+    if scaled == 0:
+        return "0"
+    let whole: Number = scaled / 100
+    let cents: Number = scaled - (whole * 100)
+    if cents == 0:
+        return sign_prefix + number_text(whole)
+    if cents - (cents / 10) * 10 == 0:
+        return sign_prefix + number_text(whole) + "." + number_text(cents / 10)
+    if cents < 10:
+        return sign_prefix + number_text(whole) + ".0" + number_text(cents)
+    return sign_prefix + number_text(whole) + "." + number_text(cents)
 
 fn viz_scale_linear(val: Float64, domain_min: Float64, domain_max: Float64, range_min: Float64, range_max: Float64) -> Float64:
     let span: Float64 = domain_max - domain_min
@@ -319,3 +336,740 @@ fn viz_heatmap_matrix(cfg: ChartConfig, row_labels: TextList, col_labels: TextLi
     let footer: Text = "matrix=" + number_text(mat.rows) + "x" + number_text(mat.cols) + " | mean=" + viz_fmt_num(desc.mean)
     list_push(out, viz_svg_axes_and_close(cfg, desc.min, desc.max, "", "", footer))
     return ok(text_join(out, ""))
+
+fn viz_palette_color(index: Number) -> Text:
+    let m: Number = index % 6
+    if m == 0: return "#10b981"
+    if m == 1: return "#38bdf8"
+    if m == 2: return "#f59e0b"
+    if m == 3: return "#a855f7"
+    if m == 4: return "#f43f5e"
+    return "#eab308"
+
+# 7. Multi-Series Line Chart with Legend (Actual vs Forecast / Multi-Model Comparison)
+fn viz_multi_line_chart(cfg: ChartConfig, xs: List[Float64], series_names: TextList, series_list: List[List[Float64]]) -> Result[Text, Text]:
+    let n: Number = list_count(xs)
+    let k: Number = list_count(series_list)
+    if n < 2 or k == 0 or k != list_count(series_names):
+        return err("viz_multi_line_chart requires >= 2 x points and matching non-empty series_names/series_list")
+    let dx: StatsSummary = stats_describe(xs)?
+    var y_min: Float64 = math_positive_infinity_float64()
+    var y_max: Float64 = math_negative_infinity_float64()
+    var s: Number = 0
+    while s < k:
+        let ys: List[Float64] = list_get(series_list, s)
+        if list_count(ys) != n:
+            return err("viz_multi_line_chart series length mismatch with xs")
+        let dy: StatsSummary = stats_describe(ys)?
+        if dy.min < y_min: set y_min = dy.min
+        if dy.max > y_max: set y_max = dy.max
+        set s = s + 1
+
+    let out: TextList = text_list()
+    list_push(out, viz_svg_frame_open(cfg, number_text(k) + " Series · n=" + number_text(n)))
+
+    var s2: Number = 0
+    while s2 < k:
+        let ys2: List[Float64] = list_get(series_list, s2)
+        let color: Text = viz_palette_color(s2)
+        let pts: TextList = text_list()
+        var i: Number = 0
+        while i < n:
+            let px: Float64 = viz_scale_linear(list_get(xs, i), dx.min, dx.max, 76.0, 720.0)
+            let py: Float64 = viz_scale_linear(list_get(ys2, i), y_min, y_max, 302.0, 88.0)
+            list_push(pts, viz_fmt_num(px) + "," + viz_fmt_num(py))
+            set i = i + 1
+        list_push(out, "<polyline points=\"" + text_join(pts, " ") + "\" fill=\"none\" stroke=\"" + color + "\" stroke-width=\"2.3\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>")
+        let lx: Number = 80 + s2 * 120
+        list_push(out, "<circle cx=\"" + number_text(lx) + "\" cy=\"66\" r=\"4\" fill=\"" + color + "\"/>")
+        list_push(out, "<text x=\"" + number_text(lx + 10) + "\" y=\"70\" fill=\"#cbd5e1\" font-family=\"system-ui,-apple-system,sans-serif\" font-size=\"10\">" + viz_escape(list_get(series_names, s2)) + "</text>")
+        set s2 = s2 + 1
+
+    let footer: Text = "series=" + number_text(k) + " | points=" + number_text(n) + " | y-range=[" + viz_fmt_num(y_min) + ", " + viz_fmt_num(y_max) + "]"
+    list_push(out, viz_svg_axes_and_close(cfg, y_min, y_max, viz_fmt_num(dx.min), viz_fmt_num(dx.max), footer))
+    return ok(text_join(out, ""))
+
+# 8. 3-Variable Bubble Plot (x, y, size_z)
+fn viz_bubble_chart(cfg: ChartConfig, xs: List[Float64], ys: List[Float64], sizes: List[Float64], labels: TextList) -> Result[Text, Text]:
+    let n: Number = list_count(xs)
+    if n < 2 or n != list_count(ys) or n != list_count(sizes):
+        return err("viz_bubble_chart requires equal-length xs, ys, sizes with count >= 2")
+    let dx: StatsSummary = stats_describe(xs)?
+    let dy: StatsSummary = stats_describe(ys)?
+    let dz: StatsSummary = stats_describe(sizes)?
+    let out: TextList = text_list()
+    list_push(out, viz_svg_frame_open(cfg, "3D Bubble · n=" + number_text(n)))
+
+    var i: Number = 0
+    while i < n:
+        let vx: Float64 = list_get(xs, i)
+        let vy: Float64 = list_get(ys, i)
+        let vz: Float64 = list_get(sizes, i)
+        let cx: Float64 = viz_scale_linear(vx, dx.min, dx.max, 92.0, 704.0)
+        let cy: Float64 = viz_scale_linear(vy, dy.min, dy.max, 294.0, 96.0)
+        let rad: Float64 = viz_scale_linear(vz, dz.min, dz.max, 6.0, 24.0)
+        var lbl: Text = "#" + number_text(i + 1)
+        if i < list_count(labels):
+            set lbl = list_get(labels, i)
+        let col: Text = viz_palette_color(i)
+        list_push(out, "<circle cx=\"" + viz_fmt_num(cx) + "\" cy=\"" + viz_fmt_num(cy) + "\" r=\"" + viz_fmt_num(rad) + "\" fill=\"" + col + "\" fill-opacity=\"0.55\" stroke=\"" + col + "\" stroke-width=\"1.6\"><title>" + viz_escape(lbl) + ": (" + viz_fmt_num(vx) + ", " + viz_fmt_num(vy) + ") size=" + viz_fmt_num(vz) + "</title></circle>")
+        set i = i + 1
+
+    let footer: Text = "bubbles=" + number_text(n) + " | size-range=[" + viz_fmt_num(dz.min) + ", " + viz_fmt_num(dz.max) + "]"
+    list_push(out, viz_svg_axes_and_close(cfg, dy.min, dy.max, viz_fmt_num(dx.min), viz_fmt_num(dx.max), footer))
+    return ok(text_join(out, ""))
+
+# 9. Horizontal Ranking Bar Chart (Benchmark Leaderboards & Feature Importance)
+fn viz_horizontal_bar_chart(cfg: ChartConfig, labels: TextList, values: List[Float64]) -> Result[Text, Text]:
+    let n: Number = list_count(labels)
+    if n == 0 or n != list_count(values):
+        return err("viz_horizontal_bar_chart requires equal-length non-empty labels and values")
+    let dv: StatsSummary = stats_describe(values)?
+    var max_v: Float64 = dv.max
+    if max_v <= 0.0: set max_v = 1.0
+    let out: TextList = text_list()
+    list_push(out, viz_svg_frame_open(cfg, "max=" + viz_fmt_num(dv.max) + " · mean=" + viz_fmt_num(dv.mean)))
+
+    let slot_h: Float64 = 224.0 / float64_from_number(n)
+    var bar_h: Float64 = slot_h * 0.62
+    if bar_h > 28.0: set bar_h = 28.0
+    if bar_h < 6.0: set bar_h = 6.0
+
+    var i: Number = 0
+    while i < n:
+        let lbl: Text = list_get(labels, i)
+        let val: Float64 = list_get(values, i)
+        let cy: Float64 = 82.0 + (float64_from_number(i) + 0.5) * slot_h
+        let by: Float64 = cy - (bar_h * 0.5)
+        var bw: Float64 = viz_scale_linear(val, 0.0, max_v, 4.0, 480.0)
+        if bw < 4.0: set bw = 4.0
+        list_push(out, "<text x=\"164\" y=\"" + viz_fmt_num(cy + 4.0) + "\" text-anchor=\"end\" fill=\"#cbd5e1\" font-family=\"system-ui,-apple-system,sans-serif\" font-size=\"11\">" + viz_escape(lbl) + "</text>")
+        list_push(out, "<rect x=\"174\" y=\"" + viz_fmt_num(by) + "\" width=\"" + viz_fmt_num(bw) + "\" height=\"" + viz_fmt_num(bar_h) + "\" rx=\"4\" fill=\"" + viz_escape(cfg.accent_hex) + "\"><title>" + viz_escape(lbl) + ": " + viz_fmt_num(val) + "</title></rect>")
+        list_push(out, "<text x=\"" + viz_fmt_num(182.0 + bw) + "\" y=\"" + viz_fmt_num(cy + 4.0) + "\" fill=\"#f8fafc\" font-family=\"ui-monospace,monospace\" font-size=\"10\" font-weight=\"600\">" + viz_fmt_num(val) + "</text>")
+        set i = i + 1
+
+    let footer: Text = "items=" + number_text(n) + " | max=" + viz_fmt_num(dv.max) + " | sum=" + viz_fmt_num(dv.sum)
+    list_push(out, viz_svg_axes_and_close(cfg, 0.0, max_v, "0", viz_fmt_num(max_v), footer))
+    return ok(text_join(out, ""))
+
+# 10. Stacked Multi-Series Bar Chart
+fn viz_stacked_bar_chart(cfg: ChartConfig, categories: TextList, series_names: TextList, series_matrix: List[List[Float64]]) -> Result[Text, Text]:
+    let n_cats: Number = list_count(categories)
+    let n_ser: Number = list_count(series_matrix)
+    if n_cats == 0 or n_ser == 0 or n_ser != list_count(series_names):
+        return err("viz_stacked_bar_chart invalid categories or series dimensions")
+    var max_tot: Float64 = 1.0
+    var c: Number = 0
+    while c < n_cats:
+        var col_tot: Float64 = 0.0
+        var s: Number = 0
+        while s < n_ser:
+            let s_vec: List[Float64] = list_get(series_matrix, s)
+            if list_count(s_vec) != n_cats:
+                return err("viz_stacked_bar_chart series length mismatch")
+            set col_tot = col_tot + math_max_float64(0.0, list_get(s_vec, c))
+            set s = s + 1
+        if col_tot > max_tot: set max_tot = col_tot
+        set c = c + 1
+
+    let out: TextList = text_list()
+    list_push(out, viz_svg_frame_open(cfg, "Stacked · " + number_text(n_ser) + " components"))
+
+    let slot_w: Float64 = 640.0 / float64_from_number(n_cats)
+    var bar_w: Float64 = slot_w * 0.58
+    if bar_w > 68.0: set bar_w = 68.0
+
+    var i: Number = 0
+    while i < n_cats:
+        let cx: Float64 = 78.0 + (float64_from_number(i) + 0.5) * slot_w
+        let bx: Float64 = cx - (bar_w * 0.5)
+        var cur_bottom: Float64 = 310.0
+        var s2: Number = 0
+        while s2 < n_ser:
+            let v: Float64 = math_max_float64(0.0, list_get(list_get(series_matrix, s2), i))
+            let seg_h: Float64 = (v / max_tot) * 216.0
+            let top_y: Float64 = cur_bottom - seg_h
+            let col: Text = viz_palette_color(s2)
+            if seg_h >= 1.0:
+                list_push(out, "<rect x=\"" + viz_fmt_num(bx) + "\" y=\"" + viz_fmt_num(top_y) + "\" width=\"" + viz_fmt_num(bar_w) + "\" height=\"" + viz_fmt_num(seg_h) + "\" fill=\"" + col + "\"><title>" + viz_escape(list_get(categories, i)) + " · " + viz_escape(list_get(series_names, s2)) + ": " + viz_fmt_num(v) + "</title></rect>")
+            set cur_bottom = top_y
+            set s2 = s2 + 1
+        list_push(out, "<text x=\"" + viz_fmt_num(cx) + "\" y=\"328\" text-anchor=\"middle\" fill=\"#94a3b8\" font-family=\"system-ui,-apple-system,sans-serif\" font-size=\"10\">" + viz_escape(list_get(categories, i)) + "</text>")
+        set i = i + 1
+
+    let footer: Text = "categories=" + number_text(n_cats) + " | peak-stack=" + viz_fmt_num(max_tot)
+    list_push(out, viz_svg_axes_and_close(cfg, 0.0, max_tot, "", "", footer))
+    return ok(text_join(out, ""))
+
+# 11. Smooth Gaussian Kernel Density Estimation (KDE) Curve (ggplot2 geom_density / seaborn.kdeplot)
+fn viz_kde_density_chart(cfg: ChartConfig, xs: List[Float64], grid_points: Number) -> Result[Text, Text]:
+    let kde: KdeCurve = stats_kde_gaussian(xs, grid_points)?
+    let desc: StatsSummary = stats_describe(xs)?
+    let dy: StatsSummary = stats_describe(kde.density_y)?
+    let dx: StatsSummary = stats_describe(kde.grid_x)?
+    let badge: Text = "bw=" + viz_fmt_num(kde.bandwidth) + " · mean=" + viz_fmt_num(desc.mean)
+
+    let out: TextList = text_list()
+    list_push(out, viz_svg_frame_open(cfg, badge))
+
+    let poly_pts: TextList = text_list()
+    let area_pts: TextList = text_list()
+    list_push(area_pts, "76,310")
+    let m: Number = list_count(kde.grid_x)
+    var i: Number = 0
+    while i < m:
+        let px: Float64 = viz_scale_linear(list_get(kde.grid_x, i), dx.min, dx.max, 76.0, 720.0)
+        let py: Float64 = viz_scale_linear(list_get(kde.density_y, i), 0.0, dy.max, 310.0, 86.0)
+        let pt: Text = viz_fmt_num(px) + "," + viz_fmt_num(py)
+        list_push(poly_pts, pt)
+        list_push(area_pts, pt)
+        set i = i + 1
+    list_push(area_pts, "720,310")
+
+    list_push(out, "<polygon points=\"" + text_join(area_pts, " ") + "\" fill=\"" + viz_escape(cfg.accent_hex) + "\" fill-opacity=\"0.22\"/>")
+    list_push(out, "<polyline points=\"" + text_join(poly_pts, " ") + "\" fill=\"none\" stroke=\"" + viz_escape(cfg.accent_hex) + "\" stroke-width=\"2.6\" stroke-linecap=\"round\"/>")
+    let mean_px: Float64 = viz_scale_linear(desc.mean, dx.min, dx.max, 76.0, 720.0)
+    list_push(out, "<line x1=\"" + viz_fmt_num(mean_px) + "\" y1=\"76\" x2=\"" + viz_fmt_num(mean_px) + "\" y2=\"310\" stroke=\"#f43f5e\" stroke-width=\"1.8\" stroke-dasharray=\"5 3\"/>")
+
+    let footer: Text = "Silverman KDE | h=" + viz_fmt_num(kde.bandwidth) + " | n=" + number_text(desc.count) + " | sd=" + viz_fmt_num(desc.std_dev_sample)
+    list_push(out, viz_svg_axes_and_close(cfg, 0.0, dy.max, viz_fmt_num(dx.min), viz_fmt_num(dx.max), footer))
+    return ok(text_join(out, ""))
+
+# 12. Multi-Group Violin Plot (Mirrored Symmetric Gaussian KDE + Median/IQR Spine — seaborn.violinplot / ggplot2 geom_violin)
+fn viz_violin_chart(cfg: ChartConfig, group_names: TextList, groups: List[List[Float64]]) -> Result[Text, Text]:
+    let k: Number = list_count(groups)
+    if k == 0 or k != list_count(group_names):
+        return err("viz_violin_chart requires equal-length non-empty group_names and groups")
+    var global_min: Float64 = math_positive_infinity_float64()
+    var global_max: Float64 = math_negative_infinity_float64()
+    var g: Number = 0
+    while g < k:
+        let d: StatsSummary = stats_describe(list_get(groups, g))?
+        if d.min < global_min: set global_min = d.min
+        if d.max > global_max: set global_max = d.max
+        set g = g + 1
+
+    let out: TextList = text_list()
+    list_push(out, viz_svg_frame_open(cfg, "Violin KDE · " + number_text(k) + " Groups"))
+
+    let slot_w: Float64 = 640.0 / float64_from_number(k)
+    var max_half_w: Float64 = slot_w * 0.36
+    if max_half_w > 46.0: set max_half_w = 46.0
+
+    var i: Number = 0
+    while i < k:
+        let grp: List[Float64] = list_get(groups, i)
+        let gname: Text = list_get(group_names, i)
+        let fns: FiveNumberSummary = stats_five_number_summary(grp)?
+        let kde: KdeCurve = stats_kde_gaussian(grp, 24)?
+        let dy: StatsSummary = stats_describe(kde.density_y)?
+        let cx: Float64 = 78.0 + (float64_from_number(i) + 0.5) * slot_w
+        let col: Text = viz_palette_color(i)
+
+        let left_pts: TextList = text_list()
+        let right_pts: TextList = text_list()
+        let m: Number = list_count(kde.grid_x)
+        var j: Number = 0
+        while j < m:
+            let yv: Float64 = math_min_float64(global_max, math_max_float64(global_min, list_get(kde.grid_x, j)))
+            let py: Float64 = viz_scale_linear(yv, global_min, global_max, 304.0, 86.0)
+            let hw: Float64 = viz_scale_linear(list_get(kde.density_y, j), 0.0, dy.max, 1.0, max_half_w)
+            list_push(right_pts, viz_fmt_num(cx + hw) + "," + viz_fmt_num(py))
+            set j = j + 1
+        var j2: Number = m - 1
+        while j2 >= 0:
+            let yv2: Float64 = math_min_float64(global_max, math_max_float64(global_min, list_get(kde.grid_x, j2)))
+            let py2: Float64 = viz_scale_linear(yv2, global_min, global_max, 304.0, 86.0)
+            let hw2: Float64 = viz_scale_linear(list_get(kde.density_y, j2), 0.0, dy.max, 1.0, max_half_w)
+            list_push(left_pts, viz_fmt_num(cx - hw2) + "," + viz_fmt_num(py2))
+            set j2 = j2 - 1
+
+        list_push(out, "<polygon points=\"" + text_join(right_pts, " ") + " " + text_join(left_pts, " ") + "\" fill=\"" + col + "\" fill-opacity=\"0.32\" stroke=\"" + col + "\" stroke-width=\"1.8\"><title>" + viz_escape(gname) + " | median=" + viz_fmt_num(fns.median) + " IQR=" + viz_fmt_num(fns.iqr) + "</title></polygon>")
+        let y_q25: Float64 = viz_scale_linear(fns.q25, global_min, global_max, 304.0, 86.0)
+        let y_q75: Float64 = viz_scale_linear(fns.q75, global_min, global_max, 304.0, 86.0)
+        let y_med: Float64 = viz_scale_linear(fns.median, global_min, global_max, 304.0, 86.0)
+        list_push(out, "<line x1=\"" + viz_fmt_num(cx) + "\" y1=\"" + viz_fmt_num(y_q75) + "\" x2=\"" + viz_fmt_num(cx) + "\" y2=\"" + viz_fmt_num(y_q25) + "\" stroke=\"#0b1120\" stroke-width=\"5\" stroke-linecap=\"round\"/>")
+        list_push(out, "<circle cx=\"" + viz_fmt_num(cx) + "\" cy=\"" + viz_fmt_num(y_med) + "\" r=\"3.5\" fill=\"#f8fafc\"/>")
+        list_push(out, "<text x=\"" + viz_fmt_num(cx) + "\" y=\"328\" text-anchor=\"middle\" fill=\"#94a3b8\" font-family=\"system-ui,-apple-system,sans-serif\" font-size=\"10\">" + viz_escape(gname) + "</text>")
+        set i = i + 1
+
+    let footer: Text = "Violin KDE + Inner IQR & Median Dot | groups=" + number_text(k)
+    list_push(out, viz_svg_axes_and_close(cfg, global_min, global_max, "", "", footer))
+    return ok(text_join(out, ""))
+
+# 13. Normal Quantile-Quantile (Q-Q) Plot with 45-deg Reference Line & Jarque-Bera Normality Badge (R qqnorm + qqline)
+fn viz_qq_normality_chart(cfg: ChartConfig, xs: List[Float64]) -> Result[Text, Text]:
+    let n: Number = list_count(xs)
+    if n < 4:
+        return err("viz_qq_normality_chart requires at least 4 observations")
+    let z_norm: List[Float64] = vec_zscore_normalize(xs)?
+    let z_sorted: List[Float64] = stats_sort_asc(z_norm)
+    let jb: NormalityTestResult = stats_jarque_bera_normality(xs)?
+    let theo_q: List[Float64] = List[Float64]()
+    let nf: Float64 = float64_from_number(n)
+    var i: Number = 0
+    while i < n:
+        let p_i: Float64 = (float64_from_number(i + 1) - 0.375) / (nf + 0.25)
+        let q_i: Float64 = stats_normal_ppf(p_i)?
+        list_push(theo_q, q_i)
+        set i = i + 1
+
+    let dx: StatsSummary = stats_describe(theo_q)?
+    let dy: StatsSummary = stats_describe(z_sorted)?
+    let dom_min: Float64 = math_min_float64(dx.min, dy.min)
+    let dom_max: Float64 = math_max_float64(dx.max, dy.max)
+    let badge: Text = "JB=" + viz_fmt_num(jb.statistic) + " · p=" + viz_fmt_num(jb.p_value)
+
+    let out: TextList = text_list()
+    list_push(out, viz_svg_frame_open(cfg, badge))
+    list_push(out, "<line x1=\"76\" y1=\"302\" x2=\"720\" y2=\"86\" stroke=\"#f43f5e\" stroke-width=\"1.8\" stroke-dasharray=\"5 4\"/>")
+
+    var j: Number = 0
+    while j < n:
+        let tx: Float64 = list_get(theo_q, j)
+        let sy: Float64 = list_get(z_sorted, j)
+        let cx: Float64 = viz_scale_linear(tx, dom_min, dom_max, 76.0, 720.0)
+        let cy: Float64 = viz_scale_linear(sy, dom_min, dom_max, 302.0, 86.0)
+        list_push(out, "<circle cx=\"" + viz_fmt_num(cx) + "\" cy=\"" + viz_fmt_num(cy) + "\" r=\"3.8\" fill=\"" + viz_escape(cfg.accent_hex) + "\" stroke=\"#0b1120\" stroke-width=\"1\"><title>Theoretical=" + viz_fmt_num(tx) + " Sample=" + viz_fmt_num(sy) + "</title></circle>")
+        set j = j + 1
+
+    let footer: Text = "Normal Q-Q Plot | n=" + number_text(n) + " | JB=" + viz_fmt_num(jb.statistic)
+    list_push(out, viz_svg_axes_and_close(cfg, dom_min, dom_max, viz_fmt_num(dom_min), viz_fmt_num(dom_max), footer))
+    return ok(text_join(out, ""))
+
+# 14. Empirical Cumulative Distribution Function (ECDF) Step Chart (R plot(ecdf(x)) / seaborn.ecdfplot)
+fn viz_ecdf_chart(cfg: ChartConfig, xs: List[Float64]) -> Result[Text, Text]:
+    let n: Number = list_count(xs)
+    if n < 2:
+        return err("viz_ecdf_chart requires at least 2 observations")
+    let sorted_xs: List[Float64] = stats_sort_asc(xs)
+    let dx: StatsSummary = stats_describe(sorted_xs)?
+    let ks: NormalityTestResult = stats_kolmogorov_smirnov_normal(xs)?
+    let out: TextList = text_list()
+    list_push(out, viz_svg_frame_open(cfg, "ECDF · KS D=" + viz_fmt_num(ks.statistic)))
+
+    let pts: TextList = text_list()
+    let nf: Float64 = float64_from_number(n)
+    var prev_py: Float64 = 310.0
+    var i: Number = 0
+    while i < n:
+        let px: Float64 = viz_scale_linear(list_get(sorted_xs, i), dx.min, dx.max, 76.0, 720.0)
+        let prob: Float64 = float64_from_number(i + 1) / nf
+        let py: Float64 = viz_scale_linear(prob, 0.0, 1.0, 310.0, 86.0)
+        list_push(pts, viz_fmt_num(px) + "," + viz_fmt_num(prev_py))
+        list_push(pts, viz_fmt_num(px) + "," + viz_fmt_num(py))
+        set prev_py = py
+        set i = i + 1
+
+    list_push(out, "<polyline points=\"" + text_join(pts, " ") + "\" fill=\"none\" stroke=\"" + viz_escape(cfg.accent_hex) + "\" stroke-width=\"2.4\"/>")
+    let footer: Text = "Empirical CDF F_n(x) | n=" + number_text(n) + " | KS-D=" + viz_fmt_num(ks.statistic) + " (p=" + viz_fmt_num(ks.p_value) + ")"
+    list_push(out, viz_svg_axes_and_close(cfg, 0.0, 1.0, viz_fmt_num(dx.min), viz_fmt_num(dx.max), footer))
+    return ok(text_join(out, ""))
+
+# 15. Time-Series Autocorrelation Correlogram (ACF Lollipop Stem Plot + 95% White-Noise Confidence Bands)
+fn viz_acf_correlogram_chart(cfg: ChartConfig, xs: List[Float64], max_lag: Number) -> Result[Text, Text]:
+    let acfs: List[Float64] = stats_acf_vector(xs, max_lag)?
+    let n: Number = list_count(xs)
+    let k: Number = list_count(acfs)
+    let ci95: Float64 = 1.95996398454 / math_sqrt_float64(float64_from_number(n))
+    let out: TextList = text_list()
+    list_push(out, viz_svg_frame_open(cfg, "ACF(0.." + number_text(max_lag) + ") · 95% CI=±" + viz_fmt_num(ci95)))
+
+    let y_zero: Float64 = viz_scale_linear(0.0, -1.0, 1.0, 304.0, 86.0)
+    let y_ci_hi: Float64 = viz_scale_linear(ci95, -1.0, 1.0, 304.0, 86.0)
+    let y_ci_lo: Float64 = viz_scale_linear(0.0 - ci95, -1.0, 1.0, 304.0, 86.0)
+    list_push(out, "<line x1=\"68\" y1=\"" + viz_fmt_num(y_zero) + "\" x2=\"728\" y2=\"" + viz_fmt_num(y_zero) + "\" stroke=\"#64748b\" stroke-width=\"1.5\"/>")
+    list_push(out, "<line x1=\"68\" y1=\"" + viz_fmt_num(y_ci_hi) + "\" x2=\"728\" y2=\"" + viz_fmt_num(y_ci_hi) + "\" stroke=\"#38bdf8\" stroke-dasharray=\"4 4\" stroke-width=\"1.2\"/>")
+    list_push(out, "<line x1=\"68\" y1=\"" + viz_fmt_num(y_ci_lo) + "\" x2=\"728\" y2=\"" + viz_fmt_num(y_ci_lo) + "\" stroke=\"#38bdf8\" stroke-dasharray=\"4 4\" stroke-width=\"1.2\"/>")
+
+    let slot_w: Float64 = 620.0 / float64_from_number(k)
+    var i: Number = 0
+    while i < k:
+        let r_val: Float64 = list_get(acfs, i)
+        let px: Float64 = 88.0 + (float64_from_number(i) + 0.5) * slot_w
+        let py: Float64 = viz_scale_linear(r_val, -1.0, 1.0, 304.0, 86.0)
+        list_push(out, "<line x1=\"" + viz_fmt_num(px) + "\" y1=\"" + viz_fmt_num(y_zero) + "\" x2=\"" + viz_fmt_num(px) + "\" y2=\"" + viz_fmt_num(py) + "\" stroke=\"" + viz_escape(cfg.accent_hex) + "\" stroke-width=\"2.6\"/>")
+        list_push(out, "<circle cx=\"" + viz_fmt_num(px) + "\" cy=\"" + viz_fmt_num(py) + "\" r=\"4\" fill=\"" + viz_escape(cfg.accent_hex) + "\"><title>Lag " + number_text(i) + ": r=" + viz_fmt_num(r_val) + "</title></circle>")
+        set i = i + 1
+
+    let footer: Text = "Autocorrelation Function | lags=0.." + number_text(max_lag) + " | 95% bounds=±" + viz_fmt_num(ci95)
+    list_push(out, viz_svg_axes_and_close(cfg, -1.0, 1.0, "Lag 0", "Lag " + number_text(max_lag), footer))
+    return ok(text_join(out, ""))
+
+# 16. Pie & Donut Chart (Trigonometric SVG Arc Paths + Percentage Breakdown Legend)
+fn viz_pie_donut_chart(cfg: ChartConfig, labels: TextList, values: List[Float64], is_donut: Boolean) -> Result[Text, Text]:
+    let n: Number = list_count(labels)
+    if n == 0 or n != list_count(values):
+        return err("viz_pie_donut_chart requires equal-length non-empty labels and values")
+    let total: Float64 = stats_sum_compensated(values)
+    if total <= 0.0:
+        return err("viz_pie_donut_chart values must sum to > 0")
+
+    let out: TextList = text_list()
+    list_push(out, "<figure class=\"yz-viz-card\"><svg class=\"yz-viz-svg\" viewBox=\"0 0 760 380\" role=\"img\" aria-label=\"" + viz_escape(cfg.title) + "\">")
+    list_push(out, "<rect x=\"0\" y=\"0\" width=\"760\" height=\"380\" rx=\"14\" fill=\"#0b1120\" stroke=\"#1e293b\" stroke-width=\"1.5\"/>")
+    list_push(out, "<text x=\"28\" y=\"34\" fill=\"#f8fafc\" font-family=\"system-ui,-apple-system,sans-serif\" font-size=\"16\" font-weight=\"700\">" + viz_escape(cfg.title) + "</text>")
+    list_push(out, "<text x=\"28\" y=\"54\" fill=\"#94a3b8\" font-family=\"system-ui,-apple-system,sans-serif\" font-size=\"12\">" + viz_escape(cfg.subtitle) + "</text>")
+
+    let cx: Float64 = 230.0
+    let cy: Float64 = 210.0
+    let r: Float64 = 118.0
+    let two_pi: Float64 = 6.28318530717958647692
+    var start_angle: Float64 = -1.57079632679489661923
+
+    var i: Number = 0
+    while i < n:
+        let v: Float64 = math_max_float64(0.0, list_get(values, i))
+        let frac: Float64 = v / total
+        let sweep: Float64 = frac * two_pi
+        let end_angle: Float64 = start_angle + sweep
+        let x1: Float64 = cx + r * math_cos_float64(start_angle)
+        let y1: Float64 = cy + r * math_sin_float64(start_angle)
+        let x2: Float64 = cx + r * math_cos_float64(end_angle)
+        let y2: Float64 = cy + r * math_sin_float64(end_angle)
+        var large_arc: Text = "0"
+        if frac > 0.5:
+            set large_arc = "1"
+        let col: Text = viz_palette_color(i)
+        let pct: Float64 = frac * 100.0
+        let path_d: Text = "M " + viz_fmt_num(cx) + " " + viz_fmt_num(cy) + " L " + viz_fmt_num(x1) + " " + viz_fmt_num(y1) + " A " + viz_fmt_num(r) + " " + viz_fmt_num(r) + " 0 " + large_arc + " 1 " + viz_fmt_num(x2) + " " + viz_fmt_num(y2) + " Z"
+        list_push(out, "<path d=\"" + path_d + "\" fill=\"" + col + "\" stroke=\"#0b1120\" stroke-width=\"2\"><title>" + viz_escape(list_get(labels, i)) + ": " + viz_fmt_num(v) + " (" + viz_fmt_num(pct) + "%)</title></path>")
+
+        let ly: Number = 104 + i * 32
+        list_push(out, "<rect x=\"430\" y=\"" + number_text(ly - 11) + "\" width=\"14\" height=\"14\" rx=\"3\" fill=\"" + col + "\"/>")
+        list_push(out, "<text x=\"454\" y=\"" + number_text(ly) + "\" fill=\"#f8fafc\" font-family=\"system-ui,-apple-system,sans-serif\" font-size=\"12\" font-weight=\"600\">" + viz_escape(list_get(labels, i)) + "</text>")
+        list_push(out, "<text x=\"716\" y=\"" + number_text(ly) + "\" text-anchor=\"end\" fill=\"#94a3b8\" font-family=\"ui-monospace,monospace\" font-size=\"12\">" + viz_fmt_num(v) + " (" + viz_fmt_num(pct) + "%)</text>")
+
+        set start_angle = end_angle
+        set i = i + 1
+
+    if is_donut:
+        list_push(out, "<circle cx=\"230\" cy=\"210\" r=\"62\" fill=\"#0b1120\" stroke=\"#1e293b\" stroke-width=\"1.5\"/>")
+        list_push(out, "<text x=\"230\" y=\"206\" text-anchor=\"middle\" fill=\"#94a3b8\" font-family=\"system-ui,-apple-system,sans-serif\" font-size=\"11\">TOTAL</text>")
+        list_push(out, "<text x=\"230\" y=\"224\" text-anchor=\"middle\" fill=\"#f8fafc\" font-family=\"ui-monospace,monospace\" font-size=\"14\" font-weight=\"700\">" + viz_fmt_num(total) + "</text>")
+
+    list_push(out, "</svg></figure>")
+    return ok(text_join(out, ""))
+
+# 17. Multi-Axis Radar / Spider Chart (Polar Multivariate Profile Comparison)
+fn viz_radar_spider_chart(cfg: ChartConfig, axis_labels: TextList, normalized_scores: List[Float64]) -> Result[Text, Text]:
+    let k: Number = list_count(axis_labels)
+    if k < 3 or k != list_count(normalized_scores):
+        return err("viz_radar_spider_chart requires >= 3 axes and matching normalized_scores in [0.0, 1.0]")
+    let out: TextList = text_list()
+    list_push(out, "<figure class=\"yz-viz-card\"><svg class=\"yz-viz-svg\" viewBox=\"0 0 760 380\" role=\"img\" aria-label=\"" + viz_escape(cfg.title) + "\">")
+    list_push(out, "<rect x=\"0\" y=\"0\" width=\"760\" height=\"380\" rx=\"14\" fill=\"#0b1120\" stroke=\"#1e293b\" stroke-width=\"1.5\"/>")
+    list_push(out, "<text x=\"28\" y=\"34\" fill=\"#f8fafc\" font-family=\"system-ui,-apple-system,sans-serif\" font-size=\"16\" font-weight=\"700\">" + viz_escape(cfg.title) + "</text>")
+    list_push(out, "<text x=\"28\" y=\"54\" fill=\"#94a3b8\" font-family=\"system-ui,-apple-system,sans-serif\" font-size=\"12\">" + viz_escape(cfg.subtitle) + "</text>")
+
+    let cx: Float64 = 380.0
+    let cy: Float64 = 212.0
+    let max_r: Float64 = 122.0
+    let two_pi: Float64 = 6.28318530717958647692
+
+    var ring: Number = 1
+    while ring <= 4:
+        let rr: Float64 = max_r * (float64_from_number(ring) * 0.25)
+        list_push(out, "<circle cx=\"380\" cy=\"212\" r=\"" + viz_fmt_num(rr) + "\" fill=\"none\" stroke=\"#1e293b\" stroke-dasharray=\"3 3\" stroke-width=\"1\"/>")
+        set ring = ring + 1
+
+    let poly_pts: TextList = text_list()
+    var i: Number = 0
+    while i < k:
+        let angle: Float64 = -1.57079632679489661923 + (float64_from_number(i) * two_pi / float64_from_number(k))
+        let ax_x: Float64 = cx + max_r * math_cos_float64(angle)
+        let ax_y: Float64 = cy + max_r * math_sin_float64(angle)
+        let lx: Float64 = cx + (max_r + 26.0) * math_cos_float64(angle)
+        let ly: Float64 = cy + (max_r + 18.0) * math_sin_float64(angle)
+        list_push(out, "<line x1=\"380\" y1=\"212\" x2=\"" + viz_fmt_num(ax_x) + "\" y2=\"" + viz_fmt_num(ax_y) + "\" stroke=\"#334155\" stroke-width=\"1\"/>")
+        list_push(out, "<text x=\"" + viz_fmt_num(lx) + "\" y=\"" + viz_fmt_num(ly) + "\" text-anchor=\"middle\" fill=\"#cbd5e1\" font-family=\"system-ui,-apple-system,sans-serif\" font-size=\"11\">" + viz_escape(list_get(axis_labels, i)) + "</text>")
+
+        let sc: Float64 = math_min_float64(1.0, math_max_float64(0.0, list_get(normalized_scores, i)))
+        let px: Float64 = cx + (max_r * sc) * math_cos_float64(angle)
+        let py: Float64 = cy + (max_r * sc) * math_sin_float64(angle)
+        list_push(poly_pts, viz_fmt_num(px) + "," + viz_fmt_num(py))
+        set i = i + 1
+
+    list_push(out, "<polygon points=\"" + text_join(poly_pts, " ") + "\" fill=\"" + viz_escape(cfg.accent_hex) + "\" fill-opacity=\"0.28\" stroke=\"" + viz_escape(cfg.accent_hex) + "\" stroke-width=\"2.4\"/>")
+    list_push(out, "</svg></figure>")
+    return ok(text_join(out, ""))
+
+# 18. Financial / Variance Waterfall Chart (Floating Positive/Negative Delta Bars + Cumulative Bridge)
+fn viz_waterfall_chart(cfg: ChartConfig, step_labels: TextList, deltas: List[Float64]) -> Result[Text, Text]:
+    let n: Number = list_count(step_labels)
+    if n == 0 or n != list_count(deltas):
+        return err("viz_waterfall_chart requires equal-length non-empty step_labels and deltas")
+    var running: Float64 = 0.0
+    var min_y: Float64 = 0.0
+    var max_y: Float64 = 0.0
+    var i: Number = 0
+    while i < n:
+        set running = running + list_get(deltas, i)
+        if running < min_y: set min_y = running
+        if running > max_y: set max_y = running
+        set i = i + 1
+    if max_y <= min_y:
+        set max_y = min_y + 1.0
+
+    let out: TextList = text_list()
+    list_push(out, viz_svg_frame_open(cfg, "Net Total=" + viz_fmt_num(running)))
+
+    let slot_w: Float64 = 640.0 / float64_from_number(n)
+    var bar_w: Float64 = slot_w * 0.56
+    if bar_w > 64.0: set bar_w = 64.0
+    var cur: Float64 = 0.0
+    var j: Number = 0
+    while j < n:
+        let d: Float64 = list_get(deltas, j)
+        let next_v: Float64 = cur + d
+        let top_val: Float64 = math_max_float64(cur, next_v)
+        let bot_val: Float64 = math_min_float64(cur, next_v)
+        let py_top: Float64 = viz_scale_linear(top_val, min_y, max_y, 306.0, 88.0)
+        let py_bot: Float64 = viz_scale_linear(bot_val, min_y, max_y, 306.0, 88.0)
+        var bh: Float64 = py_bot - py_top
+        if bh < 3.0: set bh = 3.0
+        let cx: Float64 = 78.0 + (float64_from_number(j) + 0.5) * slot_w
+        let bx: Float64 = cx - (bar_w * 0.5)
+        var col: Text = "#10b981"
+        if d < 0.0:
+            set col = "#f43f5e"
+        list_push(out, "<rect x=\"" + viz_fmt_num(bx) + "\" y=\"" + viz_fmt_num(py_top) + "\" width=\"" + viz_fmt_num(bar_w) + "\" height=\"" + viz_fmt_num(bh) + "\" rx=\"3\" fill=\"" + col + "\"><title>" + viz_escape(list_get(step_labels, j)) + ": " + viz_fmt_num(d) + " (cum=" + viz_fmt_num(next_v) + ")</title></rect>")
+        list_push(out, "<text x=\"" + viz_fmt_num(cx) + "\" y=\"328\" text-anchor=\"middle\" fill=\"#94a3b8\" font-family=\"system-ui,-apple-system,sans-serif\" font-size=\"10\">" + viz_escape(list_get(step_labels, j)) + "</text>")
+        set cur = next_v
+        set j = j + 1
+
+    let footer: Text = "Waterfall Steps=" + number_text(n) + " | Cumulative Net=" + viz_fmt_num(running)
+    list_push(out, viz_svg_axes_and_close(cfg, min_y, max_y, "", "", footer))
+    return ok(text_join(out, ""))
+
+# ==============================================================================
+# TERMINAL / CLI STATISTICAL CHART RENDERER (Unicode Box-Drawing & Block Plots)
+# Run directly in terminal via `say viz_cli_histogram(...)` or `yaza run`!
+# ==============================================================================
+
+fn viz_cli_repeat(ch: Text, count: Number) -> Text:
+    let parts: TextList = text_list()
+    var i: Number = 0
+    while i < count:
+        list_push(parts, ch)
+        set i = i + 1
+    return text_join(parts, "")
+
+fn viz_cli_pad_right(raw: Text, width: Number) -> Text:
+    let len: Number = text_length(raw)
+    if len >= width:
+        return text_slice(raw, 0, width)
+    return raw + viz_cli_repeat(" ", width - len)
+
+# 1. CLI Single-Line Unicode 8-Level Block Sparkline (▁▂▃▄▅▆▇█)
+fn viz_cli_sparkline(xs: List[Float64]) -> Result[Text, Text]:
+    let n: Number = list_count(xs)
+    if n == 0:
+        return err("viz_cli_sparkline requires non-empty input")
+    let d: StatsSummary = stats_describe(xs)?
+    let blocks: TextList = text_list()
+    list_push(blocks, "▁")
+    list_push(blocks, "▂")
+    list_push(blocks, "▃")
+    list_push(blocks, "▄")
+    list_push(blocks, "▅")
+    list_push(blocks, "▆")
+    list_push(blocks, "▇")
+    list_push(blocks, "█")
+    let out: TextList = text_list()
+    let span: Float64 = d.max - d.min
+    var i: Number = 0
+    while i < n:
+        var idx: Number = 3
+        if span > 0.0:
+            set idx = number_from_float64(math_floor_float64(((list_get(xs, i) - d.min) / span) * 7.99))
+        if idx < 0: set idx = 0
+        if idx > 7: set idx = 7
+        list_push(out, list_get(blocks, idx))
+        set i = i + 1
+    return ok(text_join(out, "") + "  [n=" + number_text(n) + " min=" + viz_fmt_num(d.min) + " mean=" + viz_fmt_num(d.mean) + " max=" + viz_fmt_num(d.max) + "]")
+
+# 2. CLI Horizontal Bar Chart
+fn viz_cli_bar_chart(title: Text, categories: TextList, values: List[Float64], max_bar_width: Number) -> Result[Text, Text]:
+    let n: Number = list_count(categories)
+    if n == 0 or n != list_count(values):
+        return err("viz_cli_bar_chart requires equal-length non-empty categories and values")
+    let dv: StatsSummary = stats_describe(values)?
+    var max_v: Float64 = dv.max
+    if max_v <= 0.0: set max_v = 1.0
+    var w: Number = max_bar_width
+    if w < 10: set w = 36
+
+    let lines: TextList = text_list()
+    list_push(lines, "╭──────────────────────────────────────────────────────────────────────╮")
+    list_push(lines, "│ " + viz_cli_pad_right(title, 68) + " │")
+    list_push(lines, "├──────────────────┬───────────────────────────────────────────────────┤")
+    var i: Number = 0
+    while i < n:
+        let lbl: Text = viz_cli_pad_right(list_get(categories, i), 16)
+        let v: Float64 = list_get(values, i)
+        var blen: Number = number_from_float64(math_round_float64((v / max_v) * float64_from_number(w)))
+        if blen < 1 and v > 0.0: set blen = 1
+        let bar_str: Text = viz_cli_repeat("█", blen)
+        list_push(lines, "│ " + lbl + " │ " + bar_str + " " + viz_fmt_num(v))
+        set i = i + 1
+    list_push(lines, "╰──────────────────┴───────────────────────────────────────────────────╯")
+    return ok(text_join(lines, "\n"))
+
+# 3. CLI Distribution Histogram + Welford & Normality Footer
+fn viz_cli_histogram(title: Text, xs: List[Float64], bin_count: Number, max_bar_width: Number) -> Result[Text, Text]:
+    let hist: HistogramBins = stats_histogram(xs, bin_count)?
+    let d: StatsSummary = stats_describe(xs)?
+    var max_cnt: Number = 1
+    var b: Number = 0
+    while b < hist.bin_count:
+        let c: Number = list_get(hist.counts, b)
+        if c > max_cnt: set max_cnt = c
+        set b = b + 1
+    var w: Number = max_bar_width
+    if w < 10: set w = 36
+
+    let lines: TextList = text_list()
+    list_push(lines, "╭──────────────────────────────────────────────────────────────────────╮")
+    list_push(lines, "│ " + viz_cli_pad_right(title, 68) + " │")
+    list_push(lines, "├──────────────────┬────────┬──────────────────────────────────────────┤")
+    var i: Number = 0
+    while i < hist.bin_count:
+        let cnt: Number = list_get(hist.counts, i)
+        let center_lbl: Text = viz_cli_pad_right(viz_fmt_num(list_get(hist.centers, i)), 16)
+        let cnt_lbl: Text = viz_cli_pad_right(number_text(cnt), 6)
+        let blen: Number = number_from_float64(math_round_float64((float64_from_number(cnt) / float64_from_number(max_cnt)) * float64_from_number(w)))
+        list_push(lines, "│ " + center_lbl + " │ " + cnt_lbl + " │ " + viz_cli_repeat("▓", blen))
+        set i = i + 1
+    list_push(lines, "├──────────────────┴────────┴──────────────────────────────────────────┤")
+    list_push(lines, "│ n=" + number_text(d.count) + " | mean=" + viz_fmt_num(d.mean) + " | sd=" + viz_fmt_num(d.std_dev_sample) + " | skew=" + viz_fmt_num(d.skewness) + " | kurt=" + viz_fmt_num(d.excess_kurtosis))
+    list_push(lines, "╰──────────────────────────────────────────────────────────────────────╯")
+    return ok(text_join(lines, "\n"))
+
+# 4. CLI Multi-Group ASCII/Unicode Box-and-Whisker Plot (├────[═══╬═══]────┤)
+fn viz_cli_boxplot(title: Text, group_names: TextList, groups: List[List[Float64]], width: Number) -> Result[Text, Text]:
+    let k: Number = list_count(groups)
+    if k == 0 or k != list_count(group_names):
+        return err("viz_cli_boxplot requires equal-length non-empty group_names and groups")
+    var w: Number = width
+    if w < 24: set w = 44
+
+    let summaries: List[FiveNumberSummary] = List[FiveNumberSummary]()
+    var g_min: Float64 = math_positive_infinity_float64()
+    var g_max: Float64 = math_negative_infinity_float64()
+    var g: Number = 0
+    while g < k:
+        let s: FiveNumberSummary = stats_five_number_summary(list_get(groups, g))?
+        if s.min < g_min: set g_min = s.min
+        if s.max > g_max: set g_max = s.max
+        list_push(summaries, s)
+        set g = g + 1
+
+    let lines: TextList = text_list()
+    list_push(lines, "╭──────────────────────────────────────────────────────────────────────╮")
+    list_push(lines, "│ " + viz_cli_pad_right(title, 68) + " │")
+    list_push(lines, "├──────────────┬───────────────────────────────────────────────────────┤")
+    let wf: Float64 = float64_from_number(w - 1)
+    var i: Number = 0
+    while i < k:
+        let s2: FiveNumberSummary = list_get(summaries, i)
+        let p_min: Number = number_from_float64(math_round_float64(viz_scale_linear(s2.min, g_min, g_max, 0.0, wf)))
+        let p_q25: Number = number_from_float64(math_round_float64(viz_scale_linear(s2.q25, g_min, g_max, 0.0, wf)))
+        let p_med: Number = number_from_float64(math_round_float64(viz_scale_linear(s2.median, g_min, g_max, 0.0, wf)))
+        let p_q75: Number = number_from_float64(math_round_float64(viz_scale_linear(s2.q75, g_min, g_max, 0.0, wf)))
+        let p_max: Number = number_from_float64(math_round_float64(viz_scale_linear(s2.max, g_min, g_max, 0.0, wf)))
+
+        let row_chars: TextList = text_list()
+        var c: Number = 0
+        while c < w:
+            if c == p_med: list_push(row_chars, "╬")
+            elif c == p_q25: list_push(row_chars, "[")
+            elif c == p_q75: list_push(row_chars, "]")
+            elif c > p_q25 and c < p_q75: list_push(row_chars, "═")
+            elif c == p_min: list_push(row_chars, "├")
+            elif c == p_max: list_push(row_chars, "┤")
+            elif (c > p_min and c < p_q25) or (c > p_q75 and c < p_max): list_push(row_chars, "─")
+            else: list_push(row_chars, " ")
+            set c = c + 1
+        let g_lbl: Text = viz_cli_pad_right(list_get(group_names, i), 12)
+        list_push(lines, "│ " + g_lbl + " │ " + text_join(row_chars, "") + " med=" + viz_fmt_num(s2.median) + " IQR=" + viz_fmt_num(s2.iqr))
+        set i = i + 1
+    list_push(lines, "╰──────────────┴───────────────────────────────────────────────────────╯")
+    return ok(text_join(lines, "\n"))
+
+# 5. CLI 2D Scatter & OLS Regression Plot (Terminal Canvas with Points ● and OLS Trend Line ·)
+fn viz_cli_scatter_plot(title: Text, xs: List[Float64], ys: List[Float64], cols: Number, rows: Number) -> Result[Text, Text]:
+    let n: Number = list_count(xs)
+    if n < 2 or n != list_count(ys):
+        return err("viz_cli_scatter_plot requires equal-length xs and ys with count >= 2")
+    var w: Number = cols
+    var h: Number = rows
+    if w < 20: set w = 48
+    if h < 8: set h = 14
+    let dx: StatsSummary = stats_describe(xs)?
+    let dy: StatsSummary = stats_describe(ys)?
+    let ols: OlsModel = ml_ols_fit(xs, ys)?
+
+    let grid: TextList = text_list()
+    var idx: Number = 0
+    while idx < w * h:
+        list_push(grid, " ")
+        set idx = idx + 1
+
+    # Plot OLS regression line dots first
+    var cx: Number = 0
+    while cx < w:
+        let x_val: Float64 = viz_scale_linear(float64_from_number(cx), 0.0, float64_from_number(w - 1), dx.min, dx.max)
+        let y_hat: Float64 = ml_ols_predict(ols, x_val)
+        let ry: Number = number_from_float64(math_round_float64(viz_scale_linear(y_hat, dy.min, dy.max, float64_from_number(h - 1), 0.0)))
+        if ry >= 0 and ry < h:
+            list_set(grid, ry * w + cx, "·")
+        set cx = cx + 1
+
+    # Overlay actual data points ●
+    var i: Number = 0
+    while i < n:
+        let px: Number = number_from_float64(math_round_float64(viz_scale_linear(list_get(xs, i), dx.min, dx.max, 0.0, float64_from_number(w - 1))))
+        let py: Number = number_from_float64(math_round_float64(viz_scale_linear(list_get(ys, i), dy.min, dy.max, float64_from_number(h - 1), 0.0)))
+        if px >= 0 and px < w and py >= 0 and py < h:
+            list_set(grid, py * w + px, "●")
+        set i = i + 1
+
+    let lines: TextList = text_list()
+    list_push(lines, "  " + title + " [OLS: y = " + viz_fmt_num(ols.intercept) + " + " + viz_fmt_num(ols.slope) + "*x | R²=" + viz_fmt_num(ols.r_squared) + "]")
+    list_push(lines, "  ╭" + viz_cli_repeat("─", w) + "╮ " + viz_fmt_num(dy.max))
+    var r: Number = 0
+    while r < h:
+        let row_cells: TextList = text_list()
+        var c: Number = 0
+        while c < w:
+            list_push(row_cells, list_get(grid, r * w + c))
+            set c = c + 1
+        list_push(lines, "  │" + text_join(row_cells, "") + "│")
+        set r = r + 1
+    list_push(lines, "  ╰" + viz_cli_repeat("─", w) + "╯ " + viz_fmt_num(dy.min))
+    list_push(lines, "   x: [" + viz_fmt_num(dx.min) + " .. " + viz_fmt_num(dx.max) + "] (● = observation, · = OLS regression line)")
+    return ok(text_join(lines, "\n"))
+
+# 6. CLI Time-Series Autocorrelation Correlogram (ACF(0..K))
+fn viz_cli_acf_correlogram(title: Text, xs: List[Float64], max_lag: Number) -> Result[Text, Text]:
+    let acfs: List[Float64] = stats_acf_vector(xs, max_lag)?
+    let lines: TextList = text_list()
+    list_push(lines, "╭──────────────────────────────────────────────────────────────────────╮")
+    list_push(lines, "│ " + viz_cli_pad_right(title, 68) + " │")
+    list_push(lines, "├─────────┬──────────┬─────────────────────────────────────────────────┤")
+    var k: Number = 0
+    while k < list_count(acfs):
+        let r_val: Float64 = list_get(acfs, k)
+        let lag_lbl: Text = viz_cli_pad_right("Lag " + number_text(k), 7)
+        let r_lbl: Text = viz_cli_pad_right(viz_fmt_num(r_val), 8)
+        let mag: Number = number_from_float64(math_round_float64(math_abs_float64(r_val) * 20.0))
+        var bar: Text = ""
+        if r_val >= 0.0:
+            set bar = viz_cli_repeat(" ", 20) + "│" + viz_cli_repeat("█", mag)
+        else:
+            set bar = viz_cli_repeat(" ", 20 - mag) + viz_cli_repeat("▒", mag) + "│"
+        list_push(lines, "│ " + lag_lbl + " │ " + r_lbl + " │ " + bar)
+        set k = k + 1
+    list_push(lines, "╰─────────┴──────────┴─────────────────────────────────────────────────╯")
+    return ok(text_join(lines, "\n"))
