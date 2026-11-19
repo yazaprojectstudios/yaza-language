@@ -93,9 +93,11 @@ fn multipart_sniff_mime(data: Bytes, filename: Text) -> Option[Text]:
     # WebP: RIFF....WEBP
     if len >= 12 and bytes_get(data, 0) == 82 and bytes_get(data, 1) == 73 and bytes_get(data, 2) == 70 and bytes_get(data, 3) == 70 and bytes_get(data, 8) == 87 and bytes_get(data, 9) == 69 and bytes_get(data, 10) == 66 and bytes_get(data, 11) == 80:
         return some("image/webp")
-    # MP4 / MOV ISO BMFF: ....ftyp
+    # MP4 / MOV ISO BMFF: big-endian box size (>= 12 and <= len) followed by 'ftyp'
     if len >= 12 and bytes_get(data, 4) == 102 and bytes_get(data, 5) == 116 and bytes_get(data, 6) == 121 and bytes_get(data, 7) == 112:
-        return some("video/mp4")
+        let box_sz: Number = bytes_get(data, 0) * 16777216 + bytes_get(data, 1) * 65536 + bytes_get(data, 2) * 256 + bytes_get(data, 3)
+        if box_sz >= 12 and box_sz <= len:
+            return some("video/mp4")
     # WebM / MKV EBML: 1A 45 DF A3
     if len >= 4 and bytes_get(data, 0) == 26 and bytes_get(data, 1) == 69 and bytes_get(data, 2) == 223 and bytes_get(data, 3) == 163:
         return some("video/webm")
@@ -122,6 +124,36 @@ fn multipart_sniff_mime(data: Bytes, filename: Text) -> Option[Text]:
             return some("application/json; charset=utf-8")
     return none
 
+fn multipart_is_valid_boundary_at(body: Bytes, pos: Number, dlen: Number, require_leading_eol: Boolean) -> Boolean:
+    let blen: Number = bytes_length(body)
+    if pos < 0 or pos + dlen > blen:
+        return false
+    if require_leading_eol:
+        let has_lf: Boolean = pos >= 1 and bytes_get(body, pos - 1) == 10
+        if not has_lf:
+            return false
+    let after: Number = pos + dlen
+    if after + 1 < blen and bytes_get(body, after) == 45 and bytes_get(body, after + 1) == 45:
+        return true
+    if after + 1 < blen and bytes_get(body, after) == 13 and bytes_get(body, after + 1) == 10:
+        return true
+    if after < blen and bytes_get(body, after) == 10:
+        return true
+    return false
+
+fn multipart_find_boundary(body: Bytes, delim: Bytes, start_offset: Number, require_leading_eol: Boolean) -> Number:
+    let dlen: Number = bytes_length(delim)
+    let blen: Number = bytes_length(body)
+    var search: Number = start_offset
+    while search + dlen <= blen:
+        let found: Number = multipart_bytes_find(body, delim, search)
+        if found < 0:
+            return -1
+        if multipart_is_valid_boundary_at(body, found, dlen, require_leading_eol):
+            return found
+        set search = found + 1
+    return -1
+
 fn multipart_parse(content_type: Text, body: Bytes, max_parts: Number, max_file_bytes: Number) -> Result[MultipartForm, Text]:
     let boundary: Text = multipart_clean_boundary(content_type)
     if text_length(boundary) == 0 or text_length(boundary) > 70:
@@ -138,7 +170,7 @@ fn multipart_parse(content_type: Text, body: Bytes, max_parts: Number, max_file_
     let fields: List[FormField] = List[FormField]()
     let files: List[HttpUploadedFile] = List[HttpUploadedFile]()
 
-    var pos: Number = multipart_bytes_find(body, delim, 0)
+    var pos: Number = multipart_find_boundary(body, delim, 0, false)
     if pos < 0:
         return err("multipart: boundary delimiter not found in body")
 
@@ -152,8 +184,10 @@ fn multipart_parse(content_type: Text, body: Bytes, max_parts: Number, max_file_
             set part_start = part_start + 2
         elif part_start < blen and bytes_get(body, part_start) == 10:
             set part_start = part_start + 1
+        else:
+            return err("multipart: boundary delimiter is not followed by line ending")
 
-        let next_pos: Number = multipart_bytes_find(body, delim, part_start)
+        let next_pos: Number = multipart_find_boundary(body, delim, part_start, true)
         if next_pos < 0:
             return err("multipart: unterminated part boundary")
 
@@ -189,7 +223,10 @@ fn multipart_parse(content_type: Text, body: Bytes, max_parts: Number, max_file_
 
         if text_length(parsed.filename) > 0:
             let safe_fn: Text = multipart_sanitize_filename(parsed.filename)
-            list_push(files, HttpUploadedFile(parsed.field_name, safe_fn, parsed.content_type, part_bytes, data_len))
+            let sniffed_opt: Option[Text] = multipart_sniff_mime(part_bytes, safe_fn)
+            if not option_is_some(sniffed_opt):
+                return err("multipart: uploaded file failed magic-byte MIME verification")
+            list_push(files, HttpUploadedFile(parsed.field_name, safe_fn, option_unwrap(sniffed_opt), part_bytes, data_len))
         elif text_length(parsed.field_name) > 0:
             let val_res: Result[Text, Text] = bytes_try_to_text(part_bytes)
             if not result_is_ok(val_res):

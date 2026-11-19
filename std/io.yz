@@ -1,16 +1,49 @@
-# Vectorized I/O, Scatter-Gather (writev), and Zero-Copy Buffered Streams for YAZA.
-# Solves large payload streaming bottlenecks without double-buffering.
+# Vectorized I/O (Scatter-Gather IoVector) and Bounded Buffered TCP/Stream I/O for YAZA.
+# Immutable value-returning state transitions prevent silent value-copy mutation bugs.
 
 shape IoVector:
+    chunks: List[Bytes]
     count: Number
     total_bytes: Number
 
 fn io_vector_create() -> IoVector:
-    return IoVector(0, 0)
+    return IoVector(List[Bytes](), 0, 0)
 
-fn io_vector_append(vec: IoVector, chunk_len: Number):
-    set vec.count = vec.count + 1
-    set vec.total_bytes = vec.total_bytes + chunk_len
+fn io_vector_append_bytes(vec: IoVector, chunk: Bytes) -> IoVector:
+    let next_chunks: List[Bytes] = List[Bytes]()
+    var i: Number = 0
+    while i < list_count(vec.chunks):
+        list_push(next_chunks, list_get(vec.chunks, i))
+        set i = i + 1
+    let clen: Number = bytes_length(chunk)
+    if clen > 0:
+        list_push(next_chunks, chunk)
+    return IoVector(next_chunks, vec.count + 1, vec.total_bytes + clen)
+
+fn io_vector_append(vec: IoVector, chunk_len: Number) -> IoVector:
+    var safe_len: Number = chunk_len
+    if safe_len < 0:
+        set safe_len = 0
+    return IoVector(vec.chunks, vec.count + 1, vec.total_bytes + safe_len)
+
+fn io_vector_flatten(vec: IoVector) -> Result[Bytes, Text]:
+    if list_count(vec.chunks) == 0:
+        return ok(bytes_empty())
+    return bytes_join(vec.chunks)
+
+fn io_vector_write_all(fd: Number, vec: IoVector, timeout_ms: Number) -> Result[Number, Text]:
+    let payload: Bytes = io_vector_flatten(vec)?
+    let total: Number = bytes_length(payload)
+    if total == 0:
+        return ok(0)
+    var offset: Number = 0
+    while offset < total:
+        let slice: Bytes = bytes_slice(payload, offset, total - offset)
+        let n: Number = net_write(fd, slice, timeout_ms)?
+        if n <= 0:
+            return err("io_vector_write_all: connection closed before completing write")
+        set offset = offset + n
+    return ok(offset)
 
 fn io_vector_total_bytes(vec: IoVector) -> Number:
     return vec.total_bytes
@@ -20,20 +53,86 @@ fn io_vector_segment_count(vec: IoVector) -> Number:
 
 shape BufferedReader:
     fd: Number
+    buffer: Bytes
     offset: Number
     length: Number
     capacity: Number
 
+shape BufferedReadResult:
+    reader: BufferedReader
+    data: Bytes
+
 fn buffered_reader_create(fd: Number, capacity: Number) -> BufferedReader:
-    return BufferedReader(fd, 0, 0, capacity)
+    var cap: Number = capacity
+    if cap <= 0:
+        set cap = 4096
+    return BufferedReader(fd, bytes_empty(), 0, 0, cap)
+
+fn buffered_reader_read(reader: BufferedReader, max_bytes: Number, timeout_ms: Number) -> Result[BufferedReadResult, Text]:
+    if max_bytes <= 0:
+        return ok(BufferedReadResult(reader, bytes_empty()))
+    var buf: Bytes = reader.buffer
+    var off: Number = reader.offset
+    var len: Number = reader.length
+    if off >= len:
+        let fresh: Bytes = net_read(reader.fd, reader.capacity, timeout_ms)?
+        set buf = fresh
+        set off = 0
+        set len = bytes_length(fresh)
+        if len == 0:
+            return ok(BufferedReadResult(BufferedReader(reader.fd, buf, 0, 0, reader.capacity), bytes_empty()))
+    var take: Number = len - off
+    if take > max_bytes:
+        set take = max_bytes
+    let out: Bytes = bytes_slice(buf, off, take)
+    return ok(BufferedReadResult(BufferedReader(reader.fd, buf, off + take, len, reader.capacity), out))
 
 shape BufferedWriter:
     fd: Number
+    chunks: List[Bytes]
     buffered_bytes: Number
     capacity: Number
 
 fn buffered_writer_create(fd: Number, capacity: Number) -> BufferedWriter:
-    return BufferedWriter(fd, 0, capacity)
+    var cap: Number = capacity
+    if cap <= 0:
+        set cap = 4096
+    return BufferedWriter(fd, List[Bytes](), 0, cap)
 
 fn buffered_writer_available(writer: BufferedWriter) -> Number:
-    return writer.capacity - writer.buffered_bytes
+    let avail: Number = writer.capacity - writer.buffered_bytes
+    if avail < 0:
+        return 0
+    return avail
+
+fn buffered_writer_flush(writer: BufferedWriter, timeout_ms: Number) -> Result[BufferedWriter, Text]:
+    if writer.buffered_bytes == 0 or list_count(writer.chunks) == 0:
+        return ok(BufferedWriter(writer.fd, List[Bytes](), 0, writer.capacity))
+    let payload: Bytes = bytes_join(writer.chunks)?
+    let total: Number = bytes_length(payload)
+    var offset: Number = 0
+    while offset < total:
+        let slice: Bytes = bytes_slice(payload, offset, total - offset)
+        let n: Number = net_write(writer.fd, slice, timeout_ms)?
+        if n <= 0:
+            return err("buffered_writer_flush: connection closed during flush")
+        set offset = offset + n
+    return ok(BufferedWriter(writer.fd, List[Bytes](), 0, writer.capacity))
+
+fn buffered_writer_write(writer: BufferedWriter, data: Bytes, timeout_ms: Number) -> Result[BufferedWriter, Text]:
+    let dlen: Number = bytes_length(data)
+    if dlen == 0:
+        return ok(writer)
+    var cur: BufferedWriter = writer
+    if cur.buffered_bytes + dlen > cur.capacity and cur.buffered_bytes > 0:
+        set cur = buffered_writer_flush(cur, timeout_ms)?
+    let next_chunks: List[Bytes] = List[Bytes]()
+    var i: Number = 0
+    while i < list_count(cur.chunks):
+        list_push(next_chunks, list_get(cur.chunks, i))
+        set i = i + 1
+    list_push(next_chunks, data)
+    let updated: BufferedWriter = BufferedWriter(cur.fd, next_chunks, cur.buffered_bytes + dlen, cur.capacity)
+    if updated.buffered_bytes >= updated.capacity:
+        return buffered_writer_flush(updated, timeout_ms)
+    return ok(updated)

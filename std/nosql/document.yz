@@ -15,13 +15,35 @@ shape BsonParsedDocument:
 
 fn bson_u32_le(val: Number) -> Result[Bytes, Text]:
     if val < 0 or val > 4294967295: return err("BSON u32_le out of range")
-    let b0: Number = val % 256
-    let b1: Number = (val / 256) % 256
-    let b2: Number = (val / 65536) % 256
-    let b3: Number = (val / 16777216) % 256
-    let p0: Bytes = bytes_concat(bytes_from_number(b0), bytes_from_number(b1))
-    let p1: Bytes = bytes_concat(bytes_from_number(b2), bytes_from_number(b3))
-    return ok(bytes_concat(p0, p1))
+    let buf: Bytes = bytes_try_new_zeroed(4)?
+    let _b0: Boolean = bytes_try_set(buf, 0, val % 256)
+    let _b1: Boolean = bytes_try_set(buf, 1, (val / 256) % 256)
+    let _b2: Boolean = bytes_try_set(buf, 2, (val / 65536) % 256)
+    let _b3: Boolean = bytes_try_set(buf, 3, (val / 16777216) % 256)
+    return ok(buf)
+
+fn bson_i32_le(val: Number) -> Result[Bytes, Text]:
+    if val < -2147483648 or val > 2147483647:
+        return err("BSON i32_le out of range")
+    var u: Number = val
+    if u < 0:
+        set u = u + 4294967296
+    return bson_u32_le(u)
+
+fn bson_i64_le(val: Number) -> Result[Bytes, Text]:
+    let buf: Bytes = bytes_try_new_zeroed(8)?
+    var v: Number = val
+    var i: Number = 0
+    while i < 8:
+        var b: Number = v % 256
+        if b < 0:
+            set b = b + 256
+            set v = (v - b) / 256
+        else:
+            set v = v / 256
+        let _s: Boolean = bytes_try_set(buf, i, b)
+        set i = i + 1
+    return ok(buf)
 
 fn bson_read_u32_le(payload: Bytes, offset: Number) -> Result[Number, Text]:
     if offset < 0 or offset + 4 > bytes_length(payload): return err("BSON buffer underflow reading u32_le")
@@ -31,19 +53,38 @@ fn bson_read_u32_le(payload: Bytes, offset: Number) -> Result[Number, Text]:
     let b3: Number = bytes_get(payload, offset + 3)
     return ok(b0 + b1 * 256 + b2 * 65536 + b3 * 16777216)
 
+fn bson_read_i32_le(payload: Bytes, offset: Number) -> Result[Number, Text]:
+    let u: Number = bson_read_u32_le(payload, offset)?
+    if u >= 2147483648:
+        return ok(u - 4294967296)
+    return ok(u)
+
+fn bson_read_i64_le(payload: Bytes, offset: Number) -> Result[Number, Text]:
+    if offset < 0 or offset + 8 > bytes_length(payload):
+        return err("BSON buffer underflow reading i64_le")
+    let lo: Number = bson_read_u32_le(payload, offset)?
+    let hi_s: Number = bson_read_i32_le(payload, offset + 4)?
+    # Guard against INT64_MIN edge: -2147483648 * 4294967296 + lo
+    if hi_s == -2147483648:
+        let base_min: Number = (-2147483647 * 4294967296) - 4294967296
+        return ok(base_min + lo)
+    return ok((hi_s * 4294967296) + lo)
+
 fn bson_cstring(text: Text) -> Bytes:
     return bytes_concat(bytes_from_text(text), bytes_from_number(0))
 
-fn bson_read_cstring(payload: Bytes, offset: Number) -> Result[Text, Text]:
-    let total: Number = bytes_length(payload)
+fn bson_read_cstring_bounded(payload: Bytes, offset: Number, limit: Number) -> Result[Text, Text]:
     var end_pos: Number = offset
-    while end_pos < total and bytes_get(payload, end_pos) != 0:
+    while end_pos < limit and bytes_get(payload, end_pos) != 0:
         set end_pos = end_pos + 1
-    if end_pos >= total: return err("BSON cstring missing null terminator")
+    if end_pos >= limit: return err("BSON cstring missing null terminator")
     let str_bytes: Bytes = bytes_slice(payload, offset, end_pos - offset)
     let opt: Option[Text] = bytes_to_text_checked(str_bytes)
     if not option_is_some(opt): return err("BSON cstring invalid UTF-8")
     return ok(option_unwrap(opt))
+
+fn bson_read_cstring(payload: Bytes, offset: Number) -> Result[Text, Text]:
+    return bson_read_cstring_bounded(payload, offset, bytes_length(payload))
 
 # Element builders
 fn bson_field_string(name: Text, value: Text) -> BsonField:
@@ -76,48 +117,56 @@ fn bson_encode_element(field: BsonField) -> Result[Bytes, Text]:
         if not result_is_ok(len_res): return err(result_unwrap_error(len_res))
         set body = bytes_concat(result_unwrap(len_res), bytes_concat(raw_str, bytes_from_number(0)))
     # Boolean: 0x08 -> 1-byte
-    if field.field_type == 8:
+    elif field.field_type == 8:
         if field.bool_val:
             set body = bytes_from_number(1)
         else:
             set body = bytes_from_number(0)
-    # Int32: 0x10 -> 4-byte LE
-    if field.field_type == 16:
-        let i_res: Result[Bytes, Text] = bson_u32_le(field.num_val)
+    # Int32: 0x10 (16) -> 4-byte signed LE
+    elif field.field_type == 16:
+        let i_res: Result[Bytes, Text] = bson_i32_le(field.num_val)
         if not result_is_ok(i_res): return err(result_unwrap_error(i_res))
         set body = result_unwrap(i_res)
-    # Int64: 0x18 (18) -> 8-byte LE
-    if field.field_type == 18:
-        let low: Number = field.num_val % 4294967296
-        let high: Number = (field.num_val / 4294967296) % 4294967296
-        let low_b: Result[Bytes, Text] = bson_u32_le(low)
-        let high_b: Result[Bytes, Text] = bson_u32_le(high)
-        if not result_is_ok(low_b) or not result_is_ok(high_b): return err("BSON int64 conversion failed")
-        set body = bytes_concat(result_unwrap(low_b), result_unwrap(high_b))
+    # Int64: 0x12 (18) -> 8-byte signed LE two's complement
+    elif field.field_type == 18:
+        let i64_res: Result[Bytes, Text] = bson_i64_le(field.num_val)
+        if not result_is_ok(i64_res): return err(result_unwrap_error(i64_res))
+        set body = result_unwrap(i64_res)
     # Null: 0x0A (10) -> 0 bytes
-    if field.field_type == 10:
+    elif field.field_type == 10:
         set body = bytes_empty()
     # Binary: 0x05 -> 4-byte len + 1-byte subtype (0) + data
-    if field.field_type == 5:
+    elif field.field_type == 5:
         let bin_len: Number = bytes_length(field.bytes_val)
         let b_len_res: Result[Bytes, Text] = bson_u32_le(bin_len)
         if not result_is_ok(b_len_res): return err(result_unwrap_error(b_len_res))
         set body = bytes_concat(result_unwrap(b_len_res), bytes_concat(bytes_from_number(0), field.bytes_val))
+    else:
+        return err("BSON unsupported element type in encode")
     return ok(bytes_concat(bytes_concat(type_b, name_b), body))
 
 fn bson_encode_document(fields: List[BsonField]) -> Result[Bytes, Text]:
-    var elements: Bytes = bytes_empty()
+    let chunks: List[Bytes] = List[Bytes]()
+    var el_bytes_len: Number = 0
     var idx: Number = 0
     while idx < list_count(fields):
         let el_res: Result[Bytes, Text] = bson_encode_element(list_get(fields, idx))
         if not result_is_ok(el_res): return err(result_unwrap_error(el_res))
-        set elements = bytes_concat(elements, result_unwrap(el_res))
+        let eb: Bytes = result_unwrap(el_res)
+        set el_bytes_len = el_bytes_len + bytes_length(eb)
+        list_push(chunks, eb)
         set idx = idx + 1
-    # total len = 4 (len prefix) + length(elements) + 1 (null terminator)
-    let total_len: Number = 4 + bytes_length(elements) + 1
+    let total_len: Number = 4 + el_bytes_len + 1
     let len_res: Result[Bytes, Text] = bson_u32_le(total_len)
     if not result_is_ok(len_res): return err(result_unwrap_error(len_res))
-    return ok(bytes_concat(bytes_concat(result_unwrap(len_res), elements), bytes_from_number(0)))
+    let all_chunks: List[Bytes] = List[Bytes]()
+    list_push(all_chunks, result_unwrap(len_res))
+    var ci: Number = 0
+    while ci < list_count(chunks):
+        list_push(all_chunks, list_get(chunks, ci))
+        set ci = ci + 1
+    list_push(all_chunks, bytes_from_number(0))
+    return bytes_join(all_chunks)
 
 fn bson_decode_document(payload: Bytes, offset: Number) -> Result[BsonParsedDocument, Text]:
     let total: Number = bytes_length(payload)
@@ -126,46 +175,73 @@ fn bson_decode_document(payload: Bytes, offset: Number) -> Result[BsonParsedDocu
     if not result_is_ok(doc_len_res): return err(result_unwrap_error(doc_len_res))
     let doc_len: Number = result_unwrap(doc_len_res)
     if doc_len < 5 or offset + doc_len > total: return err("BSON invalid document size")
-    var cursor: Number = offset + 4
     let end_limit: Number = offset + doc_len - 1
+    if bytes_get(payload, end_limit) != 0:
+        return err("BSON document missing trailing null terminator")
+    var cursor: Number = offset + 4
     let fields: List[BsonField] = List[BsonField]()
     while cursor < end_limit:
         let el_type: Number = bytes_get(payload, cursor)
         set cursor = cursor + 1
-        let name_res: Result[Text, Text] = bson_read_cstring(payload, cursor)
+        let name_res: Result[Text, Text] = bson_read_cstring_bounded(payload, cursor, end_limit)
         if not result_is_ok(name_res): return err(result_unwrap_error(name_res))
         let el_name: Text = result_unwrap(name_res)
-        set cursor = cursor + text_length(el_name) + 1
+        set cursor = cursor + bytes_length(bytes_from_text(el_name)) + 1
+        # Double (1): 8-byte IEEE-754 LE (stored as raw 8 bytes in bytes_val and bit-pattern in num_val)
+        if el_type == 1:
+            if cursor + 8 > end_limit: return err("BSON double truncated")
+            let raw_f64: Bytes = bytes_slice(payload, cursor, 8)
+            let bits_val: Number = bson_read_i64_le(payload, cursor)?
+            list_push(fields, BsonField(el_name, 1, float64_text(float64_from_bits(bits_val)), bits_val, false, raw_f64))
+            set cursor = cursor + 8
         # String (2)
-        if el_type == 2:
-            let s_len_res: Result[Number, Text] = bson_read_u32_le(payload, cursor)
-            if not result_is_ok(s_len_res): return err(result_unwrap_error(s_len_res))
-            let s_len: Number = result_unwrap(s_len_res)
+        elif el_type == 2:
+            if cursor + 4 > end_limit: return err("BSON string length truncated")
+            let s_len: Number = bson_read_i32_le(payload, cursor)?
             set cursor = cursor + 4
+            if s_len < 1 or cursor + s_len > end_limit:
+                return err("BSON string length out of document bounds")
+            if bytes_get(payload, cursor + s_len - 1) != 0:
+                return err("BSON string missing null terminator")
             let str_bytes: Bytes = bytes_slice(payload, cursor, s_len - 1)
             let str_opt: Option[Text] = bytes_to_text_checked(str_bytes)
             if not option_is_some(str_opt): return err("BSON string decoded invalid UTF-8")
             list_push(fields, bson_field_string(el_name, option_unwrap(str_opt)))
             set cursor = cursor + s_len
+        # Binary (5)
+        elif el_type == 5:
+            if cursor + 5 > end_limit: return err("BSON binary header truncated")
+            let b_len: Number = bson_read_i32_le(payload, cursor)?
+            set cursor = cursor + 5
+            if b_len < 0 or cursor + b_len > end_limit:
+                return err("BSON binary length out of document bounds")
+            let bin_bytes: Bytes = bytes_slice(payload, cursor, b_len)
+            list_push(fields, bson_field_binary(el_name, bin_bytes))
+            set cursor = cursor + b_len
+        # Boolean (8)
+        elif el_type == 8:
+            if cursor + 1 > end_limit: return err("BSON boolean truncated")
+            let b_raw: Number = bytes_get(payload, cursor)
+            if b_raw != 0 and b_raw != 1: return err("BSON invalid boolean byte")
+            list_push(fields, bson_field_boolean(el_name, b_raw == 1))
+            set cursor = cursor + 1
+        # Null (10)
+        elif el_type == 10:
+            list_push(fields, bson_field_null(el_name))
+        # Int32 (16)
+        elif el_type == 16:
+            if cursor + 4 > end_limit: return err("BSON int32 truncated")
+            let i_val: Number = bson_read_i32_le(payload, cursor)?
+            list_push(fields, bson_field_int32(el_name, i_val))
+            set cursor = cursor + 4
+        # Int64 (18)
+        elif el_type == 18:
+            if cursor + 8 > end_limit: return err("BSON int64 truncated")
+            let i64_val: Number = bson_read_i64_le(payload, cursor)?
+            list_push(fields, bson_field_int64(el_name, i64_val))
+            set cursor = cursor + 8
         else:
-            # Boolean (8)
-            if el_type == 8:
-                let b_val: Boolean = (bytes_get(payload, cursor) == 1)
-                list_push(fields, bson_field_boolean(el_name, b_val))
-                set cursor = cursor + 1
-            else:
-                # Int32 (16)
-                if el_type == 16:
-                    let i_res: Result[Number, Text] = bson_read_u32_le(payload, cursor)
-                    if not result_is_ok(i_res): return err(result_unwrap_error(i_res))
-                    list_push(fields, bson_field_int32(el_name, result_unwrap(i_res)))
-                    set cursor = cursor + 4
-                else:
-                    # Null (10)
-                    if el_type == 10:
-                        list_push(fields, bson_field_null(el_name))
-                    else:
-                        return err("BSON unsupported element type in decode")
+            return err("BSON unsupported element type in decode")
     return ok(BsonParsedDocument(fields, doc_len))
 
 # OP_MSG Wire framing (Opcode 2013)

@@ -558,12 +558,16 @@ fn pg_bind_values_message(portal_name: Text, statement_name: Text, parameters: T
 fn pg_describe_message(target: Text, name: Text) -> Result[Bytes, Text]:
     if target != "S" and target != "P":
         return err("postgres protocol: Describe target must be statement or portal")
+    if pg_text_contains_nul(name):
+        return err("postgres protocol: Describe name cannot contain NUL bytes")
     if bytes_length(bytes_from_text(name)) > 1023:
         return err("postgres protocol: Describe name exceeds 1023 bytes")
     let target_byte: Bytes = bytes_from_number(text_byte(target, 0))
     return pg_frontend_message("D", bytes_concat(target_byte, pg_cstring(name)))
 
 fn pg_execute_message(portal_name: Text, max_rows: Number) -> Result[Bytes, Text]:
+    if pg_text_contains_nul(portal_name):
+        return err("postgres protocol: Execute portal name cannot contain NUL bytes")
     if bytes_length(bytes_from_text(portal_name)) > 1023:
         return err("postgres protocol: Execute portal name exceeds 1023 bytes")
     let row_limit: Result[Bytes, Text] = pg_u32_be(max_rows)
@@ -613,6 +617,8 @@ fn pg_flush_message() -> Result[Bytes, Text]:
 fn pg_close_message(target: Text, name: Text) -> Result[Bytes, Text]:
     if target != "S" and target != "P":
         return err("postgres protocol: Close target must be statement or portal")
+    if pg_text_contains_nul(name):
+        return err("postgres protocol: Close name cannot contain NUL bytes")
     if bytes_length(bytes_from_text(name)) > 1023:
         return err("postgres protocol: Close name exceeds 1023 bytes")
     let target_byte: Bytes = bytes_from_number(text_byte(target, 0))
@@ -641,7 +647,7 @@ fn pg_parse_backend_frame(input: Bytes) -> Result[PgBackendFrame, Text]:
     let payload: Bytes = bytes_slice(input, 5, message_length - 4)
     return ok(PgBackendFrame(tag, payload))
 
-fn pg_read_cstring(input: Bytes, offset: Number) -> Result[TextList, Text]:
+fn pg_read_cstring_bounded(input: Bytes, offset: Number, max_bytes: Number) -> Result[TextList, Text]:
     let length: Number = bytes_length(input)
     if offset < 0 or offset >= length:
         return err("postgres protocol: C string offset is outside the input")
@@ -650,8 +656,8 @@ fn pg_read_cstring(input: Bytes, offset: Number) -> Result[TextList, Text]:
         set cursor = cursor + 1
     if cursor >= length:
         return err("postgres protocol: unterminated C string")
-    if cursor - offset > 1023:
-        return err("postgres protocol: C string exceeds the 1023-byte limit")
+    if cursor - offset > max_bytes:
+        return err("postgres protocol: C string exceeds the " + number_text(max_bytes) + "-byte limit")
     let raw_text: Bytes = bytes_slice(input, offset, cursor - offset)
     let decoded: Option[Text] = bytes_to_text_checked(raw_text)
     if not option_is_some(decoded):
@@ -660,6 +666,9 @@ fn pg_read_cstring(input: Bytes, offset: Number) -> Result[TextList, Text]:
     list_push(result, option_unwrap(decoded))
     list_push(result, number_text(cursor + 1))
     return ok(result)
+
+fn pg_read_cstring(input: Bytes, offset: Number) -> Result[TextList, Text]:
+    return pg_read_cstring_bounded(input, offset, 1023)
 
 fn pg_validate_row_description(input: Bytes) -> Result[Number, Text]:
     let total_length: Number = bytes_length(input)
@@ -772,7 +781,7 @@ fn pg_parse_error_response(frame: PgBackendFrame) -> Result[PgServerError, Text]
             set field_count = field_count + 1
             if field_count > 64:
                 return err("postgres protocol: ErrorResponse exceeds the 64-field limit")
-            let value_result: Result[TextList, Text] = pg_read_cstring(frame.payload, cursor)
+            let value_result: Result[TextList, Text] = pg_read_cstring_bounded(frame.payload, cursor, 16384)
             if not result_is_ok(value_result):
                 return err(result_unwrap_error(value_result))
             let value_parts: TextList = result_unwrap(value_result)

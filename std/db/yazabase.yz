@@ -126,11 +126,38 @@ fn yazabase_verify_credentials(db_dir: Text, username: Text, password: Text) -> 
         return result_unwrap(verify_result)
     return yazabase_verify_legacy_pbkdf2(password, stored_hash)
 
+fn yazabase_db_name_is_safe(name: Text) -> Boolean:
+    let len: Number = text_length(name)
+    if len < 1 or len > 63:
+        return false
+    var i: Number = 0
+    while i < len:
+        let b: Number = text_byte(name, i)
+        let ok_ch: Boolean = (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or (b >= 48 and b <= 57) or b == 95 or b == 45
+        if not ok_ch:
+            return false
+        set i = i + 1
+    return true
+
+fn yazabase_rand_hex_u32() -> Text:
+    let r: Bytes = secure_random_bytes(4)
+    let hex: Text = "0123456789abcdef"
+    let parts: TextList = text_list()
+    var i: Number = 0
+    while i < 4:
+        let b: Number = bytes_get(r, i)
+        list_push(parts, text_slice(hex, (b / 16) % 16, 1))
+        list_push(parts, text_slice(hex, b % 16, 1))
+        set i = i + 1
+    return text_join(parts, "")
+
 fn yazabase_connect(db_dir: Text, db_name: Text, username: Text, password: Text) -> Result[YazaBaseConnection, Text]:
     var eff_dir: Text = db_dir
     if eff_dir == "": set eff_dir = "./data"
     var eff_db: Text = db_name
     if eff_db == "": set eff_db = "app"
+    if not yazabase_db_name_is_safe(eff_db):
+        return err("YazaBase: invalid database name; use 1-63 ASCII letters, digits, '_' or '-'")
     var eff_user: Text = username
     if eff_user == "": set eff_user = yazabase_default_user()
     var eff_pass: Text = password
@@ -147,19 +174,32 @@ fn yazabase_connect(db_dir: Text, db_name: Text, username: Text, password: Text)
     let ydb_path: Text = eff_dir + "/" + eff_db
     let ydb_legacy_path: Text = eff_dir + "/" + eff_db + ".ydb"
     if bin_path != "" and not file_exists(ydb_path) and not file_exists(ydb_legacy_path):
-        let lock_dir: Text = eff_dir + "/.init_" + eff_db + ".lock"
-        if directory_create(lock_dir) == 0:
-            if not file_exists(ydb_path) and not file_exists(ydb_legacy_path):
-                let init_args: TextList = text_list()
-                list_push(init_args, "init")
-                list_push(init_args, eff_dir)
-                list_push(init_args, eff_db)
-                let ignored_init: Number = process(bin_path, init_args)
-        else:
-            var waited: Number = 0
-            while waited < 100 and not file_exists(ydb_path) and not file_exists(ydb_legacy_path):
-                let _slept: Boolean = sleep_ms(10)
-                set waited = waited + 1
+        let lock_name: Text = ".init_" + eff_db + ".lock"
+        let root_res: Result[Number, Text] = vfs_root_open(eff_dir)
+        if result_is_ok(root_res):
+            let root_fd: Number = result_unwrap(root_res)
+            let lock_res: Result[Number, Text] = vfs_create_exclusive(root_fd, lock_name)
+            if result_is_ok(lock_res):
+                let _c_lk: Result[Boolean, Text] = vfs_close(result_unwrap(lock_res))
+                var init_status: Number = 0
+                if not file_exists(ydb_path) and not file_exists(ydb_legacy_path):
+                    let init_args: TextList = text_list()
+                    list_push(init_args, "init")
+                    list_push(init_args, eff_dir)
+                    list_push(init_args, eff_db)
+                    set init_status = process(bin_path, init_args)
+                let _rm_lk: Result[Boolean, Text] = vfs_remove(root_fd, lock_name)
+                let _c_rt: Result[Boolean, Text] = vfs_close(root_fd)
+                if init_status != 0:
+                    return err("YazaBase database initialization failed with exit code " + number_text(init_status))
+            else:
+                let _c_rt2: Result[Boolean, Text] = vfs_close(root_fd)
+                var waited: Number = 0
+                while waited < 100 and not file_exists(ydb_path) and not file_exists(ydb_legacy_path):
+                    let _slept: Boolean = sleep_ms(10)
+                    set waited = waited + 1
+                if not file_exists(ydb_path) and not file_exists(ydb_legacy_path):
+                    return err("YazaBase database initialization did not complete in time")
     return ok(YazaBaseConnection(eff_dir, eff_db, eff_user, bin_path, true))
 
 fn yazabase_connect_default(db_dir: Text, db_name: Text) -> Result[YazaBaseConnection, Text]:
@@ -172,7 +212,7 @@ fn yazabase_run_sql_out(conn: YazaBaseConnection, sql: Text, typed_params: TextL
         return err("YazaBase binary not found; install YAZA or set YAZABASE_BIN")
     var attempt: Number = 0
     while attempt < 25:
-        let out_path: Text = conn.db_dir + "/.yb_sql_" + number_text(time_now_monotonic_ns()) + "_" + number_text(attempt) + ".tmp"
+        let out_path: Text = conn.db_dir + "/.yb_sql_" + number_text(time_now_monotonic_ns()) + "_" + yazabase_rand_hex_u32() + "_" + number_text(attempt) + ".tmp"
         let args: TextList = text_list()
         list_push(args, "sql")
         list_push(args, "--csv-out")

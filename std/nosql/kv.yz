@@ -8,15 +8,34 @@ shape KvParsedItem:
     is_error: Boolean
     bytes_consumed: Number
 
+shape KvParsedArray:
+    items: List[KvParsedItem]
+    is_null: Boolean
+    bytes_consumed: Number
+
 fn kv_crlf() -> Bytes:
     return bytes_concat(bytes_from_number(13), bytes_from_number(10))
 
+fn kv_sanitize_inline(raw: Text) -> Text:
+    # Strip CR/LF to prevent RESP simple-string / error frame injection
+    let len: Number = text_length(raw)
+    let parts: TextList = text_list()
+    var i: Number = 0
+    while i < len:
+        let b: Number = text_byte(raw, i)
+        if b != 13 and b != 10:
+            list_push(parts, text_slice(raw, i, 1))
+        set i = i + 1
+    return text_join(parts, "")
+
 fn kv_encode_simple_string(str: Text) -> Bytes:
-    var b: Bytes = bytes_concat(bytes_from_number(43), bytes_from_text(str)) # '+'
+    let safe: Text = kv_sanitize_inline(str)
+    var b: Bytes = bytes_concat(bytes_from_number(43), bytes_from_text(safe)) # '+'
     return bytes_concat(b, kv_crlf())
 
 fn kv_encode_error(err_msg: Text) -> Bytes:
-    var b: Bytes = bytes_concat(bytes_from_number(45), bytes_from_text(err_msg)) # '-'
+    let safe: Text = kv_sanitize_inline(err_msg)
+    var b: Bytes = bytes_concat(bytes_from_number(45), bytes_from_text(safe)) # '-'
     return bytes_concat(b, kv_crlf())
 
 fn kv_encode_integer(val: Number) -> Bytes:
@@ -37,14 +56,19 @@ fn kv_encode_null() -> Bytes:
 
 fn kv_encode_command(cmd: Text, args: TextList) -> Bytes:
     let count: Number = 1 + list_count(args)
-    var b: Bytes = bytes_concat(bytes_from_number(42), bytes_from_text(number_text(count))) # '*'
-    set b = bytes_concat(b, kv_crlf())
-    set b = bytes_concat(b, kv_encode_bulk_string(cmd))
+    let chunks: List[Bytes] = List[Bytes]()
+    list_push(chunks, bytes_from_number(42)) # '*'
+    list_push(chunks, bytes_from_text(number_text(count)))
+    list_push(chunks, kv_crlf())
+    list_push(chunks, kv_encode_bulk_string(cmd))
     var idx: Number = 0
     while idx < list_count(args):
-        set b = bytes_concat(b, kv_encode_bulk_string(list_get(args, idx)))
+        list_push(chunks, kv_encode_bulk_string(list_get(args, idx)))
         set idx = idx + 1
-    return b
+    let joined: Result[Bytes, Text] = bytes_join(chunks)
+    if result_is_ok(joined):
+        return result_unwrap(joined)
+    return bytes_empty()
 
 fn kv_find_crlf(payload: Bytes, offset: Number) -> Number:
     let total: Number = bytes_length(payload)
@@ -97,18 +121,51 @@ fn kv_parse_response(payload: Bytes, offset: Number) -> Result[KvParsedItem, Tex
         let parsed_len: Result[Number, Text] = number_try_parse(option_unwrap(len_str))
         if not result_is_ok(parsed_len): return err("RESP non-numeric bulk length")
         let len_val: Number = result_unwrap(parsed_len)
-        if len_val < 0:
-            # Null bulk string ($-1\r\n)
+        if len_val == -1:
             let consumed: Number = end_len_idx - offset + 2
             return ok(KvParsedItem("", 0, true, false, consumed))
+        if len_val < -1:
+            return err("RESP invalid negative bulk string length")
         let data_start: Number = end_len_idx + 2
         if data_start + len_val + 2 > total: return err("RESP bulk string truncated")
+        if bytes_get(payload, data_start + len_val) != 13 or bytes_get(payload, data_start + len_val + 1) != 10:
+            return err("RESP bulk string missing CRLF terminator")
         let str_bytes: Bytes = bytes_slice(payload, data_start, len_val)
         let opt: Option[Text] = bytes_to_text_checked(str_bytes)
         if not option_is_some(opt): return err("RESP bulk string invalid UTF-8")
         let consumed: Number = data_start + len_val + 2 - offset
         return ok(KvParsedItem(option_unwrap(opt), 0, false, false, consumed))
     return err("RESP unsupported type prefix")
+
+fn kv_parse_array(payload: Bytes, offset: Number) -> Result[KvParsedArray, Text]:
+    let total: Number = bytes_length(payload)
+    if offset < 0 or offset >= total:
+        return err("RESP array buffer underflow")
+    if bytes_get(payload, offset) != 42:
+        return err("RESP expected '*' array prefix")
+    let end_cnt_idx: Number = kv_find_crlf(payload, offset + 1)
+    if end_cnt_idx < 0:
+        return err("RESP incomplete array count")
+    let cnt_str: Option[Text] = bytes_to_text_checked(bytes_slice(payload, offset + 1, end_cnt_idx - offset - 1))
+    if not option_is_some(cnt_str):
+        return err("RESP invalid array count encoding")
+    let cnt_res: Result[Number, Text] = number_try_parse(option_unwrap(cnt_str))
+    if not result_is_ok(cnt_res):
+        return err("RESP non-numeric array count")
+    let count: Number = result_unwrap(cnt_res)
+    if count == -1:
+        return ok(KvParsedArray(List[KvParsedItem](), true, end_cnt_idx - offset + 2))
+    if count < -1 or count > 65536:
+        return err("RESP array count out of bounds")
+    let items: List[KvParsedItem] = List[KvParsedItem]()
+    var cursor: Number = end_cnt_idx + 2
+    var i: Number = 0
+    while i < count:
+        let item: KvParsedItem = kv_parse_response(payload, cursor)?
+        list_push(items, item)
+        set cursor = cursor + item.bytes_consumed
+        set i = i + 1
+    return ok(KvParsedArray(items, false, cursor - offset))
 
 # High-level Key-Value commands
 fn kv_ping() -> Bytes:

@@ -124,61 +124,93 @@ fn tds_read_u32_le(payload: Bytes, offset: Number) -> Result[Number, Text]:
     return ok(b0 + b1 * 256 + b2 * 65536 + b3 * 16777216)
 
 # String conversions for UTF-16LE
-# Multibyte UTF-8 decoding to UTF-16LE code units (supporting accented Latin, CJK, and Unicode)
+# Multibyte UTF-8 decoding to UTF-16LE code units (supporting BMP + 4-byte supplementary surrogate pairs)
 fn tds_encode_utf16le(text: Text) -> Bytes:
-    var result: Bytes = bytes_empty()
+    let chunks: List[Bytes] = List[Bytes]()
     let len: Number = text_length(text)
     var idx: Number = 0
     while idx < len:
         let b0: Number = text_byte(text, idx)
-        var cp: Number = b0
-        if b0 < 128:
-            set idx = idx + 1
-        elif b0 >= 192 and b0 < 224:
-            if idx + 1 < len:
+        if b0 >= 240 and b0 < 248 and idx + 3 < len:
+            let b1: Number = text_byte(text, idx + 1)
+            let b2: Number = text_byte(text, idx + 2)
+            let b3: Number = text_byte(text, idx + 3)
+            let full_cp: Number = ((b0 - 240) * 262144) + ((b1 - 128) * 4096) + ((b2 - 128) * 64) + (b3 - 128)
+            let adjusted: Number = full_cp - 65536
+            let hi_surr: Number = 55296 + (adjusted / 1024)
+            let lo_surr: Number = 56320 + (adjusted % 1024)
+            list_push(chunks, bytes_from_number(hi_surr % 256))
+            list_push(chunks, bytes_from_number((hi_surr / 256) % 256))
+            list_push(chunks, bytes_from_number(lo_surr % 256))
+            list_push(chunks, bytes_from_number((lo_surr / 256) % 256))
+            set idx = idx + 4
+        else:
+            var cp: Number = b0
+            if b0 < 128:
+                set idx = idx + 1
+            elif b0 >= 192 and b0 < 224 and idx + 1 < len:
                 let b1: Number = text_byte(text, idx + 1)
                 set cp = ((b0 - 192) * 64) + (b1 - 128)
                 set idx = idx + 2
-            else:
-                set idx = idx + 1
-        elif b0 >= 224 and b0 < 240:
-            if idx + 2 < len:
+            elif b0 >= 224 and b0 < 240 and idx + 2 < len:
                 let b1: Number = text_byte(text, idx + 1)
                 let b2: Number = text_byte(text, idx + 2)
                 set cp = ((b0 - 224) * 4096) + ((b1 - 128) * 64) + (b2 - 128)
                 set idx = idx + 3
             else:
+                set cp = 65533
                 set idx = idx + 1
-        else:
-            set idx = idx + 1
-        let lo: Number = cp % 256
-        let hi: Number = (cp / 256) % 256
-        set result = bytes_concat(result, bytes_concat(bytes_from_number(lo), bytes_from_number(hi)))
-    return result
+            list_push(chunks, bytes_from_number(cp % 256))
+            list_push(chunks, bytes_from_number((cp / 256) % 256))
+    let joined: Result[Bytes, Text] = bytes_join(chunks)
+    if result_is_ok(joined):
+        return result_unwrap(joined)
+    return bytes_empty()
 
 fn tds_decode_utf16le(payload: Bytes, offset: Number, char_count: Number) -> Result[Text, Text]:
+    if char_count < 0:
+        return err("TDS UTF-16LE negative char count")
     let byte_count: Number = char_count * 2
     if offset < 0 or offset + byte_count > bytes_length(payload):
         return err("TDS buffer underflow decoding UTF-16LE string")
-    var out_bytes: Bytes = bytes_empty()
+    let chunks: List[Bytes] = List[Bytes]()
     var idx: Number = 0
     while idx < char_count:
         let b0: Number = bytes_get(payload, offset + idx * 2)
         let b1: Number = bytes_get(payload, offset + idx * 2 + 1)
-        let cp: Number = b0 + b1 * 256
-        if cp < 128:
-            set out_bytes = bytes_concat(out_bytes, bytes_from_number(cp))
-        elif cp < 2048:
-            let u0: Number = 192 + (cp / 64)
-            let u1: Number = 128 + (cp % 64)
-            set out_bytes = bytes_concat(out_bytes, bytes_concat(bytes_from_number(u0), bytes_from_number(u1)))
+        var cp: Number = b0 + b1 * 256
+        if cp >= 55296 and cp <= 56319:
+            if idx + 1 >= char_count:
+                return err("TDS UTF-16LE unpaired high surrogate")
+            let lb0: Number = bytes_get(payload, offset + (idx + 1) * 2)
+            let lb1: Number = bytes_get(payload, offset + (idx + 1) * 2 + 1)
+            let lo_surr: Number = lb0 + lb1 * 256
+            if lo_surr < 56320 or lo_surr > 57343:
+                return err("TDS UTF-16LE invalid low surrogate")
+            set cp = 65536 + ((cp - 55296) * 1024) + (lo_surr - 56320)
+            set idx = idx + 2
+        elif cp >= 56320 and cp <= 57343:
+            return err("TDS UTF-16LE unexpected low surrogate")
         else:
-            let u0: Number = 224 + (cp / 4096)
-            let u1: Number = 128 + ((cp / 64) % 64)
-            let u2: Number = 128 + (cp % 64)
-            set out_bytes = bytes_concat(out_bytes, bytes_concat(bytes_from_number(u0), bytes_concat(bytes_from_number(u1), bytes_from_number(u2))))
-        set idx = idx + 1
-    let opt: Option[Text] = bytes_to_text_checked(out_bytes)
+            set idx = idx + 1
+        if cp < 128:
+            list_push(chunks, bytes_from_number(cp))
+        elif cp < 2048:
+            list_push(chunks, bytes_from_number(192 + (cp / 64)))
+            list_push(chunks, bytes_from_number(128 + (cp % 64)))
+        elif cp < 65536:
+            list_push(chunks, bytes_from_number(224 + (cp / 4096)))
+            list_push(chunks, bytes_from_number(128 + ((cp / 64) % 64)))
+            list_push(chunks, bytes_from_number(128 + (cp % 64)))
+        else:
+            list_push(chunks, bytes_from_number(240 + (cp / 262144)))
+            list_push(chunks, bytes_from_number(128 + ((cp / 4096) % 64)))
+            list_push(chunks, bytes_from_number(128 + ((cp / 64) % 64)))
+            list_push(chunks, bytes_from_number(128 + (cp % 64)))
+    let joined: Result[Bytes, Text] = bytes_join(chunks)
+    if not result_is_ok(joined):
+        return err("TDS UTF-16LE buffer assembly failed")
+    let opt: Option[Text] = bytes_to_text_checked(result_unwrap(joined))
     if not option_is_some(opt):
         return err("TDS UTF-16LE decoded to invalid text")
     return ok(option_unwrap(opt))
@@ -336,17 +368,29 @@ fn tds_parse_done_token(payload: Bytes, offset: Number) -> Result[TdsDoneToken, 
     let cmd_res: Result[Number, Text] = tds_read_u16_le(payload, offset + 2)
     if not result_is_ok(cmd_res):
         return err(result_unwrap_error(cmd_res))
-    let cnt_res: Result[Number, Text] = tds_read_u32_le(payload, offset + 4)
-    if not result_is_ok(cnt_res):
-        return err(result_unwrap_error(cnt_res))
-    return ok(TdsDoneToken(result_unwrap(st_res), result_unwrap(cmd_res), result_unwrap(cnt_res)))
+    let cnt_lo_res: Result[Number, Text] = tds_read_u32_le(payload, offset + 4)
+    if not result_is_ok(cnt_lo_res):
+        return err(result_unwrap_error(cnt_lo_res))
+    let cnt_hi_res: Result[Number, Text] = tds_read_u32_le(payload, offset + 8)
+    if not result_is_ok(cnt_hi_res):
+        return err(result_unwrap_error(cnt_hi_res))
+    let hi32: Number = result_unwrap(cnt_hi_res)
+    if hi32 > 2147483647:
+        return err("TDS DONE 64-bit row_count exceeds signed 64-bit Number range")
+    let row_count: Number = result_unwrap(cnt_lo_res) + (hi32 * 4294967296)
+    return ok(TdsDoneToken(result_unwrap(st_res), result_unwrap(cmd_res), row_count))
 
 fn tds_parse_error_token(payload: Bytes, offset: Number) -> Result[TdsErrorToken, Text]:
-    if offset < 0 or offset + 10 > bytes_length(payload):
+    let total: Number = bytes_length(payload)
+    if offset < 0 or offset + 10 > total:
         return err("TDS ERROR token buffer underflow")
     let len_res: Result[Number, Text] = tds_read_u16_le(payload, offset)
     if not result_is_ok(len_res):
         return err(result_unwrap_error(len_res))
+    let token_len: Number = result_unwrap(len_res)
+    let token_end: Number = offset + 2 + token_len
+    if token_len < 8 or token_end > total:
+        return err("TDS ERROR token length exceeds buffer bounds")
     let num_res: Result[Number, Text] = tds_read_u32_le(payload, offset + 2)
     if not result_is_ok(num_res):
         return err(result_unwrap_error(num_res))
@@ -356,7 +400,32 @@ fn tds_parse_error_token(payload: Bytes, offset: Number) -> Result[TdsErrorToken
     if not result_is_ok(msg_len_res):
         return err(result_unwrap_error(msg_len_res))
     let msg_chars: Number = result_unwrap(msg_len_res)
-    let msg_res: Result[Text, Text] = tds_decode_utf16le(payload, offset + 10, msg_chars)
+    var cursor: Number = offset + 10
+    if cursor + msg_chars * 2 > token_end:
+        return err("TDS ERROR message exceeds token bounds")
+    let msg_res: Result[Text, Text] = tds_decode_utf16le(payload, cursor, msg_chars)
     if not result_is_ok(msg_res):
         return err(result_unwrap_error(msg_res))
-    return ok(TdsErrorToken(result_unwrap(num_res), state, severity, result_unwrap(msg_res), "server", 1))
+    set cursor = cursor + msg_chars * 2
+    var server_name: Text = "server"
+    var line_number: Number = 1
+    if cursor < token_end:
+        let srv_chars: Number = bytes_get(payload, cursor)
+        set cursor = cursor + 1
+        if cursor + srv_chars * 2 <= token_end:
+            let srv_res: Result[Text, Text] = tds_decode_utf16le(payload, cursor, srv_chars)
+            if result_is_ok(srv_res):
+                set server_name = result_unwrap(srv_res)
+            set cursor = cursor + srv_chars * 2
+            if cursor < token_end:
+                let proc_chars: Number = bytes_get(payload, cursor)
+                set cursor = cursor + 1 + proc_chars * 2
+                if cursor + 4 <= token_end:
+                    let line_res: Result[Number, Text] = tds_read_u32_le(payload, cursor)
+                    if result_is_ok(line_res):
+                        set line_number = result_unwrap(line_res)
+                elif cursor + 2 <= token_end:
+                    let line16_res: Result[Number, Text] = tds_read_u16_le(payload, cursor)
+                    if result_is_ok(line16_res):
+                        set line_number = result_unwrap(line16_res)
+    return ok(TdsErrorToken(result_unwrap(num_res), state, severity, result_unwrap(msg_res), server_name, line_number))

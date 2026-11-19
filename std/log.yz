@@ -1,5 +1,5 @@
 # Structured JSON Logger for Cloud-Native APIs & Microservices.
-# Uses real wall-clock Unix timestamps (std/time) and JSON escaping (std/json).
+# Uses real wall-clock Unix timestamps (std/time), level filtering, and safe JSON serialization (std/json).
 
 use "std/time"
 use "std/json"
@@ -11,16 +11,99 @@ shape Logger:
 fn logger_create(service_name: Text, level: Text) -> Logger:
     return Logger(level, service_name)
 
+fn log_level_rank(level: Text) -> Number:
+    if level == "TRACE": return 0
+    if level == "DEBUG": return 1
+    if level == "INFO": return 2
+    if level == "WARN": return 3
+    if level == "ERROR": return 4
+    return 2
+
+fn log_is_valid_json_container(raw: Text) -> Boolean:
+    let trimmed: Text = text_trim(raw)
+    let n: Number = text_length(trimmed)
+    if n < 2: return false
+    let first: Number = text_byte(trimmed, 0)
+    let last: Number = text_byte(trimmed, n - 1)
+    if not ((first == 123 and last == 125) or (first == 91 and last == 93)):
+        return false
+    var depth: Number = 0
+    var in_string: Boolean = false
+    var escaped: Boolean = false
+    var i: Number = 0
+    while i < n:
+        let b: Number = text_byte(trimmed, i)
+        if b < 32 and b != 9 and b != 10 and b != 13:
+            return false
+        if in_string:
+            if escaped:
+                set escaped = false
+            elif b == 92:
+                set escaped = true
+            elif b == 34:
+                set in_string = false
+        else:
+            if b == 34:
+                set in_string = true
+            elif b == 123 or b == 91:
+                set depth = depth + 1
+            elif b == 125 or b == 93:
+                set depth = depth - 1
+                if depth < 0 or (depth == 0 and i < n - 1):
+                    return false
+        set i = i + 1
+    return not in_string and depth == 0
+
+fn log_safe_json_value(raw: Text) -> Text:
+    let trimmed: Text = text_trim(raw)
+    if trimmed == "null" or trimmed == "true" or trimmed == "false":
+        return trimmed
+    if log_is_valid_json_container(trimmed):
+        return trimmed
+    # If already a single valid JSON string literal ("..."), preserve; otherwise safely encode as JSON string
+    let n: Number = text_length(trimmed)
+    if n >= 2 and text_byte(trimmed, 0) == 34 and text_byte(trimmed, n - 1) == 34:
+        var escaped: Boolean = false
+        var valid_str: Boolean = true
+        var i: Number = 1
+        while i < n - 1:
+            let b: Number = text_byte(trimmed, i)
+            if b < 32:
+                set valid_str = false
+                break
+            if escaped:
+                set escaped = false
+            elif b == 92:
+                set escaped = true
+            elif b == 34:
+                set valid_str = false
+                break
+            set i = i + 1
+        if valid_str and not escaped:
+            return trimmed
+    return json_string(raw)
+
 fn log_emit(logger: Logger, level: Text, message: Text, extra_key: Text, extra_val: Text) -> Boolean:
+    if log_level_rank(level) < log_level_rank(logger.level):
+        return false
     let ts: Number = time_now_unix_ms()
-    var line: Text = "{\"timestamp_ms\":" + number_text(ts)
-    set line = line + ",\"level\":\"" + json_escape_text(level) + "\""
-    set line = line + ",\"service\":\"" + json_escape_text(logger.service_name) + "\""
-    set line = line + ",\"message\":\"" + json_escape_text(message) + "\""
+    let parts: TextList = text_list()
+    list_push(parts, "{\"timestamp_ms\":")
+    list_push(parts, number_text(ts))
+    list_push(parts, ",\"level\":\"")
+    list_push(parts, json_escape_text(level))
+    list_push(parts, "\",\"service\":\"")
+    list_push(parts, json_escape_text(logger.service_name))
+    list_push(parts, "\",\"message\":\"")
+    list_push(parts, json_escape_text(message))
+    list_push(parts, "\"")
     if extra_key != "":
-        set line = line + ",\"" + json_escape_text(extra_key) + "\":" + extra_val
-    set line = line + "}"
-    say line
+        list_push(parts, ",\"")
+        list_push(parts, json_escape_text(extra_key))
+        list_push(parts, "\":")
+        list_push(parts, log_safe_json_value(extra_val))
+    list_push(parts, "}")
+    say text_join(parts, "")
     return true
 
 fn log_info(logger: Logger, message: Text, fields_json: Text) -> Boolean:

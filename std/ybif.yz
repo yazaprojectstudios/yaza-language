@@ -39,22 +39,24 @@ fn ybif_encode_bool(val: Boolean) -> Bytes:
     return bytes_from_number(1)
 
 fn ybif_encode_number(val: Number) -> Bytes:
-    let tag: Bytes = bytes_from_number(3)
-    var sign: Number = 0
-    var abs_val: Number = val
-    if val < 0:
-        set sign = 1
-        set abs_val = 0 - val
-    let sign_byte: Bytes = bytes_from_number(sign)
-    let b0: Bytes = bytes_from_number(abs_val % 256)
-    let b1: Bytes = bytes_from_number((abs_val / 256) % 256)
-    let b2: Bytes = bytes_from_number((abs_val / 65536) % 256)
-    let b3: Bytes = bytes_from_number((abs_val / 16777216) % 256)
-    let b4: Bytes = bytes_from_number((abs_val / 4294967296) % 256)
-    let b5: Bytes = bytes_from_number((abs_val / 1099511627776) % 256)
-    let b6: Bytes = bytes_from_number((abs_val / 281474976710656) % 256)
-    let num_bytes: Bytes = bytes_concat(bytes_concat(bytes_concat(b0, b1), bytes_concat(b2, b3)), bytes_concat(bytes_concat(b4, b5), b6))
-    return bytes_concat(bytes_concat(tag, sign_byte), num_bytes)
+    # Tag 3 + full 8-byte little-endian two's complement signed 64-bit integer (handles full 64-bit range incl. INT64_MIN)
+    let buf_res: Result[Bytes, Text] = bytes_try_new_zeroed(9)
+    if not result_is_ok(buf_res):
+        return bytes_from_number(3)
+    let buf: Bytes = result_unwrap(buf_res)
+    let _t: Boolean = bytes_try_set(buf, 0, 3)
+    var v: Number = val
+    var i: Number = 0
+    while i < 8:
+        var b: Number = v % 256
+        if b < 0:
+            set b = b + 256
+            set v = (v - b) / 256
+        else:
+            set v = v / 256
+        let _s: Boolean = bytes_try_set(buf, 1 + i, b)
+        set i = i + 1
+    return buf
 
 fn ybif_encode_text(val: Text) -> Bytes:
     let tag: Bytes = bytes_from_number(4)
@@ -77,22 +79,27 @@ fn ybif_encode_error(code: Number, message: Text) -> Bytes:
 # Encodes a SQL table result in YBIF format:
 # Header + Tag 9 + column_count (4B) + columns (len + text) + row_count (4B) + row cells
 fn ybif_encode_sql_result(columns: List[Text], rows_json_format: List[Text], row_count: Number) -> Bytes:
-    var body: Bytes = bytes_from_number(9)
+    let chunks: List[Bytes] = List[Bytes]()
+    list_push(chunks, ybif_header())
+    list_push(chunks, bytes_from_number(9))
     let col_count: Number = list_count(columns)
-    set body = bytes_concat(body, ybif_u32_le(col_count))
+    list_push(chunks, ybif_u32_le(col_count))
     var i: Number = 0
     while i < col_count:
         let col_name: Text = list_get(columns, i)
         let col_bytes: Bytes = bytes_from_text(col_name)
-        set body = bytes_concat(body, ybif_u32_le(bytes_length(col_bytes)))
-        set body = bytes_concat(body, col_bytes)
+        list_push(chunks, ybif_u32_le(bytes_length(col_bytes)))
+        list_push(chunks, col_bytes)
         set i = i + 1
-    set body = bytes_concat(body, ybif_u32_le(row_count))
+    list_push(chunks, ybif_u32_le(row_count))
     var r: Number = 0
     while r < list_count(rows_json_format):
         let row_text: Text = list_get(rows_json_format, r)
         let row_bytes: Bytes = bytes_from_text(row_text)
-        set body = bytes_concat(body, ybif_u32_le(bytes_length(row_bytes)))
-        set body = bytes_concat(body, row_bytes)
+        list_push(chunks, ybif_u32_le(bytes_length(row_bytes)))
+        list_push(chunks, row_bytes)
         set r = r + 1
-    return bytes_concat(ybif_header(), body)
+    let joined: Result[Bytes, Text] = bytes_join(chunks)
+    if result_is_ok(joined):
+        return result_unwrap(joined)
+    return ybif_header()

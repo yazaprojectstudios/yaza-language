@@ -1,0 +1,204 @@
+# Comprehensive regression test for Batches A, B, C, and D stdlib audit fixes.
+use "std/uuid"
+use "std/time"
+use "std/log"
+use "std/ybif"
+use "std/math"
+use "std/testing"
+use "std/io"
+use "std/sync"
+use "std/data/random"
+use "std/data/stats"
+use "std/data/frame"
+use "std/data/viz"
+use "std/data/ml"
+use "std/data/matrix"
+use "std/config/api_config"
+use "std/db/core"
+use "std/db/mssql"
+use "std/db/mysql"
+use "std/db/postgres"
+use "std/db/yazabase"
+use "std/mssql/protocol"
+use "std/mssql/uri"
+use "std/mysql/auth"
+use "std/nosql/document"
+use "std/nosql/kv"
+use "std/web/cookie"
+use "std/web/request"
+use "std/web/response"
+use "std/web/multipart"
+use "std/web/media"
+use "std/web/view"
+use "std/web/static"
+
+start:
+    # --- Batch A: UUIDv4/v7, Time ISO-8601, Logger level+JSON, YBIF 64-bit, Web hardening ---
+    let u4a: Uuid = uuid_v4()
+    let u4b: Uuid = uuid_v4()
+    assert(text_length(u4a.hex_string) == 36 and u4a.version == 4 and u4a.hex_string != u4b.hex_string)
+    assert(text_slice(u4a.hex_string, 14, 1) == "4")
+
+    let u7a: Uuid = uuid_v7()
+    let u7b: Uuid = uuid_v7()
+    assert(text_length(u7a.hex_string) == 36 and u7a.version == 7 and u7a.hex_string != u7b.hex_string)
+    assert(text_slice(u7a.hex_string, 14, 1) == "7")
+
+    let dt_utc: DateTime = time_create_datetime(2026, 5, 9, 7, 4, 3)
+    assert(time_format_iso8601(dt_utc) == "2026-05-09T07:04:03Z")
+    let dt_wib: DateTime = DateTime(2026, 11, 19, 15, 30, 5, 0, 25200)
+    assert(time_format_iso8601(dt_wib) == "2026-11-19T15:30:05+07:00")
+    let dt_neg: DateTime = DateTime(2026, 1, 2, 3, 4, 5, 0, -18000)
+    assert(time_format_iso8601(dt_neg) == "2026-01-02T03:04:05-05:00")
+
+    let err_logger: Logger = logger_create("audit-svc", "ERROR")
+    assert(not log_info(err_logger, "should be filtered", "{}"))
+    assert(not log_warn(err_logger, "should be filtered", "{}"))
+    assert(log_safe_json_value("plain text\", \"role\":\"admin") == "\"plain text\\\", \\\"role\\\":\\\"admin\"")
+    assert(log_safe_json_value("{\"ok\":true}") == "{\"ok\":true}")
+
+    # YBIF full 64-bit encoding (including >56-bit and INT64_MIN)
+    let int64_min: Number = (-9223372036854775 * 1000) - 808
+    let enc_min: Bytes = ybif_encode_number(int64_min)
+    assert(bytes_length(enc_min) == 9 and bytes_get(enc_min, 0) == 3 and bytes_get(enc_min, 8) == 128)
+    let enc_ns: Bytes = ybif_encode_number(1795066132109123456)
+    assert(bytes_length(enc_ns) == 9 and bytes_get(enc_ns, 8) != 0)
+
+    # Cookie validation
+    assert(session_sign_cookie("u", "user", "iss", 3600, "too-short") == "")
+    assert(session_sign_cookie("u", "user", "iss", 0, "01234567890123456789012345678901") == "")
+    assert(cookie_set_header("sid", "abc", -5, true, "Lax") == "")
+
+    # Web multi-cookie & 304 without Content-Length & header sanitization
+    var resp_mc: WebResponse = web_html_ok("<h1>hi</h1>")
+    set resp_mc = web_with_cookie(resp_mc, "a=1; Path=/; HttpOnly")
+    set resp_mc = web_with_cookie(resp_mc, "b=2; Path=/; HttpOnly")
+    let mc_wire: Text = bytes_to_text(web_format_response(resp_mc, "req-mc", false))
+    assert(text_find(mc_wire, "Set-Cookie: a=1") >= 0 and text_find(mc_wire, "Set-Cookie: b=2") >= 0)
+    let wire_304: Text = bytes_to_text(web_format_response(web_not_modified("\"e1\"", "public"), "req-304", false))
+    assert(text_find(wire_304, "Content-Length:") < 0)
+
+    # Web request multi-Cookie concatenation & lossy non-UTF-8 Referer preservation
+    let raw_hdr_b: Bytes = bytes_from_text("GET / HTTP/1.1\r\nHost: localhost\r\nCookie: a=1\r\nCookie: b=2\r\n\r\n")
+    let wreq_mc: WebRequest = result_unwrap(web_parse_request(raw_hdr_b))
+    assert(option_unwrap(web_request_cookie(wreq_mc, "a")) == "1")
+    assert(option_unwrap(web_request_cookie(wreq_mc, "b")) == "2")
+
+    # View tag & attribute validation
+    assert(view_attr("onclick", "alert(1)") == "")
+    assert(view_attr("data-id", "42") == " data-id=\"42\"")
+    assert(text_starts_with(view_text_tag("script", "", "alert(1)"), "<span>"))
+    assert(media_is_safe_name("bad\"quote.png") == false)
+    assert(option_unwrap(static_mime_for_path("LOGO.PNG")) == "image/png")
+
+    # Multipart spoofed file MUST fail magic-byte verification in multipart_parse
+    let mp_spoof: Bytes = bytes_from_text("--B1\r\nContent-Disposition: form-data; name=\"f\"; filename=\"x.png\"\r\nContent-Type: image/png\r\n\r\n<script>alert(1)</script>\r\n--B1--\r\n")
+    assert(not result_is_ok(multipart_parse("multipart/form-data; boundary=B1", mp_spoof, 8, 1024)))
+
+    # --- Batch B: Math subnormal ln & neg-base pow, Random seed safety, Stats NaN sort, Frame CSV, Viz 100% pie, ML, Config, Testing ---
+    let subnormal_min: Float64 = float64_from_bits(1)
+    let ln_sub: Float64 = math_ln_float64(subnormal_min)
+    assert(ln_sub < -744.0 and ln_sub > -745.0)
+    assert(math_pow_float64(1.0, math_nan_float64()) == 1.0)
+    assert(math_pow_float64(-2.0, math_positive_infinity_float64()) == math_positive_infinity_float64())
+    assert(math_pow_float64(-2.0, 9007199254740992.0) == math_positive_infinity_float64())
+
+    # Random seed safety (nanosecond clock & 2147483647 trap & RngStep progression)
+    let r_big: List[Float64] = rng_uniform_vec(1795066132109123456, 5, 0.0, 1.0)
+    assert(list_count(r_big) == 5 and list_get(r_big, 0) >= 0.0 and list_get(r_big, 0) < 1.0)
+    let r_trap: List[Float64] = rng_uniform_vec(2147483647, 5, 0.0, 1.0)
+    assert(list_get(r_trap, 0) > 0.0 and list_get(r_trap, 1) != list_get(r_trap, 0))
+    let s0: RngStream = rng_create(42)
+    let st1: RngStep = rng_next_step(s0)
+    let st2: RngStep = rng_next_step(st1.next_stream)
+    assert(st1.value != st2.value)
+
+    # Stats NaN-safe sort
+    let with_nan: List[Float64] = [3.0, math_nan_float64(), 1.0, 2.0]
+    let sorted_nan: List[Float64] = stats_sort_asc(with_nan)
+    assert(list_get(sorted_nan, 0) == 1.0 and list_get(sorted_nan, 1) == 2.0 and list_get(sorted_nan, 2) == 3.0 and math_is_nan_float64(list_get(sorted_nan, 3)))
+
+    # DataFrame malformed CSV row rejected + NaN describe safe
+    assert(not result_is_ok(df_from_csv("a,b\n1,2\n3\n")))
+    let df_na: DataFrame = result_unwrap(df_from_csv("k,v\nx,10\ny,NA\nz,20\n"))
+    let desc_na: Text = df_describe_text(df_na)
+    assert(text_find(desc_na, "count=2") >= 0)
+
+    # Viz 100% pie draws <circle> + negative CLI bar renders cleanly
+    let pie_lbls: TextList = text_list()
+    list_push(pie_lbls, "Only")
+    let pie_vals: List[Float64] = [100.0]
+    let pie_svg: Text = result_unwrap(viz_pie_donut_chart(viz_default_config("Single", "X", "Y"), pie_lbls, pie_vals, false))
+    assert(text_find(pie_svg, "<circle ") >= 0)
+    let neg_cats: TextList = text_list()
+    list_push(neg_cats, "Loss")
+    list_push(neg_cats, "Gain")
+    let neg_vals: List[Float64] = [-5.0, 10.0]
+    let cli_neg: Text = result_unwrap(viz_cli_bar_chart("PnL", neg_cats, neg_vals, 20))
+    assert(text_find(cli_neg, "-▓") >= 0)
+
+    # ML & api_config & testing assertions
+    assert(not result_is_ok(ml_kmeans_1d([1.0, 2.0, 3.0], 2, 0)))
+    assert(not result_is_ok(api_config_parse("[api]\nbind = \"127.0.0.1:99999\"\n")))
+    assert(not result_is_ok(api_config_parse("[api.resources]\nrequest_arena_floor = \"-10MiB\"\n")))
+    let eq_err: Result[Boolean, Text] = assert_eq_number(41, 42, "life")
+    assert(not result_is_ok(eq_err) and text_find(result_unwrap_error(eq_err), "expected 42, got 41") >= 0)
+
+    # --- Batch C: DB Core/MSSQL/MySQL/Postgres/YazaBase, TDS UTF-16LE 4-byte, BSON signed/bounds, RESP Array ---
+    assert(not json_is_valid("{broken"))
+    assert(not json_is_valid("{\"a\":1},{\"b\":2}"))
+    assert(json_is_valid("{\"a\":[1,2,\"ok\"]}"))
+    assert(db_timestamp_text_valid("2026-11-19 15:00:00.1234567"))
+    assert(db_timestamp_tz_text_valid("2026-11-19 15:00:00.1234567 +07:00"))
+    assert(db_postgres_float64_text_valid("0.0000000001e305"))
+    assert(not result_is_ok(yazabase_connect("./data", "../../evil", "u", "p")))
+
+    # MSSQL TDS 106=DECIMALN, 109=FLTN, UTF-16LE 4-byte emoji roundtrip, IPv6 URI
+    let dec_col: TdsColumnMetadata = TdsColumnMetadata(0, 0, 106, 17, "price")
+    let flt_col: TdsColumnMetadata = TdsColumnMetadata(0, 0, 109, 8, "ratio")
+    assert(result_is_ok(db_mssql_decode_cell(dec_col, "123.45", false)))
+    assert(result_is_ok(db_mssql_decode_cell(flt_col, "3.14159", false)))
+    let emoji: Text = "hi 🚀 ok"
+    let utf16_e: Bytes = tds_encode_utf16le(emoji)
+    assert(result_unwrap(tds_decode_utf16le(utf16_e, 0, bytes_length(utf16_e) / 2)) == emoji)
+    let ms_uri: MssqlConnectionConfig = result_unwrap(mssql_parse_uri("mssql://sa:pw@[::1]:1433/master?connectionTimeout=15"))
+    assert(ms_uri.host == "::1" and ms_uri.port == 1433 and ms_uri.connect_timeout_seconds == 15)
+    assert(not result_is_ok(mssql_parse_uri("mssql://:1433/master")))
+    assert(not result_is_ok(mssql_parse_uri("mssql://localhost/master?connectionTimeout=0")))
+
+    # MySQL INT UNSIGNED & MEDIUMBLOB
+    let u32_col: MysqlColumnDefinition = MysqlColumnDefinition("def", "db", "t", "t", "id", "id", 63, 10, 3, 32, 0)
+    assert(result_is_ok(db_mysql_decode_cell(u32_col, "3000000000", false)))
+    assert(bytes_length(mysql_auth_cleartext("pw")) == 3)
+
+    # BSON negative Int32/Int64 + Binary roundtrip & OOB rejection
+    let bfields: List[BsonField] = List[BsonField]()
+    list_push(bfields, bson_field_int32("neg32", -42))
+    list_push(bfields, bson_field_int64("neg64", -9000000000000))
+    list_push(bfields, bson_field_binary("raw", bytes_from_text("abc")))
+    let bdoc: Bytes = result_unwrap(bson_encode_document(bfields))
+    let bdec: BsonParsedDocument = result_unwrap(bson_decode_document(bdoc, 0))
+    assert(list_count(bdec.fields) == 3)
+    assert(list_get(bdec.fields, 0).num_val == -42)
+    assert(list_get(bdec.fields, 1).num_val == -9000000000000)
+    assert(bytes_equal(list_get(bdec.fields, 2).bytes_val, bytes_from_text("abc")))
+
+    # RESP CRLF sanitization, Bulk String CRLF check, Array '*'
+    let clean_ss: Bytes = kv_encode_simple_string("OK\r\n+FAKE")
+    assert(bytes_to_text(clean_ss) == "+OK+FAKE\r\n")
+    assert(not result_is_ok(kv_parse_response(bytes_from_text("$3\r\nabcXX"), 0)))
+    let resp_arr: KvParsedArray = result_unwrap(kv_parse_array(bytes_from_text("*2\r\n$3\r\nfoo\r\n:42\r\n"), 0))
+    assert(list_count(resp_arr.items) == 2 and list_get(resp_arr.items, 0).value_text == "foo" and list_get(resp_arr.items, 1).value_int == 42)
+
+    # --- Batch D: std/io value-returning IoVector & std/sync ---
+    var iov: IoVector = io_vector_create()
+    set iov = io_vector_append_bytes(iov, bytes_from_text("hello "))
+    set iov = io_vector_append_bytes(iov, bytes_from_text("world"))
+    assert(io_vector_segment_count(iov) == 2 and io_vector_total_bytes(iov) == 11)
+    assert(bytes_to_text(result_unwrap(io_vector_flatten(iov))) == "hello world")
+    let m: Mutex = mutex_new()
+    assert(mutex_lock(m) and mutex_unlock(m) and mutex_destroy(m))
+    let a: AtomicNumber = atomic_create(10)
+    assert(atomic_load(a) == 10 and atomic_fetch_add(a, 5) == 15 and atomic_load(a) == 15)
+
+    say "std-audit-regression-smoke: PASS"
