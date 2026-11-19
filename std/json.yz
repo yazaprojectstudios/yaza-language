@@ -1,28 +1,28 @@
-# Strict, bounded JSON serialization and parsing for YAZA.
-# Provides encoding of primitives, arrays, and objects, and bounded field extraction.
+# Strict, bounded JSON serialization and structural top-level object parsing for YAZA.
+# Uses O(N) TextList/text_join encoding and an escape/depth-aware RFC 8259 scanner immune to claim injection.
 
 fn json_escape_text(raw: Text) -> Text:
-    var result: Text = ""
+    let parts: TextList = text_list()
     var index: Number = 0
     let length: Number = text_length(raw)
     while index < length:
         let byte: Number = text_byte(raw, index)
         if byte == 34:
-            set result = result + "\\\""
+            list_push(parts, "\\\"")
         elif byte == 92:
-            set result = result + "\\\\"
+            list_push(parts, "\\\\")
         elif byte == 10:
-            set result = result + "\\n"
+            list_push(parts, "\\n")
         elif byte == 13:
-            set result = result + "\\r"
+            list_push(parts, "\\r")
         elif byte == 9:
-            set result = result + "\\t"
+            list_push(parts, "\\t")
         elif byte < 32:
-            set result = result + " "
+            list_push(parts, " ")
         else:
-            set result = result + text_slice(raw, index, 1)
+            list_push(parts, text_slice(raw, index, 1))
         set index = index + 1
-    return result
+    return text_join(parts, "")
 
 fn json_null() -> Text:
     return "null"
@@ -44,73 +44,222 @@ fn json_field(key: Text, value: Text) -> Text:
     return json_string(key) + ": " + value
 
 fn json_object(fields: List[Text]) -> Text:
-    var res: Text = "{"
+    let parts: TextList = text_list()
     var i: Number = 0
     let count: Number = list_count(fields)
     while i < count:
-        if i > 0: set res = res + ", "
-        set res = res + list_get(fields, i)
+        list_push(parts, list_get(fields, i))
         set i = i + 1
-    return res + "}"
+    return "{" + text_join(parts, ", ") + "}"
 
 fn json_array(items: List[Text]) -> Text:
-    var res: Text = "["
+    let parts: TextList = text_list()
     var i: Number = 0
     let count: Number = list_count(items)
     while i < count:
-        if i > 0: set res = res + ", "
-        set res = res + list_get(items, i)
+        list_push(parts, list_get(items, i))
         set i = i + 1
-    return res + "]"
+    return "[" + text_join(parts, ", ") + "]"
 
-# Bounded extraction of a string field from a flat JSON object: {"key": "val"}
-fn json_extract_string(json: Text, key: Text) -> Option[Text]:
-    let needle: Text = "\"" + key + "\""
-    let pos: Number = text_find(json, needle)
-    if pos < 0: return none
-    var colon_pos: Number = pos + text_length(needle)
-    let json_len: Number = text_length(json)
-    while colon_pos < json_len and text_byte(json, colon_pos) != 58: # ':'
-        set colon_pos = colon_pos + 1
-    if colon_pos >= json_len: return none
-    var val_start: Number = colon_pos + 1
-    while val_start < json_len and text_byte(json, val_start) <= 32:
-        set val_start = val_start + 1
-    if val_start >= json_len: return none
-    if text_byte(json, val_start) != 34: # must start with '"'
+fn json_is_ws(byte: Number) -> Boolean:
+    return byte == 32 or byte == 9 or byte == 10 or byte == 13
+
+fn json_skip_ws(json: Text, start: Number) -> Number:
+    let len: Number = text_length(json)
+    var i: Number = start
+    while i < len and json_is_ws(text_byte(json, i)):
+        set i = i + 1
+    return i
+
+# Scans from an opening '"' to its matching unescaped closing '"', properly handling '\\' escape pairs.
+fn json_scan_string_end(json: Text, quote_open_pos: Number) -> Number:
+    let len: Number = text_length(json)
+    if quote_open_pos < 0 or quote_open_pos >= len or text_byte(json, quote_open_pos) != 34:
+        return -1
+    var i: Number = quote_open_pos + 1
+    while i < len:
+        let b: Number = text_byte(json, i)
+        if b == 92: # '\'
+            if i + 1 >= len:
+                return -1
+            let esc: Number = text_byte(json, i + 1)
+            # Validate legal JSON escape initiator: ", \, /, b, f, n, r, t, u
+            let ok_esc: Boolean = esc == 34 or esc == 92 or esc == 47 or esc == 98 or esc == 102 or esc == 110 or esc == 114 or esc == 116 or esc == 117
+            if not ok_esc:
+                return -1
+            set i = i + 2
+        elif b == 34: # '"'
+            return i
+        elif b < 32:
+            return -1
+        else:
+            set i = i + 1
+    return -1
+
+# Unescapes the inner contents [start, end) of a validated JSON string literal in O(N).
+fn json_unescape_slice(json: Text, start: Number, end: Number) -> Option[Text]:
+    if start < 0 or end < start or end > text_length(json):
         return none
-    set val_start = val_start + 1
-    var val_end: Number = val_start
-    while val_end < json_len:
-        let b: Number = text_byte(json, val_end)
-        if b == 34 and text_byte(json, val_end - 1) != 92: # unescaped quote
-            return some(text_slice(json, val_start, val_end - val_start))
-        set val_end = val_end + 1
-    return none
+    let parts: TextList = text_list()
+    var i: Number = start
+    while i < end:
+        let b: Number = text_byte(json, i)
+        if b == 92: # '\'
+            if i + 1 >= end:
+                return none
+            let esc: Number = text_byte(json, i + 1)
+            if esc == 34: list_push(parts, "\"")
+            elif esc == 92: list_push(parts, "\\")
+            elif esc == 47: list_push(parts, "/")
+            elif esc == 110: list_push(parts, "\n")
+            elif esc == 114: list_push(parts, "\r")
+            elif esc == 116: list_push(parts, "\t")
+            elif esc == 98 or esc == 102: list_push(parts, " ")
+            elif esc == 117:
+                # Preserve \uXXXX sequence verbatim if present (4 hex digits required)
+                if i + 6 > end:
+                    return none
+                list_push(parts, text_slice(json, i, 6))
+                set i = i + 4
+            else:
+                return none
+            set i = i + 2
+        else:
+            list_push(parts, text_slice(json, i, 1))
+            set i = i + 1
+    return some(text_join(parts, ""))
 
-# Bounded extraction of a number field from a JSON object: {"key": 123}
-fn json_extract_number(json: Text, key: Text) -> Option[Number]:
-    let needle: Text = "\"" + key + "\""
-    let pos: Number = text_find(json, needle)
-    if pos < 0: return none
-    var colon_pos: Number = pos + text_length(needle)
-    let json_len: Number = text_length(json)
-    while colon_pos < json_len and text_byte(json, colon_pos) != 58:
-        set colon_pos = colon_pos + 1
-    if colon_pos >= json_len: return none
-    var val_start: Number = colon_pos + 1
-    while val_start < json_len and text_byte(json, val_start) <= 32:
-        set val_start = val_start + 1
-    if val_start >= json_len: return none
-    var val_end: Number = val_start
-    while val_end < json_len:
-        let b: Number = text_byte(json, val_end)
-        let is_digit_or_sign: Boolean = (b >= 48 and b <= 57) or b == 45
-        if not is_digit_or_sign:
+# Advances past one JSON value (string, nested object/array, number, bool, null) respecting string/escape boundaries.
+fn json_skip_value(json: Text, start: Number) -> Number:
+    let len: Number = text_length(json)
+    if start < 0 or start >= len:
+        return -1
+    let first: Number = text_byte(json, start)
+    if first == 34: # string
+        let end_q: Number = json_scan_string_end(json, start)
+        if end_q < 0: return -1
+        return end_q + 1
+    if first == 123 or first == 91: # '{' or '['
+        var depth: Number = 0
+        var i: Number = start
+        while i < len:
+            let b: Number = text_byte(json, i)
+            if b == 34:
+                let sq: Number = json_scan_string_end(json, i)
+                if sq < 0: return -1
+                set i = sq + 1
+            elif b == 123 or b == 91:
+                set depth = depth + 1
+                if depth > 64: return -1
+                set i = i + 1
+            elif b == 125 or b == 93:
+                set depth = depth - 1
+                set i = i + 1
+                if depth == 0:
+                    return i
+            else:
+                set i = i + 1
+        return -1
+    # Primitive: number, true, false, null
+    var p: Number = start
+    while p < len:
+        let ch: Number = text_byte(json, p)
+        if json_is_ws(ch) or ch == 44 or ch == 125 or ch == 93:
             break
-        set val_end = val_end + 1
-    if val_end <= val_start: return none
-    let num_str: Text = text_slice(json, val_start, val_end - val_start)
+        set p = p + 1
+    if p == start:
+        return -1
+    return p
+
+# Structurally scans a top-level JSON object and returns the start offset of the unique value for target_key.
+# Rejects malformed JSON, trailing garbage, nested-key shadowing, and duplicate matching keys.
+fn json_find_top_level_value_pos(json: Text, target_key: Text) -> Number:
+    let len: Number = text_length(json)
+    var i: Number = json_skip_ws(json, 0)
+    if i >= len or text_byte(json, i) != 123: # must start with '{'
+        return -1
+    set i = json_skip_ws(json, i + 1)
+    if i >= len:
+        return -1
+    if text_byte(json, i) == 125: # empty object {}
+        return -1
+
+    var found_pos: Number = -1
+    var found_count: Number = 0
+    while i < len:
+        set i = json_skip_ws(json, i)
+        if i >= len or text_byte(json, i) != 34:
+            return -1
+        let key_end: Number = json_scan_string_end(json, i)
+        if key_end < 0:
+            return -1
+        let key_opt: Option[Text] = json_unescape_slice(json, i + 1, key_end)
+        if not option_is_some(key_opt):
+            return -1
+        let key_name: Text = option_unwrap(key_opt)
+
+        set i = json_skip_ws(json, key_end + 1)
+        if i >= len or text_byte(json, i) != 58: # ':'
+            return -1
+        let val_pos: Number = json_skip_ws(json, i + 1)
+        if val_pos >= len:
+            return -1
+
+        if key_name == target_key:
+            set found_count = found_count + 1
+            if found_count > 1:
+                return -2
+            set found_pos = val_pos
+
+        let after_val: Number = json_skip_value(json, val_pos)
+        if after_val < 0:
+            return -1
+        set i = json_skip_ws(json, after_val)
+        if i >= len:
+            return -1
+        let sep: Number = text_byte(json, i)
+        if sep == 44: # ','
+            set i = i + 1
+        elif sep == 125: # '}'
+            let trailing: Number = json_skip_ws(json, i + 1)
+            if trailing != len:
+                return -1
+            return found_pos
+        else:
+            return -1
+    return -1
+
+# Structural extraction of a top-level string field from a JSON object: {"key": "val"}
+fn json_extract_string(json: Text, key: Text) -> Option[Text]:
+    let vpos: Number = json_find_top_level_value_pos(json, key)
+    if vpos < 0: return none
+    if text_byte(json, vpos) != 34: # must be a JSON string starting with '"'
+        return none
+    let vend: Number = json_scan_string_end(json, vpos)
+    if vend < 0: return none
+    return json_unescape_slice(json, vpos + 1, vend)
+
+# Structural extraction of a top-level integer field from a JSON object: {"key": 123}
+fn json_extract_number(json: Text, key: Text) -> Option[Number]:
+    let vpos: Number = json_find_top_level_value_pos(json, key)
+    if vpos < 0: return none
+    let len: Number = text_length(json)
+    var p: Number = vpos
+    if p < len and text_byte(json, p) == 45: # optional leading '-'
+        set p = p + 1
+    let digits_start: Number = p
+    while p < len:
+        let b: Number = text_byte(json, p)
+        if b < 48 or b > 57:
+            break
+        set p = p + 1
+    if p <= digits_start:
+        return none
+    if p < len:
+        let delim: Number = text_byte(json, p)
+        if not (json_is_ws(delim) or delim == 44 or delim == 125):
+            return none
+    let num_str: Text = text_slice(json, vpos, p - vpos)
     let parsed: Result[Number, Text] = number_try_parse(num_str)
     if result_is_ok(parsed):
         return some(result_unwrap(parsed))

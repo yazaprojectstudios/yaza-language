@@ -1,6 +1,7 @@
 # Yaza Web Token (YWT) v1 implementation
-# Cryptographically signed using RFC 2104 HMAC-SHA256 and verified in constant time.
-# Token format: "ywt1." + hex(payload) + "." + hmac_sha256_hex
+# Cryptographically signed using domain-separated RFC 2104 HMAC-SHA256 and verified in constant time
+# strictly BEFORE hex decoding, UTF-8 conversion, or structural JSON parsing (verify-before-parse).
+# Token format: "ywt1." + hex(payload) + "." + hmac_sha256_hex(subkey, hex(payload))
 
 use "std/json"
 use "std/crypto/hash"
@@ -11,14 +12,15 @@ fn ywt_hex_byte(b: Number) -> Text:
     let lo: Number = b % 16
     return text_slice(digits, hi, 1) + text_slice(digits, lo, 1)
 
+# O(N) Arena-friendly hex encoder using TextList + single-pass text_join
 fn ywt_bytes_to_hex(b: Bytes) -> Text:
-    var res: Text = ""
+    let parts: TextList = text_list()
     var i: Number = 0
     let len: Number = bytes_length(b)
     while i < len:
-        set res = res + ywt_hex_byte(bytes_get(b, i))
+        list_push(parts, ywt_hex_byte(bytes_get(b, i)))
         set i = i + 1
-    return res
+    return text_join(parts, "")
 
 fn ywt_hex_val(byte: Number) -> Number:
     if byte >= 48 and byte <= 57: return byte - 48
@@ -26,9 +28,10 @@ fn ywt_hex_val(byte: Number) -> Number:
     if byte >= 65 and byte <= 70: return byte - 55
     return -1
 
+# Strict hex decoder that rejects odd lengths, invalid hex digits, and embedded NUL (0x00) bytes
 fn ywt_hex_to_bytes(hex: Text) -> Result[Bytes, Text]:
     let len: Number = text_length(hex)
-    if len % 2 != 0: return err("invalid hex length")
+    if len == 0 or len % 2 != 0: return err("invalid hex length")
     let b: Bytes = bytes_try_new_zeroed(len / 2)?
     var i: Number = 0
     while i < len:
@@ -36,31 +39,46 @@ fn ywt_hex_to_bytes(hex: Text) -> Result[Bytes, Text]:
         let l: Number = ywt_hex_val(text_byte(hex, i + 1))
         if h < 0 or l < 0: return err("invalid hex digit")
         let val: Number = h * 16 + l
+        if val == 0: return err("YWT payload must not contain NUL bytes")
         let _s: Boolean = bytes_try_set(b, i / 2, val)
         set i = i + 2
     return ok(b)
+
+# Domain-separated sub-key derivation prevents cross-protocol token substitution when sharing YAZA_AUTH_SECRET
+fn ywt_derive_signing_key(secret: Text) -> Text:
+    return crypto_hmac_sha256_hex(secret, "ywt1:hmac-sha256:signing-key")
 
 shape YwtClaims:
     subject: Text
     role: Text
     issuer: Text
     expiry_s: Number
+    issued_at_s: Number
+    token_id: Text
+
+fn ywt_sign_payload_json(payload_json: Text, secret: Text) -> Text:
+    if text_length(secret) < 32: fail("YWT signing secret must contain at least 32 characters")
+    let payload_bytes: Bytes = bytes_from_text(payload_json)
+    let payload_hex: Text = ywt_bytes_to_hex(payload_bytes)
+    let signing_key: Text = ywt_derive_signing_key(secret)
+    let sig_text: Text = crypto_hmac_sha256_hex(signing_key, payload_hex)
+    return "ywt1." + payload_hex + "." + sig_text
 
 fn ywt_create(subject: Text, issuer: Text, expiry_s: Number, secret: Text) -> Text:
-    if text_length(secret) < 32: fail("YWT signing secret must contain at least 32 characters")
     let payload_json: Text = "{\"sub\":\"" + json_escape_text(subject) + "\",\"iss\":\"" + json_escape_text(issuer) + "\",\"exp\":" + number_text(expiry_s) + "}"
-    let payload_bytes: Bytes = bytes_from_text(payload_json)
-    let payload_hex: Text = ywt_bytes_to_hex(payload_bytes)
-    let sig_text: Text = crypto_hmac_sha256_hex(secret, payload_hex)
-    return "ywt1." + payload_hex + "." + sig_text
+    return ywt_sign_payload_json(payload_json, secret)
 
 fn ywt_create_with_role(subject: Text, issuer: Text, role: Text, expiry_s: Number, secret: Text) -> Text:
-    if text_length(secret) < 32: fail("YWT signing secret must contain at least 32 characters")
     let payload_json: Text = "{\"sub\":\"" + json_escape_text(subject) + "\",\"iss\":\"" + json_escape_text(issuer) + "\",\"role\":\"" + json_escape_text(role) + "\",\"exp\":" + number_text(expiry_s) + "}"
-    let payload_bytes: Bytes = bytes_from_text(payload_json)
-    let payload_hex: Text = ywt_bytes_to_hex(payload_bytes)
-    let sig_text: Text = crypto_hmac_sha256_hex(secret, payload_hex)
-    return "ywt1." + payload_hex + "." + sig_text
+    return ywt_sign_payload_json(payload_json, secret)
+
+# Full YWT creation with iat (issued at) and jti (128-bit random token ID if omitted) for revocation & clock-skew protection
+fn ywt_create_with_claims(subject: Text, issuer: Text, role: Text, issued_at_s: Number, expiry_s: Number, token_id: Text, secret: Text) -> Text:
+    var jti: Text = token_id
+    if jti == "":
+        set jti = ywt_bytes_to_hex(secure_random_bytes(16))
+    let payload_json: Text = "{\"sub\":\"" + json_escape_text(subject) + "\",\"iss\":\"" + json_escape_text(issuer) + "\",\"role\":\"" + json_escape_text(role) + "\",\"iat\":" + number_text(issued_at_s) + ",\"exp\":" + number_text(expiry_s) + ",\"jti\":\"" + json_escape_text(jti) + "\"}"
+    return ywt_sign_payload_json(payload_json, secret)
 
 fn ywt_verify_claims(token: Text, expected_issuer: Text, current_time_s: Number, secret: Text) -> Result[YwtClaims, Text]:
     if text_length(secret) < 32:
@@ -77,23 +95,33 @@ fn ywt_verify_claims(token: Text, expected_issuer: Text, current_time_s: Number,
             set dot_pos = i
             break
         set i = i - 1
-    if dot_pos < 0: return err("malformed YWT token structure")
+    if dot_pos <= 0: return err("malformed YWT token structure")
     let payload_hex: Text = text_slice(raw, 0, dot_pos)
+    if text_find(payload_hex, ".") >= 0:
+        return err("malformed YWT token structure")
     let sig_text: Text = text_slice(raw, dot_pos + 1, text_length(raw) - dot_pos - 1)
     if text_length(payload_hex) == 0 or text_length(payload_hex) > 4096:
         return err("YWT payload exceeds the 2 KiB hard limit")
     if text_length(sig_text) != 64:
         return err("invalid YWT signature encoding")
 
+    # 1. Verify-Before-Decode: validate domain-separated HMAC-SHA256 in constant time BEFORE decoding hex or parsing JSON
+    let signing_key: Text = ywt_derive_signing_key(secret)
+    let expected_sig: Text = crypto_hmac_sha256_hex(signing_key, payload_hex)
+    if not crypto_constant_time_compare(expected_sig, sig_text):
+        return err("invalid YWT token signature")
+
+    # 2. Decode hex (rejects non-hex and NUL bytes) and convert via crash-free UTF-8 validator
     let payload_bytes_res: Result[Bytes, Text] = ywt_hex_to_bytes(payload_hex)
     if not result_is_ok(payload_bytes_res): return err("malformed YWT payload encoding")
     let payload_bytes: Bytes = result_unwrap(payload_bytes_res)
 
-    let expected_sig: Text = crypto_hmac_sha256_hex(secret, payload_hex)
-    if not crypto_constant_time_compare(expected_sig, sig_text):
-        return err("invalid YWT token signature")
+    let payload_text_res: Result[Text, Text] = bytes_try_to_text(payload_bytes)
+    if not result_is_ok(payload_text_res):
+        return err("invalid UTF-8 or NUL byte in YWT payload")
+    let payload_text: Text = result_unwrap(payload_text_res)
 
-    let payload_text: Text = bytes_to_text(payload_bytes)
+    # 3. Structural top-level JSON claim extraction (immune to claim injection & duplicate-key smuggling)
     let sub_opt: Option[Text] = json_extract_string(payload_text, "sub")
     if not option_is_some(sub_opt) or option_unwrap(sub_opt) == "": return err("missing subject claim")
     let iss_opt: Option[Text] = json_extract_string(payload_text, "iss")
@@ -103,11 +131,28 @@ fn ywt_verify_claims(token: Text, expected_issuer: Text, current_time_s: Number,
     if not option_is_some(exp_opt): return err("missing expiry claim")
     let exp_val: Number = option_unwrap(exp_opt)
     if exp_val <= current_time_s: return err("token expired")
+
+    # Optional iat (Issued At): reject future-dated tokens beyond 60-second clock skew tolerance
+    var iat_val: Number = 0
+    let iat_opt: Option[Number] = json_extract_number(payload_text, "iat")
+    if option_is_some(iat_opt):
+        set iat_val = option_unwrap(iat_opt)
+        if iat_val > current_time_s + 60:
+            return err("YWT token issued in the future")
+        if iat_val >= exp_val:
+            return err("YWT token iat must be before exp")
+
     var role_val: Text = ""
     let role_opt: Option[Text] = json_extract_string(payload_text, "role")
     if option_is_some(role_opt):
         set role_val = option_unwrap(role_opt)
-    return ok(YwtClaims(option_unwrap(sub_opt), role_val, option_unwrap(iss_opt), exp_val))
+
+    var jti_val: Text = ""
+    let jti_opt: Option[Text] = json_extract_string(payload_text, "jti")
+    if option_is_some(jti_opt):
+        set jti_val = option_unwrap(jti_opt)
+
+    return ok(YwtClaims(option_unwrap(sub_opt), role_val, option_unwrap(iss_opt), exp_val, iat_val, jti_val))
 
 fn ywt_verify(token: Text, expected_issuer: Text, current_time_s: Number, secret: Text) -> Result[Text, Text]:
     let claims_res: Result[YwtClaims, Text] = ywt_verify_claims(token, expected_issuer, current_time_s, secret)

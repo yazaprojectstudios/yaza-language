@@ -1,32 +1,85 @@
 use "std/json"
 use "std/http"
 use "std/ywt"
+use "std/jwt"
+use "std/crypto/hash"
 
 start:
-    # 1. JSON test
+    # 1. Structural JSON extraction & unescaping tests
     let obj: Text = "{\"name\": \"yaza\", \"count\": 42}"
     let name_opt: Option[Text] = json_extract_string(obj, "name")
-    if not option_is_some(name_opt): fail("json: name not found")
-    if option_unwrap(name_opt) != "yaza": fail("json: name mismatch")
+    assert(option_is_some(name_opt) and option_unwrap(name_opt) == "yaza")
     say "JSON name: " + option_unwrap(name_opt)
 
     let count_opt: Option[Number] = json_extract_number(obj, "count")
-    if not option_is_some(count_opt): fail("json: count not found")
-    if option_unwrap(count_opt) != 42: fail("json: count mismatch")
+    assert(option_is_some(count_opt) and option_unwrap(count_opt) == 42)
     say "JSON count: " + number_text(option_unwrap(count_opt))
 
-    # 2. YWT test
+    # Duplicate key smuggling & nested key shadowing MUST be rejected
+    assert(not option_is_some(json_extract_string("{\"role\":\"user\",\"role\":\"admin\"}", "role")))
+    assert(not option_is_some(json_extract_number("{\"exp\":100,\"exp\":99999}", "exp")))
+    assert(not option_is_some(json_extract_string("{\"meta\":{\"role\":\"admin\"}}", "role")))
+
+    # 2. YWT basic test
     let secret: Text = "super-secret-key-for-yaza-smoke-32-bytes-min"
     let token: Text = ywt_create("admin", "yazabase", 5000, secret)
     say "YWT token: " + token
     let verified: Result[Text, Text] = ywt_verify(token, "yazabase", 1000, secret)
-    if not result_is_ok(verified): fail("ywt: verify failed: " + result_unwrap_error(verified))
+    assert(result_is_ok(verified) and result_unwrap(verified) == "admin")
     say "YWT verified sub: " + result_unwrap(verified)
 
-    # 3. HTTP parse test
+    # 3. Adversarial Claim Injection #1: Role spoofing inside subject
+    let evil_role_sub: Text = "alice\",\"role\":\"admin"
+    let tok_evil_role: Text = ywt_create_with_role(evil_role_sub, "yazabase", "user", 5000, secret)
+    let c_role: YwtClaims = result_unwrap(ywt_verify_claims(tok_evil_role, "yazabase", 1000, secret))
+    assert(c_role.subject == evil_role_sub)
+    assert(c_role.role == "user")
+
+    # 4. Adversarial Claim Injection #2: Expiry spoofing inside subject
+    let evil_exp_sub: Text = "alice\",\"exp\":9999999999,\"x\":\""
+    let tok_evil_exp: Text = ywt_create_with_role(evil_exp_sub, "yazabase", "user", 2000, secret)
+    let c_exp: YwtClaims = result_unwrap(ywt_verify_claims(tok_evil_exp, "yazabase", 1000, secret))
+    assert(c_exp.subject == evil_exp_sub)
+    assert(c_exp.expiry_s == 2000)
+    assert(not result_is_ok(ywt_verify_claims(tok_evil_exp, "yazabase", 2500, secret)))
+
+    # 5. Adversarial Escaped-Backslash Tail #3: subject ending in '\'
+    let slash_sub: Text = "alice\\"
+    let tok_slash: Text = ywt_create_with_role(slash_sub, "yazabase", "viewer", 5000, secret)
+    let c_slash: YwtClaims = result_unwrap(ywt_verify_claims(tok_slash, "yazabase", 1000, secret))
+    assert(c_slash.subject == slash_sub and c_slash.role == "viewer")
+
+    # 6. Adversarial Domain Separation #4: Token signed with raw secret instead of derived subkey MUST fail
+    let raw_payload_hex: Text = ywt_bytes_to_hex(bytes_from_text("{\"sub\":\"admin\",\"iss\":\"yazabase\",\"exp\":5000}"))
+    let raw_sig: Text = crypto_hmac_sha256_hex(secret, raw_payload_hex)
+    let raw_forged: Text = "ywt1." + raw_payload_hex + "." + raw_sig
+    assert(not result_is_ok(ywt_verify_claims(raw_forged, "yazabase", 1000, secret)))
+
+    # 7. Adversarial NUL-Byte Rejection #5 (must return err cleanly, never crash)
+    assert(not result_is_ok(ywt_hex_to_bytes("7b007d")))
+    let nul_hex: Text = "7b22737562223a22610062227d"
+    let nul_sig: Text = crypto_hmac_sha256_hex(ywt_derive_signing_key(secret), nul_hex)
+    assert(not result_is_ok(ywt_verify_claims("ywt1." + nul_hex + "." + nul_sig, "yazabase", 1000, secret)))
+
+    # 8. YWT iat (clock-skew) + jti (128-bit random token ID) verification
+    let tok_full: Text = ywt_create_with_claims("alice", "yazabase", "editor", 1000, 5000, "", secret)
+    let c_full: YwtClaims = result_unwrap(ywt_verify_claims(tok_full, "yazabase", 1000, secret))
+    assert(c_full.subject == "alice" and c_full.role == "editor" and c_full.issued_at_s == 1000 and text_length(c_full.token_id) == 32)
+    # Future-dated iat beyond 60s clock skew MUST be rejected
+    assert(not result_is_ok(ywt_verify_claims(tok_full, "yazabase", 900, secret)))
+    # Within 60s clock skew tolerance MUST pass
+    assert(result_is_ok(ywt_verify_claims(tok_full, "yazabase", 950, secret)))
+
+    # 9. JWT Claim Injection defense (inherits structural std/json + verify-before-parse)
+    let jwt_evil: Text = jwt_create_hs256(evil_exp_sub, "yazabase", "api", "user", 2000, secret)
+    let jc: JwtClaims = result_unwrap(jwt_verify_hs256(jwt_evil, "yazabase", "api", 1000, secret))
+    assert(jc.subject == evil_exp_sub and jc.expiry_s == 2000 and jc.role == "user")
+    assert(not result_is_ok(jwt_verify_hs256(jwt_evil, "yazabase", "api", 2500, secret)))
+
+    # 10. HTTP parse test
     let raw_http: Text = "POST /api/v1/sql HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: 18\r\n\r\n{\"sql\":\"SELECT 1\"}"
     let req_res: Result[HttpRequest, Text] = http_parse_request(bytes_from_text(raw_http))
-    if not result_is_ok(req_res): fail("http: parse failed: " + result_unwrap_error(req_res))
+    assert(result_is_ok(req_res))
     let req: HttpRequest = result_unwrap(req_res)
     say "HTTP method: " + req.method
     say "HTTP path: " + req.path

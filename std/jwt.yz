@@ -1,5 +1,6 @@
 # Standard JSON Web Token (JWT) HS256 (RFC 7519) for YAZA.
 # Token format: base64url(header) + "." + base64url(payload) + "." + base64url(hmac_sha256(signing_input, secret))
+# Verifies constant-time HMAC-SHA256 strictly BEFORE base64url decoding or JSON parsing (verify-before-parse).
 
 use "std/json"
 use "std/crypto/hash"
@@ -14,16 +15,17 @@ shape JwtClaims:
 fn jwt_b64url_alphabet() -> Text:
     return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 
+# O(N) Arena-friendly base64url encoder using TextList + single-pass text_join
 fn jwt_b64url_encode(data: Bytes) -> Text:
     let alphabet: Text = jwt_b64url_alphabet()
     let len: Number = bytes_length(data)
-    var out: Text = ""
+    let parts: TextList = text_list()
     var i: Number = 0
     while i < len:
         let b0: Number = bytes_get(data, i)
         var b1: Number = 0
         var b2: Number = 0
-        var remaining: Number = len - i
+        let remaining: Number = len - i
         if remaining > 1: set b1 = bytes_get(data, i + 1)
         if remaining > 2: set b2 = bytes_get(data, i + 2)
         let n: Number = (b0 * 65536) + (b1 * 256) + b2
@@ -31,13 +33,14 @@ fn jwt_b64url_encode(data: Bytes) -> Text:
         let c1: Number = (n / 4096) % 64
         let c2: Number = (n / 64) % 64
         let c3: Number = n % 64
-        set out = out + text_slice(alphabet, c0, 1) + text_slice(alphabet, c1, 1)
+        list_push(parts, text_slice(alphabet, c0, 1))
+        list_push(parts, text_slice(alphabet, c1, 1))
         if remaining > 1:
-            set out = out + text_slice(alphabet, c2, 1)
+            list_push(parts, text_slice(alphabet, c2, 1))
         if remaining > 2:
-            set out = out + text_slice(alphabet, c3, 1)
+            list_push(parts, text_slice(alphabet, c3, 1))
         set i = i + 3
-    return out
+    return text_join(parts, "")
 
 fn jwt_b64url_val(byte: Number) -> Number:
     if byte >= 65 and byte <= 90: return byte - 65
@@ -64,7 +67,7 @@ fn jwt_b64url_decode(encoded: Text) -> Result[Bytes, Text]:
         if v0 < 0 or v1 < 0: return err("invalid base64url character")
         var v2: Number = 0
         var v3: Number = 0
-        var rem: Number = len - i
+        let rem: Number = len - i
         if rem > 2:
             set v2 = jwt_b64url_val(text_byte(encoded, i + 2))
             if v2 < 0: return err("invalid base64url character")
@@ -105,22 +108,31 @@ fn jwt_verify_hs256(token: Text, expected_issuer: Text, expected_audience: Text,
     let h_b64: Text = list_get(parts, 0)
     let p_b64: Text = list_get(parts, 1)
     let sig_b64: Text = list_get(parts, 2)
+    if text_length(h_b64) == 0 or text_length(p_b64) == 0 or text_length(sig_b64) != 43:
+        return err("malformed JWT segment lengths")
 
-    let header_bytes_res: Result[Bytes, Text] = jwt_b64url_decode(h_b64)
-    if not result_is_ok(header_bytes_res): return err("invalid JWT header encoding")
-    let header_text: Text = bytes_to_text(result_unwrap(header_bytes_res))
-    let alg_opt: Option[Text] = json_extract_string(header_text, "alg")
-    if not option_is_some(alg_opt) or option_unwrap(alg_opt) != "HS256":
-        return err("unsupported JWT algorithm; expected HS256")
-
+    # 1. Verify-Before-Parse: validate HS256 signature in constant time BEFORE decoding untrusted header or payload
     let signing_input: Text = h_b64 + "." + p_b64
     let expected_sig: Text = jwt_b64url_encode(crypto_hmac_sha256(bytes_from_text(secret), bytes_from_text(signing_input)))
     if not crypto_constant_time_compare(expected_sig, sig_b64):
         return err("invalid JWT signature")
 
+    # 2. Decode & UTF-8 validate header cleanly via bytes_try_to_text (never crashes on NUL/invalid UTF-8)
+    let header_bytes_res: Result[Bytes, Text] = jwt_b64url_decode(h_b64)
+    if not result_is_ok(header_bytes_res): return err("invalid JWT header encoding")
+    let header_text_res: Result[Text, Text] = bytes_try_to_text(result_unwrap(header_bytes_res))
+    if not result_is_ok(header_text_res): return err("invalid UTF-8 or NUL byte in JWT header")
+    let header_text: Text = result_unwrap(header_text_res)
+    let alg_opt: Option[Text] = json_extract_string(header_text, "alg")
+    if not option_is_some(alg_opt) or option_unwrap(alg_opt) != "HS256":
+        return err("unsupported JWT algorithm; expected HS256")
+
+    # 3. Decode & UTF-8 validate payload cleanly via bytes_try_to_text
     let payload_bytes_res: Result[Bytes, Text] = jwt_b64url_decode(p_b64)
     if not result_is_ok(payload_bytes_res): return err("invalid JWT payload encoding")
-    let payload_text: Text = bytes_to_text(result_unwrap(payload_bytes_res))
+    let payload_text_res: Result[Text, Text] = bytes_try_to_text(result_unwrap(payload_bytes_res))
+    if not result_is_ok(payload_text_res): return err("invalid UTF-8 or NUL byte in JWT payload")
+    let payload_text: Text = result_unwrap(payload_text_res)
 
     let sub_opt: Option[Text] = json_extract_string(payload_text, "sub")
     if not option_is_some(sub_opt) or option_unwrap(sub_opt) == "": return err("JWT missing sub claim")
