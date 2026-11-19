@@ -1,26 +1,30 @@
-# Bounded application/x-www-form-urlencoded Parser & Percent Decoder for YAZA Web.
+# Bounded O(N) application/x-www-form-urlencoded Parser & Percent Decoder for YAZA Web.
 use "std/url"
 
 shape FormField:
     name: Text
     value: Text
 
+# Single-allocation O(N) percent-decoder (eliminates O(N^2) bytes_concat arena exhaustion)
 fn form_url_decode(raw: Text) -> Result[Text, Text]:
     let input: Bytes = bytes_from_text(raw)
     let len: Number = bytes_length(input)
     if len > 65536:
         return err("form: field exceeds 64 KiB limit")
-    var out_list: TextList = text_list()
-    var buf: Bytes = bytes_empty()
+    if len == 0:
+        return ok("")
+    let out_buf: Bytes = bytes_try_new_zeroed(len)?
+    var out_len: Number = 0
     var i: Number = 0
     while i < len:
         let b: Number = bytes_get(input, i)
         if b == 0:
             return err("form: NUL byte rejected")
-        if b == 43:
-            set buf = bytes_concat(buf, bytes_from_text(" "))
+        if b == 43: # '+'
+            let _ok1: Boolean = bytes_try_set(out_buf, out_len, 32)
+            set out_len = out_len + 1
             set i = i + 1
-        elif b == 37:
+        elif b == 37: # '%'
             if i + 2 >= len:
                 return err("form: incomplete percent escape")
             let hi: Number = url_hex_value(bytes_get(input, i + 1))
@@ -30,17 +34,17 @@ fn form_url_decode(raw: Text) -> Result[Text, Text]:
             let decoded: Number = hi * 16 + lo
             if decoded == 0:
                 return err("form: percent-encoded NUL byte rejected")
-            var one: Bytes = bytes_from_text(" ")
-            let _ok: Boolean = bytes_try_set(one, 0, decoded)
-            set buf = bytes_concat(buf, one)
+            let _ok2: Boolean = bytes_try_set(out_buf, out_len, decoded)
+            set out_len = out_len + 1
             set i = i + 3
         else:
-            set buf = bytes_concat(buf, bytes_slice(input, i, 1))
+            let _ok3: Boolean = bytes_try_set(out_buf, out_len, b)
+            set out_len = out_len + 1
             set i = i + 1
-    let valid: Option[Text] = bytes_to_text_checked(buf)
+    let final_bytes: Bytes = bytes_slice(out_buf, 0, out_len)
+    let valid: Option[Text] = bytes_to_text_checked(final_bytes)
     if not option_is_some(valid):
         return err("form: decoded value is not valid non-NUL UTF-8")
-    let _unused: Number = list_count(out_list)
     return ok(option_unwrap(valid))
 
 fn form_parse_urlencoded(body: Text, max_fields: Number) -> Result[List[FormField], Text]:

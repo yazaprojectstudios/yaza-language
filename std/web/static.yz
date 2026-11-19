@@ -81,12 +81,31 @@ fn static_serve_vfs(vfs_root_handle: Number, url_path: Text, mount_prefix: Text,
         return ok(web_not_modified(etag, cache_ctrl))
     return ok(web_static_ok(mime, data, etag, cache_ctrl))
 
+fn static_is_utf8_text_mime(mime: Text) -> Boolean:
+    if text_starts_with(mime, "text/"): return true
+    if text_starts_with(mime, "application/javascript"): return true
+    if text_starts_with(mime, "application/json"): return true
+    if mime == "image/svg+xml": return true
+    return false
+
 fn static_serve_public_dir(public_dir: Text, url_path: Text, mount_prefix: Text, if_none_match: Text, max_bytes: Number) -> Result[WebResponse, Text]:
+    # Prefer capability-rooted yaza_vfs_v1 (supports binary PNG/JPG/WOFF2/MP4 + blocks symlinks) when directory is 0700
+    let vfs_root: Result[Number, Text] = vfs_root_open(public_dir)
+    if result_is_ok(vfs_root):
+        let root_fd: Number = result_unwrap(vfs_root)
+        let res: Result[WebResponse, Text] = static_serve_vfs(root_fd, url_path, mount_prefix, if_none_match, max_bytes)
+        let _cl: Result[Boolean, Text] = vfs_close(root_fd)
+        if result_is_ok(res):
+            return res
+
+    # Fallback for standard 0755/0644 public directories: restrict to UTF-8 text assets so binary files never abort file_read
     let filename: Text = static_normalize_child_name(url_path, mount_prefix)?
     let mime_opt: Option[Text] = static_mime_for_path(filename)
     if not option_is_some(mime_opt):
         return err("disallowed static asset extension")
     let mime: Text = option_unwrap(mime_opt)
+    if not static_is_utf8_text_mime(mime):
+        return err("binary static assets require a 0700 VFS root or /media/ route")
     if not is_directory(public_dir):
         return err("static root directory not found")
     let entries: TextList = directory_list(public_dir)

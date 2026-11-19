@@ -86,26 +86,31 @@ fn dispatch_web_req(req: WebRequest, profile_label: Text) -> WebResponse:
         return web_html_ok(render_web_welcome(profile_label))
     return web_html_status(404, "Not Found", "<h1>404 Page Not Found</h1>")
 
-fn header_end_index(raw_text: Text) -> Number:
-    let crlf: Number = text_find(raw_text, "\r\n\r\n")
-    if crlf >= 0: return crlf + 4
-    let lf: Number = text_find(raw_text, "\n\n")
-    if lf >= 0: return lf + 2
-    return -1
-
 fn read_req_bytes(client_fd: Number) -> Bytes:
-    var buf: Bytes = bytes_empty()
+    let parts: List[Bytes] = List[Bytes]()
+    var total: Number = 0
     var chunks: Number = 0
-    while chunks < 32:
+    while chunks < 16 and total < 16384:
         let rd: Result[Bytes, Text] = tcp_read(client_fd, 8192, 5000)
         if not result_is_ok(rd): break
         let chunk: Bytes = result_unwrap(rd)
-        if bytes_length(chunk) == 0: break
-        set buf = bytes_concat(buf, chunk)
-        if header_end_index(bytes_to_text(buf)) >= 0:
-            return buf
+        let clen: Number = bytes_length(chunk)
+        if clen == 0: break
+        list_push(parts, chunk)
+        set total = total + clen
+        let joined_res: Result[Bytes, Text] = bytes_join(parts)
+        if not result_is_ok(joined_res):
+            return bytes_empty()
+        let joined: Bytes = result_unwrap(joined_res)
+        if http_find_header_end_bytes(joined) >= 0:
+            return joined
         set chunks = chunks + 1
-    return buf
+    if list_count(parts) == 0:
+        return bytes_empty()
+    let final_res: Result[Bytes, Text] = bytes_join(parts)
+    if result_is_ok(final_res):
+        return result_unwrap(final_res)
+    return bytes_empty()
 
 fn handle_web_client(client_fd: Number, profile_label: Text) -> Boolean:
     var keep_alive: Boolean = true
@@ -116,7 +121,7 @@ fn handle_web_client(client_fd: Number, profile_label: Text) -> Boolean:
             let raw: Bytes = read_req_bytes(client_fd)
             if bytes_length(raw) > 0:
                 set n = n + 1
-                let txt: Text = bytes_to_text(raw)
+                let txt: Text = web_header_block_text(raw)
                 if n >= 64 or text_find(txt, "Connection: close") >= 0 or text_find(txt, "connection: close") >= 0:
                     set keep_alive = false
                 let parsed: Result[WebRequest, Text] = web_parse_request(raw)

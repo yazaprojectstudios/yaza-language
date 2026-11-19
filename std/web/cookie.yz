@@ -1,4 +1,4 @@
-# Bounded HTTP Cookie Parsing & Signed HttpOnly Session Cookies (YWT / HMAC-SHA256).
+# Bounded HTTP Cookie Parsing & Signed HttpOnly Session Cookies (YWT with iat + 128-bit jti).
 use "std/ywt"
 use "std/time"
 
@@ -8,6 +8,19 @@ fn cookie_has_control_or_newline(value: Text) -> Boolean:
     while i < len:
         let b: Number = text_byte(value, i)
         if b < 32 or b == 127 or b == 59:
+            return true
+        set i = i + 1
+    return false
+
+fn cookie_name_is_invalid(name: Text) -> Boolean:
+    let len: Number = text_length(name)
+    if len == 0 or len > 128:
+        return true
+    var i: Number = 0
+    while i < len:
+        let b: Number = text_byte(name, i)
+        # Reject controls, spaces, ';', '=', ',' in RFC 6265 cookie-name token
+        if b <= 32 or b >= 127 or b == 59 or b == 61 or b == 44:
             return true
         set i = i + 1
     return false
@@ -34,15 +47,18 @@ fn cookie_get(cookie_header: Text, name: Text) -> Option[Text]:
     return none
 
 fn cookie_set_header(name: Text, value: Text, max_age_s: Number, secure: Boolean, same_site: Text) -> Text:
-    if text_length(name) == 0 or cookie_has_control_or_newline(name) or cookie_has_control_or_newline(value):
+    if cookie_name_is_invalid(name) or cookie_has_control_or_newline(value):
         return ""
     var ss: Text = "Lax"
+    var eff_secure: Boolean = secure
     if same_site == "Strict":
         set ss = "Strict"
     elif same_site == "None":
         set ss = "None"
+        # SameSite=None requires Secure per RFC 6265bis / modern browser policy
+        set eff_secure = true
     var hdr: Text = name + "=" + value + "; Path=/; HttpOnly; SameSite=" + ss + "; Max-Age=" + number_text(max_age_s)
-    if secure:
+    if eff_secure:
         set hdr = hdr + "; Secure"
     return hdr
 
@@ -52,7 +68,7 @@ fn cookie_clear_header(name: Text, secure: Boolean) -> Text:
 fn session_sign_cookie(subject: Text, role: Text, issuer: Text, ttl_s: Number, secret: Text) -> Text:
     let now_s: Number = time_now_unix_ms() / 1000
     let exp_s: Number = now_s + ttl_s
-    return ywt_create_with_role(subject, issuer, role, exp_s, secret)
+    return ywt_create_with_claims(subject, issuer, role, now_s, exp_s, "", secret)
 
 fn session_verify_cookie(cookie_value: Text, issuer: Text, secret: Text) -> Result[YwtClaims, Text]:
     if text_length(cookie_value) == 0:
