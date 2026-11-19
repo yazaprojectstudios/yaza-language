@@ -127,7 +127,7 @@ static void *yaza_rt_v1_thread_entry(void *opaque);
 #endif
 
 #ifndef YAZA_RT_V1_PROCESS_LIMIT
-#define YAZA_RT_V1_PROCESS_LIMIT (512ULL * 1024ULL * 1024ULL)
+#define YAZA_RT_V1_PROCESS_LIMIT (4096ULL * 1024ULL * 1024ULL)
 #endif
 #ifndef YAZA_RT_V1_CHUNK_SIZE
 #define YAZA_RT_V1_CHUNK_SIZE (64ULL * 1024ULL)
