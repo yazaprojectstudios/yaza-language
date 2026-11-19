@@ -1,0 +1,157 @@
+# Data Layer: Parameterized YazaBase ACID SQL Repository for TaskItem.
+use "std/db/yazabase"
+use "std/csv"
+use "std/convert"
+use "std/time"
+use "task"
+
+fn task_db_dir() -> Text:
+    let env_dir: Text = env_get("YAZABASE_DATA_DIR")
+    if env_dir != "":
+        return env_dir
+    return "./data"
+
+fn task_parse_csv_rows(csv_text: Text) -> List[TaskItem]:
+    let out: List[TaskItem] = List[TaskItem]()
+    let raw_bytes: Bytes = bytes_from_text(csv_text)
+    let total_len: Number = bytes_length(raw_bytes)
+    if total_len == 0:
+        return out
+    var offset: Number = 0
+    var row_idx: Number = 0
+    while offset < total_len:
+        let rec_res: Result[Option[CsvRecord], Text] = csv_read_record(raw_bytes, offset)
+        if not result_is_ok(rec_res): break
+        let rec_opt: Option[CsvRecord] = result_unwrap(rec_res)
+        if not option_is_some(rec_opt): break
+        let rec: CsvRecord = option_unwrap(rec_opt)
+        set offset = rec.next_offset
+        if row_idx > 0 and list_count(rec.fields) >= 7:
+            list_push(out, TaskItem(list_get(rec.fields, 1), list_get(rec.fields, 2), list_get(rec.fields, 3), list_get(rec.fields, 4), list_get(rec.fields, 5), list_get(rec.fields, 6)))
+        set row_idx = row_idx + 1
+    return out
+
+fn task_insert_row(conn: YazaBaseConnection, row_id: Number, item: TaskItem) -> Result[Boolean, Text]:
+    let p: TextList = text_list()
+    list_push(p, "bigint:" + number_text(row_id))
+    list_push(p, "text:" + item.id)
+    list_push(p, "text:" + item.title)
+    list_push(p, "text:" + item.owner)
+    list_push(p, "text:" + item.priority)
+    list_push(p, "text:" + item.status)
+    list_push(p, "text:" + item.created_at)
+    let res: Result[Text, Text] = yazabase_exec_params(conn, "INSERT INTO tasks (row_id, id, title, owner, priority, status, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)", p)
+    if not result_is_ok(res):
+        return err(result_unwrap_error(res))
+    return ok(true)
+
+fn task_connect_and_ready() -> Result[YazaBaseConnection, Text]:
+    let conn: YazaBaseConnection = yazabase_connect_default(task_db_dir(), "monolith")?
+    let schema_marker: Text = conn.db_dir + "/.tasks_sql_schema_v1"
+    if not file_exists(schema_marker):
+        let lock_dir: Text = conn.db_dir + "/.tasks_schema.lock"
+        if directory_create(lock_dir) == 0:
+            let empty_p: TextList = text_list()
+            let probe: Result[Text, Text] = yazabase_query_csv(conn, "SELECT row_id FROM tasks LIMIT 1", empty_p)
+            if not result_is_ok(probe):
+                let ddl: Result[Text, Text] = yazabase_exec_params(conn, "CREATE TABLE tasks (row_id BIGINT PRIMARY KEY, id TEXT NOT NULL, title TEXT NOT NULL, owner TEXT NOT NULL, priority TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL)", empty_p)
+                if not result_is_ok(ddl):
+                    return err(result_unwrap_error(ddl))
+                let _s1: Boolean = task_insert_row(conn, 1, TaskItem("tsk-1", "Verify Zero-GC Arena-SSR Pipeline", "admin", "high", "done", "2026-11-19"))?
+                let _s2: Boolean = task_insert_row(conn, 2, TaskItem("tsk-2", "Enable Strict Web CSP & CSRF Tokens", "admin", "high", "open", "2026-11-19"))?
+                let _s3: Boolean = task_insert_row(conn, 3, TaskItem("tsk-3", "Configure Balanced 512 MiB AQB Profile", "admin", "normal", "open", "2026-11-19"))?
+            let _w: Number = file_write(schema_marker, "1\n")
+        else:
+            var waited: Number = 0
+            while waited < 100 and not file_exists(schema_marker):
+                let _sl: Boolean = sleep_ms(15)
+                set waited = waited + 1
+    return ok(conn)
+
+fn task_next_row_id(conn: YazaBaseConnection) -> Number:
+    let empty_p: TextList = text_list()
+    let q_res: Result[Text, Text] = yazabase_query_csv(conn, "SELECT row_id FROM tasks ORDER BY row_id DESC LIMIT 1", empty_p)
+    var db_next: Number = 1
+    if result_is_ok(q_res):
+        let raw_bytes: Bytes = bytes_from_text(result_unwrap(q_res))
+        let total_len: Number = bytes_length(raw_bytes)
+        var offset: Number = 0
+        var row_idx: Number = 0
+        while offset < total_len:
+            let rec_res: Result[Option[CsvRecord], Text] = csv_read_record(raw_bytes, offset)
+            if not result_is_ok(rec_res): break
+            let rec_opt: Option[CsvRecord] = result_unwrap(rec_res)
+            if not option_is_some(rec_opt): break
+            let rec: CsvRecord = option_unwrap(rec_opt)
+            set offset = rec.next_offset
+            if row_idx == 1 and list_count(rec.fields) >= 1:
+                let n_res: Result[Number, Text] = number_try_parse(list_get(rec.fields, 0))
+                if result_is_ok(n_res):
+                    set db_next = result_unwrap(n_res) + 1
+                    break
+            set row_idx = row_idx + 1
+    let seq_path: Text = conn.db_dir + "/.tasks_next_id"
+    var seq_next: Number = db_next
+    if file_exists(seq_path):
+        let s_res: Result[Number, Text] = number_try_parse(text_trim(file_read(seq_path)))
+        if result_is_ok(s_res):
+            let s_val: Number = result_unwrap(s_res)
+            if s_val > seq_next:
+                set seq_next = s_val
+    let _w: Number = file_write(seq_path, number_text(seq_next + 1))
+    return seq_next
+
+fn task_repository_ping() -> Result[Boolean, Text]:
+    let conn: YazaBaseConnection = task_connect_and_ready()?
+    let empty_p: TextList = text_list()
+    let q_res: Result[Text, Text] = yazabase_query_csv(conn, "SELECT row_id FROM tasks LIMIT 1", empty_p)
+    if not result_is_ok(q_res):
+        return err("yazabase readiness check failed")
+    return ok(true)
+
+fn task_repository_list() -> Result[List[TaskItem], Text]:
+    let conn: YazaBaseConnection = task_connect_and_ready()?
+    let empty_p: TextList = text_list()
+    let q_res: Result[Text, Text] = yazabase_query_csv(conn, "SELECT row_id, id, title, owner, priority, status, created_at FROM tasks ORDER BY row_id DESC LIMIT 100", empty_p)
+    if not result_is_ok(q_res):
+        return err(result_unwrap_error(q_res))
+    return ok(task_parse_csv_rows(result_unwrap(q_res)))
+
+fn task_repository_find(task_id: Text) -> Result[Option[TaskItem], Text]:
+    let conn: YazaBaseConnection = task_connect_and_ready()?
+    let p: TextList = text_list()
+    list_push(p, "text:" + task_id)
+    let q_res: Result[Text, Text] = yazabase_query_csv(conn, "SELECT row_id, id, title, owner, priority, status, created_at FROM tasks WHERE id = $1 LIMIT 1", p)
+    if not result_is_ok(q_res):
+        return err(result_unwrap_error(q_res))
+    let rows: List[TaskItem] = task_parse_csv_rows(result_unwrap(q_res))
+    if list_count(rows) == 0:
+        return ok(none)
+    return ok(some(list_get(rows, 0)))
+
+fn task_repository_create(title: Text, owner: Text, priority: Text) -> Result[TaskItem, Text]:
+    let conn: YazaBaseConnection = task_connect_and_ready()?
+    let next_row: Number = task_next_row_id(conn)
+    let tid: Text = "tsk-" + number_text(next_row)
+    let item: TaskItem = TaskItem(tid, text_trim(title), owner, task_normalize_priority(priority), "open", "ts-" + number_text(time_now_unix_ms()))
+    let _ins: Boolean = task_insert_row(conn, next_row, item)?
+    return ok(item)
+
+fn task_repository_set_status(task_id: Text, next_status: Text) -> Result[Boolean, Text]:
+    let conn: YazaBaseConnection = task_connect_and_ready()?
+    let p: TextList = text_list()
+    list_push(p, "text:" + next_status)
+    list_push(p, "text:" + task_id)
+    let res: Result[Text, Text] = yazabase_exec_params(conn, "UPDATE tasks SET status = $1 WHERE id = $2", p)
+    if not result_is_ok(res):
+        return err(result_unwrap_error(res))
+    return ok(true)
+
+fn task_repository_delete(task_id: Text) -> Result[Boolean, Text]:
+    let conn: YazaBaseConnection = task_connect_and_ready()?
+    let p: TextList = text_list()
+    list_push(p, "text:" + task_id)
+    let res: Result[Text, Text] = yazabase_exec_params(conn, "DELETE FROM tasks WHERE id = $1", p)
+    if not result_is_ok(res):
+        return err(result_unwrap_error(res))
+    return ok(true)

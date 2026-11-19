@@ -1,0 +1,102 @@
+# Tri-Mode Task Controller: Full SSR Page, Hypermedia Fragment Swap & JSON API from One Controller.
+use "std/http"
+use "std/json"
+use "std/web/request"
+use "std/web/response"
+use "std/web/form"
+use "../models/task"
+use "../services/task_service"
+use "../middleware/web_security"
+use "../views/components/task_board"
+use "../views/pages/dashboard_page"
+
+fn render_tasks_response(req: WebRequest, sess: WebSession, profile_label: Text, flash_msg: Text, is_error: Boolean) -> WebResponse:
+    let list_res: Result[List[TaskItem], Text] = task_service_list()
+    if not result_is_ok(list_res):
+        if web_request_wants_json(req):
+            return web_from_http_response(http_response_service_unavailable(result_unwrap_error(list_res), true))
+        return web_html_status(503, "Service Unavailable", "<h1>Database Unavailable</h1>")
+    let items: List[TaskItem] = result_unwrap(list_res)
+    if web_request_wants_json(req):
+        return web_from_http_response(http_response_ok_json(task_list_to_json(items)))
+    let stats: TaskStats = task_service_compute_stats(items)
+    if web_request_wants_fragment(req):
+        return web_fragment_ok(render_task_board_fragment(items, stats, sess.csrf_token, flash_msg, is_error))
+    return web_html_ok(render_dashboard_page(items, stats, sess.username, sess.csrf_token, profile_label, flash_msg, is_error))
+
+fn task_controller_index(req: WebRequest, profile_label: Text) -> WebResponse:
+    let sess: WebSession = web_current_session(req)
+    if web_request_wants_json(req):
+        if not web_api_is_authorized(req, sess):
+            return web_from_http_response(http_response_unauthorized("authentication required", true))
+        return render_tasks_response(req, sess, profile_label, "", false)
+    if not sess.authenticated:
+        return web_redirect_see_other("/login")
+    return render_tasks_response(req, sess, profile_label, "", false)
+
+fn task_controller_create(req: WebRequest, profile_label: Text) -> WebResponse:
+    let sess: WebSession = web_current_session(req)
+    if web_request_wants_json(req):
+        if not web_api_is_authorized(req, sess):
+            return web_from_http_response(http_response_unauthorized("authentication required", true))
+        let title_opt: Option[Text] = json_extract_string(req.http.body_text, "title")
+        let prio_opt: Option[Text] = json_extract_string(req.http.body_text, "priority")
+        var title: Text = ""
+        if option_is_some(title_opt): set title = option_unwrap(title_opt)
+        var prio: Text = "normal"
+        if option_is_some(prio_opt): set prio = option_unwrap(prio_opt)
+        var owner: Text = "api"
+        if sess.authenticated: set owner = sess.username
+        let created_res: Result[TaskItem, Text] = task_service_create(title, owner, prio)
+        if not result_is_ok(created_res):
+            return web_from_http_response(http_response_bad_request(result_unwrap_error(created_res), true))
+        return web_from_http_response(http_response_created_json(task_to_json(result_unwrap(created_res))))
+
+    if not sess.authenticated:
+        return web_redirect_see_other("/login")
+    let form_res: Result[List[FormField], Text] = form_parse_urlencoded(req.http.body_text, 16)
+    if not result_is_ok(form_res):
+        return render_tasks_response(req, sess, profile_label, "Malformed form payload.", true)
+    let fields: List[FormField] = result_unwrap(form_res)
+    if not web_verify_request_csrf(req, sess, fields):
+        return web_html_status(403, "Forbidden", "<h1>403 Forbidden: Invalid CSRF token</h1>")
+    let title: Text = form_get_or(fields, "title", "")
+    let priority: Text = form_get_or(fields, "priority", "normal")
+    let created_res: Result[TaskItem, Text] = task_service_create(title, sess.username, priority)
+    if not result_is_ok(created_res):
+        return render_tasks_response(req, sess, profile_label, result_unwrap_error(created_res), true)
+    if web_request_wants_fragment(req):
+        return render_tasks_response(req, sess, profile_label, "Task saved to YazaBase SQL.", false)
+    return web_redirect_see_other("/")
+
+fn task_controller_toggle(req: WebRequest, task_id: Text, profile_label: Text) -> WebResponse:
+    let sess: WebSession = web_current_session(req)
+    if not sess.authenticated:
+        return web_redirect_see_other("/login")
+    let form_res: Result[List[FormField], Text] = form_parse_urlencoded(req.http.body_text, 16)
+    var fields: List[FormField] = List[FormField]()
+    if result_is_ok(form_res): set fields = result_unwrap(form_res)
+    if not web_verify_request_csrf(req, sess, fields):
+        return web_html_status(403, "Forbidden", "<h1>403 Forbidden: Invalid CSRF token</h1>")
+    let res: Result[Boolean, Text] = task_service_toggle(task_id)
+    if not result_is_ok(res):
+        return render_tasks_response(req, sess, profile_label, result_unwrap_error(res), true)
+    if web_request_wants_fragment(req):
+        return render_tasks_response(req, sess, profile_label, "Task status updated.", false)
+    return web_redirect_see_other("/")
+
+fn task_controller_delete(req: WebRequest, task_id: Text, profile_label: Text) -> WebResponse:
+    let sess: WebSession = web_current_session(req)
+    if not sess.authenticated:
+        return web_redirect_see_other("/login")
+    let form_res: Result[List[FormField], Text] = form_parse_urlencoded(req.http.body_text, 16)
+    var fields: List[FormField] = List[FormField]()
+    if result_is_ok(form_res): set fields = result_unwrap(form_res)
+    if not web_verify_request_csrf(req, sess, fields):
+        return web_html_status(403, "Forbidden", "<h1>403 Forbidden: Invalid CSRF token</h1>")
+    let res: Result[Boolean, Text] = task_service_delete(task_id)
+    if not result_is_ok(res):
+        return render_tasks_response(req, sess, profile_label, result_unwrap_error(res), true)
+    if web_request_wants_fragment(req):
+        return render_tasks_response(req, sess, profile_label, "Task deleted.", false)
+    return web_redirect_see_other("/")

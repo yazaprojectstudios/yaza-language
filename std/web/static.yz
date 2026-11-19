@@ -1,0 +1,107 @@
+# Capability-Rooted Static Asset Server over yaza_vfs_v1 (Blocks ../ traversal, NUL bytes & symlinks).
+use "std/web/response"
+
+fn static_mime_for_path(filename: Text) -> Option[Text]:
+    if text_ends_with(filename, ".css"): return some("text/css; charset=utf-8")
+    if text_ends_with(filename, ".js"): return some("application/javascript; charset=utf-8")
+    if text_ends_with(filename, ".svg"): return some("image/svg+xml")
+    if text_ends_with(filename, ".png"): return some("image/png")
+    if text_ends_with(filename, ".jpg") or text_ends_with(filename, ".jpeg"): return some("image/jpeg")
+    if text_ends_with(filename, ".webp"): return some("image/webp")
+    if text_ends_with(filename, ".woff2"): return some("font/woff2")
+    if text_ends_with(filename, ".ico"): return some("image/x-icon")
+    if text_ends_with(filename, ".txt"): return some("text/plain; charset=utf-8")
+    if text_ends_with(filename, ".json"): return some("application/json; charset=utf-8")
+    return none
+
+fn static_normalize_child_name(url_path: Text, mount_prefix: Text) -> Result[Text, Text]:
+    if not text_starts_with(url_path, mount_prefix):
+        return err("path does not match mount prefix")
+    let rel: Text = text_slice(url_path, text_length(mount_prefix), text_length(url_path) - text_length(mount_prefix))
+    let rlen: Number = text_length(rel)
+    if rlen == 0 or rlen > 128:
+        return err("invalid static asset filename length")
+    if text_find(rel, "/") >= 0 or text_find(rel, "\\") >= 0 or text_find(rel, "..") >= 0:
+        return err("static path traversal rejected")
+    var i: Number = 0
+    while i < rlen:
+        let b: Number = text_byte(rel, i)
+        if b < 32 or b == 127:
+            return err("control byte in static filename")
+        set i = i + 1
+    return ok(rel)
+
+fn static_compute_etag(data: Bytes) -> Text:
+    let len: Number = bytes_length(data)
+    var h: Number = 2166136261
+    var i: Number = 0
+    var step: Number = 1
+    if len > 4096:
+        set step = len / 2048
+        if step < 1: set step = 1
+    while i < len:
+        let b: Number = bytes_get(data, i)
+        set h = ((h * 33) + b + 17) % 2147483647
+        set i = i + step
+    return "\"v1-" + number_text(len) + "-" + number_text(h) + "\""
+
+fn static_serve_vfs(vfs_root_handle: Number, url_path: Text, mount_prefix: Text, if_none_match: Text, max_bytes: Number) -> Result[WebResponse, Text]:
+    let filename: Text = static_normalize_child_name(url_path, mount_prefix)?
+    let mime_opt: Option[Text] = static_mime_for_path(filename)
+    if not option_is_some(mime_opt):
+        return err("disallowed static asset extension")
+    let mime: Text = option_unwrap(mime_opt)
+    let file_handle: Number = vfs_open_read(vfs_root_handle, filename)?
+    let size_res: Result[Number, Text] = vfs_file_size(file_handle)
+    if not result_is_ok(size_res):
+        let _c1: Result[Boolean, Text] = vfs_close(file_handle)
+        return err(result_unwrap_error(size_res))
+    let size: Number = result_unwrap(size_res)
+    if size < 0 or size > max_bytes:
+        let _c2: Result[Boolean, Text] = vfs_close(file_handle)
+        return err("static asset exceeds configured byte limit")
+    var data: Bytes = bytes_empty()
+    if size > 0:
+        let read_res: Result[Bytes, Text] = vfs_read_exact(file_handle, 0, size)
+        let _c3: Result[Boolean, Text] = vfs_close(file_handle)
+        if not result_is_ok(read_res):
+            return err(result_unwrap_error(read_res))
+        set data = result_unwrap(read_res)
+    else:
+        let _c4: Result[Boolean, Text] = vfs_close(file_handle)
+    let etag: Text = static_compute_etag(data)
+    let cache_ctrl: Text = "public, max-age=300, must-revalidate"
+    if if_none_match == etag:
+        return ok(web_not_modified(etag, cache_ctrl))
+    return ok(web_static_ok(mime, data, etag, cache_ctrl))
+
+fn static_serve_public_dir(public_dir: Text, url_path: Text, mount_prefix: Text, if_none_match: Text, max_bytes: Number) -> Result[WebResponse, Text]:
+    let filename: Text = static_normalize_child_name(url_path, mount_prefix)?
+    let mime_opt: Option[Text] = static_mime_for_path(filename)
+    if not option_is_some(mime_opt):
+        return err("disallowed static asset extension")
+    let mime: Text = option_unwrap(mime_opt)
+    if not is_directory(public_dir):
+        return err("static root directory not found")
+    let entries: TextList = directory_list(public_dir)
+    var found: Boolean = false
+    var ei: Number = 0
+    while ei < list_count(entries):
+        if list_get(entries, ei) == filename:
+            set found = true
+            break
+        set ei = ei + 1
+    if not found:
+        return err("static asset not found")
+    let full_path: Text = public_dir + "/" + filename
+    if is_directory(full_path) or not file_exists(full_path):
+        return err("static path is not a readable regular file")
+    let raw_text: Text = file_read(full_path)
+    let data: Bytes = bytes_from_text(raw_text)
+    if bytes_length(data) > max_bytes:
+        return err("static asset exceeds configured byte limit")
+    let etag: Text = static_compute_etag(data)
+    let cache_ctrl: Text = "public, max-age=300, must-revalidate"
+    if if_none_match == etag:
+        return ok(web_not_modified(etag, cache_ctrl))
+    return ok(web_static_ok(mime, data, etag, cache_ctrl))

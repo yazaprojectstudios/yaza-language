@@ -1,0 +1,93 @@
+# Bounded application/x-www-form-urlencoded Parser & Percent Decoder for YAZA Web.
+use "std/url"
+
+shape FormField:
+    name: Text
+    value: Text
+
+fn form_url_decode(raw: Text) -> Result[Text, Text]:
+    let input: Bytes = bytes_from_text(raw)
+    let len: Number = bytes_length(input)
+    if len > 65536:
+        return err("form: field exceeds 64 KiB limit")
+    var out_list: TextList = text_list()
+    var buf: Bytes = bytes_empty()
+    var i: Number = 0
+    while i < len:
+        let b: Number = bytes_get(input, i)
+        if b == 0:
+            return err("form: NUL byte rejected")
+        if b == 43:
+            set buf = bytes_concat(buf, bytes_from_text(" "))
+            set i = i + 1
+        elif b == 37:
+            if i + 2 >= len:
+                return err("form: incomplete percent escape")
+            let hi: Number = url_hex_value(bytes_get(input, i + 1))
+            let lo: Number = url_hex_value(bytes_get(input, i + 2))
+            if hi < 0 or lo < 0:
+                return err("form: invalid percent escape")
+            let decoded: Number = hi * 16 + lo
+            if decoded == 0:
+                return err("form: percent-encoded NUL byte rejected")
+            var one: Bytes = bytes_from_text(" ")
+            let _ok: Boolean = bytes_try_set(one, 0, decoded)
+            set buf = bytes_concat(buf, one)
+            set i = i + 3
+        else:
+            set buf = bytes_concat(buf, bytes_slice(input, i, 1))
+            set i = i + 1
+    let valid: Option[Text] = bytes_to_text_checked(buf)
+    if not option_is_some(valid):
+        return err("form: decoded value is not valid non-NUL UTF-8")
+    let _unused: Number = list_count(out_list)
+    return ok(option_unwrap(valid))
+
+fn form_parse_urlencoded(body: Text, max_fields: Number) -> Result[List[FormField], Text]:
+    let blen: Number = text_length(body)
+    if blen > 65536:
+        return err("form: body exceeds 64 KiB limit")
+    var cap: Number = max_fields
+    if cap <= 0 or cap > 128:
+        set cap = 128
+    let out: List[FormField] = List[FormField]()
+    if blen == 0:
+        return ok(out)
+    var start: Number = 0
+    var count: Number = 0
+    while start < blen:
+        if count >= cap:
+            return err("form: exceeds maximum field count")
+        var end: Number = start
+        while end < blen and text_byte(body, end) != 38:
+            set end = end + 1
+        let pair: Text = text_slice(body, start, end - start)
+        if text_length(pair) > 0:
+            let eq: Number = text_find(pair, "=")
+            if eq < 0:
+                let k: Text = form_url_decode(pair)?
+                list_push(out, FormField(k, ""))
+            else:
+                let raw_k: Text = text_slice(pair, 0, eq)
+                let raw_v: Text = text_slice(pair, eq + 1, text_length(pair) - eq - 1)
+                let k: Text = form_url_decode(raw_k)?
+                let v: Text = form_url_decode(raw_v)?
+                list_push(out, FormField(k, v))
+            set count = count + 1
+        set start = end + 1
+    return ok(out)
+
+fn form_get(fields: List[FormField], key: Text) -> Option[Text]:
+    var i: Number = 0
+    while i < list_count(fields):
+        let f: FormField = list_get(fields, i)
+        if f.name == key:
+            return some(f.value)
+        set i = i + 1
+    return none
+
+fn form_get_or(fields: List[FormField], key: Text, fallback: Text) -> Text:
+    let opt: Option[Text] = form_get(fields, key)
+    if option_is_some(opt):
+        return option_unwrap(opt)
+    return fallback

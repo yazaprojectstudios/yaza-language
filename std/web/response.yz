@@ -1,0 +1,86 @@
+# Web HTTP/1.1 Response Builders & Wire Formatter (HTML SSR, Fragments, 303 Redirects, Cookies, Web CSP).
+use "std/http"
+
+shape WebResponse:
+    status_code: Number
+    status_text: Text
+    content_type: Text
+    body: Bytes
+    location: Text
+    set_cookie: Text
+    etag: Text
+    cache_control: Text
+    csp_policy: Text
+    vary_header: Text
+
+fn web_default_csp() -> Text:
+    return "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+
+fn web_api_csp() -> Text:
+    return "default-src 'none'; frame-ancestors 'none'"
+
+fn web_sanitize_header_line(value: Text) -> Text:
+    let len: Number = text_length(value)
+    var i: Number = 0
+    while i < len:
+        let b: Number = text_byte(value, i)
+        if b < 32 or b == 127:
+            return ""
+        set i = i + 1
+    return value
+
+fn web_html_status(status_code: Number, status_text: Text, html_body: Text) -> WebResponse:
+    return WebResponse(status_code, status_text, "text/html; charset=utf-8", bytes_from_text(html_body), "", "", "", "no-store", web_default_csp(), "Accept, X-Yaza-Fragment")
+
+fn web_html_ok(html_body: Text) -> WebResponse:
+    return web_html_status(200, "OK", html_body)
+
+fn web_fragment_ok(fragment_html: Text) -> WebResponse:
+    return web_html_status(200, "OK", fragment_html)
+
+fn web_redirect_see_other(location: Text) -> WebResponse:
+    var safe_loc: Text = web_sanitize_header_line(location)
+    if text_length(safe_loc) == 0 or not text_starts_with(safe_loc, "/"):
+        set safe_loc = "/"
+    return WebResponse(303, "See Other", "text/plain; charset=utf-8", bytes_empty(), safe_loc, "", "", "no-store", web_default_csp(), "Accept")
+
+fn web_static_ok(content_type: Text, body: Bytes, etag: Text, cache_control: Text) -> WebResponse:
+    return WebResponse(200, "OK", content_type, body, "", "", etag, cache_control, web_default_csp(), "Accept-Encoding")
+
+fn web_not_modified(etag: Text, cache_control: Text) -> WebResponse:
+    return WebResponse(304, "Not Modified", "", bytes_empty(), "", "", etag, cache_control, web_default_csp(), "Accept-Encoding")
+
+fn web_from_http_response(resp: HttpResponse) -> WebResponse:
+    return WebResponse(resp.status_code, resp.status_text, resp.content_type, resp.body, "", "", "", "no-store", web_api_csp(), "Accept")
+
+fn web_with_cookie(resp: WebResponse, set_cookie_value: Text) -> WebResponse:
+    let safe_cookie: Text = web_sanitize_header_line(set_cookie_value)
+    return WebResponse(resp.status_code, resp.status_text, resp.content_type, resp.body, resp.location, safe_cookie, resp.etag, resp.cache_control, resp.csp_policy, resp.vary_header)
+
+fn web_format_response(resp: WebResponse, request_id: Text, keep_alive: Boolean) -> Bytes:
+    var header_text: Text = "HTTP/1.1 " + number_text(resp.status_code) + " " + resp.status_text + "\r\n"
+    if text_length(resp.content_type) > 0:
+        set header_text = header_text + "Content-Type: " + resp.content_type + "\r\n"
+    set header_text = header_text + "Content-Length: " + number_text(bytes_length(resp.body)) + "\r\n"
+    if text_length(resp.location) > 0:
+        set header_text = header_text + "Location: " + resp.location + "\r\n"
+    if text_length(resp.set_cookie) > 0:
+        set header_text = header_text + "Set-Cookie: " + resp.set_cookie + "\r\n"
+    if text_length(resp.etag) > 0:
+        set header_text = header_text + "ETag: " + resp.etag + "\r\n"
+    set header_text = header_text + "X-Content-Type-Options: nosniff\r\n"
+    set header_text = header_text + "X-Frame-Options: DENY\r\n"
+    set header_text = header_text + "Referrer-Policy: strict-origin-when-cross-origin\r\n"
+    if text_length(resp.csp_policy) > 0:
+        set header_text = header_text + "Content-Security-Policy: " + resp.csp_policy + "\r\n"
+    if text_length(resp.cache_control) > 0:
+        set header_text = header_text + "Cache-Control: " + resp.cache_control + "\r\n"
+    if text_length(request_id) > 0:
+        set header_text = header_text + "X-Request-Id: " + request_id + "\r\n"
+    if text_length(resp.vary_header) > 0:
+        set header_text = header_text + "Vary: " + resp.vary_header + "\r\n"
+    if keep_alive:
+        set header_text = header_text + "Connection: keep-alive\r\nKeep-Alive: timeout=5, max=64\r\n\r\n"
+    else:
+        set header_text = header_text + "Connection: close\r\n\r\n"
+    return bytes_concat(bytes_from_text(header_text), resp.body)

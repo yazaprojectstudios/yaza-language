@@ -1,0 +1,90 @@
+# Web Security Middleware: Fail-Closed Auth Secret, Argon2id Login, Signed HttpOnly Session & CSRF.
+use "std/web/cookie"
+use "std/web/csrf"
+use "std/web/form"
+use "std/web/request"
+use "std/db/yazabase"
+use "std/jwt"
+use "std/time"
+use "../models/task_repository"
+
+shape WebSession:
+    authenticated: Boolean
+    username: Text
+    role: Text
+    raw_token: Text
+    csrf_token: Text
+
+fn web_dev_fallback_secret() -> Text:
+    return "yaza-fullstack-dev-secret-change-in-production-min32"
+
+fn web_auth_secret() -> Text:
+    let s: Text = env_get("YAZA_AUTH_SECRET")
+    if s != "":
+        return s
+    return web_dev_fallback_secret()
+
+fn web_is_production() -> Boolean:
+    return env_get("YAZA_ENV") == "production"
+
+fn web_auth_issuer() -> Text:
+    return "{{project_name}}-web"
+
+fn web_auth_validate_config() -> Result[Boolean, Text]:
+    if web_is_production():
+        let s: Text = env_get("YAZA_AUTH_SECRET")
+        if text_length(s) < 32 or s == web_dev_fallback_secret():
+            return err("YAZA_ENV=production requires YAZA_AUTH_SECRET (>= 32 non-default characters)")
+    return ok(true)
+
+fn web_session_cookie_name() -> Text:
+    return "yaza_session"
+
+fn web_current_session(req: WebRequest) -> WebSession:
+    let secret: Text = web_auth_secret()
+    let tok_opt: Option[Text] = web_request_cookie(req, web_session_cookie_name())
+    if not option_is_some(tok_opt):
+        return WebSession(false, "", "", "", "")
+    let raw_tok: Text = option_unwrap(tok_opt)
+    let claims_res: Result[YwtClaims, Text] = session_verify_cookie(raw_tok, web_auth_issuer(), secret)
+    if not result_is_ok(claims_res):
+        return WebSession(false, "", "", "", "")
+    let claims: YwtClaims = result_unwrap(claims_res)
+    let csrf: Text = csrf_issue_token(raw_tok, secret)
+    return WebSession(true, claims.subject, claims.role, raw_tok, csrf)
+
+fn web_issue_session_cookie(username: Text, role: Text) -> Text:
+    let secret: Text = web_auth_secret()
+    let tok: Text = session_sign_cookie(username, role, web_auth_issuer(), 3600, secret)
+    return cookie_set_header(web_session_cookie_name(), tok, 3600, web_is_production(), "Lax")
+
+fn web_issue_session_token(username: Text, role: Text) -> Text:
+    return session_sign_cookie(username, role, web_auth_issuer(), 3600, web_auth_secret())
+
+fn web_clear_session_cookie() -> Text:
+    return cookie_clear_header(web_session_cookie_name(), web_is_production())
+
+fn web_authenticate_credentials(username: Text, password: Text) -> Boolean:
+    let clean_u: Text = text_trim(username)
+    if text_length(clean_u) == 0 or text_length(password) == 0:
+        return false
+    return yazabase_verify_credentials(task_db_dir(), clean_u, password)
+
+fn web_verify_request_csrf(req: WebRequest, sess: WebSession, fields: List[FormField]) -> Boolean:
+    if not sess.authenticated:
+        return false
+    var submitted: Text = form_get_or(fields, "_csrf", "")
+    if text_length(submitted) == 0:
+        set submitted = req.csrf_header
+    return csrf_verify_token(sess.raw_token, submitted, web_auth_secret())
+
+fn web_api_is_authorized(req: WebRequest, sess: WebSession) -> Boolean:
+    if sess.authenticated:
+        return true
+    let auth: Text = req.http.authorization
+    if text_starts_with(auth, "Bearer "):
+        let tok: Text = text_slice(auth, 7, text_length(auth) - 7)
+        let now_s: Number = time_now_unix_ms() / 1000
+        let v: Result[JwtClaims, Text] = jwt_verify_hs256(tok, web_auth_issuer(), "api-clients", now_s, web_auth_secret())
+        return result_is_ok(v)
+    return false

@@ -1,0 +1,233 @@
+# Single-Binary Fullstack Monolith (Arena-SSR MVC + Hypermedia Fragments + JSON API + YazaBase SQL)
+# Project: {{project_name}}
+use "app"
+use "middleware/web_security"
+use "services/task_service"
+use "std/net"
+use "std/json"
+use "std/sync"
+use "std/log"
+use "std/time"
+use "std/http"
+use "std/web/request"
+use "std/web/response"
+use "std/web/csrf"
+use "std/config/api_config"
+
+shape HttpReadOutcome:
+    ok_read: Boolean
+    raw: Bytes
+    error_response: Option[WebResponse]
+
+fn header_end_index(raw_text: Text) -> Number:
+    let crlf: Number = text_find(raw_text, "\r\n\r\n")
+    if crlf >= 0: return crlf + 4
+    let lf: Number = text_find(raw_text, "\n\n")
+    if lf >= 0: return lf + 2
+    return -1
+
+fn request_wants_close(raw_text: Text) -> Boolean:
+    if text_find(raw_text, "Connection: close") >= 0 or text_find(raw_text, "connection: close") >= 0:
+        return true
+    if text_find(raw_text, "HTTP/1.0") >= 0 and text_find(raw_text, "keep-alive") < 0:
+        return true
+    return false
+
+fn read_bounded_http_request(client_fd: Number, max_body_bytes: Number) -> HttpReadOutcome:
+    var buf: Bytes = bytes_empty()
+    let header_limit: Number = 16384
+    var hdr_end: Number = -1
+    var content_len: Number = 0
+    var chunks: Number = 0
+
+    while chunks < 256:
+        let rd: Result[Bytes, Text] = tcp_read(client_fd, 16384, 5000)
+        if not result_is_ok(rd): break
+        let chunk: Bytes = result_unwrap(rd)
+        if bytes_length(chunk) == 0: break
+        set buf = bytes_concat(buf, chunk)
+        let cur_len: Number = bytes_length(buf)
+        if hdr_end < 0:
+            if cur_len > header_limit and header_end_index(bytes_to_text(buf)) < 0:
+                return HttpReadOutcome(false, bytes_empty(), some(web_from_http_response(http_response_payload_too_large("HTTP header exceeds 16 KiB limit", true))))
+            let txt: Text = bytes_to_text(buf)
+            set hdr_end = header_end_index(txt)
+            if hdr_end >= 0:
+                let hdr_req_res: Result[HttpRequest, Text] = http_parse_request(bytes_slice(buf, 0, hdr_end))
+                if result_is_ok(hdr_req_res):
+                    set content_len = result_unwrap(hdr_req_res).content_length
+                if content_len > max_body_bytes:
+                    return HttpReadOutcome(false, bytes_empty(), some(web_from_http_response(http_response_payload_too_large("request body exceeds configured limit", true))))
+        if hdr_end >= 0 and cur_len >= hdr_end + content_len:
+            return HttpReadOutcome(true, bytes_slice(buf, 0, hdr_end + content_len), none)
+        set chunks = chunks + 1
+
+    if bytes_length(buf) == 0:
+        return HttpReadOutcome(false, bytes_empty(), none)
+    return HttpReadOutcome(true, buf, none)
+
+fn handle_client_connection(client_fd: Number, public_dir: Text, profile_label: Text, max_body_bytes: Number, max_in_flight: Number, m_in_flight: AtomicNumber, m_total: AtomicNumber, m_errors: AtomicNumber, m_rate_limited: AtomicNumber, logger: Logger) -> Boolean:
+    var keep_alive: Boolean = true
+    var req_on_conn: Number = 0
+    while keep_alive and req_on_conn < 64:
+        var continue_conn: Boolean = false
+        arena_scope 1048576:
+            let rd_out: HttpReadOutcome = read_bounded_http_request(client_fd, max_body_bytes)
+            if not rd_out.ok_read:
+                if option_is_some(rd_out.error_response):
+                    let wire_err: Bytes = web_format_response(option_unwrap(rd_out.error_response), "req-limit", false)
+                    let _wr: Result[Number, Text] = tcp_write(client_fd, wire_err, 5000)
+            else:
+                set req_on_conn = req_on_conn + 1
+                let raw_text: Text = bytes_to_text(rd_out.raw)
+                if request_wants_close(raw_text):
+                    set keep_alive = false
+
+                let started_ns: Number = time_now_monotonic_ns()
+                let cur_in_flight: Number = atomic_fetch_add(m_in_flight, 1)
+                let req_res: Result[WebRequest, Text] = web_parse_request(rd_out.raw)
+                var resp: WebResponse = web_from_http_response(http_response_bad_request("malformed HTTP request", true))
+                var req_id: Text = "req-" + number_text(req_on_conn)
+                var log_method: Text = "UNKNOWN"
+                var log_path: Text = "/"
+
+                if result_is_ok(req_res):
+                    let req: WebRequest = result_unwrap(req_res)
+                    set log_method = req.http.method
+                    set log_path = req.http.path
+                    if req.http.x_request_id != "":
+                        set req_id = req.http.x_request_id
+                    if cur_in_flight >= max_in_flight:
+                        let _rl: AtomicNumber = atomic_add(m_rate_limited, 1)
+                        set resp = web_from_http_response(http_response_service_unavailable("maximum in-flight concurrency limit reached", true))
+                    else:
+                        set resp = app_dispatch_request(req, public_dir, profile_label, m_total, m_errors)
+                let _dec: AtomicNumber = atomic_add(m_in_flight, -1)
+
+                if resp.status_code >= 500:
+                    let _er: AtomicNumber = atomic_add(m_errors, 1)
+
+                let wire: Bytes = web_format_response(resp, req_id, keep_alive)
+                let wr_res: Result[Number, Text] = tcp_write(client_fd, wire, 5000)
+                let elapsed_ms: Number = (time_now_monotonic_ns() - started_ns) / 1000000
+                let access_json: Text = "{\"method\":\"" + json_escape_text(log_method) + "\",\"path\":\"" + json_escape_text(log_path) + "\",\"status\":" + number_text(resp.status_code) + ",\"latency_ms\":" + number_text(elapsed_ms) + ",\"request_id\":\"" + json_escape_text(req_id) + "\"}"
+                let _li: Boolean = log_info(logger, "http_request", access_json)
+                if result_is_ok(wr_res):
+                    set continue_conn = true
+        if not continue_conn:
+            break
+
+    let _cl: Result[Boolean, Text] = tcp_close(client_fd)
+    return true
+
+async fn fullstack_worker_loop(accept_lock: Mutex, listener: Number, public_dir: Text, profile_label: Text, max_body_bytes: Number, max_in_flight: Number, m_in_flight: AtomicNumber, m_total: AtomicNumber, m_errors: AtomicNumber, m_rate_limited: AtomicNumber, logger: Logger) -> Boolean:
+    while true:
+        let _lk: Boolean = mutex_lock(accept_lock)
+        let acc_res: Result[Number, Text] = tcp_accept(listener, 1000)
+        let _unlk: Boolean = mutex_unlock(accept_lock)
+        if result_is_ok(acc_res):
+            let client_fd: Number = result_unwrap(acc_res)
+            let _ok: Boolean = handle_client_connection(client_fd, public_dir, profile_label, max_body_bytes, max_in_flight, m_in_flight, m_total, m_errors, m_rate_limited, logger)
+    return true
+
+fn load_effective_service_config() -> ApiServiceConfig:
+    if file_exists("yaza.toml"):
+        let parsed: Result[ApiServiceConfig, Text] = api_config_parse(file_read("yaza.toml"))
+        if result_is_ok(parsed):
+            return result_unwrap(parsed)
+    return result_unwrap(api_config_parse("[project]\nname = \"{{project_name}}\"\n"))
+
+fn run_fullstack_self_test(public_dir: Text, profile_label: Text, m_total: AtomicNumber, m_errors: AtomicNumber) -> Boolean:
+    arena_scope 1048576:
+        # 1. Unauthenticated GET / redirects to /login (303)
+        let r_anon_raw: Bytes = bytes_from_text("GET / HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nAccept: text/html\r\n\r\n")
+        let r_anon: WebResponse = app_dispatch_request(result_unwrap(web_parse_request(r_anon_raw)), public_dir, profile_label, m_total, m_errors)
+        assert(r_anon.status_code == 303 and r_anon.location == "/login")
+
+        # 2. Signed session cookie -> Full SSR Dashboard (200 HTML with YAZA UI)
+        let sess_tok: Text = web_issue_session_token("admin", "admin")
+        let csrf_tok: Text = csrf_issue_token(sess_tok, web_auth_secret())
+        let r_dash_raw: Bytes = bytes_from_text("GET / HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nAccept: text/html\r\nCookie: yaza_session=" + sess_tok + "\r\n\r\n")
+        let r_dash: WebResponse = app_dispatch_request(result_unwrap(web_parse_request(r_dash_raw)), public_dir, profile_label, m_total, m_errors)
+        assert(r_dash.status_code == 200)
+        assert(text_find(bytes_to_text(r_dash.body), "id=\"task-board\"") >= 0)
+
+        # 3. Missing CSRF on POST /tasks MUST return 403 Forbidden
+        let bad_body: Text = "title=Exploit&priority=high"
+        let r_bad_raw: Bytes = bytes_from_text("POST /tasks HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: " + number_text(text_length(bad_body)) + "\r\nCookie: yaza_session=" + sess_tok + "\r\n\r\n" + bad_body)
+        let r_bad: WebResponse = app_dispatch_request(result_unwrap(web_parse_request(r_bad_raw)), public_dir, profile_label, m_total, m_errors)
+        assert(r_bad.status_code == 403)
+
+        # 4. Valid CSRF + X-Yaza-Fragment POST /tasks creates row & returns partial fragment HTML (XSS escaped!)
+        let good_body: Text = "_csrf=" + csrf_tok + "&title=%3Cb%3ESelfTest+Task%3C%2Fb%3E&priority=high"
+        let r_frag_raw: Bytes = bytes_from_text("POST /tasks HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nAccept: text/vnd.yaza.fragment\r\nX-Yaza-Fragment: #task-board\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: " + number_text(text_length(good_body)) + "\r\nCookie: yaza_session=" + sess_tok + "\r\n\r\n" + good_body)
+        let r_frag: WebResponse = app_dispatch_request(result_unwrap(web_parse_request(r_frag_raw)), public_dir, profile_label, m_total, m_errors)
+        assert(r_frag.status_code == 200)
+        let frag_html: Text = bytes_to_text(r_frag.body)
+        assert(text_starts_with(frag_html, "<section id=\"task-board\">"))
+        assert(text_find(frag_html, "&lt;b&gt;SelfTest Task&lt;/b&gt;") >= 0)
+
+        # 5. JSON API parity (/api/v1/tasks)
+        let r_api_raw: Bytes = bytes_from_text("GET /api/v1/tasks HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nAccept: application/json\r\nCookie: yaza_session=" + sess_tok + "\r\n\r\n")
+        let r_api: WebResponse = app_dispatch_request(result_unwrap(web_parse_request(r_api_raw)), public_dir, profile_label, m_total, m_errors)
+        assert(r_api.status_code == 200)
+        assert(text_find(bytes_to_text(r_api.body), "SelfTest Task") >= 0)
+
+        # 6. Static asset CSS (200 + ETag 304) & path traversal blocked (404)
+        let r_css_raw: Bytes = bytes_from_text("GET /public/yaza-ui.css HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\r\n")
+        let r_css: WebResponse = app_dispatch_request(result_unwrap(web_parse_request(r_css_raw)), public_dir, profile_label, m_total, m_errors)
+        assert(r_css.status_code == 200 and text_length(r_css.etag) > 0)
+        let r_trav_raw: Bytes = bytes_from_text("GET /public/../yaza.toml HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\r\n")
+        let r_trav: WebResponse = app_dispatch_request(result_unwrap(web_parse_request(r_trav_raw)), public_dir, profile_label, m_total, m_errors)
+        assert(r_trav.status_code == 404)
+    return true
+
+start:
+    let logger: Logger = logger_create("{{project_name}}", "INFO")
+    let cfg: ApiServiceConfig = load_effective_service_config()
+    let profile_label: Text = cfg.resources.profile + " / " + cfg.resources.arena_mode
+    let public_dir: Text = "./public"
+
+    let auth_check: Result[Boolean, Text] = web_auth_validate_config()
+    if not result_is_ok(auth_check):
+        let _le1: Boolean = log_error(logger, "startup_auth_config_failed", result_unwrap_error(auth_check))
+        exit(1)
+
+    let db_ready: Result[Boolean, Text] = task_service_ping()
+    if not result_is_ok(db_ready):
+        let _le2: Boolean = log_error(logger, "startup_yazabase_failed", result_unwrap_error(db_ready) + " (Hint: mkdir -p data && yaza db set-user ./data admin <pass> and export YAZABASE_USER / YAZABASE_PASSWORD)")
+        exit(1)
+
+    let m_in_flight: AtomicNumber = atomic_create(0)
+    let m_total: AtomicNumber = atomic_create(0)
+    let m_errors: AtomicNumber = atomic_create(0)
+    let m_rate_limited: AtomicNumber = atomic_create(0)
+
+    if env_get("YAZA_SELF_TEST") == "1":
+        let ok_test: Boolean = run_fullstack_self_test(public_dir, profile_label, m_total, m_errors)
+        assert(ok_test)
+        say "FULLSTACK_MVC_SELF_TEST: PASS"
+        exit(0)
+
+    let listener_res: Result[Number, Text] = tcp_listen(cfg.bind_host, cfg.bind_port, 128)
+    if not result_is_ok(listener_res):
+        let _le3: Boolean = log_error(logger, "tcp_listen_failed", result_unwrap_error(listener_res))
+        exit(1)
+    let listener: Number = result_unwrap(listener_res)
+
+    say "=== {{project_name}} Fullstack Monolith (Arena-SSR MVC) ==="
+    say "Profile      : " + cfg.resources.profile + " (" + cfg.resources.arena_mode + ") | max_in_flight = " + number_text(cfg.resources.max_in_flight) + " | DB: YazaBase SQL"
+    say "Web UI       : http://" + cfg.bind_host + ":" + number_text(cfg.bind_port) + "/login"
+    say "JSON API     : http://" + cfg.bind_host + ":" + number_text(cfg.bind_port) + "/api/v1/tasks"
+    say "Probes       : /healthz | /readyz | /metrics"
+
+    let accept_lock: Mutex = mutex_create(1)
+    let workers: List[Task[Boolean]] = List[Task[Boolean]]()
+    var wi: Number = 0
+    while wi < 8:
+        list_push(workers, spawn fullstack_worker_loop(accept_lock, listener, public_dir, profile_label, cfg.max_request_body_bytes, cfg.resources.max_in_flight, m_in_flight, m_total, m_errors, m_rate_limited, logger))
+        set wi = wi + 1
+    var wj: Number = 0
+    while wj < list_count(workers):
+        let _done: Boolean = await list_get(workers, wj)
+        set wj = wj + 1

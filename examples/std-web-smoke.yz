@@ -1,0 +1,118 @@
+# Focused Security & Functional Smoke Test for std/web/* (RFC 0009 Phase 1)
+use "std/web/cookie"
+use "std/web/form"
+use "std/web/csrf"
+use "std/web/request"
+use "std/web/response"
+use "std/web/static"
+use "std/web/view"
+
+start:
+    let secret: Text = "yaza-web-smoke-secret-at-least-32-bytes-long!"
+
+    # 1. Cookie parsing & signed HttpOnly session cookies
+    let c_hdr: Text = "theme=dark; yaza_session=tok123; lang=en"
+    assert(option_unwrap(cookie_get(c_hdr, "yaza_session")) == "tok123")
+    assert(option_unwrap(cookie_get(c_hdr, "theme")) == "dark")
+    assert(not option_is_some(cookie_get(c_hdr, "missing")))
+    let set_c: Text = cookie_set_header("yaza_session", "abc", 3600, true, "Lax")
+    assert(text_find(set_c, "HttpOnly") >= 0)
+    assert(text_find(set_c, "SameSite=Lax") >= 0)
+    assert(text_find(set_c, "Secure") >= 0)
+    assert(cookie_set_header("bad\r\n", "v", 60, false, "Lax") == "")
+
+    let sess_tok: Text = session_sign_cookie("user-1", "admin", "yaza-fullstack", 3600, secret)
+    let sess_ok: Result[YwtClaims, Text] = session_verify_cookie(sess_tok, "yaza-fullstack", secret)
+    assert(result_is_ok(sess_ok))
+    assert(result_unwrap(sess_ok).subject == "user-1")
+    assert(result_unwrap(sess_ok).role == "admin")
+    assert(not result_is_ok(session_verify_cookie(sess_tok + "x", "yaza-fullstack", secret)))
+    assert(not result_is_ok(session_verify_cookie(sess_tok, "yaza-fullstack", "short")))
+
+    # 2. Form URL-encoded parsing & NUL rejection
+    let form_res: Result[List[FormField], Text] = form_parse_urlencoded("title=Ship+YAZA%20MVC&priority=high&notes=100%25+safe", 16)
+    assert(result_is_ok(form_res))
+    let fields: List[FormField] = result_unwrap(form_res)
+    assert(form_get_or(fields, "title", "") == "Ship YAZA MVC")
+    assert(form_get_or(fields, "priority", "") == "high")
+    assert(form_get_or(fields, "notes", "") == "100% safe")
+    assert(not result_is_ok(form_parse_urlencoded("bad=abc%00def", 16)))
+    assert(not result_is_ok(form_parse_urlencoded("a=1&b=2&c=3", 2)))
+
+    # 3. Session-bound CSRF token verification
+    let csrf_tok: Text = csrf_issue_token(sess_tok, secret)
+    assert(text_length(csrf_tok) == 64)
+    assert(csrf_verify_token(sess_tok, csrf_tok, secret))
+    assert(not csrf_verify_token(sess_tok, "forged-token", secret))
+    assert(not csrf_verify_token("other-session", csrf_tok, secret))
+    assert(not csrf_verify_token(sess_tok, csrf_tok, "short-secret"))
+
+    # 4. Compiled view XSS escaping & safe href enforcement
+    let escaped: Text = view_escape("<script>alert(\"xss\")</script>")
+    assert(text_find(escaped, "<script>") < 0)
+    assert(text_find(escaped, "&lt;script&gt;") >= 0)
+    assert(view_safe_href("javascript:alert(1)") == "#")
+    assert(view_safe_href("//evil.example/phish") == "#")
+    assert(view_safe_href("/tasks/42") == "/tasks/42")
+    assert(view_safe_href("https://yazastudios.id/benchmarks") == "https://yazastudios.id/benchmarks")
+    let csrf_in: Text = view_csrf_input(csrf_tok)
+    assert(text_find(csrf_in, "name=\"_csrf\"") >= 0)
+
+    # 5. WebRequest parsing & WebResponse formatting (Web CSP, Redirect, Fragment)
+    let raw_req: Text = "GET /tasks HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nAccept: text/html\r\nCookie: yaza_session=" + sess_tok + "\r\nX-Yaza-Fragment: #task-list\r\nX-CSRF-Token: " + csrf_tok + "\r\n\r\n"
+    let wreq_res: Result[WebRequest, Text] = web_parse_request(bytes_from_text(raw_req))
+    assert(result_is_ok(wreq_res))
+    let wreq: WebRequest = result_unwrap(wreq_res)
+    assert(web_request_wants_fragment(wreq))
+    assert(not web_request_wants_json(wreq))
+    assert(wreq.fragment_target == "#task-list")
+    assert(wreq.csrf_header == csrf_tok)
+    assert(option_unwrap(web_request_cookie(wreq, "yaza_session")) == sess_tok)
+
+    let redir: WebResponse = web_redirect_see_other("/dashboard")
+    assert(redir.status_code == 303)
+    assert(redir.location == "/dashboard")
+    let bad_redir: WebResponse = web_redirect_see_other("https://evil.example")
+    assert(bad_redir.location == "/")
+
+    let html_resp: WebResponse = web_with_cookie(web_html_ok("<h1>OK</h1>"), set_c)
+    let wire: Text = bytes_to_text(web_format_response(html_resp, "req-web-1", true))
+    assert(text_find(wire, "Content-Type: text/html; charset=utf-8") >= 0)
+    assert(text_find(wire, "script-src 'self'") >= 0)
+    assert(text_find(wire, "Set-Cookie: yaza_session=abc;") >= 0)
+
+    # 6. Rooted static asset serving & traversal/extension defense via yaza_vfs_v1
+    let pub_dir: Text = env_get("YAZA_WEB_SMOKE_PUBLIC_DIR")
+    assert(text_length(pub_dir) > 0)
+    let root_fd: Number = result_unwrap(vfs_root_open(pub_dir))
+    let css_res: Result[WebResponse, Text] = static_serve_vfs(root_fd, "/public/app.css", "/public/", "", 1048576)
+    assert(result_is_ok(css_res))
+    let css_resp: WebResponse = result_unwrap(css_res)
+    assert(css_resp.status_code == 200)
+    assert(css_resp.content_type == "text/css; charset=utf-8")
+    assert(text_length(css_resp.etag) > 0)
+
+    let not_mod: Result[WebResponse, Text] = static_serve_vfs(root_fd, "/public/app.css", "/public/", css_resp.etag, 1048576)
+    assert(result_is_ok(not_mod))
+    assert(result_unwrap(not_mod).status_code == 304)
+
+    # Adversarial static requests MUST fail closed (traversal, disallowed ext, symlink)
+    assert(not result_is_ok(static_serve_vfs(root_fd, "/public/../secret.txt", "/public/", "", 1048576)))
+    assert(not result_is_ok(static_serve_vfs(root_fd, "/public/config.env", "/public/", "", 1048576)))
+    assert(not result_is_ok(static_serve_vfs(root_fd, "/public/link.css", "/public/", "", 1048576)))
+    let _cl: Result[Boolean, Text] = vfs_close(root_fd)
+
+    # 7. Standard 0644 public directory serving with strict whitelist & ETag
+    let pub_std_dir: Text = env_get("YAZA_WEB_SMOKE_STD_PUBLIC_DIR")
+    assert(text_length(pub_std_dir) > 0)
+    let ui_res: Result[WebResponse, Text] = static_serve_public_dir(pub_std_dir, "/public/yaza-ui.css", "/public/", "", 1048576)
+    assert(result_is_ok(ui_res))
+    let ui_resp: WebResponse = result_unwrap(ui_res)
+    assert(ui_resp.status_code == 200)
+    assert(ui_resp.content_type == "text/css; charset=utf-8")
+    let ui_304: Result[WebResponse, Text] = static_serve_public_dir(pub_std_dir, "/public/yaza-ui.css", "/public/", ui_resp.etag, 1048576)
+    assert(result_is_ok(ui_304) and result_unwrap(ui_304).status_code == 304)
+    assert(not result_is_ok(static_serve_public_dir(pub_std_dir, "/public/../secret.txt", "/public/", "", 1048576)))
+    assert(not result_is_ok(static_serve_public_dir(pub_std_dir, "/public/config.env", "/public/", "", 1048576)))
+
+    say "std-web-smoke: PASS"

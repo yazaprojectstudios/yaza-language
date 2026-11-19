@@ -1,0 +1,60 @@
+# Fullstack Web Request Parser (Wraps std/http HttpRequest with Cookie, Fragment, CSRF & ETag headers).
+use "std/http"
+use "std/web/cookie"
+
+shape WebRequest:
+    http: HttpRequest
+    cookie_header: Text
+    fragment_target: Text
+    csrf_header: Text
+    if_none_match: Text
+
+fn web_extract_header_value(raw_headers: Text, target_lower: Text) -> Text:
+    let lines: TextList = text_lines(raw_headers)
+    var i: Number = 1
+    while i < list_count(lines):
+        let line: Text = text_trim(list_get(lines, i))
+        let colon: Number = text_find(line, ":")
+        if colon > 0:
+            let name_lower: Text = http_ascii_lower_header_name(text_trim(text_slice(line, 0, colon)))
+            if name_lower == target_lower:
+                return text_trim(text_slice(line, colon + 1, text_length(line) - colon - 1))
+        set i = i + 1
+    return ""
+
+fn web_header_block_text(raw_bytes: Bytes) -> Text:
+    let raw_text_res: Result[Text, Text] = bytes_try_to_text(raw_bytes)
+    if not result_is_ok(raw_text_res):
+        return ""
+    let raw_text: Text = result_unwrap(raw_text_res)
+    let crlf: Number = text_find(raw_text, "\r\n\r\n")
+    if crlf >= 0:
+        return text_slice(raw_text, 0, crlf)
+    let lf: Number = text_find(raw_text, "\n\n")
+    if lf >= 0:
+        return text_slice(raw_text, 0, lf)
+    return raw_text
+
+fn web_parse_request(raw_bytes: Bytes) -> Result[WebRequest, Text]:
+    let http_req: HttpRequest = http_parse_request(raw_bytes)?
+    let hdr_block: Text = web_header_block_text(raw_bytes)
+    let cookie_hdr: Text = web_extract_header_value(hdr_block, "cookie")
+    let frag_hdr: Text = web_extract_header_value(hdr_block, "x-yaza-fragment")
+    let csrf_hdr: Text = web_extract_header_value(hdr_block, "x-csrf-token")
+    let inm_hdr: Text = web_extract_header_value(hdr_block, "if-none-match")
+    return ok(WebRequest(http_req, cookie_hdr, frag_hdr, csrf_hdr, inm_hdr))
+
+fn web_request_cookie(req: WebRequest, name: Text) -> Option[Text]:
+    return cookie_get(req.cookie_header, name)
+
+fn web_request_wants_fragment(req: WebRequest) -> Boolean:
+    if text_length(req.fragment_target) > 0:
+        return true
+    return text_find(req.http.accept, "text/vnd.yaza.fragment") >= 0
+
+fn web_request_wants_json(req: WebRequest) -> Boolean:
+    if text_starts_with(req.http.path, "/api/"):
+        return true
+    let has_json: Boolean = text_find(req.http.accept, "application/json") >= 0
+    let has_html: Boolean = text_find(req.http.accept, "text/html") >= 0
+    return has_json and not has_html
