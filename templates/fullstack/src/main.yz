@@ -40,7 +40,7 @@ fn read_bounded_http_request(client_fd: Number, max_body_bytes: Number) -> HttpR
     var content_len: Number = 0
     var chunks: Number = 0
 
-    while chunks < 256:
+    while chunks < 512:
         let rd: Result[Bytes, Text] = tcp_read(client_fd, 16384, 5000)
         if not result_is_ok(rd): break
         let chunk: Bytes = result_unwrap(rd)
@@ -48,11 +48,11 @@ fn read_bounded_http_request(client_fd: Number, max_body_bytes: Number) -> HttpR
         set buf = bytes_concat(buf, chunk)
         let cur_len: Number = bytes_length(buf)
         if hdr_end < 0:
-            if cur_len > header_limit and header_end_index(bytes_to_text(buf)) < 0:
+            let raw_hdr_pos: Number = http_find_header_end_bytes(buf)
+            if cur_len > header_limit and raw_hdr_pos < 0:
                 return HttpReadOutcome(false, bytes_empty(), some(web_from_http_response(http_response_payload_too_large("HTTP header exceeds 16 KiB limit", true))))
-            let txt: Text = bytes_to_text(buf)
-            set hdr_end = header_end_index(txt)
-            if hdr_end >= 0:
+            if raw_hdr_pos >= 0:
+                set hdr_end = raw_hdr_pos + 4
                 let hdr_req_res: Result[HttpRequest, Text] = http_parse_request(bytes_slice(buf, 0, hdr_end))
                 if result_is_ok(hdr_req_res):
                     set content_len = result_unwrap(hdr_req_res).content_length
@@ -71,7 +71,7 @@ fn handle_client_connection(client_fd: Number, public_dir: Text, profile_label: 
     var req_on_conn: Number = 0
     while keep_alive and req_on_conn < 64:
         var continue_conn: Boolean = false
-        arena_scope 1048576:
+        arena_scope 4194304:
             let rd_out: HttpReadOutcome = read_bounded_http_request(client_fd, max_body_bytes)
             if not rd_out.ok_read:
                 if option_is_some(rd_out.error_response):
@@ -79,8 +79,8 @@ fn handle_client_connection(client_fd: Number, public_dir: Text, profile_label: 
                     let _wr: Result[Number, Text] = tcp_write(client_fd, wire_err, 5000)
             else:
                 set req_on_conn = req_on_conn + 1
-                let raw_text: Text = bytes_to_text(rd_out.raw)
-                if req_on_conn >= 64 or request_wants_close(raw_text):
+                let hdr_text: Text = web_header_block_text(rd_out.raw)
+                if req_on_conn >= 64 or request_wants_close(hdr_text):
                     set keep_alive = false
 
                 let started_ns: Number = time_now_monotonic_ns()
@@ -138,7 +138,7 @@ fn load_effective_service_config() -> ApiServiceConfig:
     return result_unwrap(api_config_parse("[project]\nname = \"{{project_name}}\"\n"))
 
 fn run_fullstack_self_test(public_dir: Text, profile_label: Text, m_total: AtomicNumber, m_errors: AtomicNumber) -> Boolean:
-    arena_scope 1048576:
+    arena_scope 4194304:
         # 1. Public Welcome to YAZA page (GET / -> 200 OK with live DB count)
         let r_wel_raw: Bytes = bytes_from_text("GET / HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nAccept: text/html\r\n\r\n")
         let r_wel: WebResponse = app_dispatch_request(result_unwrap(web_parse_request(r_wel_raw)), public_dir, profile_label, m_total, m_errors)
@@ -202,6 +202,23 @@ fn run_fullstack_self_test(public_dir: Text, profile_label: Text, m_total: Atomi
         let r_trav_raw: Bytes = bytes_from_text("GET /public/../yaza.toml HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\r\n")
         let r_trav: WebResponse = app_dispatch_request(result_unwrap(web_parse_request(r_trav_raw)), public_dir, profile_label, m_total, m_errors)
         assert(r_trav.status_code == 404)
+
+        # 9. Binary Media Upload (/api/v1/media) + Download (?download=1) + Seekable HTTP 206 Range Streaming
+        let bnd: Text = "----MvcMediaSelfTest"
+        let pdf_raw: Bytes = bytes_from_text("%PDF-1.7\nYAZA MVC Media & Streaming Test 0123456789\n%%EOF\n")
+        var mp: Bytes = bytes_from_text("--" + bnd + "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"handbook.pdf\"\r\nContent-Type: application/pdf\r\n\r\n")
+        set mp = bytes_concat(mp, pdf_raw)
+        set mp = bytes_concat(mp, bytes_from_text("\r\n--" + bnd + "--\r\n"))
+        let up_hdr: Text = "POST /api/v1/media HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nCookie: yaza_session=" + sess_tok + "\r\nContent-Type: multipart/form-data; boundary=" + bnd + "\r\nContent-Length: " + number_text(bytes_length(mp)) + "\r\n\r\n"
+        let r_up: WebResponse = app_dispatch_request(result_unwrap(web_parse_request(bytes_concat(bytes_from_text(up_hdr), mp))), public_dir, profile_label, m_total, m_errors)
+        assert(r_up.status_code == 201)
+        let stored_opt: Option[Text] = json_extract_string(bytes_to_text(r_up.body), "stored_name")
+        assert(option_is_some(stored_opt))
+        let stored_file: Text = option_unwrap(stored_opt)
+        let r_dl: WebResponse = app_dispatch_request(result_unwrap(web_parse_request(bytes_from_text("GET /media/" + stored_file + "?download=1 HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\r\n"))), public_dir, profile_label, m_total, m_errors)
+        assert(r_dl.status_code == 200 and text_find(r_dl.content_disposition, "attachment") >= 0)
+        let r_rng: WebResponse = app_dispatch_request(result_unwrap(web_parse_request(bytes_from_text("GET /media/" + stored_file + " HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nRange: bytes=0-15\r\n\r\n"))), public_dir, profile_label, m_total, m_errors)
+        assert(r_rng.status_code == 206 and bytes_length(r_rng.body) == 16 and text_find(r_rng.content_range, "bytes 0-15/") == 0)
     return true
 
 start:

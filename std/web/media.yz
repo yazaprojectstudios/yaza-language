@@ -1,0 +1,199 @@
+# Zero-GC Binary Media Serving, File Download & HTTP 206 Seekable Video/Audio Streaming (MVC + API).
+use "std/fs"
+use "std/convert"
+use "std/web/response"
+use "std/web/static"
+
+shape MediaRange:
+    start_offset: Number
+    end_offset: Number
+    total_size: Number
+
+fn media_ascii_lower(raw: Text) -> Text:
+    let len: Number = text_length(raw)
+    let parts: TextList = text_list()
+    var i: Number = 0
+    while i < len:
+        let b: Number = text_byte(raw, i)
+        if b >= 65 and b <= 90:
+            var one: Bytes = bytes_from_text("a")
+            let _ok: Boolean = bytes_try_set(one, 0, b + 32)
+            list_push(parts, bytes_to_text(one))
+        else:
+            list_push(parts, text_slice(raw, i, 1))
+        set i = i + 1
+    return text_join(parts, "")
+
+fn media_mime_for_filename(filename: Text) -> Option[Text]:
+    let low: Text = media_ascii_lower(filename)
+    if text_ends_with(low, ".png"): return some("image/png")
+    if text_ends_with(low, ".jpg") or text_ends_with(low, ".jpeg"): return some("image/jpeg")
+    if text_ends_with(low, ".webp"): return some("image/webp")
+    if text_ends_with(low, ".gif"): return some("image/gif")
+    if text_ends_with(low, ".svg"): return some("image/svg+xml")
+    if text_ends_with(low, ".ico"): return some("image/x-icon")
+    if text_ends_with(low, ".mp4"): return some("video/mp4")
+    if text_ends_with(low, ".webm"): return some("video/webm")
+    if text_ends_with(low, ".mov"): return some("video/quicktime")
+    if text_ends_with(low, ".mp3"): return some("audio/mpeg")
+    if text_ends_with(low, ".wav"): return some("audio/wav")
+    if text_ends_with(low, ".ogg"): return some("audio/ogg")
+    if text_ends_with(low, ".pdf"): return some("application/pdf")
+    if text_ends_with(low, ".zip"): return some("application/zip")
+    if text_ends_with(low, ".txt"): return some("text/plain; charset=utf-8")
+    if text_ends_with(low, ".json"): return some("application/json; charset=utf-8")
+    if text_ends_with(low, ".css"): return some("text/css; charset=utf-8")
+    if text_ends_with(low, ".js"): return some("application/javascript; charset=utf-8")
+    if text_ends_with(low, ".woff2"): return some("font/woff2")
+    return none
+
+fn media_is_safe_name(filename: Text) -> Boolean:
+    let flen: Number = text_length(filename)
+    if flen == 0 or flen > 128:
+        return false
+    if text_find(filename, "/") >= 0 or text_find(filename, "\\") >= 0 or text_find(filename, "..") >= 0:
+        return false
+    var i: Number = 0
+    while i < flen:
+        let b: Number = text_byte(filename, i)
+        if b < 32 or b == 127:
+            return false
+        set i = i + 1
+    return true
+
+fn media_parse_range(range_header: Text, total_size: Number, max_chunk_bytes: Number) -> Result[MediaRange, Text]:
+    if total_size <= 0:
+        return err("empty media file")
+    let clean: Text = text_trim(range_header)
+    if not text_starts_with(clean, "bytes="):
+        return err("unsupported range unit")
+    var spec: Text = text_trim(text_slice(clean, 6, text_length(clean) - 6))
+    let comma: Number = text_find(spec, ",")
+    if comma >= 0:
+        set spec = text_trim(text_slice(spec, 0, comma))
+    let dash: Number = text_find(spec, "-")
+    if dash < 0:
+        return err("malformed byte range")
+
+    let left: Text = text_trim(text_slice(spec, 0, dash))
+    let right: Text = text_trim(text_slice(spec, dash + 1, text_length(spec) - dash - 1))
+
+    var start_pos: Number = 0
+    var end_pos: Number = total_size - 1
+
+    if text_length(left) == 0:
+        # Suffix byte range: bytes=-N
+        if text_length(right) == 0:
+            return err("empty byte range")
+        let suf: Number = number_try_parse(right)?
+        if suf <= 0:
+            return err("invalid suffix range")
+        if suf >= total_size:
+            set start_pos = 0
+        else:
+            set start_pos = total_size - suf
+        set end_pos = total_size - 1
+    else:
+        set start_pos = number_try_parse(left)?
+        if start_pos < 0 or start_pos >= total_size:
+            return err("range start out of bounds")
+        if text_length(right) > 0:
+            set end_pos = number_try_parse(right)?
+            if end_pos < start_pos:
+                return err("range end before start")
+            if end_pos >= total_size:
+                set end_pos = total_size - 1
+        else:
+            set end_pos = total_size - 1
+
+    # Cap chunk size to stay safely inside per-request arena_scope for multi-GB video streaming
+    var cap: Number = max_chunk_bytes
+    if cap <= 0:
+        set cap = 524288
+    if end_pos - start_pos + 1 > cap:
+        set end_pos = start_pos + cap - 1
+
+    return ok(MediaRange(start_pos, end_pos, total_size))
+
+fn media_serve_vfs(storage_dir: Text, filename: Text, range_header: Text, if_none_match: Text, as_download: Boolean, max_chunk_bytes: Number) -> Result[WebResponse, Text]:
+    if not media_is_safe_name(filename):
+        return err("unsafe media filename")
+    let mime_opt: Option[Text] = media_mime_for_filename(filename)
+    if not option_is_some(mime_opt):
+        return err("unsupported media extension")
+    let mime: Text = option_unwrap(mime_opt)
+
+    let root_h: Number = root_open(storage_dir)?
+    let fh_res: Result[Number, Text] = open_read(root_h, filename)
+    if not result_is_ok(fh_res):
+        let _cr1: Result[Boolean, Text] = close(root_h)
+        return err(result_unwrap_error(fh_res))
+    let fh: Number = result_unwrap(fh_res)
+
+    let sz_res: Result[Number, Text] = file_size(fh)
+    if not result_is_ok(sz_res):
+        let _c1: Result[Boolean, Text] = close(fh)
+        let _cr2: Result[Boolean, Text] = close(root_h)
+        return err(result_unwrap_error(sz_res))
+    let total_size: Number = result_unwrap(sz_res)
+
+    let etag: Text = "\"media-" + number_text(total_size) + "-" + filename + "\""
+    var chunk_cap: Number = max_chunk_bytes
+    if chunk_cap <= 0:
+        set chunk_cap = 524288
+
+    # Seekable Video / Audio / Resumable Download Range Request -> HTTP 206 Partial Content
+    if text_length(text_trim(range_header)) > 0:
+        let rng_res: Result[MediaRange, Text] = media_parse_range(range_header, total_size, chunk_cap)
+        if not result_is_ok(rng_res):
+            let _c2: Result[Boolean, Text] = close(fh)
+            let _cr3: Result[Boolean, Text] = close(root_h)
+            return ok(web_range_not_satisfiable(total_size))
+        let rng: MediaRange = result_unwrap(rng_res)
+        let read_len: Number = rng.end_offset - rng.start_offset + 1
+        let data_res: Result[Bytes, Text] = read_exact(fh, rng.start_offset, read_len)
+        let _c3: Result[Boolean, Text] = close(fh)
+        let _cr4: Result[Boolean, Text] = close(root_h)
+        if not result_is_ok(data_res):
+            return err(result_unwrap_error(data_res))
+        var resp206: WebResponse = web_partial_content(mime, result_unwrap(data_res), rng.start_offset, rng.end_offset, total_size, etag)
+        if as_download:
+            set resp206 = web_with_content_disposition(resp206, filename, true)
+        return ok(resp206)
+
+    # Conditional 304 Not Modified (for inline photo/asset viewing)
+    let cache_ctrl: Text = "public, max-age=300, must-revalidate"
+    if not as_download and if_none_match == etag:
+        let _c4: Result[Boolean, Text] = close(fh)
+        let _cr5: Result[Boolean, Text] = close(root_h)
+        return ok(web_not_modified(etag, cache_ctrl))
+
+    # Full 200 OK response (bounded by chunk_cap; if file exceeds chunk_cap, auto-upgrade to 206 initial chunk!)
+    if total_size > chunk_cap and not as_download:
+        let first_chunk_res: Result[Bytes, Text] = read_exact(fh, 0, chunk_cap)
+        let _c5: Result[Boolean, Text] = close(fh)
+        let _cr6: Result[Boolean, Text] = close(root_h)
+        if not result_is_ok(first_chunk_res):
+            return err(result_unwrap_error(first_chunk_res))
+        return ok(web_partial_content(mime, result_unwrap(first_chunk_res), 0, chunk_cap - 1, total_size, etag))
+
+    if total_size > chunk_cap:
+        let _c6: Result[Boolean, Text] = close(fh)
+        let _cr7: Result[Boolean, Text] = close(root_h)
+        return err("file exceeds single-request download limit; use Range header for chunked download")
+
+    var full_data: Bytes = bytes_empty()
+    if total_size > 0:
+        let full_res: Result[Bytes, Text] = read_exact(fh, 0, total_size)
+        let _c7: Result[Boolean, Text] = close(fh)
+        let _cr8: Result[Boolean, Text] = close(root_h)
+        if not result_is_ok(full_res):
+            return err(result_unwrap_error(full_res))
+        set full_data = result_unwrap(full_res)
+    else:
+        let _c8: Result[Boolean, Text] = close(fh)
+        let _cr9: Result[Boolean, Text] = close(root_h)
+
+    if as_download:
+        return ok(web_download_bytes(filename, mime, full_data))
+    return ok(web_media_ok(mime, full_data, etag, cache_ctrl))

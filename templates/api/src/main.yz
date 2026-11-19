@@ -8,6 +8,10 @@ use "std/sync"
 use "std/log"
 use "std/time"
 use "std/config/api_config"
+use "std/web/request"
+use "std/web/response"
+use "std/web/multipart"
+use "std/web/media"
 
 shape HttpReadOutcome:
     ok_read: Boolean
@@ -47,7 +51,7 @@ fn read_bounded_http_request(client_fd: Number, max_body_bytes: Number) -> HttpR
     var content_len: Number = 0
     var chunks: Number = 0
 
-    while chunks < 256:
+    while chunks < 512:
         let rd: Result[Bytes, Text] = tcp_read(client_fd, 16384, 5000)
         if not result_is_ok(rd):
             break
@@ -57,11 +61,11 @@ fn read_bounded_http_request(client_fd: Number, max_body_bytes: Number) -> HttpR
         set buf = bytes_concat(buf, chunk)
         let cur_len: Number = bytes_length(buf)
         if hdr_end < 0:
-            if cur_len > header_limit and header_end_index(bytes_to_text(buf)) < 0:
+            let raw_hdr_pos: Number = http_find_header_end_bytes(buf)
+            if cur_len > header_limit and raw_hdr_pos < 0:
                 return HttpReadOutcome(false, bytes_empty(), some(http_response_payload_too_large("HTTP header exceeds 16 KiB limit", true)))
-            let txt: Text = bytes_to_text(buf)
-            set hdr_end = header_end_index(txt)
-            if hdr_end >= 0:
+            if raw_hdr_pos >= 0:
+                set hdr_end = raw_hdr_pos + 4
                 let hdr_req_res: Result[HttpRequest, Text] = http_parse_request(bytes_slice(buf, 0, hdr_end))
                 if result_is_ok(hdr_req_res):
                     set content_len = result_unwrap(hdr_req_res).content_length
@@ -74,6 +78,45 @@ fn read_bounded_http_request(client_fd: Number, max_body_bytes: Number) -> HttpR
     if bytes_length(buf) == 0:
         return HttpReadOutcome(false, bytes_empty(), none)
     return HttpReadOutcome(true, buf, none)
+
+fn api_media_dir() -> Text:
+    let env_dir: Text = env_get("YAZA_UPLOADS_DIR")
+    if env_dir != "":
+        return env_dir
+    return "./uploads"
+
+fn dispatch_api_media(wreq: WebRequest) -> Option[WebResponse]:
+    let path: Text = wreq.http.path
+    let method: Text = wreq.http.method
+    if path == "/api/media" and method == "POST":
+        let auth_ctx: MiddlewareContext = api_middleware_pipeline_auth(wreq.http, "admin,editor")
+        if auth_ctx.rejected:
+            return some(web_from_http_response(auth_ctx.reject_response))
+        let mp_res: Result[MultipartForm, Text] = multipart_parse(wreq.http.content_type, wreq.http.body, 16, 4194304)
+        if not result_is_ok(mp_res):
+            return some(web_from_http_response(http_response_bad_request(result_unwrap_error(mp_res), true)))
+        let mform: MultipartForm = result_unwrap(mp_res)
+        if list_count(mform.files) == 0:
+            return some(web_from_http_response(http_response_bad_request("missing file part", true)))
+        let up: HttpUploadedFile = list_get(mform.files, 0)
+        let mime_opt: Option[Text] = multipart_sniff_mime(up.data, up.filename)
+        if not option_is_some(mime_opt):
+            return some(web_from_http_response(http_response_bad_request("unsupported or spoofed media file type", true)))
+        let stored_name: Text = number_text(time_now_unix_ms()) + "-" + up.filename
+        let save_res: Result[Text, Text] = multipart_save_vfs(api_media_dir(), stored_name, up.data)
+        if not result_is_ok(save_res):
+            return some(web_from_http_response(http_response_internal_error("failed to store media: " + result_unwrap_error(save_res), true)))
+        let final_name: Text = result_unwrap(save_res)
+        let j: Text = "{\"stored_name\":\"" + json_escape_text(final_name) + "\",\"mime\":\"" + json_escape_text(option_unwrap(mime_opt)) + "\",\"size_bytes\":" + number_text(up.size_bytes) + ",\"url\":\"/api/media/" + json_escape_text(final_name) + "\",\"download_url\":\"/api/media/" + json_escape_text(final_name) + "?download=1\"}"
+        return some(web_from_http_response(http_response_created_json(j)))
+    if text_starts_with(path, "/api/media/") and (method == "GET" or method == "HEAD"):
+        let fname: Text = text_slice(path, 11, text_length(path) - 11)
+        let as_dl: Boolean = text_find(wreq.http.query, "download=1") >= 0
+        let mres: Result[WebResponse, Text] = media_serve_vfs(api_media_dir(), fname, wreq.range_header, wreq.if_none_match, as_dl, 524288)
+        if result_is_ok(mres):
+            return some(result_unwrap(mres))
+        return some(web_from_http_response(http_response_not_found("media asset not found", true)))
+    return none
 
 fn dispatch_http_request(req: HttpRequest, m_total: AtomicNumber, m_errors: AtomicNumber) -> HttpResponse:
     let _t_inc: AtomicNumber = atomic_add(m_total, 1)
@@ -124,7 +167,7 @@ fn handle_client_connection(client_fd: Number, max_body_bytes: Number, max_in_fl
     var req_on_conn: Number = 0
     while keep_alive and req_on_conn < 64:
         var continue_conn: Boolean = false
-        arena_scope 1048576:
+        arena_scope 4194304:
             let rd_out: HttpReadOutcome = read_bounded_http_request(client_fd, max_body_bytes)
             if not rd_out.ok_read:
                 if option_is_some(rd_out.error_response):
@@ -132,38 +175,53 @@ fn handle_client_connection(client_fd: Number, max_body_bytes: Number, max_in_fl
                     let _wr: Result[Number, Text] = tcp_write(client_fd, wire_err, 5000)
             else:
                 set req_on_conn = req_on_conn + 1
-                let raw_text: Text = bytes_to_text(rd_out.raw)
-                if request_wants_close(raw_text):
+                let hdr_text: Text = web_header_block_text(rd_out.raw)
+                if req_on_conn >= 64 or request_wants_close(hdr_text):
                     set keep_alive = false
 
                 let started_ns: Number = time_now_monotonic_ns()
                 let cur_in_flight: Number = atomic_fetch_add(m_in_flight, 1)
-                let req_res: Result[HttpRequest, Text] = http_parse_request(rd_out.raw)
-                var resp: HttpResponse = http_response_bad_request("malformed HTTP request", true)
+                let wreq_res: Result[WebRequest, Text] = web_parse_request(rd_out.raw)
+                var resp_status: Number = 400
+                var wire: Bytes = bytes_empty()
                 var req_id: Text = "req-" + number_text(req_on_conn)
                 var log_method: Text = "UNKNOWN"
                 var log_path: Text = "/"
 
-                if result_is_ok(req_res):
-                    let req: HttpRequest = result_unwrap(req_res)
+                if result_is_ok(wreq_res):
+                    let wreq: WebRequest = result_unwrap(wreq_res)
+                    let req: HttpRequest = wreq.http
                     set log_method = req.method
                     set log_path = req.path
                     if req.x_request_id != "":
                         set req_id = req.x_request_id
                     if cur_in_flight >= max_in_flight:
                         let _rl: AtomicNumber = atomic_add(m_rate_limited, 1)
-                        set resp = http_response_service_unavailable("maximum in-flight concurrency limit reached", true)
+                        let busy: HttpResponse = http_response_service_unavailable("maximum in-flight concurrency limit reached", true)
+                        set resp_status = busy.status_code
+                        set wire = http_format_response_keep_alive(busy, req_id, keep_alive)
                     else:
-                        set resp = dispatch_http_request(req, m_total, m_errors)
+                        let media_opt: Option[WebResponse] = dispatch_api_media(wreq)
+                        if option_is_some(media_opt):
+                            let mresp: WebResponse = option_unwrap(media_opt)
+                            set resp_status = mresp.status_code
+                            set wire = web_format_response(mresp, req_id, keep_alive)
+                        else:
+                            let hresp: HttpResponse = dispatch_http_request(req, m_total, m_errors)
+                            set resp_status = hresp.status_code
+                            set wire = http_format_response_keep_alive(hresp, req_id, keep_alive)
+                else:
+                    let bad: HttpResponse = http_response_bad_request("malformed HTTP request", true)
+                    set resp_status = bad.status_code
+                    set wire = http_format_response_keep_alive(bad, req_id, keep_alive)
                 let _dec: AtomicNumber = atomic_add(m_in_flight, -1)
 
-                if resp.status_code >= 500:
+                if resp_status >= 500:
                     let _er: AtomicNumber = atomic_add(m_errors, 1)
 
-                let wire: Bytes = http_format_response_keep_alive(resp, req_id, keep_alive)
                 let wr_res: Result[Number, Text] = tcp_write(client_fd, wire, 5000)
                 let elapsed_ms: Number = (time_now_monotonic_ns() - started_ns) / 1000000
-                let access_json: Text = "{\"method\":\"" + json_escape_text(log_method) + "\",\"path\":\"" + json_escape_text(log_path) + "\",\"status\":" + number_text(resp.status_code) + ",\"latency_ms\":" + number_text(elapsed_ms) + ",\"request_id\":\"" + json_escape_text(req_id) + "\"}"
+                let access_json: Text = "{\"method\":\"" + json_escape_text(log_method) + "\",\"path\":\"" + json_escape_text(log_path) + "\",\"status\":" + number_text(resp_status) + ",\"latency_ms\":" + number_text(elapsed_ms) + ",\"request_id\":\"" + json_escape_text(req_id) + "\"}"
                 let _li: Boolean = log_info(logger, "http_request", access_json)
                 if result_is_ok(wr_res):
                     set continue_conn = true
@@ -237,6 +295,27 @@ start:
             let d_req: HttpRequest = HttpRequest("DELETE", "/api/products/sku-003", "", "application/json", "application/json", "Bearer " + admin_jwt, "self-4", 0, bytes_empty(), "")
             let d_res: HttpResponse = dispatch_http_request(d_req, m_total, m_errors)
             assert(d_res.status_code == 204)
+
+            # Media Upload (multipart/form-data) + Range 206 Streaming + Attachment Download
+            let bnd: Text = "----ApiMediaSelfTest"
+            let pdf_raw: Bytes = bytes_from_text("%PDF-1.7\nYAZA API Media Streaming Test Payload 0123456789\n%%EOF\n")
+            var mp: Bytes = bytes_from_text("--" + bnd + "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"guide.pdf\"\r\nContent-Type: application/pdf\r\n\r\n")
+            set mp = bytes_concat(mp, pdf_raw)
+            set mp = bytes_concat(mp, bytes_from_text("\r\n--" + bnd + "--\r\n"))
+            let up_hdr: Text = "POST /api/media HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nAuthorization: Bearer " + admin_jwt + "\r\nContent-Type: multipart/form-data; boundary=" + bnd + "\r\nContent-Length: " + number_text(bytes_length(mp)) + "\r\n\r\n"
+            let up_wreq: WebRequest = result_unwrap(web_parse_request(bytes_concat(bytes_from_text(up_hdr), mp)))
+            let up_res: WebResponse = option_unwrap(dispatch_api_media(up_wreq))
+            assert(up_res.status_code == 201)
+            let up_json: Text = bytes_to_text(up_res.body)
+            let stored_opt: Option[Text] = json_extract_string(up_json, "stored_name")
+            assert(option_is_some(stored_opt))
+            let stored_file: Text = option_unwrap(stored_opt)
+            let dl_wreq: WebRequest = result_unwrap(web_parse_request(bytes_from_text("GET /api/media/" + stored_file + "?download=1 HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\r\n")))
+            let dl_res: WebResponse = option_unwrap(dispatch_api_media(dl_wreq))
+            assert(dl_res.status_code == 200 and text_find(dl_res.content_disposition, "attachment") >= 0)
+            let rng_wreq: WebRequest = result_unwrap(web_parse_request(bytes_from_text("GET /api/media/" + stored_file + " HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nRange: bytes=0-15\r\n\r\n")))
+            let rng_res: WebResponse = option_unwrap(dispatch_api_media(rng_wreq))
+            assert(rng_res.status_code == 206 and bytes_length(rng_res.body) == 16)
         say "API_PRODUCTION_SELF_TEST: PASS"
         exit(0)
 
@@ -258,6 +337,8 @@ start:
     say "  PUT    /api/products/:id"
     say "  PATCH  /api/products/:id"
     say "  DELETE /api/products/:id"
+    say "  POST   /api/media              (multipart binary upload)"
+    say "  GET    /api/media/:file        (view, HTTP 206 stream, ?download=1)"
     if env_get("YAZA_ENV") != "production":
         say "Demo Bearer JWT (admin): " + demo_jwt
 

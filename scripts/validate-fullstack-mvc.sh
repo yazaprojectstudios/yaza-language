@@ -14,8 +14,9 @@ export YAZA_STDLIB_DIR="$PROJECT_DIR/std"
 export YAZA_RUNTIME_DIR="$PROJECT_DIR/runtime"
 export YAZABASE_BIN="$YAZABASE_CLI"
 
-printf '==> Fullstack Gate 1: Validating std/web/* & native view syntax (debug, -O2, ASan/UBSan)...\n'
+printf '==> Fullstack Gate 1: Validating std/web/*, native view syntax & binary media/streaming (debug, -O2, ASan/UBSan)...\n'
 sh "$PROJECT_DIR/scripts/validate-std-web.sh"
+sh "$PROJECT_DIR/scripts/validate-web-media.sh"
 "$YAZA_BIN" run "$PROJECT_DIR/examples/view-syntax-smoke.yz"
 
 printf '==> Fullstack Gate 2: Scaffolding via yaza new --mvc & running MVC checks...\n'

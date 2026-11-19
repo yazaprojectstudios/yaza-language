@@ -164,15 +164,37 @@ fn http_parse_content_length(value: Text) -> Result[Number, Text]:
         set i = i + 1
     return ok(parsed)
 
+fn http_response_bytes(status_code: Number, status_text: Text, content_type: Text, data: Bytes) -> HttpResponse:
+    return HttpResponse(status_code, status_text, content_type, data)
+
+fn http_find_header_end_bytes(raw_bytes: Bytes) -> Number:
+    let total: Number = bytes_length(raw_bytes)
+    var limit: Number = total
+    if limit > 16388:
+        set limit = 16388
+    var i: Number = 0
+    while i + 3 < limit:
+        if bytes_get(raw_bytes, i) == 13 and bytes_get(raw_bytes, i + 1) == 10 and bytes_get(raw_bytes, i + 2) == 13 and bytes_get(raw_bytes, i + 3) == 10:
+            return i
+        set i = i + 1
+    return -1
+
 fn http_parse_request(raw_bytes: Bytes) -> Result[HttpRequest, Text]:
-    if bytes_length(raw_bytes) == 0:
+    let total_bytes: Number = bytes_length(raw_bytes)
+    if total_bytes == 0:
         return err("empty HTTP request")
-    let raw_text: Text = bytes_to_text(raw_bytes)
-    let length: Number = text_length(raw_text)
+    let header_end: Number = http_find_header_end_bytes(raw_bytes)
+    if header_end < 0: return err("incomplete HTTP headers")
+    let header_slice: Bytes = bytes_slice(raw_bytes, 0, header_end)
+    let header_text_res: Result[Text, Text] = bytes_try_to_text(header_slice)
+    if not result_is_ok(header_text_res):
+        return err("HTTP headers must be valid non-NUL ASCII/UTF-8")
+    let raw_text: Text = result_unwrap(header_text_res)
 
     # Require strict CRLF framing and exactly three request-line fields.
-    let line_end: Number = text_find(raw_text, "\r\n")
-    if line_end < 0: return err("malformed HTTP request line")
+    var line_end: Number = text_find(raw_text, "\r\n")
+    if line_end < 0:
+        set line_end = text_length(raw_text)
     let request_line: Text = text_slice(raw_text, 0, line_end)
     let first_space: Number = text_find(request_line, " ")
     if first_space <= 0: return err("invalid HTTP request line format")
@@ -194,12 +216,10 @@ fn http_parse_request(raw_bytes: Bytes) -> Result[HttpRequest, Text]:
         set path = text_slice(full_target, 0, qpos)
         set query = text_slice(full_target, qpos + 1, text_length(full_target) - qpos - 1)
 
-    let header_end: Number = text_find(raw_text, "\r\n\r\n")
-    if header_end < 0: return err("incomplete HTTP headers")
     let body_start: Number = header_end + 4
-    let headers_len: Number = header_end - (line_end + 2)
-    if headers_len < 0: return err("malformed HTTP header boundary")
-    let headers_part: Text = text_slice(raw_text, line_end + 2, headers_len)
+    var headers_part: Text = ""
+    if header_end > line_end + 2:
+        set headers_part = text_slice(raw_text, line_end + 2, header_end - (line_end + 2))
     var accept: Text = ""
     var content_type: Text = ""
     var authorization: Text = ""
@@ -264,7 +284,7 @@ fn http_parse_request(raw_bytes: Bytes) -> Result[HttpRequest, Text]:
 
     var body_bytes: Bytes = bytes_empty()
     var body_text: Text = ""
-    let received_body_length: Number = length - body_start
+    let received_body_length: Number = total_bytes - body_start
     if received_body_length > content_length: return err("request contains bytes beyond the declared Content-Length")
     if received_body_length > 0:
         set body_bytes = bytes_slice(raw_bytes, body_start, received_body_length)

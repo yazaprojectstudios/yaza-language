@@ -1,0 +1,239 @@
+# Binary-Safe multipart/form-data Parser, Magic-Byte MIME Sniffer & VFS Upload Saver (MVC + API).
+use "std/http"
+use "std/web/form"
+use "std/fs"
+
+shape MultipartForm:
+    fields: List[FormField]
+    files: List[HttpUploadedFile]
+
+fn multipart_bytes_find(haystack: Bytes, needle: Bytes, start_offset: Number) -> Number:
+    let hlen: Number = bytes_length(haystack)
+    let nlen: Number = bytes_length(needle)
+    if nlen == 0 or start_offset < 0 or start_offset + nlen > hlen:
+        return -1
+    let first: Number = bytes_get(needle, 0)
+    var i: Number = start_offset
+    let limit: Number = hlen - nlen
+    while i <= limit:
+        if bytes_get(haystack, i) == first:
+            var j: Number = 1
+            var matched: Boolean = true
+            while j < nlen:
+                if bytes_get(haystack, i + j) != bytes_get(needle, j):
+                    set matched = false
+                    break
+                set j = j + 1
+            if matched:
+                return i
+        set i = i + 1
+    return -1
+
+fn multipart_clean_boundary(content_type: Text) -> Text:
+    let raw: Text = http_extract_multipart_boundary(content_type)
+    let rlen: Number = text_length(raw)
+    if rlen >= 2 and text_byte(raw, 0) == 34 and text_byte(raw, rlen - 1) == 34:
+        return text_slice(raw, 1, rlen - 2)
+    return raw
+
+fn multipart_sanitize_filename(raw: Text) -> Text:
+    let len: Number = text_length(raw)
+    var start: Number = 0
+    var i: Number = 0
+    while i < len:
+        let b: Number = text_byte(raw, i)
+        if b == 47 or b == 92:
+            set start = i + 1
+        set i = i + 1
+    let base: Text = text_slice(raw, start, len - start)
+    let blen: Number = text_length(base)
+    let parts: TextList = text_list()
+    var j: Number = 0
+    while j < blen and j < 96:
+        let ch: Number = text_byte(base, j)
+        let ok_ch: Boolean = (ch >= 48 and ch <= 57) or (ch >= 65 and ch <= 90) or (ch >= 97 and ch <= 122) or ch == 45 or ch == 46 or ch == 95
+        if ok_ch:
+            list_push(parts, text_slice(base, j, 1))
+        else:
+            list_push(parts, "_")
+        set j = j + 1
+    let cleaned: Text = text_join(parts, "")
+    if text_length(cleaned) == 0 or cleaned == "." or cleaned == ".." or text_find(cleaned, "..") >= 0:
+        return "upload.bin"
+    return cleaned
+
+fn multipart_ascii_lower(raw: Text) -> Text:
+    let len: Number = text_length(raw)
+    let parts: TextList = text_list()
+    var i: Number = 0
+    while i < len:
+        let b: Number = text_byte(raw, i)
+        if b >= 65 and b <= 90:
+            var one: Bytes = bytes_from_text("a")
+            let _ok: Boolean = bytes_try_set(one, 0, b + 32)
+            list_push(parts, bytes_to_text(one))
+        else:
+            list_push(parts, text_slice(raw, i, 1))
+        set i = i + 1
+    return text_join(parts, "")
+
+fn multipart_sniff_mime(data: Bytes, filename: Text) -> Option[Text]:
+    let len: Number = bytes_length(data)
+    let low_name: Text = multipart_ascii_lower(filename)
+
+    # PNG: 89 50 4E 47 0D 0A 1A 0A
+    if len >= 8 and bytes_get(data, 0) == 137 and bytes_get(data, 1) == 80 and bytes_get(data, 2) == 78 and bytes_get(data, 3) == 71:
+        return some("image/png")
+    # JPEG: FF D8 FF
+    if len >= 3 and bytes_get(data, 0) == 255 and bytes_get(data, 1) == 216 and bytes_get(data, 2) == 255:
+        return some("image/jpeg")
+    # GIF: GIF87a / GIF89a
+    if len >= 6 and bytes_get(data, 0) == 71 and bytes_get(data, 1) == 73 and bytes_get(data, 2) == 70 and bytes_get(data, 3) == 56:
+        return some("image/gif")
+    # WebP: RIFF....WEBP
+    if len >= 12 and bytes_get(data, 0) == 82 and bytes_get(data, 1) == 73 and bytes_get(data, 2) == 70 and bytes_get(data, 3) == 70 and bytes_get(data, 8) == 87 and bytes_get(data, 9) == 69 and bytes_get(data, 10) == 66 and bytes_get(data, 11) == 80:
+        return some("image/webp")
+    # MP4 / MOV ISO BMFF: ....ftyp
+    if len >= 12 and bytes_get(data, 4) == 102 and bytes_get(data, 5) == 116 and bytes_get(data, 6) == 121 and bytes_get(data, 7) == 112:
+        return some("video/mp4")
+    # WebM / MKV EBML: 1A 45 DF A3
+    if len >= 4 and bytes_get(data, 0) == 26 and bytes_get(data, 1) == 69 and bytes_get(data, 2) == 223 and bytes_get(data, 3) == 163:
+        return some("video/webm")
+    # PDF: %PDF-
+    if len >= 5 and bytes_get(data, 0) == 37 and bytes_get(data, 1) == 80 and bytes_get(data, 2) == 68 and bytes_get(data, 3) == 70 and bytes_get(data, 4) == 45:
+        return some("application/pdf")
+    # ZIP: PK\x03\x04
+    if len >= 4 and bytes_get(data, 0) == 80 and bytes_get(data, 1) == 75 and bytes_get(data, 2) == 3 and bytes_get(data, 3) == 4:
+        return some("application/zip")
+    # MP3 (ID3 or frame sync FF FB)
+    if (len >= 3 and bytes_get(data, 0) == 73 and bytes_get(data, 1) == 68 and bytes_get(data, 2) == 51) or (len >= 2 and bytes_get(data, 0) == 255 and (bytes_get(data, 1) == 251 or bytes_get(data, 1) == 243)):
+        return some("audio/mpeg")
+    # WAV: RIFF....WAVE
+    if len >= 12 and bytes_get(data, 0) == 82 and bytes_get(data, 1) == 73 and bytes_get(data, 2) == 70 and bytes_get(data, 3) == 70 and bytes_get(data, 8) == 87 and bytes_get(data, 9) == 65 and bytes_get(data, 10) == 86 and bytes_get(data, 11) == 69:
+        return some("audio/wav")
+    # Plain text / JSON fallback (only when extension explicitly matches and body is valid UTF-8)
+    if text_ends_with(low_name, ".txt"):
+        let t_ok: Result[Text, Text] = bytes_try_to_text(data)
+        if result_is_ok(t_ok):
+            return some("text/plain; charset=utf-8")
+    if text_ends_with(low_name, ".json"):
+        let j_ok: Result[Text, Text] = bytes_try_to_text(data)
+        if result_is_ok(j_ok):
+            return some("application/json; charset=utf-8")
+    return none
+
+fn multipart_parse(content_type: Text, body: Bytes, max_parts: Number, max_file_bytes: Number) -> Result[MultipartForm, Text]:
+    let boundary: Text = multipart_clean_boundary(content_type)
+    if text_length(boundary) == 0 or text_length(boundary) > 70:
+        return err("multipart: missing or invalid boundary")
+    let delim: Bytes = bytes_from_text("--" + boundary)
+    let dlen: Number = bytes_length(delim)
+    let crlfcrlf: Bytes = bytes_from_text("\r\n\r\n")
+    let blen: Number = bytes_length(body)
+
+    var cap_parts: Number = max_parts
+    if cap_parts <= 0 or cap_parts > 64:
+        set cap_parts = 32
+
+    let fields: List[FormField] = List[FormField]()
+    let files: List[HttpUploadedFile] = List[HttpUploadedFile]()
+
+    var pos: Number = multipart_bytes_find(body, delim, 0)
+    if pos < 0:
+        return err("multipart: boundary delimiter not found in body")
+
+    var part_count: Number = 0
+    while pos >= 0:
+        let after_delim: Number = pos + dlen
+        if after_delim + 1 < blen and bytes_get(body, after_delim) == 45 and bytes_get(body, after_delim + 1) == 45:
+            break
+        var part_start: Number = after_delim
+        if part_start + 1 < blen and bytes_get(body, part_start) == 13 and bytes_get(body, part_start + 1) == 10:
+            set part_start = part_start + 2
+        elif part_start < blen and bytes_get(body, part_start) == 10:
+            set part_start = part_start + 1
+
+        let next_pos: Number = multipart_bytes_find(body, delim, part_start)
+        if next_pos < 0:
+            return err("multipart: unterminated part boundary")
+
+        if part_count >= cap_parts:
+            return err("multipart: exceeds maximum part count")
+        set part_count = part_count + 1
+
+        let hdr_end: Number = multipart_bytes_find(body, crlfcrlf, part_start)
+        if hdr_end < 0 or hdr_end >= next_pos:
+            return err("multipart: malformed part header boundary")
+
+        let hdr_bytes: Bytes = bytes_slice(body, part_start, hdr_end - part_start)
+        let hdr_res: Result[Text, Text] = bytes_try_to_text(hdr_bytes)
+        if not result_is_ok(hdr_res):
+            return err("multipart: part headers must be valid ASCII/UTF-8")
+        let hdr_text: Text = result_unwrap(hdr_res)
+
+        let data_start: Number = hdr_end + 4
+        var data_end: Number = next_pos
+        if data_end >= data_start + 2 and bytes_get(body, data_end - 2) == 13 and bytes_get(body, data_end - 1) == 10:
+            set data_end = data_end - 2
+        elif data_end >= data_start + 1 and bytes_get(body, data_end - 1) == 10:
+            set data_end = data_end - 1
+
+        let data_len: Number = data_end - data_start
+        if data_len < 0:
+            return err("multipart: negative part length")
+        if data_len > max_file_bytes:
+            return err("multipart: uploaded part exceeds configured byte limit")
+
+        let part_bytes: Bytes = bytes_slice(body, data_start, data_len)
+        let parsed: HttpUploadedFile = http_parse_uploaded_file(hdr_text, part_bytes)
+
+        if text_length(parsed.filename) > 0:
+            let safe_fn: Text = multipart_sanitize_filename(parsed.filename)
+            list_push(files, HttpUploadedFile(parsed.field_name, safe_fn, parsed.content_type, part_bytes, data_len))
+        elif text_length(parsed.field_name) > 0:
+            let val_res: Result[Text, Text] = bytes_try_to_text(part_bytes)
+            if not result_is_ok(val_res):
+                return err("multipart: text field contains invalid UTF-8")
+            list_push(fields, FormField(parsed.field_name, result_unwrap(val_res)))
+
+        set pos = next_pos
+
+    return ok(MultipartForm(fields, files))
+
+fn multipart_field(form: MultipartForm, name: Text) -> Option[Text]:
+    return form_get(form.fields, name)
+
+fn multipart_field_or(form: MultipartForm, name: Text, fallback: Text) -> Text:
+    return form_get_or(form.fields, name, fallback)
+
+fn multipart_file(form: MultipartForm, field_name: Text) -> Option[HttpUploadedFile]:
+    var i: Number = 0
+    while i < list_count(form.files):
+        let f: HttpUploadedFile = list_get(form.files, i)
+        if f.field_name == field_name:
+            return some(f)
+        set i = i + 1
+    return none
+
+fn multipart_save_vfs(upload_dir: Text, stored_name: Text, data: Bytes) -> Result[Text, Text]:
+    let safe_name: Text = multipart_sanitize_filename(stored_name)
+    if not is_directory(upload_dir):
+        let _mk: Number = directory_create(upload_dir)
+    let root_h: Number = root_open(upload_dir)?
+    let file_res: Result[Number, Text] = create_exclusive(root_h, safe_name)
+    if not result_is_ok(file_res):
+        let _cr: Result[Boolean, Text] = close(root_h)
+        return err(result_unwrap_error(file_res))
+    let fh: Number = result_unwrap(file_res)
+    let len: Number = bytes_length(data)
+    if len > 0:
+        let wr_res: Result[Number, Text] = write_exact(fh, 0, data)
+        if not result_is_ok(wr_res):
+            let _c1: Result[Boolean, Text] = close(fh)
+            let _c2: Result[Boolean, Text] = close(root_h)
+            return err(result_unwrap_error(wr_res))
+    let _sf: Result[Boolean, Text] = sync(fh)
+    let _cf: Result[Boolean, Text] = close(fh)
+    let _sd: Result[Boolean, Text] = sync_directory(root_h)
+    let _cr2: Result[Boolean, Text] = close(root_h)
+    return ok(safe_name)

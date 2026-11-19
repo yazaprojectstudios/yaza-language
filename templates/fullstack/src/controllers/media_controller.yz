@@ -1,0 +1,72 @@
+# Media Controller: Multipart Binary Upload, Photo View, File Download & HTTP 206 Video Streaming (MVC + API).
+use "std/http"
+use "std/json"
+use "std/time"
+use "std/web/request"
+use "std/web/response"
+use "std/web/multipart"
+use "std/web/media"
+use "../middleware/web_security"
+
+fn media_uploads_dir() -> Text:
+    let env_dir: Text = env_get("YAZA_UPLOADS_DIR")
+    if env_dir != "":
+        return env_dir
+    return "./uploads"
+
+fn media_controller_upload(req: WebRequest) -> WebResponse:
+    let sess: WebSession = web_current_session(req)
+    let wants_json: Boolean = web_request_wants_json(req)
+    if wants_json:
+        if not web_api_is_authorized(req, sess):
+            return web_from_http_response(http_response_unauthorized("authentication required", true))
+    else:
+        if not sess.authenticated:
+            return web_redirect_see_other("/login")
+
+    let mp_res: Result[MultipartForm, Text] = multipart_parse(req.http.content_type, req.http.body, 16, 4194304)
+    if not result_is_ok(mp_res):
+        let err_msg: Text = result_unwrap_error(mp_res)
+        if wants_json:
+            return web_from_http_response(http_response_bad_request(err_msg, true))
+        return web_html_status(400, "Bad Request", "<h1>400 Invalid Upload</h1><p>" + err_msg + "</p>")
+
+    let mform: MultipartForm = result_unwrap(mp_res)
+    if not wants_json and not web_verify_request_csrf(req, sess, mform.fields):
+        return web_html_status(403, "Forbidden", "<h1>403 Forbidden</h1><p>Invalid CSRF token.</p>")
+
+    if list_count(mform.files) == 0:
+        if wants_json:
+            return web_from_http_response(http_response_bad_request("missing file upload part", true))
+        return web_html_status(400, "Bad Request", "<h1>400 Missing File</h1>")
+
+    let up: HttpUploadedFile = list_get(mform.files, 0)
+    let mime_opt: Option[Text] = multipart_sniff_mime(up.data, up.filename)
+    if not option_is_some(mime_opt):
+        if wants_json:
+            return web_from_http_response(http_response_bad_request("unsupported or spoofed media file type", true))
+        return web_html_status(415, "Unsupported Media Type", "<h1>415 Unsupported Media Type</h1>")
+    let mime: Text = option_unwrap(mime_opt)
+
+    let stored_name: Text = number_text(time_now_unix_ms()) + "-" + up.filename
+    let save_res: Result[Text, Text] = multipart_save_vfs(media_uploads_dir(), stored_name, up.data)
+    if not result_is_ok(save_res):
+        let serr: Text = result_unwrap_error(save_res)
+        if wants_json:
+            return web_from_http_response(http_response_internal_error("failed to store upload: " + serr, true))
+        return web_html_status(500, "Internal Server Error", "<h1>500 Upload Failed</h1>")
+    let final_name: Text = result_unwrap(save_res)
+
+    if wants_json:
+        let j: Text = "{\"stored_name\":\"" + json_escape_text(final_name) + "\",\"mime\":\"" + json_escape_text(mime) + "\",\"size_bytes\":" + number_text(up.size_bytes) + ",\"url\":\"/media/" + json_escape_text(final_name) + "\",\"download_url\":\"/media/" + json_escape_text(final_name) + "?download=1\"}"
+        return web_from_http_response(http_response_created_json(j))
+    return web_redirect_see_other("/dashboard")
+
+fn media_controller_serve(req: WebRequest, filename: Text) -> WebResponse:
+    let as_download: Boolean = text_find(req.http.query, "download=1") >= 0
+    let res: Result[WebResponse, Text] = media_serve_vfs(media_uploads_dir(), filename, req.range_header, req.if_none_match, as_download, 524288)
+    if result_is_ok(res):
+        return result_unwrap(res)
+    if web_request_wants_json(req):
+        return web_from_http_response(http_response_not_found("media asset not found", true))
+    return web_html_status(404, "Not Found", "<h1>404 Media Not Found</h1>")

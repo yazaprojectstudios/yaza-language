@@ -1,0 +1,152 @@
+# End-to-End Smoke Test: Binary Upload (multipart/form-data), Magic-Byte Validation, Photo View, File Download & HTTP 206 Video Range Streaming (MVC + API).
+use "std/http"
+use "std/web/request"
+use "std/web/response"
+use "std/web/multipart"
+use "std/web/media"
+
+fn make_binary_png() -> Bytes:
+    # Real 8-byte PNG signature (includes 0x89 and NUL-containing IHDR chunk)
+    var b: Bytes = bytes_from_text("123456789012345678901234")
+    let _0: Boolean = bytes_try_set(b, 0, 137)
+    let _1: Boolean = bytes_try_set(b, 1, 80)
+    let _2: Boolean = bytes_try_set(b, 2, 78)
+    let _3: Boolean = bytes_try_set(b, 3, 71)
+    let _4: Boolean = bytes_try_set(b, 4, 13)
+    let _5: Boolean = bytes_try_set(b, 5, 10)
+    let _6: Boolean = bytes_try_set(b, 6, 26)
+    let _7: Boolean = bytes_try_set(b, 7, 10)
+    let _8: Boolean = bytes_try_set(b, 8, 0)
+    let _9: Boolean = bytes_try_set(b, 9, 0)
+    let _10: Boolean = bytes_try_set(b, 10, 0)
+    let _11: Boolean = bytes_try_set(b, 11, 13)
+    let _12: Boolean = bytes_try_set(b, 12, 73)
+    let _13: Boolean = bytes_try_set(b, 13, 72)
+    let _14: Boolean = bytes_try_set(b, 14, 68)
+    let _15: Boolean = bytes_try_set(b, 15, 82)
+    return b
+
+fn make_binary_mp4(total_len: Number) -> Bytes:
+    # ISO BMFF MP4 header: 00 00 00 18 'f' 't' 'y' 'p' 'i' 's' 'o' 'm' + binary frames with NUL bytes
+    var out: Bytes = bytes_empty()
+    var hdr: Bytes = bytes_from_text("0000ftypisom0000")
+    let _0: Boolean = bytes_try_set(hdr, 0, 0)
+    let _1: Boolean = bytes_try_set(hdr, 1, 0)
+    let _2: Boolean = bytes_try_set(hdr, 2, 0)
+    let _3: Boolean = bytes_try_set(hdr, 3, 24)
+    let _12: Boolean = bytes_try_set(hdr, 12, 0)
+    let _13: Boolean = bytes_try_set(hdr, 13, 0)
+    set out = bytes_concat(out, hdr)
+    var i: Number = 16
+    while i < total_len:
+        var blk: Bytes = bytes_from_text("0123456789ABCDEF")
+        let _z: Boolean = bytes_try_set(blk, 0, i % 256)
+        let _n: Boolean = bytes_try_set(blk, 1, 0)
+        set out = bytes_concat(out, blk)
+        set i = i + 16
+    return bytes_slice(out, 0, total_len)
+
+start:
+    let storage_dir: Text = env_get("YAZA_MEDIA_TEST_DIR")
+    assert(text_length(storage_dir) > 0)
+
+    # 1. Build a real binary HTTP/1.1 multipart/form-data upload containing a PNG photo, MP4 video & PDF doc + CSRF field
+    let png_data: Bytes = make_binary_png()
+    let mp4_data: Bytes = make_binary_mp4(256)
+    let pdf_data: Bytes = bytes_from_text("%PDF-1.7\n1 0 obj<<>>endobj\n%%EOF\n")
+    let boundary: Text = "----YazaBoundary2026"
+
+    var mp_body: Bytes = bytes_empty()
+    set mp_body = bytes_concat(mp_body, bytes_from_text("--" + boundary + "\r\nContent-Disposition: form-data; name=\"_csrf\"\r\n\r\ntok-123\r\n"))
+    set mp_body = bytes_concat(mp_body, bytes_from_text("--" + boundary + "\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"../../avatar.png\"\r\nContent-Type: image/png\r\n\r\n"))
+    set mp_body = bytes_concat(mp_body, png_data)
+    set mp_body = bytes_concat(mp_body, bytes_from_text("\r\n--" + boundary + "\r\nContent-Disposition: form-data; name=\"video\"; filename=\"demo_clip.mp4\"\r\nContent-Type: video/mp4\r\n\r\n"))
+    set mp_body = bytes_concat(mp_body, mp4_data)
+    set mp_body = bytes_concat(mp_body, bytes_from_text("\r\n--" + boundary + "\r\nContent-Disposition: form-data; name=\"doc\"; filename=\"report.pdf\"\r\nContent-Type: application/pdf\r\n\r\n"))
+    set mp_body = bytes_concat(mp_body, pdf_data)
+    set mp_body = bytes_concat(mp_body, bytes_from_text("\r\n--" + boundary + "--\r\n"))
+
+    let req_hdr: Text = "POST /api/v1/media HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nContent-Type: multipart/form-data; boundary=" + boundary + "\r\nContent-Length: " + number_text(bytes_length(mp_body)) + "\r\n\r\n"
+    let raw_req: Bytes = bytes_concat(bytes_from_text(req_hdr), mp_body)
+
+    # Verify BOTH std/http AND std/web parse binary multipart request without NUL-byte failure
+    let parsed_res: Result[WebRequest, Text] = web_parse_request(raw_req)
+    assert(result_is_ok(parsed_res))
+    let wreq: WebRequest = result_unwrap(parsed_res)
+    assert(wreq.http.method == "POST" and wreq.http.path == "/api/v1/media")
+    assert(bytes_length(wreq.http.body) == bytes_length(mp_body))
+
+    let form_res: Result[MultipartForm, Text] = multipart_parse(wreq.http.content_type, wreq.http.body, 16, 1048576)
+    assert(result_is_ok(form_res))
+    let mform: MultipartForm = result_unwrap(form_res)
+    assert(multipart_field_or(mform, "_csrf", "") == "tok-123")
+    assert(list_count(mform.files) == 3)
+
+    # 2. Verify filename sanitization, magic-byte MIME sniffing & spoofing rejection
+    let photo_file: HttpUploadedFile = option_unwrap(multipart_file(mform, "photo"))
+    assert(photo_file.filename == "avatar.png")
+    assert(option_unwrap(multipart_sniff_mime(photo_file.data, photo_file.filename)) == "image/png")
+
+    let video_file: HttpUploadedFile = option_unwrap(multipart_file(mform, "video"))
+    assert(video_file.filename == "demo_clip.mp4")
+    assert(option_unwrap(multipart_sniff_mime(video_file.data, video_file.filename)) == "video/mp4")
+
+    let pdf_file: HttpUploadedFile = option_unwrap(multipart_file(mform, "doc"))
+    assert(option_unwrap(multipart_sniff_mime(pdf_file.data, pdf_file.filename)) == "application/pdf")
+
+    # Spoofed .png containing HTML/JS must be rejected by magic-byte sniffer!
+    let fake_png: Bytes = bytes_from_text("<script>alert(1)</script>")
+    assert(not option_is_some(multipart_sniff_mime(fake_png, "evil.png")))
+
+    # 3. Save all 3 files via VFS confinement
+    let saved_png: Text = result_unwrap(multipart_save_vfs(storage_dir, photo_file.filename, photo_file.data))
+    let saved_mp4: Text = result_unwrap(multipart_save_vfs(storage_dir, video_file.filename, video_file.data))
+    let saved_pdf: Text = result_unwrap(multipart_save_vfs(storage_dir, pdf_file.filename, pdf_file.data))
+    assert(saved_png == "avatar.png" and saved_mp4 == "demo_clip.mp4" and saved_pdf == "report.pdf")
+
+    # 4. View Photo (200 OK + image/png + Accept-Ranges + ETag 304 + CSP media-src)
+    let view_png: WebResponse = result_unwrap(media_serve_vfs(storage_dir, "avatar.png", "", "", false, 524288))
+    assert(view_png.status_code == 200 and view_png.content_type == "image/png")
+    assert(bytes_length(view_png.body) == 24 and bytes_get(view_png.body, 0) == 137 and bytes_get(view_png.body, 8) == 0)
+    assert(view_png.accept_ranges == "bytes")
+    assert(text_find(view_png.csp_policy, "media-src 'self'") >= 0)
+    let png_304: WebResponse = result_unwrap(media_serve_vfs(storage_dir, "avatar.png", "", view_png.etag, false, 524288))
+    assert(png_304.status_code == 304)
+
+    # 5. File Download (200 OK + Content-Disposition: attachment)
+    let dl_pdf: WebResponse = result_unwrap(media_serve_vfs(storage_dir, "report.pdf", "", "", true, 524288))
+    assert(dl_pdf.status_code == 200 and dl_pdf.content_type == "application/pdf")
+    assert(dl_pdf.content_disposition == "attachment; filename=\"report.pdf\"")
+    let dl_wire: Text = bytes_to_text(web_format_response(dl_pdf, "req-dl", false))
+    assert(text_find(dl_wire, "Content-Disposition: attachment; filename=\"report.pdf\"") >= 0)
+
+    # 6. Seekable Video Streaming (HTTP 206 Partial Content + Range parsing + chunk clamping + 416)
+    let r_req1: WebRequest = result_unwrap(web_parse_request(bytes_from_text("GET /media/demo_clip.mp4 HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nRange: bytes=0-63\r\n\r\n")))
+    assert(r_req1.range_header == "bytes=0-63")
+    let vid_p1: WebResponse = result_unwrap(media_serve_vfs(storage_dir, "demo_clip.mp4", r_req1.range_header, "", false, 64))
+    assert(vid_p1.status_code == 206 and vid_p1.content_type == "video/mp4")
+    assert(vid_p1.content_range == "bytes 0-63/256")
+    assert(bytes_length(vid_p1.body) == 64 and bytes_get(vid_p1.body, 4) == 102 and bytes_get(vid_p1.body, 5) == 116)
+
+    # Second seek chunk (64..127)
+    let vid_p2: WebResponse = result_unwrap(media_serve_vfs(storage_dir, "demo_clip.mp4", "bytes=64-127", "", false, 64))
+    assert(vid_p2.status_code == 206 and vid_p2.content_range == "bytes 64-127/256")
+    assert(bytes_length(vid_p2.body) == 64 and bytes_get(vid_p2.body, 0) == 64)
+
+    # Open-ended Range clamped to max_chunk_bytes (64) -> Zero-GC multi-GB streaming guarantee!
+    let vid_clamped: WebResponse = result_unwrap(media_serve_vfs(storage_dir, "demo_clip.mp4", "bytes=0-", "", false, 64))
+    assert(vid_clamped.status_code == 206 and vid_clamped.content_range == "bytes 0-63/256")
+
+    # Suffix range (last 32 bytes)
+    let vid_suf: WebResponse = result_unwrap(media_serve_vfs(storage_dir, "demo_clip.mp4", "bytes=-32", "", false, 64))
+    assert(vid_suf.status_code == 206 and vid_suf.content_range == "bytes 224-255/256" and bytes_length(vid_suf.body) == 32)
+
+    # Out-of-bounds range -> 416 Range Not Satisfiable
+    let vid_416: WebResponse = result_unwrap(media_serve_vfs(storage_dir, "demo_clip.mp4", "bytes=9999-", "", false, 64))
+    assert(vid_416.status_code == 416 and vid_416.content_range == "bytes */256")
+
+    # Path traversal rejection
+    let trav: Result[WebResponse, Text] = media_serve_vfs(storage_dir, "../yaza.toml", "", "", false, 64)
+    assert(not result_is_ok(trav))
+
+    say "WEB_MEDIA_STREAMING_SMOKE: PASS"
