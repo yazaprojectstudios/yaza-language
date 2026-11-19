@@ -92,7 +92,19 @@ yaza build --release hello.yz -o hello
 YAZA provides production-ready project generators that scaffold clean architectures with full test coverage, Dockerfiles, and API specifications.
 
 ### Fullstack MVC Monolith Starter (`--mvc` / `--fullstack`)
-Generates a single-binary **Arena-SSR MVC** monolith (RFC 0009) combining frontend and backend in one YAZA project: **YAZA UI v1.0** landing page (`GET /`) + interactive workspace dashboard (`/dashboard`), live **Hypermedia Fragments** (`X-Yaza-Fragment`), embedded YazaBase ACID SQL CRUD, Argon2id login with signed `HttpOnly` session cookies, constant-time CSRF protection, strict Web CSP (`style-src 'self'; script-src 'self'`), and JSON API parity (`/api/v1/tasks`):
+Generates a single-binary **Arena-SSR MVC** monolith (RFC 0009) combining frontend and backend in one YAZA project: **native `view` template syntax** (zero `list_push` boilerplate, auto-escaped `{{ expr }}` and trusted `{! raw !}` composition), **YAZA UI v1.0** landing page (`GET /`) + workspace dashboard (`/dashboard`), live **Hypermedia Fragments** (`X-Yaza-Fragment`), embedded YazaBase ACID SQL CRUD, Argon2id login with signed `HttpOnly` session cookies, constant-time CSRF protection, strict Web CSP (`style-src 'self'; script-src 'self'`), and JSON API parity (`/api/v1/tasks`):
+
+```yaza
+use "std/web/view"
+
+view render_card(title: Text, count: Number, body_html: Text):
+    <section class="yz-card">
+      <h2>{{ title }}</h2>
+      if count > 0:
+          <span class="yz-badge">{{ number_text(count) }} items</span>
+      {! body_html !}
+    </section>
+```
 
 ```sh
 yaza new --mvc my_app
