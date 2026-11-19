@@ -50,4 +50,18 @@ fi
 rm -f src/views/pages/bad_csp.yz
 printf '  [PASS] yaza audit --security flagged weak unsafe-inline CSP (YZA-SEC-005)\n'
 
+if YAZA_ENV=production YAZA_AUTH_SECRET="" ./mvc_ci_bin >/dev/null 2>&1; then
+  printf 'error: production mode failed to reject empty YAZA_AUTH_SECRET\n' >&2
+  exit 1
+fi
+printf '  [PASS] YAZA_ENV=production fails closed when YAZA_AUTH_SECRET is missing\n'
+
+printf '==> Fullstack Gate 4: Scaffolding & verifying yaza new --web...\n'
+cd "$WORK_DIR"
+"$YAZA_BIN" new --web web_ci
+cd web_ci
+"$YAZA_BIN" check
+"$YAZA_BIN" build --release src/main.yz -o web_ci_bin
+YAZA_SELF_TEST=1 ./web_ci_bin
+
 printf 'fullstack-mvc-validation-ok\n'

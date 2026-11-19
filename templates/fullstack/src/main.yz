@@ -139,26 +139,32 @@ fn load_effective_service_config() -> ApiServiceConfig:
 
 fn run_fullstack_self_test(public_dir: Text, profile_label: Text, m_total: AtomicNumber, m_errors: AtomicNumber) -> Boolean:
     arena_scope 1048576:
-        # 1. Unauthenticated GET / redirects to /login (303)
-        let r_anon_raw: Bytes = bytes_from_text("GET / HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nAccept: text/html\r\n\r\n")
+        # 1. Public Welcome to YAZA page (GET / -> 200 OK with live DB count)
+        let r_wel_raw: Bytes = bytes_from_text("GET / HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nAccept: text/html\r\n\r\n")
+        let r_wel: WebResponse = app_dispatch_request(result_unwrap(web_parse_request(r_wel_raw)), public_dir, profile_label, m_total, m_errors)
+        assert(r_wel.status_code == 200)
+        assert(text_find(bytes_to_text(r_wel.body), "Welcome to YAZA.") >= 0)
+
+        # 2. Unauthenticated GET /dashboard redirects to /login (303)
+        let r_anon_raw: Bytes = bytes_from_text("GET /dashboard HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nAccept: text/html\r\n\r\n")
         let r_anon: WebResponse = app_dispatch_request(result_unwrap(web_parse_request(r_anon_raw)), public_dir, profile_label, m_total, m_errors)
         assert(r_anon.status_code == 303 and r_anon.location == "/login")
 
-        # 2. Signed session cookie -> Full SSR Dashboard (200 HTML with YAZA UI)
+        # 3. Signed session cookie -> Full SSR Dashboard (200 HTML with YAZA UI)
         let sess_tok: Text = web_issue_session_token("admin", "admin")
         let csrf_tok: Text = csrf_issue_token(sess_tok, web_auth_secret())
-        let r_dash_raw: Bytes = bytes_from_text("GET / HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nAccept: text/html\r\nCookie: yaza_session=" + sess_tok + "\r\n\r\n")
+        let r_dash_raw: Bytes = bytes_from_text("GET /dashboard HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nAccept: text/html\r\nCookie: yaza_session=" + sess_tok + "\r\n\r\n")
         let r_dash: WebResponse = app_dispatch_request(result_unwrap(web_parse_request(r_dash_raw)), public_dir, profile_label, m_total, m_errors)
         assert(r_dash.status_code == 200)
         assert(text_find(bytes_to_text(r_dash.body), "id=\"task-board\"") >= 0)
 
-        # 3. Missing CSRF on POST /tasks MUST return 403 Forbidden
+        # 4. Missing CSRF on POST /tasks MUST return 403 Forbidden
         let bad_body: Text = "title=Exploit&priority=high"
         let r_bad_raw: Bytes = bytes_from_text("POST /tasks HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: " + number_text(text_length(bad_body)) + "\r\nCookie: yaza_session=" + sess_tok + "\r\n\r\n" + bad_body)
         let r_bad: WebResponse = app_dispatch_request(result_unwrap(web_parse_request(r_bad_raw)), public_dir, profile_label, m_total, m_errors)
         assert(r_bad.status_code == 403)
 
-        # 4. Valid CSRF + X-Yaza-Fragment POST /tasks creates row & returns partial fragment HTML (XSS escaped!)
+        # 5. Valid CSRF + X-Yaza-Fragment POST /tasks creates row & returns partial fragment HTML (XSS escaped!)
         let good_body: Text = "_csrf=" + csrf_tok + "&title=%3Cb%3ESelfTest+Task%3C%2Fb%3E&priority=high"
         let r_frag_raw: Bytes = bytes_from_text("POST /tasks HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nAccept: text/vnd.yaza.fragment\r\nX-Yaza-Fragment: #task-board\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: " + number_text(text_length(good_body)) + "\r\nCookie: yaza_session=" + sess_tok + "\r\n\r\n" + good_body)
         let r_frag: WebResponse = app_dispatch_request(result_unwrap(web_parse_request(r_frag_raw)), public_dir, profile_label, m_total, m_errors)
@@ -167,16 +173,32 @@ fn run_fullstack_self_test(public_dir: Text, profile_label: Text, m_total: Atomi
         assert(text_starts_with(frag_html, "<section id=\"task-board\">"))
         assert(text_find(frag_html, "&lt;b&gt;SelfTest Task&lt;/b&gt;") >= 0)
 
-        # 5. JSON API parity (/api/v1/tasks)
+        # 6. Toggle (SQL UPDATE) & Delete (SQL DELETE) with CSRF on newly created tsk-4
+        let csrf_only: Text = "_csrf=" + csrf_tok
+        let r_tog_raw: Bytes = bytes_from_text("POST /tasks/tsk-4/toggle HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nAccept: text/vnd.yaza.fragment\r\nX-Yaza-Fragment: #task-board\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: " + number_text(text_length(csrf_only)) + "\r\nCookie: yaza_session=" + sess_tok + "\r\n\r\n" + csrf_only)
+        let r_tog: WebResponse = app_dispatch_request(result_unwrap(web_parse_request(r_tog_raw)), public_dir, profile_label, m_total, m_errors)
+        assert(r_tog.status_code == 200)
+        assert(text_find(bytes_to_text(r_tog.body), "Task status updated.") >= 0)
+
+        let r_del_raw: Bytes = bytes_from_text("POST /tasks/tsk-4/delete HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nAccept: text/vnd.yaza.fragment\r\nX-Yaza-Fragment: #task-board\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: " + number_text(text_length(csrf_only)) + "\r\nCookie: yaza_session=" + sess_tok + "\r\n\r\n" + csrf_only)
+        let r_del: WebResponse = app_dispatch_request(result_unwrap(web_parse_request(r_del_raw)), public_dir, profile_label, m_total, m_errors)
+        assert(r_del.status_code == 200)
+        assert(text_find(bytes_to_text(r_del.body), "Task deleted.") >= 0)
+
+        # 7. JSON API parity (/api/v1/tasks) confirms seeded rows remain & deleted tsk-4 is gone
         let r_api_raw: Bytes = bytes_from_text("GET /api/v1/tasks HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nAccept: application/json\r\nCookie: yaza_session=" + sess_tok + "\r\n\r\n")
         let r_api: WebResponse = app_dispatch_request(result_unwrap(web_parse_request(r_api_raw)), public_dir, profile_label, m_total, m_errors)
         assert(r_api.status_code == 200)
-        assert(text_find(bytes_to_text(r_api.body), "SelfTest Task") >= 0)
+        let api_json: Text = bytes_to_text(r_api.body)
+        assert(text_find(api_json, "tsk-1") >= 0 and text_find(api_json, "SelfTest Task") < 0)
 
-        # 6. Static asset CSS (200 + ETag 304) & path traversal blocked (404)
+        # 8. Static asset CSS (200 + ETag 304) & path traversal blocked (404)
         let r_css_raw: Bytes = bytes_from_text("GET /public/yaza-ui.css HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\r\n")
         let r_css: WebResponse = app_dispatch_request(result_unwrap(web_parse_request(r_css_raw)), public_dir, profile_label, m_total, m_errors)
         assert(r_css.status_code == 200 and text_length(r_css.etag) > 0)
+        let r_304_raw: Bytes = bytes_from_text("GET /public/yaza-ui.css HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nIf-None-Match: " + r_css.etag + "\r\n\r\n")
+        let r_304: WebResponse = app_dispatch_request(result_unwrap(web_parse_request(r_304_raw)), public_dir, profile_label, m_total, m_errors)
+        assert(r_304.status_code == 304)
         let r_trav_raw: Bytes = bytes_from_text("GET /public/../yaza.toml HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\r\n")
         let r_trav: WebResponse = app_dispatch_request(result_unwrap(web_parse_request(r_trav_raw)), public_dir, profile_label, m_total, m_errors)
         assert(r_trav.status_code == 404)
@@ -217,7 +239,8 @@ start:
 
     say "=== {{project_name}} Fullstack Monolith (Arena-SSR MVC) ==="
     say "Profile      : " + cfg.resources.profile + " (" + cfg.resources.arena_mode + ") | max_in_flight = " + number_text(cfg.resources.max_in_flight) + " | DB: YazaBase SQL"
-    say "Web UI       : http://" + cfg.bind_host + ":" + number_text(cfg.bind_port) + "/login"
+    say "Welcome Page : http://" + cfg.bind_host + ":" + number_text(cfg.bind_port) + "/"
+    say "Dashboard    : http://" + cfg.bind_host + ":" + number_text(cfg.bind_port) + "/dashboard"
     say "JSON API     : http://" + cfg.bind_host + ":" + number_text(cfg.bind_port) + "/api/v1/tasks"
     say "Probes       : /healthz | /readyz | /metrics"
 
