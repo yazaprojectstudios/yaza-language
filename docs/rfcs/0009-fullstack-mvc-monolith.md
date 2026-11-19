@@ -195,3 +195,27 @@ Enforced via `yaza arch check`:
 2. `std/web` positive and adversarial security fixtures (XSS, CSRF, cookie forgery, `../` traversal, symlink escape, oversized form body) pass under normal, `-O2`, and `ASan/UBSan`.
 3. `yaza new --fullstack demo_app` compiles cleanly (`yaza check`, `yaza build --release`), passes `YAZA_SELF_TEST=1`, and renders cleanly in a live browser with zero CSP errors and working progressive fragment swaps.
 4. No third-party runtime dependencies are introduced.
+
+
+---
+
+## Addendum: First-Class Native `view` Syntax (Zero `list_push` Boilerplate)
+
+To eliminate manual `list_push(p, "...")` and quote-escaping (`\"`) noise in view templates without introducing runtime template reflection, `compiler/core_hir.yz` natively supports `view` declarations:
+
+```yaza
+use "std/web/view"
+
+view render_card(title: Text, count: Number, body_html: Text):
+    <section class="yz-card">
+      <h2>{{ title }}</h2>
+      if count > 0:
+          <span class="yz-badge">{{ number_text(count) }} items</span>
+      {! body_html !}
+    </section>
+```
+
+- **`view <name>(<params>):`** compiles directly to `fn <name>(<params>) -> Text:` backed by an arena-scoped `TextList` + single-pass `text_join`.
+- **`{{ expr }}`** auto-escapes via `view_escape(expr)` (XSS-safe by default).
+- **`{! expr !}`** inserts explicit trusted HTML/child view components without double-escaping.
+- **Line sigils**: lines starting with `<`, `{{`, `{!`, or `|` (plain text line) emit markup; all other indented lines (`let`, `var`, `set`, `if`/`elif`/`else`, `while`, `for`) compile as native statically-typed YAZA control flow with 2-space or 4-space HTML indentation freely supported.

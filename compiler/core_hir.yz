@@ -1427,6 +1427,7 @@ fn core_expand_modules(path: Text, source: Text, visited: TextList, stack: TextL
     let dependencies: TextList = text_list()
     let dependency_origins: List[HirImportOrigin] = List[HirImportOrigin]()
     var saw_start: Boolean = false
+    var in_view_block: Boolean = false
     var line_index: Number = 0
     while line_index < list_count(lines):
         let raw_line: Text = list_get(lines, line_index)
@@ -1434,13 +1435,18 @@ fn core_expand_modules(path: Text, source: Text, visited: TextList, stack: TextL
         var indent: Number = 0
         while indent < text_length(raw_line) and text_byte(raw_line, indent) == 32:
             set indent = indent + 1
+        if indent == 0 and trimmed != "" and not text_starts_with(trimmed, "#"):
+            if text_starts_with(trimmed, "view "):
+                set in_view_block = true
+            else:
+                set in_view_block = false
         let tab_column: Number = text_find(raw_line, "\t") + 1
         if tab_column > 0:
             if source_origin_path == "":
                 fail("YAZA indentation cannot contain tabs (line " + number_text(line_index + 1) + ", column " + number_text(tab_column) + ")")
             else:
                 fail("YAZA indentation cannot contain tabs (" + source_origin_path + ":" + number_text(line_index + 1) + ":" + number_text(tab_column) + ")")
-        if trimmed != "" and not text_starts_with(trimmed, "#") and indent % 4 != 0:
+        if not (in_view_block and indent > 0) and trimmed != "" and not text_starts_with(trimmed, "#") and indent % 4 != 0:
             let invalid_indent_column: Number = (indent / 4) * 4 + 1
             if source_origin_path == "":
                 fail("YAZA indentation must use multiples of four spaces (line " + number_text(line_index + 1) + ", column " + number_text(invalid_indent_column) + ")")
@@ -1473,7 +1479,7 @@ fn core_expand_modules(path: Text, source: Text, visited: TextList, stack: TextL
                 list_push(dependencies, dependency_path)
                 list_push(dependency_origins, resolved_import_origin)
             else:
-                if not is_root and indent == 0 and not text_starts_with(trimmed, "fn ") and not text_starts_with(trimmed, "async fn ") and not text_starts_with(trimmed, "shape ") and not text_starts_with(trimmed, "variant ") and not text_starts_with(trimmed, "impl From["):
+                if not is_root and indent == 0 and not text_starts_with(trimmed, "fn ") and not text_starts_with(trimmed, "async fn ") and not text_starts_with(trimmed, "view ") and not text_starts_with(trimmed, "shape ") and not text_starts_with(trimmed, "variant ") and not text_starts_with(trimmed, "impl From["):
                     let declaration_origin: HirImportOrigin = HirImportOrigin(source_origin_path, line_index + 1, indent + 1, indent + text_length(trimmed))
                     fail("LLVM Core parser: imported modules may contain function and type declarations only" + core_import_origin_context(declaration_origin))
                 core_expanded_push(local_source, raw_line, source_origin_path, line_index + 1)
@@ -1808,8 +1814,195 @@ fn core_parse_indented_records(source: CoreExpandedSource) -> TextList:
         set line_index = line_index + 1
     return records
 
+fn core_view_spaces(count: Number) -> Text:
+    var out: Text = ""
+    var i: Number = 0
+    while i < count:
+        set out = out + " "
+        set i = i + 1
+    return out
+
+fn core_view_escape_literal(raw: Text) -> Text:
+    let parts: TextList = text_list()
+    let len: Number = text_length(raw)
+    var seg_start: Number = 0
+    var i: Number = 0
+    while i < len:
+        let b: Number = text_byte(raw, i)
+        if b == 92 or b == 34:
+            if i > seg_start:
+                list_push(parts, text_slice(raw, seg_start, i - seg_start))
+            if b == 92:
+                list_push(parts, "\\\\")
+            else:
+                list_push(parts, "\\\"")
+            set seg_start = i + 1
+        set i = i + 1
+    if len > seg_start:
+        list_push(parts, text_slice(raw, seg_start, len - seg_start))
+    return text_join(parts, "")
+
+fn core_view_is_markup_line(trimmed: Text) -> Boolean:
+    if text_starts_with(trimmed, "<"): return true
+    if text_starts_with(trimmed, "{{"): return true
+    if text_starts_with(trimmed, "{!"): return true
+    if text_starts_with(trimmed, "|"): return true
+    return false
+
+fn core_view_is_block_header(trimmed: Text) -> Boolean:
+    if not text_ends_with(trimmed, ":"): return false
+    if text_starts_with(trimmed, "if "): return true
+    if text_starts_with(trimmed, "elif "): return true
+    if trimmed == "else:": return true
+    if text_starts_with(trimmed, "while "): return true
+    if text_starts_with(trimmed, "for "): return true
+    if text_starts_with(trimmed, "match "): return true
+    return false
+
+fn core_view_find_close(text: Text, start: Number, first_byte: Number, second_byte: Number) -> Number:
+    let len: Number = text_length(text)
+    var i: Number = start
+    var in_str: Boolean = false
+    var escaped: Boolean = false
+    while i + 1 < len:
+        let b: Number = text_byte(text, i)
+        if in_str:
+            if escaped:
+                set escaped = false
+            else:
+                if b == 92:
+                    set escaped = true
+                else:
+                    if b == 34:
+                        set in_str = false
+            set i = i + 1
+        else:
+            if b == 34:
+                set in_str = true
+                set i = i + 1
+            else:
+                if b == first_byte and text_byte(text, i + 1) == second_byte:
+                    return i
+                set i = i + 1
+    return -1
+
+fn core_view_origin_label(origin: HirSourceOrigin) -> Text:
+    if origin.source_file == "":
+        return "line " + number_text(origin.source_line)
+    return origin.source_file + ":" + number_text(origin.source_line)
+
+fn core_view_header_to_fn(trimmed: Text, origin: HirSourceOrigin) -> Text:
+    if not text_ends_with(trimmed, ":"):
+        fail("LLVM Core parser: view declaration must end with ':' (" + core_view_origin_label(origin) + ")")
+    let rest: Text = text_trim(text_slice(trimmed, 5, text_length(trimmed) - 5))
+    if text_find(rest, "(") < 0:
+        fail("LLVM Core parser: view declaration requires parameter list 'view name(...):' (" + core_view_origin_label(origin) + ")")
+    if text_find(rest, "->") >= 0:
+        return "fn " + rest
+    let without_colon: Text = text_trim(text_slice(rest, 0, text_length(rest) - 1))
+    return "fn " + without_colon + " -> Text:"
+
+fn core_emit_view_markup_line(output_source: CoreExpandedSource, pad: Text, trimmed: Text, origin: HirSourceOrigin) -> Number:
+    var line_text: Text = trimmed
+    if text_starts_with(line_text, "| "):
+        set line_text = text_slice(line_text, 2, text_length(line_text) - 2)
+    else:
+        if text_starts_with(line_text, "|"):
+            set line_text = text_slice(line_text, 1, text_length(line_text) - 1)
+    let len: Number = text_length(line_text)
+    var lit_start: Number = 0
+    var i: Number = 0
+    while i < len:
+        if i + 1 < len and text_byte(line_text, i) == 123 and (text_byte(line_text, i + 1) == 123 or text_byte(line_text, i + 1) == 33):
+            if i > lit_start:
+                let chunk: Text = text_slice(line_text, lit_start, i - lit_start)
+                core_expanded_push(output_source, pad + "list_push(__yz_v, \"" + core_view_escape_literal(chunk) + "\")", origin.source_file, origin.source_line)
+            let is_raw: Boolean = text_byte(line_text, i + 1) == 33
+            var close_idx: Number = -1
+            if is_raw:
+                set close_idx = core_view_find_close(line_text, i + 2, 33, 125)
+            else:
+                set close_idx = core_view_find_close(line_text, i + 2, 125, 125)
+            if close_idx < 0:
+                if is_raw:
+                    fail("LLVM Core parser: unterminated '{! ... !}' interpolation in view (" + core_view_origin_label(origin) + ")")
+                else:
+                    fail("LLVM Core parser: unterminated '{{ ... }}' interpolation in view (" + core_view_origin_label(origin) + ")")
+            let expr_text: Text = text_trim(text_slice(line_text, i + 2, close_idx - (i + 2)))
+            if expr_text == "":
+                fail("LLVM Core parser: empty interpolation expression in view (" + core_view_origin_label(origin) + ")")
+            if is_raw:
+                core_expanded_push(output_source, pad + "list_push(__yz_v, " + expr_text + ")", origin.source_file, origin.source_line)
+            else:
+                core_expanded_push(output_source, pad + "list_push(__yz_v, view_escape(" + expr_text + "))", origin.source_file, origin.source_line)
+            set i = close_idx + 2
+            set lit_start = i
+        else:
+            set i = i + 1
+    if len > lit_start:
+        let tail: Text = text_slice(line_text, lit_start, len - lit_start)
+        core_expanded_push(output_source, pad + "list_push(__yz_v, \"" + core_view_escape_literal(tail) + "\\n\")", origin.source_file, origin.source_line)
+    else:
+        core_expanded_push(output_source, pad + "list_push(__yz_v, \"\\n\")", origin.source_file, origin.source_line)
+    return 0
+
+fn core_expand_views(source: CoreExpandedSource) -> CoreExpandedSource:
+    let source_lines: TextList = source.lines
+    let output_source: CoreExpandedSource = core_expanded_source()
+    var line_index: Number = 0
+    while line_index < list_count(source_lines):
+        let raw_line: Text = list_get(source_lines, line_index)
+        let trimmed: Text = text_trim(raw_line)
+        var indent: Number = 0
+        while indent < text_length(raw_line) and text_byte(raw_line, indent) == 32:
+            set indent = indent + 1
+        if indent == 0 and text_starts_with(trimmed, "view "):
+            let header_origin: HirSourceOrigin = core_expanded_origin(source, line_index + 1)
+            let fn_header: Text = core_view_header_to_fn(trimmed, header_origin)
+            core_expanded_push(output_source, fn_header, header_origin.source_file, header_origin.source_line)
+            core_expanded_push(output_source, "    let __yz_v: TextList = text_list()", header_origin.source_file, header_origin.source_line)
+            set line_index = line_index + 1
+            let block_indents: TextList = text_list()
+            var block_depth: Number = 0
+            var in_body: Boolean = true
+            while line_index < list_count(source_lines) and in_body:
+                let b_raw: Text = list_get(source_lines, line_index)
+                let b_trim: Text = text_trim(b_raw)
+                var b_indent: Number = 0
+                while b_indent < text_length(b_raw) and text_byte(b_raw, b_indent) == 32:
+                    set b_indent = b_indent + 1
+                if b_trim == "" or text_starts_with(b_trim, "#"):
+                    set line_index = line_index + 1
+                else:
+                    if b_indent == 0:
+                        set in_body = false
+                    else:
+                        let b_origin: HirSourceOrigin = core_expanded_origin(source, line_index + 1)
+                        while block_depth > 0 and b_indent <= number_parse(list_get(block_indents, block_depth - 1)):
+                            set block_depth = block_depth - 1
+                        let code_indent: Number = 4 + block_depth * 4
+                        let pad: Text = core_view_spaces(code_indent)
+                        if core_view_is_markup_line(b_trim):
+                            let _em: Number = core_emit_view_markup_line(output_source, pad, b_trim, b_origin)
+                        else:
+                            core_expanded_push(output_source, pad + b_trim, b_origin.source_file, b_origin.source_line)
+                            if core_view_is_block_header(b_trim):
+                                if block_depth < list_count(block_indents):
+                                    list_set(block_indents, block_depth, number_text(b_indent))
+                                else:
+                                    list_push(block_indents, number_text(b_indent))
+                                set block_depth = block_depth + 1
+                        set line_index = line_index + 1
+            core_expanded_push(output_source, "    return text_join(__yz_v, \"\")", header_origin.source_file, header_origin.source_line)
+        else:
+            let origin: HirSourceOrigin = core_expanded_origin(source, line_index + 1)
+            core_expanded_push(output_source, raw_line, origin.source_file, origin.source_line)
+            set line_index = line_index + 1
+    return output_source
+
 fn core_parse_expanded_hir(source: CoreExpandedSource) -> HirProgram:
-    let mapped_source: CoreExpandedSource = core_expand_from_implementations(source)
+    let view_expanded: CoreExpandedSource = core_expand_views(source)
+    let mapped_source: CoreExpandedSource = core_expand_from_implementations(view_expanded)
     let expanded_text: Text = core_expanded_text(mapped_source)
     let records: TextList = core_parse_indented_records(mapped_source)
     let source_lines: TextList = text_lines(expanded_text)
