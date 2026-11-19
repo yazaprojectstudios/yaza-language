@@ -9,7 +9,7 @@ DIST_DIR="$PROJECT_ROOT/dist"
 mkdir -p "$DIST_DIR"
 
 MACHINE=$(uname -m)
-VERSION="1.0.0"
+VERSION=${YAZA_VERSION:-$(cat "$PROJECT_ROOT/VERSION")}
 PACKAGE="$DIST_DIR/yaza-$VERSION-macos-arm64.pkg"
 
 if [ "$MACHINE" != "arm64" ]; then
@@ -96,7 +96,7 @@ cat <<'EOF' > "$PKG_SCRIPTS/postinstall"
 #!/bin/sh
 printf '\n'
 printf '  ███▄      ▄███    Welcome to YAZA Programming Language!\n'
-printf '   ▀███▄  ▄███▀     Version 1.0.0 · Zero-GC Arena · Native LLVM · YazaBase\n'
+printf '   ▀███▄  ▄███▀     Version 1.0.1 · Zero-GC Arena · Native LLVM · YazaBase\n'
 printf '     ▀███▄ ▀█▀\n'
 printf '     ▄███▀          Installed CLI tools to: /usr/local/bin/yaza & yazabase\n'
 printf '   ▄███▀            Docs: https://yazastudios.id/docs/\n\n'

@@ -4,7 +4,7 @@ set -eu
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 cd "$SCRIPT_DIR"
 
-VERSION="1.0.0"
+VERSION=$(cat "$SCRIPT_DIR/../../VERSION")
 VSIX_NAME="yaza-language-support-$VERSION.vsix"
 OUTPUT_DIR="$SCRIPT_DIR/../../dist"
 WEB_RELEASES="$SCRIPT_DIR/../../../website/public/releases"
