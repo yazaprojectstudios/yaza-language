@@ -1,6 +1,6 @@
-# YAZA Fullstack Arena-SSR Benchmark Report (19 Nov 2026)
+# YAZA Fullstack Web & MVC (Arena-SSR) Benchmark Report (19 Nov 2026)
 
-Reproducible multi-runtime MVC/Web HTTP/1.1 benchmark comparing **YAZA Fullstack Arena-SSR (`std/web/*` + `arena_scope`, `-O2`)** against **Go `1.27.3` (`net/http` + `html/template`)** and **Node.js `v26.0.0` (`node:http`)** producing **identical HTML5, Hypermedia Fragment, CSS, ETag, Web CSP, and JSON payloads**.
+Reproducible **8-framework HTTP/1.1 SSR & Fullstack Web benchmark** comparing **YAZA v1.0.0 Arena-SSR (`-O2`, native `view` syntax + `arena_scope`)** against **Go `1.27.3` (`net/http` + `html/template`)**, **Node.js `v26.0.0` (raw `node:http`)**, **Fastify `5.12.8`**, **Express `5.3.0`**, **PHP `8.5.6`**, **React `19.3.1` SSR (`renderToString`)**, and **Next.js `16.4.6` Production SSR (`next build` + `next start`)**.
 
 ---
 
@@ -8,44 +8,48 @@ Reproducible multi-runtime MVC/Web HTTP/1.1 benchmark comparing **YAZA Fullstack
 
 - **Date:** 19 November 2026
 - **Host:** `darwin arm64` (Apple Silicon, 10 logical CPUs)
-- **Transport:** Local TCP loopback (`127.0.0.1`), HTTP/1.1 keep-alive
-- **Load Profile:** `c = 8` concurrent sockets, `80` warmup requests + `2,000` timed requests × `3` rounds per workload (`30,000` measured requests per runtime, `0` errors)
-- **Peer Runtimes:** `go version go1.27.3 darwin/arm64` (`net/http` + `html/template`), `Node.js v26.0.0` (`node:http`), each isolated in its own OS process for clean Peak RSS (`ps -o rss=`) measurement
+- **Transport:** Local TCP loopback (`127.0.0.1`), HTTP/1.1 keep-alive (`c = 8` concurrent sockets)
+- **Load Profile:** `80` warm-up requests + `1,500` timed requests × `3` rounds per workload (`600 × 3` for Next.js & PHP; median of 3 rounds, `0` errors)
+- **Workload Parity:** Every server runs in its own isolated OS process and dynamically constructs 16 task items per request, XSS-escapes HTML titles (`<verified & safe>`), embeds 16 hidden CSRF inputs, sets strict Web CSP security headers, and exposes `/api/v1/tasks` JSON parity.
+- **Process Footprint:** Peak RSS measured across each server's full process tree via `ps -axo pid=,ppid=,rss=` during live load; cold start measured from process `spawn` until first HTTP `200 OK` on `/healthz` (`/api/healthz` on Next.js).
 - **Reproduce:**
   ```sh
   YAZA_STDLIB_DIR="$PWD/std" YAZA_RUNTIME_DIR="$PWD/runtime" \
     ./build/yaza build --release examples/fullstack-ssr-bench.yz -o build/fullstack-ssr-bench
-  node scripts/bench-fullstack-ssr.mjs
+  node scripts/bench-web-frameworks.mjs
   ```
 
 ---
 
-## Footprint, Binary Size & Peak RSS
+## 8-Framework Throughput, Latency & Resource Footprint (`c = 8`, Median of 3 Rounds)
 
-| Metric | YAZA Arena-SSR (`-O2`) | Go `1.27.3` (`html/template`) | Node.js `v26.0.0` |
-| :--- | :--- | :--- | :--- |
-| **Standalone Binary** | **`208.4 KB`** (`302 KB` full MVC starter) | `12.47 MB` (`60×` larger) | V8 Runtime |
-| **Peak RSS (30k live reqs)** | **`2.83 MB`** (8 concurrent workers) | `21.38 MB` (`7.6×` more RAM) | `68.08 MB` (`24.1×` more RAM) |
+| Rank | Framework / Runtime | Full SSR HTML (`c=8`, p50 · p95) | Fragment (`#task-board`) | JSON API (16 items) | Peak RSS (RAM) | Cold Start | Footprint |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **1** | **YAZA v1.0.0 Arena-SSR (`-O2`, native `view`)** | **`29,024 req/s`** (`167 µs` · `326 µs`) | **`37,990 req/s`** (`123 µs` · `246 µs`) | `33,437 req/s` (`138 µs`) | **`3.17 MB`** | **`31.8 ms`** | **`208.4 KB` binary** (`318 KB` Forum MVC) |
+| **2** | **Go `1.27.3` (`net/http` + `html/template`)** | `28,743 req/s` (`162 µs` · `464 µs`) | `27,991 req/s` (`173 µs` · `442 µs`) | `41,848 req/s` (`107 µs`) | `22.05 MB` (`7.0×`) | `614.1 ms` | `12.18 MB` binary (`59×`) |
+| **3** | **Node.js `v26.0.0` (raw `node:http`)** | `27,430 req/s` (`182 µs` · `414 µs`) | `28,733 req/s` (`178 µs` · `359 µs`) | `38,894 req/s` (`96 µs`) | `73.86 MB` (`23.3×`) | `113.6 ms` | V8 runtime |
+| **4** | **Fastify `5.12.8` (Node.js v26)** | `25,295 req/s` (`202 µs` · `450 µs`) | `25,772 req/s` (`199 µs` · `415 µs`) | `39,740 req/s` (`105 µs`) | `86.44 MB` (`27.3×`) | `163.6 ms` | Node + `node_modules` |
+| **5** | **Express `5.3.0` (Node.js v26)** | `22,553 req/s` (`238 µs` · `530 µs`) | `22,492 req/s` (`239 µs` · `487 µs`) | `36,257 req/s` (`118 µs`) | `77.81 MB` (`24.5×`) | `136.3 ms` | Node + `node_modules` |
+| **6** | **PHP `8.5.6` (built-in server)** | `12,001 req/s` (`435 µs` · `854 µs`) | `13,425 req/s` (`366 µs` · `785 µs`) | `14,502 req/s` (`338 µs`) | `29.47 MB` (`9.3×`) | `136.0 ms` | PHP 8.5 runtime |
+| **7** | **React `19.3.1` SSR (`renderToString` / Node)** | `6,304 req/s` (`1,006 µs` · `2,075 µs`) | `6,953 req/s` (`913 µs` · `1,830 µs`) | **`45,394 req/s`** (`75 µs`) | `140.75 MB` (`44.4×`) | `107.4 ms` | Node + React 19 |
+| **8** | **Next.js `16.4.6` Production SSR (`next start`)** | `4,473 req/s` (`1,386 µs` · `2,711 µs`) | — *(full SSR page)* | `10,693 req/s` (`439 µs`) | `212.30 MB` (`67.0×`) | `197.2 ms` | `365 MB` `node_modules` + `.next` |
+
+### Static Asset Delivery (`public/yaza-ui.css`, `20,158 B`, `c = 8`)
+Measured separately in `scripts/bench-fullstack-ssr.mjs`:
+- **Static CSS (`200 OK`, `20,158 B`):** YAZA **`63,268 req/s`** (`99 µs` p50) vs Node.js `61,456 req/s` (`103 µs`).
+- **Static CSS Conditional (`304 ETag`):** YAZA **`82,539 req/s`** (`69 µs` p50 · `153 µs` p95) vs Node.js `81,136 req/s` (`78 µs` · `160 µs`).
 
 ---
 
-## Throughput & Latency Results (`c = 8`, Median of 3 Rounds)
+## Key Engineering Takeaways
 
-| Workload | Payload | YAZA `-O2` | Go `1.27.3` (`html/template`) | Node.js `v26.0.0` |
-| :--- | :--- | :--- | :--- | :--- |
-| **Full SSR HTML (16 escaped rows + CSP)** | `3,980 B` | **`51,327 req/s`** (`138 µs` p50 · `257 µs` p95) | `40,626 req/s` (`163 µs` · `407 µs`) | `37,454 req/s` (`178 µs` · `397 µs`) |
-| **Hypermedia Fragment (`#task-board`)** | `3,706 B` | **`50,930 req/s`** (`139 µs` p50 · `271 µs` p95) | `37,385 req/s` (`176 µs` · `444 µs`) | `40,377 req/s` (`162 µs` · `345 µs`) |
-| **Static CSS Asset (`200 OK`)** | `8,878 B` | **`65,051 req/s`** (`98 µs` p50 · `209 µs` p95) | `58,531 req/s` (`134 µs` · `238 µs`) | `61,730 req/s` (`100 µs` · `234 µs`) |
-| **Static CSS Conditional (`304 ETag`)** | `0 B` | **`72,720 req/s`** (`109 µs` p50 · `174 µs` p95) | `72,224 req/s` (`110 µs` · `191 µs`) | `68,563 req/s` (`87 µs` · `220 µs`) |
-| **JSON API Parity (16 items)** | `1,813 B` | `39,837 req/s` (`178 µs` p50 · `360 µs` p95) | `56,962 req/s` (`125 µs` · `276 µs`) | **`65,509 req/s`** (`106 µs` · `224 µs`) |
+1. **#1 Overall on Full SSR & Hypermedia Fragments:** Compiled YAZA `view` functions assemble HTML directly inside per-request `arena_scope` via `TextList` + single-pass `text_join` with zero template reflection, zero Virtual DOM reconciliation, and zero GC pauses.
+2. **Vs Next.js `16.4.6` & React `19.3.1` SSR:**
+   - **`6.5×` faster Full SSR** than Next.js `16.4.6` (`29,024` vs `4,473 req/s`) and **`4.6×` faster** than React `19.3.1` `renderToString` (`6,304 req/s`).
+   - **`67×` less RAM** than Next.js (`3.17 MB` vs `212.30 MB`) and **`44.4×` less RAM** than React SSR (`140.75 MB`).
+   - **`208.4 KB` single binary** vs `365 MB` `node_modules` + `.next` build artifacts.
+3. **Vs Express `5.3.0`, Fastify `5.12.8`, Node.js `v26`, and Go `1.27.3`:**
+   - Outperforms Express 5 (`+28.7%` Full SSR, `+68.9%` Fragment), Fastify 5 (`+14.7%` Full SSR, `+47.4%` Fragment), raw Node.js (`+5.8%` Full SSR, `+32.2%` Fragment), and Go `html/template` (`+35.7%` Fragment, `30%` tighter Full SSR p95: `326 µs` vs `464 µs`), while using `7×`–`27×` less RAM.
+4. **Honest Tradeoff on 16-Item JSON:** V8's C++ `JSON.stringify` (Node/Fastify/Express/React API: `36k–45k req/s`) and Go's `encoding/json` (`41.8k req/s`) remain faster than YAZA's current pure-YAZA `json_escape_text` loop (`33.4k req/s`), though YAZA still beats Next.js API routes (`10.7k req/s`) by `3.1×` and PHP (`14.5k req/s`) by `2.3×`.
 
-### Key Engineering Takeaways
-1. **Compiled Arena-SSR Beats Both Go `html/template` and Node.js:**
-   - Full HTML5 SSR: **`51,327 req/s`** (**`+26.3%`** vs Go, **`+37.0%`** vs Node.js) with **`257 µs` p95** vs Go's `407 µs` and Node's `397 µs`.
-   - Hypermedia Fragment (`#task-board`): **`50,930 req/s`** (**`+36.2%`** vs Go, **`+26.1%`** vs Node.js).
-   - Because YAZA views compile straight to LLVM machine code and assemble inside per-request `arena_scope` via `TextList` + `text_join`, there is zero runtime template reflection and zero GC tail-latency spikes.
-2. **Container Footprint Advantage:** **`2.83 MB` Peak RSS** (`7.6×` less RAM than Go, `24.1×` less RAM than Node.js) and **`208.4 KB` binary** (`60×` smaller than Go's `12.47 MB`).
-3. **Static Assets (`200 OK` & `304 ETag`):** YAZA leads on both full CSS delivery (`65,051 req/s`) and conditional `304` ETag checks (`72,720 req/s`).
-4. **Honest Tradeoff on 16-Item JSON:** Node's native C++ `JSON.stringify` (`65.5k`) and Go's `encoding/json` (`56.9k`) remain faster than YAZA's pure-YAZA character-scanning `json_escape_text` loop (`39.8k req/s`).
-
-*Scope note: This benchmark isolates MVC HTTP/1.1 framing, `arena_scope` lifecycle, compiled XSS-escaped SSR views, Hypermedia Fragment responses, ETag static assets, and strict Web CSP over loopback without external TLS or disk SQL I/O. End-to-end YazaBase SQL CRUD (`INSERT`/`SELECT`/`UPDATE`/`DELETE`), Argon2id login, CSRF protection, and browser rendering are verified separately via `scripts/validate-fullstack-mvc.sh`.*
+*Scope note: This loopback benchmark isolates HTTP/1.1 keep-alive framing, `arena_scope` lifecycle, compiled XSS-escaped SSR views, Hypermedia Fragments, strict Web CSP, and JSON serialization without external TLS or disk SQL I/O. Full end-to-end YazaBase ACID SQL CRUD, Argon2id sessions, CSRF, and browser rendering are verified via `scripts/validate-fullstack-mvc.sh` and `yaza-forum`.*

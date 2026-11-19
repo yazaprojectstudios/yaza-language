@@ -5,7 +5,7 @@
 [![Build Matrix](https://img.shields.io/badge/Platforms-macOS%20%7C%20Linux%20%7C%20Windows-brightgreen.svg)](https://github.com/yazaprojectstudios/yaza-language/actions)
 [![Zero-GC](https://img.shields.io/badge/Memory-Zero--GC%20%28Scoped%20Arenas%29-mint.svg)](#memory-model-arena_scope)
 [![Benchmarks](https://img.shields.io/badge/HTTP%2F1.1-93%2C854%20req%2Fs%20%40%2078%C2%B5s-yellowgreen.svg)](#benchmarks)
-[![Arena-SSR](https://img.shields.io/badge/Arena--SSR%20MVC-51%2C327%20req%2Fs%20%40%202.83%20MB%20RSS-teal.svg)](#fullstack-web--mvc-arena-ssr-19-nov-2026)
+[![Arena-SSR](https://img.shields.io/badge/Arena--SSR%20MVC-6.5x%20Next.js%20%40%203.17%20MB%20RSS-teal.svg)](#fullstack-web--mvc-arena-ssr-19-nov-2026)
 
 **YAZA** is a self-hosted systems programming language designed for high-concurrency cloud backends and single-binary fullstack web applications. It compiles to native machine code via **LLVM 18**, eliminates garbage collection pauses using deterministic **Scoped Arenas (`arena_scope`)**, and ships with **YazaBase**, a built-in ACID B+Tree SQL storage engine.
 
@@ -275,19 +275,22 @@ Independent loopback benchmarks conducted on **18 November 2026** (macOS arm64, 
 
 ### Fullstack Web & MVC (Arena-SSR, 19 Nov 2026)
 
-Three-runtime HTTP/1.1 loopback benchmark (`darwin arm64`, `c = 8`, 2,000 requests × 3 rounds = 30,000 measured requests per runtime, 0 errors, exact HTML5/Fragment/CSS/CSP/JSON payload parity) comparing compiled **YAZA Arena-SSR (`std/web/*`, `-O2`)** against **Go `1.27.3` (`net/http` + `html/template`)** and **Node.js `v26.0.0`**:
+Reproducible **8-framework HTTP/1.1 SSR & Web benchmark** (`darwin arm64`, `c = 8`, isolated OS processes, 16 XSS-escaped rows + CSRF inputs + strict Web CSP + JSON API, 0 errors) comparing compiled **YAZA v1.0.0 native `view` Arena-SSR (`-O2`)** against Go, Node.js, Fastify, Express, PHP, React 19 SSR, and Next.js 16 Production SSR:
 
-| Workload (`c = 8`) | Payload | YAZA Arena-SSR (`-O2`) | Go `1.27.3` (`html/template`) | Node.js `v26.0.0` |
-| :--- | :--- | :--- | :--- | :--- |
-| **Full SSR HTML (16 escaped rows + CSP)** | `3,980 B` | **`51,327 req/s`** (`138 µs` p50 · `257 µs` p95) | `40,626 req/s` (`163 µs` · `407 µs`) | `37,454 req/s` (`178 µs` · `397 µs`) |
-| **Hypermedia Fragment (`#task-board`)** | `3,706 B` | **`50,930 req/s`** (`139 µs` p50 · `271 µs` p95) | `37,385 req/s` (`176 µs` · `444 µs`) | `40,377 req/s` (`162 µs` · `345 µs`) |
-| **Static CSS Asset (`200 OK`)** | `8,878 B` | **`65,051 req/s`** (`98 µs` p50) | `58,531 req/s` (`134 µs`) | `61,730 req/s` (`100 µs`) |
-| **Static CSS Conditional (`304 ETag`)** | `0 B` | **`72,720 req/s`** (`109 µs` p50) | `72,224 req/s` (`110 µs`) | `68,563 req/s` (`87 µs`) |
-| **JSON API Parity (16 items)** | `1,813 B` | `39,837 req/s` (`178 µs` p50) | `56,962 req/s` (`125 µs`) | **`65,509 req/s`** (`106 µs`) |
-| **Peak RSS (30k live requests)** | — | **`2.83 MB`** (8 workers) | `21.38 MB` (`7.6×` RAM) | `68.08 MB` (`24.1×` RAM) |
-| **Standalone Binary Size** | — | **`208.4 KB`** (`302 KB` MVC starter) | `12.47 MB` (`60×` larger) | V8 Runtime |
+| Framework / Runtime (`c = 8`) | Full SSR HTML (p50 · p95) | Fragment (`#task-board`) | JSON API (16 items) | Peak RSS | Cold Start | Footprint |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **YAZA v1.0.0 Arena-SSR (`-O2`, native `view`)** | **`29,024 req/s`** (`167 µs` · `326 µs`) | **`37,990 req/s`** (`123 µs` · `246 µs`) | `33,437 req/s` (`138 µs`) | **`3.17 MB`** | **`31.8 ms`** | **`208.4 KB` binary** |
+| **Go `1.27.3` (`net/http` + `html/template`)** | `28,743 req/s` (`162 µs` · `464 µs`) | `27,991 req/s` (`173 µs` · `442 µs`) | `41,848 req/s` (`107 µs`) | `22.05 MB` (`7.0×`) | `614.1 ms` | `12.18 MB` binary |
+| **Node.js `v26.0.0` (raw `node:http`)** | `27,430 req/s` (`182 µs` · `414 µs`) | `28,733 req/s` (`178 µs` · `359 µs`) | `38,894 req/s` (`96 µs`) | `73.86 MB` (`23.3×`) | `113.6 ms` | V8 runtime |
+| **Fastify `5.12.8` (Node.js v26)** | `25,295 req/s` (`202 µs` · `450 µs`) | `25,772 req/s` (`199 µs` · `415 µs`) | `39,740 req/s` (`105 µs`) | `86.44 MB` (`27.3×`) | `163.6 ms` | Node + `node_modules` |
+| **Express `5.3.0` (Node.js v26)** | `22,553 req/s` (`238 µs` · `530 µs`) | `22,492 req/s` (`239 µs` · `487 µs`) | `36,257 req/s` (`118 µs`) | `77.81 MB` (`24.5×`) | `136.3 ms` | Node + `node_modules` |
+| **PHP `8.5.6` (built-in server)** | `12,001 req/s` (`435 µs` · `854 µs`) | `13,425 req/s` (`366 µs` · `785 µs`) | `14,502 req/s` (`338 µs`) | `29.47 MB` (`9.3×`) | `136.0 ms` | PHP 8.5 runtime |
+| **React `19.3.1` SSR (`renderToString`)** | `6,304 req/s` (`1,006 µs` · `2,075 µs`) | `6,953 req/s` (`913 µs` · `1,830 µs`) | **`45,394 req/s`** (`75 µs`) | `140.75 MB` (`44.4×`) | `107.4 ms` | Node + React 19 |
+| **Next.js `16.4.6` Production SSR (`next start`)** | `4,473 req/s` (`1,386 µs` · `2,711 µs`) | — | `10,693 req/s` (`439 µs`) | `212.30 MB` (`67.0×`) | `197.2 ms` | `365 MB` `node_modules` + `.next` |
 
-See [docs/benchmarks/fullstack-ssr-2026-11-19.md](docs/benchmarks/fullstack-ssr-2026-11-19.md) and [yazastudios.id/benchmarks](https://yazastudios.id/benchmarks/#fullstack-ssr) for full methodology and raw results.
+*Static asset delivery (`20,158 B` YAZA UI v1.0 CSS): YAZA **`63,268 req/s`** (`200 OK`) & **`82,539 req/s`** (`304 ETag`).*
+
+See [docs/benchmarks/fullstack-ssr-2026-11-19.md](docs/benchmarks/fullstack-ssr-2026-11-19.md), `scripts/bench-web-frameworks.mjs`, and [yazastudios.id/benchmarks](https://yazastudios.id/benchmarks/#fullstack-ssr) for full methodology and reproduction steps.
 
 ---
 
