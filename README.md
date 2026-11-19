@@ -5,8 +5,9 @@
 [![Build Matrix](https://img.shields.io/badge/Platforms-macOS%20%7C%20Linux%20%7C%20Windows-brightgreen.svg)](https://github.com/yazaprojectstudios/yaza-language/actions)
 [![Zero-GC](https://img.shields.io/badge/Memory-Zero--GC%20%28Scoped%20Arenas%29-mint.svg)](#memory-model-arena_scope)
 [![Benchmarks](https://img.shields.io/badge/HTTP%2F1.1-93%2C854%20req%2Fs%20%40%2078%C2%B5s-yellowgreen.svg)](#benchmarks)
+[![Arena-SSR](https://img.shields.io/badge/Arena--SSR%20MVC-51%2C327%20req%2Fs%20%40%202.83%20MB%20RSS-teal.svg)](#fullstack-web--mvc-arena-ssr-19-nov-2026)
 
-**YAZA** is a self-hosted systems programming language designed for high-concurrency, low-latency cloud backends. It compiles to native machine code via **LLVM 18**, eliminates garbage collection pauses using deterministic **Scoped Arenas (`arena_scope`)**, and ships with **YazaBase**, a built-in ACID B+Tree SQL storage engine.
+**YAZA** is a self-hosted systems programming language designed for high-concurrency cloud backends and single-binary fullstack web applications. It compiles to native machine code via **LLVM 18**, eliminates garbage collection pauses using deterministic **Scoped Arenas (`arena_scope`)**, and ships with **YazaBase**, a built-in ACID B+Tree SQL storage engine.
 
 ---
 
@@ -14,10 +15,11 @@
 
 - **Self-Hosted Compiler & Native LLVM Backend:** Generates optimized binaries for macOS (`arm64`, `x86_64`), Linux (`x86_64`, `aarch64`), and Windows (`x86_64 PE32+`).
 - **Zero-GC Scoped Arena Architecture:** Replaces global garbage collection with bounded `arena_scope` blocks. Allocate with $O(1)$ bump pointers, rewind memory in a single step upon request exit (1,000,000 scopes reclaimed in 521 ms, 1.56 MB Peak RSS).
+- **Single-Binary Fullstack MVC (`--mvc` / `--fullstack` & `--web`):** Built-in `std/web/*` stack (compiled type-safe HTML5 Arena-SSR views, Hypermedia Fragments via `X-Yaza-Fragment`, YAZA UI v1.0 design system, signed `HttpOnly` cookies, constant-time CSRF, strict Web CSP, and safe ETag static file serving) with compile-time layer boundary enforcement (`yaza arch check`).
 - **Embedded ACID SQL Engine (YazaBase):** Built-in B+Tree indexed storage with ARIES WAL recovery, parameterized query binding, non-reparse VFS path confinement, and zero external database dependencies.
 - **Pluggable Database Adapters:** Native wire-protocol clients for **PostgreSQL** (v3 + SCRAM-SHA-256), **MySQL** (v10 + caching_sha2_password), **MSSQL** (TDS), and **NoSQL** (Redis RESP / MongoDB BSON).
 - **Hardware-Aware API Resource Profiles:** Tune memory ceilings and concurrency per deployment target (`low_memory`, `balanced`, `throughput`) with Adaptive Query Budgeting (AQB) verified at boot.
-- **Enterprise-Grade Security (11/11 CI Safety Gates):** Compile-time borrow checker, AddressSanitizer reset poisoning, ThreadSanitizer concurrency isolation (0 data races across 200k scopes on 8 workers), and constant-time HMAC-SHA256 JWT/YWT authentication.
+- **Enterprise-Grade Security (11/11 CI Safety Gates):** Compile-time borrow checker, AddressSanitizer reset poisoning, ThreadSanitizer concurrency isolation (0 data races across 200k scopes on 8 workers), static web XSS/CSP audit (`yaza audit --security`), and constant-time HMAC-SHA256 JWT/YWT + Argon2id authentication.
 
 ---
 
@@ -88,6 +90,33 @@ yaza build --release hello.yz -o hello
 ## Project Starters & CLI Tooling
 
 YAZA provides production-ready project generators that scaffold clean architectures with full test coverage, Dockerfiles, and API specifications.
+
+### Fullstack MVC Monolith Starter (`--mvc` / `--fullstack`)
+Generates a single-binary **Arena-SSR MVC** monolith (RFC 0009) combining frontend and backend in one YAZA project: **YAZA UI v1.0** landing page (`GET /`) + interactive workspace dashboard (`/dashboard`), live **Hypermedia Fragments** (`X-Yaza-Fragment`), embedded YazaBase ACID SQL CRUD, Argon2id login with signed `HttpOnly` session cookies, constant-time CSRF protection, strict Web CSP (`style-src 'self'; script-src 'self'`), and JSON API parity (`/api/v1/tasks`):
+
+```sh
+yaza new --mvc my_app
+cd my_app
+
+# Provision local YazaBase credentials
+mkdir -p data
+yaza db set-user ./data admin 'AdminPass_2026_Secure'
+export YAZABASE_USER=admin
+export YAZABASE_PASSWORD='AdminPass_2026_Secure'
+export YAZA_AUTH_SECRET="$(yaza secret token)"
+
+# Enforce MVC layer boundaries, security CSP/XSS rules, and build
+yaza arch check
+yaza audit --security
+yaza check
+yaza build --release src/main.yz -o my_app
+YAZA_SELF_TEST=1 ./my_app
+
+# Start live Fullstack MVC server on http://127.0.0.1:8080
+./my_app
+```
+
+For a lightweight SSR web site without a database layer, use `yaza new --web my_site`.
 
 ### REST API Starter (`--api`)
 Generates a layered architecture with route controllers, YazaBase SQL CRUD, JWT/RBAC middleware, and HTTP/1.1 keep-alive multi-worker loop:
@@ -244,7 +273,21 @@ Independent loopback benchmarks conducted on **18 November 2026** (macOS arm64, 
 
 *Deterministic reclaim verification: 1,000,000 request scopes (`10 × 256 B`) reclaimed in **521.00 ms** at **1.59 MB** RSS.*
 
-Full raw benchmark datasets and reproduction steps are available at [yazastudios.id/benchmarks](https://yazastudios.id/benchmarks/).
+### Fullstack Web & MVC (Arena-SSR, 19 Nov 2026)
+
+Three-runtime HTTP/1.1 loopback benchmark (`darwin arm64`, `c = 8`, 2,000 requests × 3 rounds = 30,000 measured requests per runtime, 0 errors, exact HTML5/Fragment/CSS/CSP/JSON payload parity) comparing compiled **YAZA Arena-SSR (`std/web/*`, `-O2`)** against **Go `1.27.3` (`net/http` + `html/template`)** and **Node.js `v26.0.0`**:
+
+| Workload (`c = 8`) | Payload | YAZA Arena-SSR (`-O2`) | Go `1.27.3` (`html/template`) | Node.js `v26.0.0` |
+| :--- | :--- | :--- | :--- | :--- |
+| **Full SSR HTML (16 escaped rows + CSP)** | `3,980 B` | **`51,327 req/s`** (`138 µs` p50 · `257 µs` p95) | `40,626 req/s` (`163 µs` · `407 µs`) | `37,454 req/s` (`178 µs` · `397 µs`) |
+| **Hypermedia Fragment (`#task-board`)** | `3,706 B` | **`50,930 req/s`** (`139 µs` p50 · `271 µs` p95) | `37,385 req/s` (`176 µs` · `444 µs`) | `40,377 req/s` (`162 µs` · `345 µs`) |
+| **Static CSS Asset (`200 OK`)** | `8,878 B` | **`65,051 req/s`** (`98 µs` p50) | `58,531 req/s` (`134 µs`) | `61,730 req/s` (`100 µs`) |
+| **Static CSS Conditional (`304 ETag`)** | `0 B` | **`72,720 req/s`** (`109 µs` p50) | `72,224 req/s` (`110 µs`) | `68,563 req/s` (`87 µs`) |
+| **JSON API Parity (16 items)** | `1,813 B` | `39,837 req/s` (`178 µs` p50) | `56,962 req/s` (`125 µs`) | **`65,509 req/s`** (`106 µs`) |
+| **Peak RSS (30k live requests)** | — | **`2.83 MB`** (8 workers) | `21.38 MB` (`7.6×` RAM) | `68.08 MB` (`24.1×` RAM) |
+| **Standalone Binary Size** | — | **`208.4 KB`** (`302 KB` MVC starter) | `12.47 MB` (`60×` larger) | V8 Runtime |
+
+See [docs/benchmarks/fullstack-ssr-2026-11-19.md](docs/benchmarks/fullstack-ssr-2026-11-19.md) and [yazastudios.id/benchmarks](https://yazastudios.id/benchmarks/#fullstack-ssr) for full methodology and raw results.
 
 ---
 

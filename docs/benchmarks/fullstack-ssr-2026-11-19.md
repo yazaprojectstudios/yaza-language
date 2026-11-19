@@ -24,7 +24,7 @@ Reproducible multi-runtime MVC/Web HTTP/1.1 benchmark comparing **YAZA Fullstack
 
 | Metric | YAZA Arena-SSR (`-O2`) | Go `1.27.3` (`html/template`) | Node.js `v26.0.0` |
 | :--- | :--- | :--- | :--- |
-| **Standalone Binary** | **`208.4 KB`** (`283 KB` full MVC starter) | `12.47 MB` (`60×` larger) | V8 Runtime |
+| **Standalone Binary** | **`208.4 KB`** (`302 KB` full MVC starter) | `12.47 MB` (`60×` larger) | V8 Runtime |
 | **Peak RSS (30k live reqs)** | **`2.83 MB`** (8 concurrent workers) | `21.38 MB` (`7.6×` more RAM) | `68.08 MB` (`24.1×` more RAM) |
 
 ---
