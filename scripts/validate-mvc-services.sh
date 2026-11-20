@@ -35,11 +35,18 @@ YAZA_WEB_ADMIN_USER=admin YAZA_WEB_ADMIN_PASSWORD=WebAdminPass_2026_Secure ./adm
 ./migrate down
 ./migrate up
 "$YAZA_BIN" build --release src/mail_worker.yz -o mail-worker
+"$YAZA_BIN" build --release src/job_worker.yz -o job-worker
 "$YAZA_BIN" build --release src/main.yz -o app
 YAZA_SELF_TEST=1 ./app
 cp "$PROJECT_DIR/tests/mvc-services-smoke.yz" src/mvc_services_smoke.yz
 "$YAZA_BIN" build --release src/mvc_services_smoke.yz -o mvc-services-smoke
 ./mvc-services-smoke
+mkdir -p data/job_files
+printf 'abc' > data/job_files/input.txt
+chmod 600 data/job_files/input.txt
+cp "$PROJECT_DIR/tests/mvc-background-job-smoke.yz" src/mvc_background_job_smoke.yz
+"$YAZA_BIN" build --release src/mvc_background_job_smoke.yz -o mvc-background-job-smoke
+./mvc-background-job-smoke
 cp "$PROJECT_DIR/tests/mvc-trace-smoke.yz" src/mvc_trace_smoke.yz
 "$YAZA_BIN" build --release src/mvc_trace_smoke.yz -o mvc-trace-smoke
 YAZA_TRACE_REQUESTS=1 ./mvc-trace-smoke > "$WORK_DIR/trace.log"

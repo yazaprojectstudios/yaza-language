@@ -1,0 +1,40 @@
+use "models/background_job_repository"
+use "jobs/handlers"
+use "std/fs"
+
+fn background_worker_run() -> Result[Boolean, Text]:
+    let conn: YazaBaseConnection = background_job_connect()?
+    let root: Number = root_open(conn.db_dir)?
+    defer background_job_close(root)
+    let lock: Number = lock_exclusive(root, ".background_worker.lock")?
+    defer background_job_close(lock)
+    let _recovered: Boolean = background_job_recover_inflight(conn)?
+    while true:
+        var fatal: Boolean = false
+        arena_scope 4194304:
+            let picked: Result[Option[BackgroundJob], Text] = background_job_claim(conn)
+            if not result_is_ok(picked):
+                say "background worker claim: " + result_unwrap_error(picked)
+                set fatal = true
+            elif option_is_some(result_unwrap(picked)):
+                let job: BackgroundJob = option_unwrap(result_unwrap(picked))
+                let outcome: Result[Text, Text] = background_job_handle(job)
+                if result_is_ok(outcome):
+                    let completed: Result[Boolean, Text] = background_job_complete(conn, job, result_unwrap(outcome))
+                    if not result_is_ok(completed):
+                        say "background worker complete: " + result_unwrap_error(completed)
+                        set fatal = true
+                else:
+                    let retried: Result[Boolean, Text] = background_job_retry(conn, job, result_unwrap_error(outcome))
+                    if not result_is_ok(retried):
+                        say "background worker retry: " + result_unwrap_error(retried)
+                        set fatal = true
+        if fatal: return err("background worker database operation failed")
+        let _slept: Boolean = sleep_ms(250)
+    return ok(true)
+
+start:
+    let outcome: Result[Boolean, Text] = background_worker_run()
+    if not result_is_ok(outcome):
+        say "background worker: " + result_unwrap_error(outcome)
+        exit(1)

@@ -63,7 +63,8 @@ yaza build --release src/migrate.yz -o migrate
 
 `./migrate down` rolls back the latest applied migration. The bundled first
 migration creates `mail_jobs`; the second stores one-time account action tokens;
-the third records admin email verification.
+the third records admin email verification; the fourth creates the general
+`background_jobs` queue.
 A rollback can delete queued messages or active reset links, so only
 run it after reviewing the data. YazaBase currently commits each SQL
 statement separately; migration metadata is marked `pending` or
@@ -131,6 +132,37 @@ The worker currently polls every 250 ms and uses one YazaBase CLI subprocess
 per SQL statement. `mail_service_send` remains available for synchronous
 tools. An SMTP success means the relay accepted the message, not that the
 recipient received it.
+
+## General background jobs
+
+`src/models/background_job_repository.yz` provides a durable queue for
+non-email work. `src/jobs/handlers.yz` is the explicit handler registry; add
+application job kinds there. The template includes `echo` for a basic smoke
+test and `sha256_file` as a bounded file-processing example. The latter reads
+one child file (maximum 1 MiB) from `data/job_files/` through a confined VFS
+root and stores its SHA-256 digest in `background_jobs.result_text`. The VFS
+requires each input file to be owned by the service user and private
+(`chmod 600 data/job_files/<name>`).
+
+```sh
+mkdir -p data/job_files
+yaza build --release src/job_worker.yz -o job-worker
+./job-worker
+```
+
+```yaza
+use "models/background_job_repository"
+
+fn queue_file_digest(name: Text) -> Result[Number, Text]:
+    return background_job_enqueue("sha256_file", name)
+```
+
+The worker runs outside the request path, holds a single-worker file lock,
+recovers interrupted claims, and retries failed jobs up to five times with
+backoff. It offers at-least-once execution; a crash after a handler's external
+side effect and before the `done` update may repeat that side effect. Make
+application handlers idempotent. Job kinds are fixed strings and payloads are
+data, never executable code or shell commands.
 
 ## Metrics and account security
 

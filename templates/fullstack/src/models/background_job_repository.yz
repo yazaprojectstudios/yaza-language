@@ -1,0 +1,114 @@
+use "std/db/yazabase"
+use "std/db/migrations"
+use "std/csv"
+use "std/time"
+use "../migrations/registry"
+use "task_repository"
+
+shape BackgroundJob:
+    id: Number
+    kind: Text
+    payload: Text
+    attempts: Number
+
+fn background_job_connect() -> Result[YazaBaseConnection, Text]:
+    let conn: YazaBaseConnection = yazabase_connect_default(task_db_dir(), "monolith")?
+    let _applied: Number = db_migration_apply_all(conn, app_migrations())?
+    return ok(conn)
+
+fn background_job_kind_valid(kind: Text) -> Boolean:
+    let size: Number = text_length(kind)
+    if size < 1 or size > 64: return false
+    var index: Number = 0
+    while index < size:
+        let ch: Number = text_byte(kind, index)
+        if not ((ch >= 65 and ch <= 90) or (ch >= 97 and ch <= 122) or (ch >= 48 and ch <= 57) or ch == 95): return false
+        set index = index + 1
+    return true
+
+fn background_job_next_id() -> Result[Number, Text]:
+    let random: Bytes = secure_random_bytes_try(4)?
+    let suffix: Number = (bytes_get(random, 0) * 16777216 + bytes_get(random, 1) * 65536 + bytes_get(random, 2) * 256 + bytes_get(random, 3)) % 1000000
+    return ok(time_now_unix_ms() * 1000000 + suffix)
+
+fn background_job_enqueue(kind: Text, payload: Text) -> Result[Number, Text]:
+    if not background_job_kind_valid(kind): return err("background job kind is invalid")
+    if text_length(payload) > 16384: return err("background job payload exceeds 16 KiB")
+    let conn: YazaBaseConnection = background_job_connect()?
+    var attempt: Number = 0
+    while attempt < 5:
+        let id: Number = background_job_next_id()?
+        let p: TextList = text_list()
+        list_push(p, "bigint:" + number_text(id))
+        list_push(p, "text:" + kind)
+        list_push(p, "text:" + payload)
+        list_push(p, "text:queued")
+        list_push(p, "bigint:0")
+        list_push(p, "bigint:" + number_text(time_now_unix_ms()))
+        list_push(p, "text:")
+        list_push(p, "text:")
+        let inserted: Result[Text, Text] = yazabase_exec_params(conn, "INSERT INTO background_jobs (id, kind, payload, status, attempts, next_attempt_ms, result_text, last_error) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)", p)
+        if result_is_ok(inserted): return ok(id)
+        if text_find(result_unwrap_error(inserted), "duplicate") < 0 and text_find(result_unwrap_error(inserted), "clustered key") < 0:
+            return err(result_unwrap_error(inserted))
+        set attempt = attempt + 1
+    return err("could not allocate a unique background job id")
+
+fn background_job_parse_first(csv_text: Text) -> Result[Option[BackgroundJob], Text]:
+    let raw: Bytes = bytes_try_from_text(csv_text)?
+    if bytes_length(raw) == 0: return ok(none)
+    let header: Option[CsvRecord] = csv_read_record(raw, 0)?
+    if not option_is_some(header): return ok(none)
+    let row: Option[CsvRecord] = csv_read_record(raw, option_unwrap(header).next_offset)?
+    if not option_is_some(row): return ok(none)
+    let fields: TextList = option_unwrap(row).fields
+    if list_count(fields) != 4: return err("background job row is malformed")
+    let id: Number = number_try_parse(list_get(fields, 0))?
+    let attempts: Number = number_try_parse(list_get(fields, 3))?
+    return ok(some(BackgroundJob(id, list_get(fields, 1), list_get(fields, 2), attempts)))
+
+fn background_job_claim(conn: YazaBaseConnection) -> Result[Option[BackgroundJob], Text]:
+    let p: TextList = text_list()
+    list_push(p, "bigint:" + number_text(time_now_unix_ms()))
+    let csv: Text = yazabase_query_csv(conn, "SELECT id, kind, payload, attempts FROM background_jobs WHERE status = 'queued' AND next_attempt_ms <= $1 ORDER BY id LIMIT 1", p)?
+    let job: Option[BackgroundJob] = background_job_parse_first(csv)?
+    if not option_is_some(job): return ok(none)
+    let picked: BackgroundJob = option_unwrap(job)
+    let mark: TextList = text_list()
+    list_push(mark, "text:sending")
+    list_push(mark, "bigint:" + number_text(picked.id))
+    let _updated: Text = yazabase_exec_params(conn, "UPDATE background_jobs SET status = $1 WHERE id = $2", mark)?
+    return ok(some(picked))
+
+fn background_job_recover_inflight(conn: YazaBaseConnection) -> Result[Boolean, Text]:
+    let p: TextList = text_list()
+    let _updated: Text = yazabase_exec_params(conn, "UPDATE background_jobs SET status = 'queued' WHERE status = 'sending'", p)?
+    return ok(true)
+
+fn background_job_complete(conn: YazaBaseConnection, job: BackgroundJob, result_text: Text) -> Result[Boolean, Text]:
+    if text_length(result_text) > 16384: return err("background job result exceeds 16 KiB")
+    let p: TextList = text_list()
+    list_push(p, "text:" + result_text)
+    list_push(p, "bigint:" + number_text(job.id))
+    let _updated: Text = yazabase_exec_params(conn, "UPDATE background_jobs SET status = 'done', result_text = $1, last_error = '' WHERE id = $2", p)?
+    return ok(true)
+
+fn background_job_retry(conn: YazaBaseConnection, job: BackgroundJob, error_text: Text) -> Result[Boolean, Text]:
+    let next_attempt: Number = job.attempts + 1
+    var status: Text = "queued"
+    if next_attempt >= 5: set status = "failed"
+    var delay_ms: Number = 1000
+    var i: Number = 1
+    while i < next_attempt:
+        set delay_ms = delay_ms * 2
+        set i = i + 1
+    var safe_error: Text = error_text
+    if text_length(safe_error) > 512: set safe_error = text_try_slice(safe_error, 0, 512)?
+    let p: TextList = text_list()
+    list_push(p, "text:" + status)
+    list_push(p, "bigint:" + number_text(next_attempt))
+    list_push(p, "bigint:" + number_text(time_now_unix_ms() + delay_ms))
+    list_push(p, "text:" + safe_error)
+    list_push(p, "bigint:" + number_text(job.id))
+    let _updated: Text = yazabase_exec_params(conn, "UPDATE background_jobs SET status = $1, attempts = $2, next_attempt_ms = $3, last_error = $4 WHERE id = $5", p)?
+    return ok(true)

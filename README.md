@@ -135,7 +135,8 @@ YAZA_SELF_TEST=1 ./my_app
 ```
 
 The MVC template also includes a certificate-verified HTTPS client,
-Google/Brevo or local-relay SMTP, a YazaBase-backed mail outbox and worker,
+Google/Brevo or local-relay SMTP, a YazaBase-backed mail outbox and general
+background-job worker,
 versioned migrations, latency metrics, login throttling, and single-admin
 password reset/email verification. Configure `YAZA_MAIL_PROVIDER` and related
 secrets as described in the generated project's `README.md`. Run the worker
