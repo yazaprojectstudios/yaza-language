@@ -67,6 +67,8 @@ if [ -f "$PROJECT_ROOT/runtime/src/yaza_runtime_v1.c" ]; then
     install -m 644 "$PROJECT_ROOT/runtime/src/yaza_security_login_v1.inc" "$PAYLOAD/usr/local/share/yaza/runtime/src/yaza_security_login_v1.inc"
 fi
 
+install -m 644 "$PROJECT_ROOT/runtime/watch-run.sh" "$PAYLOAD/usr/local/share/yaza/runtime/watch-run.sh"
+
 if [ -d "$PROJECT_ROOT/std" ]; then
     cp -R -X "$PROJECT_ROOT/std/." "$PAYLOAD/usr/local/share/yaza/std/"
 fi

@@ -15,6 +15,7 @@ shape ApiResourcesConfig:
     request_arena_ceiling: Number
     max_in_flight: Number
     max_query_work_units: Number
+    worker_threads: Number
     profile_source: Text
     arena_mode_source: Text
     process_limit_source: Text
@@ -23,6 +24,7 @@ shape ApiResourcesConfig:
     request_ceiling_source: Text
     max_in_flight_source: Text
     work_units_source: Text
+    worker_threads_source: Text
 
 shape ApiServiceConfig:
     service_name: Text
@@ -110,12 +112,19 @@ fn api_config_format_bytes(bytes_count: Number) -> Text:
     return number_text(bytes_count) + " B"
 
 fn api_resources_default_for_profile(profile_name: Text) -> Result[ApiResourcesConfig, Text]:
+    var detected: Number = processor_count()
+    if detected < 1: set detected = 1
+    if detected > 128: set detected = 128
     if profile_name == "balanced":
-        return ok(ApiResourcesConfig("balanced", "adaptive", 536870912, 1048576, 262144, 67108864, 32, 100000000, "default", "profile_default", "profile_default", "profile_default", "profile_default", "profile_default", "profile_default", "profile_default"))
+        var workers: Number = detected
+        if workers > 32: set workers = 32
+        return ok(ApiResourcesConfig("balanced", "adaptive", 536870912, 1048576, 262144, 67108864, 32, 100000000, workers, "default", "profile_default", "profile_default", "profile_default", "profile_default", "profile_default", "profile_default", "profile_default", "hardware_auto"))
     if profile_name == "throughput":
-        return ok(ApiResourcesConfig("throughput", "adaptive", 2147483648, 4194304, 1048576, 268435456, 128, 500000000, "explicit", "profile_default", "profile_default", "profile_default", "profile_default", "profile_default", "profile_default", "profile_default"))
+        return ok(ApiResourcesConfig("throughput", "adaptive", 2147483648, 4194304, 1048576, 268435456, 128, 500000000, detected, "explicit", "profile_default", "profile_default", "profile_default", "profile_default", "profile_default", "profile_default", "profile_default", "hardware_auto"))
     if profile_name == "low_memory":
-        return ok(ApiResourcesConfig("low_memory", "fixed", 134217728, 262144, 65536, 8388608, 8, 10000000, "explicit", "profile_default", "profile_default", "profile_default", "profile_default", "profile_default", "profile_default", "profile_default"))
+        var workers: Number = detected
+        if workers > 8: set workers = 8
+        return ok(ApiResourcesConfig("low_memory", "fixed", 134217728, 262144, 65536, 8388608, 8, 10000000, workers, "explicit", "profile_default", "profile_default", "profile_default", "profile_default", "profile_default", "profile_default", "profile_default", "hardware_auto"))
     return err("unknown resource profile '" + profile_name + "'; must be 'balanced', 'throughput', or 'low_memory'")
 
 fn api_resources_validate_invariants(res: ApiResourcesConfig) -> Result[Boolean, Text]:
@@ -135,6 +144,8 @@ fn api_resources_validate_invariants(res: ApiResourcesConfig) -> Result[Boolean,
         return err("max_in_flight must be at least 1, got " + number_text(res.max_in_flight))
     if res.max_query_work_units < 1:
         return err("max_query_work_units must be at least 1, got " + number_text(res.max_query_work_units))
+    if res.worker_threads < 1 or res.worker_threads > res.max_in_flight:
+        return err("workers must be between 1 and max_in_flight")
     return ok(true)
 
 fn api_config_parse_string_list(raw: Text) -> TextList:
@@ -193,6 +204,8 @@ fn api_config_parse(toml_content: Text) -> Result[ApiServiceConfig, Text]:
     var ov_max_in_flight: Number = 0
     var has_work_units: Boolean = false
     var ov_work_units: Number = 0
+    var has_worker_override: Boolean = false
+    var ov_worker_threads: Number = 0
 
     let lines: TextList = text_lines(toml_content)
     var line_idx: Number = 0
@@ -288,7 +301,15 @@ fn api_config_parse(toml_content: Text) -> Result[ApiServiceConfig, Text]:
                             if not result_is_ok(n_res): return err("invalid max_query_work_units: " + val_str)
                             set has_work_units = true
                             set ov_work_units = result_unwrap(n_res)
-                        elif key == "workers" or key == "worker_threads" or key == "event_loop" or key == "io_vectorization":
+                        elif key == "workers" or key == "worker_threads":
+                            if val_str == "auto":
+                                set has_worker_override = false
+                            else:
+                                let n_res: Result[Number, Text] = number_try_parse(val_str)
+                                if not result_is_ok(n_res): return err("invalid workers: expected 'auto' or a positive integer")
+                                set has_worker_override = true
+                                set ov_worker_threads = result_unwrap(n_res)
+                        elif key == "event_loop" or key == "io_vectorization":
                             let _accepted_runtime_hint: Text = val_str
                         else:
                             return err("unknown resource setting '" + key + "' in [api.resources]")
@@ -322,6 +343,11 @@ fn api_config_parse(toml_content: Text) -> Result[ApiServiceConfig, Text]:
     if has_work_units:
         set base_res.max_query_work_units = ov_work_units
         set base_res.work_units_source = "explicit"
+    if base_res.worker_threads > base_res.max_in_flight:
+        set base_res.worker_threads = base_res.max_in_flight
+    if has_worker_override:
+        set base_res.worker_threads = ov_worker_threads
+        set base_res.worker_threads_source = "explicit"
 
     # Validate all invariants
     let inv_res: Result[Boolean, Text] = api_resources_validate_invariants(base_res)
@@ -352,6 +378,7 @@ fn api_config_format_diagnostics(config: ApiServiceConfig) -> Text:
     set out = out + "  Request Arena Ceiling   : " + number_text(r.request_arena_ceiling) + " bytes (" + api_config_format_bytes(r.request_arena_ceiling) + ") [" + r.request_ceiling_source + "]\n"
     set out = out + "  Max Concurrency (Slots) : " + number_text(r.max_in_flight) + " in-flight [" + r.max_in_flight_source + "]\n"
     set out = out + "  Max Query Work Units    : " + number_text(r.max_query_work_units) + " units [" + r.work_units_source + "]\n"
+    set out = out + "  Worker Threads          : " + number_text(r.worker_threads) + " [" + r.worker_threads_source + "]\n"
     set out = out + "  Invariant Verification  : PASS (floor <= initial <= ceiling <= process_limit)"
     return out
 
@@ -396,6 +423,8 @@ fn api_config_to_json(config: ApiServiceConfig) -> Text:
     set out = out + "\"max_in_flight_source\":\"" + json_escape_text(r.max_in_flight_source) + "\","
     set out = out + "\"max_query_work_units\":" + number_text(r.max_query_work_units) + ","
     set out = out + "\"work_units_source\":\"" + json_escape_text(r.work_units_source) + "\","
+    set out = out + "\"worker_threads\":" + number_text(r.worker_threads) + ","
+    set out = out + "\"worker_threads_source\":\"" + json_escape_text(r.worker_threads_source) + "\","
     set out = out + "\"invariants_valid\":true"
     set out = out + "}"
     set out = out + "}"

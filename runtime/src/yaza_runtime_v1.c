@@ -7495,6 +7495,8 @@ int64_t yaza_rt_v1_process(const YazaTextV1 *command, void *typed_text_list) {
         total_bytes += argument->length;
         arguments[index + 1] = (char *)argument->data;
     }
+    /* Keep parent status lines visible and ordered before child output. */
+    (void)fflush(stdout);
 #if defined(_WIN32)
     char *cmdline = NULL;
     size_t cmdlen = 0;

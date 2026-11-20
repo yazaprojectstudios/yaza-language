@@ -19,7 +19,7 @@
 - **Zero-GC Data Science, Statistical Computing, ML & Visualization (`std/data/*`):** Built-in R/Python alternative combining Neumaier (1974) compensated summation, Welford 1-pass moments, partial-pivoting Gaussian matrix linear algebra, Columnar Arena DataFrame (`df_from_csv`, `df_fillna_mean`, `df_inner_join`, `df_groupby_agg`, `df_to_html_table`), 30+ parametric/non-parametric/Bayesian statistical methods, ML (`ml_ols_fit`, `ml_multiple_ols_fit`, `ml_logistic_fit`, `ml_pca_first_component`, `ml_knn_classify`, `ml_kmeans_1d`, `ml_roc_auc`), **18 zero-JS Frontend SVG chart types**, and **6 Terminal CLI chart types**.
 - **Embedded ACID SQL Engine (YazaBase):** Built-in B+Tree indexed storage with ARIES WAL recovery, parameterized query binding, non-reparse VFS path confinement, and zero external database dependencies.
 - **Pluggable Database Adapters:** Native wire-protocol clients for **PostgreSQL** (v3 + SCRAM-SHA-256), **MySQL** (v10 + caching_sha2_password), **MSSQL** (TDS), and **NoSQL** (Redis RESP / MongoDB BSON).
-- **Hardware-Aware API Resource Profiles:** Tune memory ceilings and concurrency per deployment target (`low_memory`, `balanced`, `throughput`) with Adaptive Query Budgeting (AQB) verified at boot.
+- **API Resource Profiles:** `low_memory`, `balanced`, and `throughput` validate resource settings; the fullstack server applies request concurrency and CPU-aware worker counts. Arena budget values are not wired to its allocator yet.
 - **Enterprise-Grade Security (11/11 CI Safety Gates):** Compile-time borrow checker, AddressSanitizer reset poisoning, ThreadSanitizer concurrency isolation (0 data races across 200k scopes on 8 workers), static web XSS/CSP audit (`yaza audit --security`), and constant-time HMAC-SHA256 JWT/YWT + Argon2id authentication.
 
 ---
@@ -166,6 +166,9 @@ YAZA_SELF_TEST=1 ./store_api
 
 # Start live HTTP server on http://127.0.0.1:8080
 yaza run
+
+# During development, rebuild and restart when .yz or yaza.toml changes
+yaza run --watch
 ```
 
 ### Cloud-Native Microservice Starter (`--microservice`)
@@ -214,33 +217,38 @@ arena_scope 1048576:
 
 ## Hardware-Aware Resource Profiles (`yaza.toml`)
 
-Configure operational memory budgets and Adaptive Query Budgeting (AQB) directly in `yaza.toml` without modifying source code:
+The fullstack template reads `yaza.toml`. The current server applies
+`max_in_flight` and `workers`; it parses and validates the arena budget fields
+but does not apply them to allocation yet. `yaza config` shows parsed values.
 
 ```toml
 [api.resources]
 # Built-in profiles: "low_memory" | "balanced" (default) | "throughput"
 profile = "balanced"
-arena_mode = "adaptive"
-process_arena_limit = "512MiB"
-request_arena_floor = "256KiB"
-request_arena_initial = "1MiB"
-request_arena_ceiling = "64MiB"
-max_in_flight = 32
-max_query_work_units = 100000000
+# workers = "auto"            # available CPUs, capped by max_in_flight
+# max_in_flight = 32
+# arena_mode = "adaptive"     # parsed, not yet applied by this server
+# process_arena_limit = "512MiB"
+# request_arena_floor = "256KiB"
+# request_arena_initial = "1MiB"
+# request_arena_ceiling = "64MiB"
+# max_query_work_units = 100000000
 ```
 
 | Parameter | `low_memory` (Fixed) | `balanced` (Adaptive, Default) | `throughput` (Adaptive) | Purpose |
 | :--- | :--- | :--- | :--- | :--- |
-| **Process Cap** | `128 MiB` | `512 MiB` | `2 GiB` | Hard upper memory limit for the process |
-| **Req Arena Initial**| `256 KiB` | `1 MiB` | `4 MiB` | Initial allocation slab for each request |
-| **Req Arena Floor**  | `64 KiB`  | `256 KiB`| `1 MiB` | Minimum slab retention floor |
-| **Req Arena Ceiling**| `8 MiB`   | `64 MiB` | `256 MiB` | Maximum burst allocation per request |
+| **Process Cap** | `128 MiB` | `512 MiB` | `2 GiB` | Parsed profile value; not yet enforced by fullstack |
+| **Req Arena Initial**| `256 KiB` | `1 MiB` | `4 MiB` | Parsed profile value; not yet applied by fullstack |
+| **Req Arena Floor**  | `64 KiB`  | `256 KiB`| `1 MiB` | Parsed profile value; not yet applied by fullstack |
+| **Req Arena Ceiling**| `8 MiB`   | `64 MiB` | `256 MiB` | Parsed profile value; not yet applied by fullstack |
 | **Max In-Flight**    | `8`       | `32`     | `128` | Concurrency slots before atomic HTTP 503 load-shedding |
 | **Target Workload**  | Edge, IoT, Micro-VMs | Production REST APIs, K8s Pods | High-QPS Analytics, Burst Services |
 
-At startup, YAZA proves the invariant:
+The parser checks the invariant:
 $$\text{floor} \le \text{initial} \le \text{ceiling} \le \text{process\_arena\_limit}$$
-Invalid configurations fail immediately during boot with clear operator diagnostics.
+The fullstack starter fails startup on invalid configurations. For an actual
+process arena hard cap, the current runtime reads
+`YAZA_RT_V1_PROCESS_LIMIT_BYTES` from its environment.
 
 ---
 

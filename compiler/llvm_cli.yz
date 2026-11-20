@@ -487,12 +487,8 @@ fn create_project(project_name: Text, template_name: Text) -> Number:
         fail("yaza new: project name must start with a letter and use letters, numbers, hyphens, or underscores; maximum 64 characters")
     var template_root: Text = "templates"
     if not is_directory(template_root):
-        let executable: Text = arg(0)
-        var separator: Number = text_length(executable)
-        while separator > 0 and text_byte(executable, separator - 1) != 47:
-            set separator = separator - 1
-        if separator > 0:
-            let executable_dir: Text = text_slice(executable, 0, separator - 1)
+        let executable_dir: Text = yaza_executable_dir()
+        if executable_dir != "":
             if is_directory(executable_dir + "/../templates"): set template_root = executable_dir + "/../templates"
             if is_directory(executable_dir + "/../share/yaza/templates"): set template_root = executable_dir + "/../share/yaza/templates"
     if not is_directory(template_root):
@@ -941,6 +937,7 @@ fn config_from_arguments() -> Number:
 fn run_from_arguments() -> Number:
     var source_path: Text = ""
     var optimization: Text = "-O0"
+    var watch: Boolean = false
     var first_program_argument: Number = 2
     var argument_index: Number = 2
     var source_selected: Boolean = false
@@ -955,15 +952,18 @@ fn run_from_arguments() -> Number:
                 set optimization = "-O2"
                 set argument_index = argument_index + 1
             else:
-                if current_argument == "--port":
+                if current_argument == "--watch":
+                    set watch = true
+                    set argument_index = argument_index + 1
+                elif current_argument == "--port":
                     if argument_index + 1 > arg_count():
-                        fail("Usage: yaza run [--port <1-65535>] [file.yz] [-- args]")
+                        fail("Usage: yaza run [--watch] [--port <1-65535>] [file.yz] [-- args]")
                     let port_value: Text = arg(argument_index + 1)
                     yaza_env_set_var("YAZA_PORT", port_value)
                     set argument_index = argument_index + 2
                 else:
                     if text_starts_with(current_argument, "-"):
-                        fail("Usage: yaza run [--port <1-65535>] [file.yz] [-- args]")
+                        fail("Usage: yaza run [--watch] [--port <1-65535>] [file.yz] [-- args]")
                     set source_path = current_argument
                     set first_program_argument = argument_index + 1
                     set source_selected = true
@@ -971,17 +971,46 @@ fn run_from_arguments() -> Number:
         set source_path = resolve_project_entrypoint()
         if not separator_found:
             set first_program_argument = argument_index
+    let show_progress: Boolean = not source_selected
     let arguments: TextList = text_list()
     var arg_idx: Number = first_program_argument
     while arg_idx <= arg_count():
         list_push(arguments, arg(arg_idx))
         set arg_idx = arg_idx + 1
+    if watch:
+        if yaza_host_is_windows(): fail("yaza run --watch currently requires macOS or Linux")
+        let watch_script: Text = core_llvm_runtime_root() + "/watch-run.sh"
+        if not file_exists(watch_script): fail("yaza run --watch: watcher script missing from runtime package")
+        let watch_args: TextList = text_list()
+        list_push(watch_args, watch_script)
+        list_push(watch_args, executable_path())
+        list_push(watch_args, source_path)
+        list_push(watch_args, optimization)
+        var watch_arg_idx: Number = 0
+        while watch_arg_idx < list_count(arguments):
+            list_push(watch_args, list_get(arguments, watch_arg_idx))
+            set watch_arg_idx = watch_arg_idx + 1
+        return process("sh", watch_args)
     var nonce: Number = monotonic_ms()
     var output_path: Text = yaza_temp_program_path("yaza-run-", nonce)
     while file_exists(output_path):
         set nonce = nonce + 1
         set output_path = yaza_temp_program_path("yaza-run-", nonce)
+    let build_started_ms: Number = monotonic_ms()
+    if show_progress:
+        say ""
+        say "YAZA Runner"
+        say "  Source : " + source_path
+        if optimization == "-O2":
+            say "  Build  : release (-O2)"
+        else:
+            say "  Build  : development (-O0)"
+        say "  Status : compiling..."
     build_core_program_ex(source_path, output_path, optimization, "", false)
+    if show_progress:
+        say "  Ready  : " + number_text(monotonic_ms() - build_started_ms) + " ms"
+        say "  Status : running"
+        say ""
     let exit_status: Number = process(output_path, arguments)
     remove_core_build_artifacts(output_path)
     if file_exists(output_path): file_remove(output_path)
@@ -1713,13 +1742,13 @@ fn print_yaza_llvm_help() -> Number:
     say "  new --mobile <name>      Create mobile starter layout"
     say ""
     say "DEVELOPMENT"
-    say "  run [--release] [--port <port>] [file.yz] [-- args...]  Build and run"
+    say "  run [--release] [--watch] [--port <port>] [file.yz] [-- args...]  Build and run"
     say "  build [--release] [--sanitize] [--target <triple>] <source.yz> -o <bin>"
     say "  check [file.yz] [--format json]  Check source or project entrypoint"
     say "  generate [--all | --postman | --openapi | --swagger] [project] [-o out.json]"
     say "                           Generate Postman collection & Swagger/OpenAPI 3.1 docs"
     say "  arch check [project]     Enforce module layer rules in yaza.toml"
-    say "  config [project] [--format json]  Show effective API and resource config"
+    say "  config [project] [--format json]  Show parsed API and resource settings"
     say "  test [directory] [--format json]  Run test suite"
     say "  bench [source.yz] [count]  Measure repeated native runs"
     say ""

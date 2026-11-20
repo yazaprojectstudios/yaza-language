@@ -66,6 +66,7 @@ cp "$PROJECT_DIR/runtime/include/yaza_runtime_v1.h" "$YAZA_STAGE/runtime/include
 cp "$PROJECT_DIR/runtime/src/yaza_runtime_v1.c" "$YAZA_STAGE/runtime/src/"
 cp "$PROJECT_DIR/runtime/src/yaza_transport_curl_v1.inc" "$YAZA_STAGE/runtime/src/"
 cp "$PROJECT_DIR/runtime/src/yaza_security_login_v1.inc" "$YAZA_STAGE/runtime/src/"
+cp "$PROJECT_DIR/runtime/watch-run.sh" "$YAZA_STAGE/runtime/"
 cp -R "$PROJECT_DIR/std/." "$YAZA_STAGE/std/"
 cp -R "$PROJECT_DIR/templates/." "$YAZA_STAGE/templates/"
 cp -R "$PROJECT_DIR/bindings/." "$YAZA_STAGE/bindings/"

@@ -1,12 +1,30 @@
 # {{project_name}} — YAZA Fullstack Monolith (Arena-SSR MVC + Hypermedia Fragments)
 
 Single-binary **Backend + Frontend + Embedded YazaBase ACID SQL** monolith following **RFC 0009**:
-- **Zero-GC Arena-SSR:** Every request executes inside a bounded `arena_scope` (`yaza.toml` `[api.resources]`), reclaimed in 1 step on exit.
+- **Zero-GC Arena-SSR:** Every request executes inside a bounded `arena_scope`, reclaimed on exit. The current server chooses its request arena cap in `src/main.yz`; the arena sizing keys in `yaza.toml` are advisory until runtime wiring is complete.
 - **Compiled Type-Safe Views (`src/views/`):** Native LLVM-compiled HTML components with `std/html.yz` XSS escaping and `html_href_is_safe` link checks.
 - **Tri-Mode Controllers (`src/controllers/`):** Serve Full HTML SSR (`GET /`), instant Hypermedia Fragment swaps (`X-Yaza-Fragment` via zero-dep `public/yaza-live.js`), and JSON API (`/api/v1/tasks`) from the same MVC controller & service layer.
 - **Web Security by Default:** Separate Argon2id web-admin credentials, HMAC-SHA256 signed `HttpOnly; SameSite=Lax` session cookies, session-bound CSRF tokens, login throttling, strict Web CSP (`script-src 'self'`), and confined static assets.
 
 ## Quick Start
+
+`yaza run` shows the source, build mode, and compile status before starting the
+server. `yaza config` prints the parsed settings and their sources; only the
+settings listed below currently change this server's behavior.
+Use `yaza run --watch` during development to rebuild on `.yz` or `yaza.toml`
+changes. A failed rebuild leaves the previous server running; stop the watcher
+with Ctrl+C. Watch mode is available on macOS and Linux. Use `yaza build
+--release` and a process supervisor for deployment.
+
+The generated `yaza.toml` uses `balanced` by default. Available profiles are
+`balanced`, `throughput`, and `low_memory`; available arena modes are
+`adaptive` and `fixed`. Uncomment only settings you intend to override.
+`max_in_flight`, `max_request_body_bytes`, and `workers` affect this server.
+`workers = "auto"` detects available CPUs and respects the profile's
+concurrency cap. Arena mode and arena budgets are currently parsed and shown
+by `yaza config`, but do not yet control request allocation. The same applies
+to `max_query_work_units`. The fullstack routes currently select HTML or JSON
+themselves; the response format keys do not negotiate YBIF yet.
 
 1. Provision YazaBase service credentials and a separate web-admin account:
 ```sh

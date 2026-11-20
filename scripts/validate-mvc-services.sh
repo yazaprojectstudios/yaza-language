@@ -15,6 +15,7 @@ export YAZABASE_BIN="$YAZABASE_CLI"
 "$YAZA_BIN" run "$PROJECT_DIR/examples/telemetry-histogram-smoke.yz"
 "$YAZA_BIN" run "$PROJECT_DIR/examples/db-migrations-smoke.yz"
 "$YAZA_BIN" run "$PROJECT_DIR/examples/outbound-transport-smoke.yz"
+"$YAZA_BIN" run "$PROJECT_DIR/examples/api-config-workers-smoke.yz"
 
 ln -s "$PROJECT_DIR/templates" "$WORK_DIR/templates"
 cd "$WORK_DIR"
