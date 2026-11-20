@@ -8,6 +8,7 @@ use "std/json"
 use "std/sync"
 use "std/log"
 use "std/time"
+use "std/telemetry"
 use "std/http"
 use "std/web/request"
 use "std/web/response"
@@ -91,7 +92,7 @@ fn read_bounded_http_request(client_fd: Number, max_body_bytes: Number) -> HttpR
             return HttpReadOutcome(true, result_unwrap(j_res), none)
     return HttpReadOutcome(true, header_buf, none)
 
-fn handle_client_connection(client_fd: Number, public_dir: Text, profile_label: Text, max_body_bytes: Number, max_in_flight: Number, m_in_flight: AtomicNumber, m_total: AtomicNumber, m_errors: AtomicNumber, m_rate_limited: AtomicNumber, logger: Logger) -> Boolean:
+fn handle_client_connection(client_fd: Number, public_dir: Text, profile_label: Text, max_body_bytes: Number, max_in_flight: Number, m_in_flight: AtomicNumber, m_total: AtomicNumber, m_errors: AtomicNumber, m_rate_limited: AtomicNumber, m_latency: LatencyHistogram, logger: Logger) -> Boolean:
     var keep_alive: Boolean = true
     var req_on_conn: Number = 0
     var req_arena_cap: Number = max_body_bytes * 4 + 33554432
@@ -115,21 +116,22 @@ fn handle_client_connection(client_fd: Number, public_dir: Text, profile_label: 
                 let cur_in_flight: Number = atomic_fetch_add(m_in_flight, 1)
                 let req_res: Result[WebRequest, Text] = web_parse_request(rd_out.raw)
                 var resp: WebResponse = web_from_http_response(http_response_bad_request("malformed HTTP request", true))
-                var req_id: Text = "req-" + number_text(req_on_conn)
+                let req_id: Text = "req-" + number_text(started_ns) + "-" + number_text(req_on_conn)
                 var log_method: Text = "UNKNOWN"
                 var log_path: Text = "/"
 
                 if result_is_ok(req_res):
-                    let req: WebRequest = result_unwrap(req_res)
+                    let parsed: WebRequest = result_unwrap(req_res)
+                    let parsed_http: HttpRequest = parsed.http
+                    let traced_http: HttpRequest = HttpRequest(parsed_http.method, parsed_http.path, parsed_http.query, parsed_http.accept, parsed_http.content_type, parsed_http.authorization, req_id, parsed_http.content_length, parsed_http.body, parsed_http.body_text)
+                    let req: WebRequest = WebRequest(traced_http, parsed.cookie_header, parsed.fragment_target, parsed.csrf_header, parsed.if_none_match, parsed.range_header)
                     set log_method = req.http.method
                     set log_path = req.http.path
-                    if req.http.x_request_id != "":
-                        set req_id = req.http.x_request_id
                     if cur_in_flight >= max_in_flight:
                         let _rl: AtomicNumber = atomic_add(m_rate_limited, 1)
                         set resp = web_from_http_response(http_response_service_unavailable("maximum in-flight concurrency limit reached", true))
                     else:
-                        set resp = app_dispatch_request(req, public_dir, profile_label, m_total, m_errors)
+                        set resp = app_dispatch_request_with_metrics(req, public_dir, profile_label, m_total, m_errors, m_latency)
                 let _dec: AtomicNumber = atomic_add(m_in_flight, -1)
 
                 if resp.status_code >= 500:
@@ -137,7 +139,9 @@ fn handle_client_connection(client_fd: Number, public_dir: Text, profile_label: 
 
                 let wire: Bytes = web_format_response(resp, req_id, keep_alive)
                 let wr_res: Result[Number, Text] = tcp_write(client_fd, wire, 5000)
-                let elapsed_ms: Number = (time_now_monotonic_ns() - started_ns) / 1000000
+                let elapsed_ns: Number = time_now_monotonic_ns() - started_ns
+                let _latency_recorded: Boolean = telemetry_latency_record(m_latency, elapsed_ns)
+                let elapsed_ms: Number = elapsed_ns / 1000000
                 let access_json: Text = "{\"method\":\"" + json_escape_text(log_method) + "\",\"path\":\"" + json_escape_text(log_path) + "\",\"status\":" + number_text(resp.status_code) + ",\"latency_ms\":" + number_text(elapsed_ms) + ",\"request_id\":\"" + json_escape_text(req_id) + "\"}"
                 let _li: Boolean = log_info(logger, "http_request", access_json)
                 if result_is_ok(wr_res):
@@ -148,14 +152,14 @@ fn handle_client_connection(client_fd: Number, public_dir: Text, profile_label: 
     let _cl: Result[Boolean, Text] = tcp_close(client_fd)
     return true
 
-async fn fullstack_worker_loop(accept_lock: Mutex, listener: Number, public_dir: Text, profile_label: Text, max_body_bytes: Number, max_in_flight: Number, m_in_flight: AtomicNumber, m_total: AtomicNumber, m_errors: AtomicNumber, m_rate_limited: AtomicNumber, logger: Logger) -> Boolean:
+async fn fullstack_worker_loop(accept_lock: Mutex, listener: Number, public_dir: Text, profile_label: Text, max_body_bytes: Number, max_in_flight: Number, m_in_flight: AtomicNumber, m_total: AtomicNumber, m_errors: AtomicNumber, m_rate_limited: AtomicNumber, m_latency: LatencyHistogram, logger: Logger) -> Boolean:
     while true:
         let _lk: Boolean = mutex_lock(accept_lock)
         let acc_res: Result[Number, Text] = tcp_accept(listener, 1000)
         let _unlk: Boolean = mutex_unlock(accept_lock)
         if result_is_ok(acc_res):
             let client_fd: Number = result_unwrap(acc_res)
-            let _ok: Boolean = handle_client_connection(client_fd, public_dir, profile_label, max_body_bytes, max_in_flight, m_in_flight, m_total, m_errors, m_rate_limited, logger)
+            let _ok: Boolean = handle_client_connection(client_fd, public_dir, profile_label, max_body_bytes, max_in_flight, m_in_flight, m_total, m_errors, m_rate_limited, m_latency, logger)
     return true
 
 fn load_effective_service_config() -> ApiServiceConfig:
@@ -180,7 +184,7 @@ fn run_fullstack_self_test(public_dir: Text, profile_label: Text, m_total: Atomi
 
         # 3. Signed session cookie -> Full SSR Dashboard (200 HTML with YAZA UI)
         let sess_tok: Text = web_issue_session_token("admin", "admin")
-        let csrf_tok: Text = csrf_issue_token(sess_tok, web_auth_secret())
+        let csrf_tok: Text = csrf_issue_token(sess_tok, web_session_signing_secret())
         let r_dash_raw: Bytes = bytes_from_text("GET /dashboard HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nAccept: text/html\r\nCookie: yaza_session=" + sess_tok + "\r\n\r\n")
         let r_dash: WebResponse = app_dispatch_request(result_unwrap(web_parse_request(r_dash_raw)), public_dir, profile_label, m_total, m_errors)
         assert(r_dash.status_code == 200)
@@ -269,6 +273,7 @@ start:
     let m_total: AtomicNumber = atomic_create(0)
     let m_errors: AtomicNumber = atomic_create(0)
     let m_rate_limited: AtomicNumber = atomic_create(0)
+    let m_latency: LatencyHistogram = telemetry_latency_new()
 
     if env_get("YAZA_SELF_TEST") == "1":
         let ok_test: Boolean = run_fullstack_self_test(public_dir, profile_label, m_total, m_errors)
@@ -293,7 +298,7 @@ start:
     let workers: List[Task[Boolean]] = List[Task[Boolean]]()
     var wi: Number = 0
     while wi < 8:
-        list_push(workers, spawn fullstack_worker_loop(accept_lock, listener, public_dir, profile_label, cfg.max_request_body_bytes, cfg.resources.max_in_flight, m_in_flight, m_total, m_errors, m_rate_limited, logger))
+        list_push(workers, spawn fullstack_worker_loop(accept_lock, listener, public_dir, profile_label, cfg.max_request_body_bytes, cfg.resources.max_in_flight, m_in_flight, m_total, m_errors, m_rate_limited, m_latency, logger))
         set wi = wi + 1
     var wj: Number = 0
     while wj < list_count(workers):

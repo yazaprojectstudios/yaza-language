@@ -1,8 +1,8 @@
 # YAZA
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Release](https://img.shields.io/badge/Release-v1.0.0-green.svg)](https://github.com/yazaprojectstudios/yaza-language/releases)
-[![Build Matrix](https://img.shields.io/badge/Platforms-macOS%20%7C%20Linux%20%7C%20Windows-brightgreen.svg)](https://github.com/yazaprojectstudios/yaza-language/actions)
+[![Release](https://img.shields.io/badge/Release-v1.0.1-green.svg)](https://github.com/yazaprojectstudios/yaza-language/releases)
+[![Build Matrix](https://img.shields.io/badge/Platforms-macOS%20%7C%20Linux%20%7C%20Windows%20experimental-yellow.svg)](https://github.com/yazaprojectstudios/yaza-language/actions)
 [![Zero-GC](https://img.shields.io/badge/Memory-Zero--GC%20%28Scoped%20Arenas%29-mint.svg)](#memory-model-arena_scope)
 [![Benchmarks](https://img.shields.io/badge/HTTP%2F1.1-93%2C854%20req%2Fs%20%40%2078%C2%B5s-yellowgreen.svg)](#benchmarks)
 [![Arena-SSR](https://img.shields.io/badge/Arena--SSR%20MVC-6.5x%20Next.js%20%40%203.17%20MB%20RSS-teal.svg)](#fullstack-web--mvc-arena-ssr-19-nov-2026)
@@ -13,7 +13,7 @@
 
 ## Key Features
 
-- **Self-Hosted Compiler & Native LLVM Backend:** Generates optimized binaries for macOS (`arm64`, `x86_64`), Linux (`x86_64`, `aarch64`), and Windows (`x86_64 PE32+`).
+- **Self-Hosted Compiler & Native LLVM Backend:** Generates optimized binaries for macOS (`arm64`, `x86_64`) and Linux (`x86_64`, `aarch64`). Windows (`x86_64 PE32+`) support is experimental.
 - **Zero-GC Scoped Arena Architecture:** Replaces global garbage collection with bounded `arena_scope` blocks. Allocate with $O(1)$ bump pointers, rewind memory in a single step upon request exit (1,000,000 scopes reclaimed in 521 ms, 1.56 MB Peak RSS).
 - **Single-Binary Fullstack MVC (`--mvc` / `--fullstack` & `--web`):** Built-in `std/web/*` stack (compiled type-safe HTML5 Arena-SSR views, Hypermedia Fragments via `X-Yaza-Fragment`, YAZA UI v1.0 design system, binary `multipart/form-data` media upload with magic-byte validation, HTTP 206 seekable video streaming, signed `HttpOnly` cookies, constant-time CSRF, strict Web CSP, and safe ETag static file serving) with compile-time layer boundary enforcement (`yaza arch check`).
 - **Zero-GC Data Science, Statistical Computing, ML & Visualization (`std/data/*`):** Built-in R/Python alternative combining Neumaier (1974) compensated summation, Welford 1-pass moments, partial-pivoting Gaussian matrix linear algebra, Columnar Arena DataFrame (`df_from_csv`, `df_fillna_mean`, `df_inner_join`, `df_groupby_agg`, `df_to_html_table`), 30+ parametric/non-parametric/Bayesian statistical methods, ML (`ml_ols_fit`, `ml_multiple_ols_fit`, `ml_logistic_fit`, `ml_pca_first_component`, `ml_knn_classify`, `ml_kmeans_1d`, `ml_roc_auc`), **18 zero-JS Frontend SVG chart types**, and **6 Terminal CLI chart types**.
@@ -39,21 +39,24 @@ irm https://yazastudios.id/install.ps1 | iex
 ```
 
 ### Manual Release Archives
-Pre-built archives for all supported targets are available on the [Releases](https://github.com/yazaprojectstudios/yaza-language/releases) page:
-- `yaza-1.0.0-darwin-arm64.tar.gz` (Apple Silicon)
-- `yaza-1.0.0-darwin-x64.tar.gz` (macOS Intel)
-- `yaza-1.0.0-linux-x64.tar.gz` (Linux x86-64)
-- `yaza-1.0.0-linux-arm64.tar.gz` (Linux ARM64)
-- `yaza-1.0.0-windows-x64.zip` (Windows x64 Native PE32+)
+Pre-built archives for the released targets are available on the [Releases](https://github.com/yazaprojectstudios/yaza-language/releases) page:
+- `yaza-1.0.1-darwin-arm64.tar.gz` (Apple Silicon)
+- `yaza-1.0.1-darwin-x64.tar.gz` (macOS Intel)
+- `yaza-1.0.1-linux-x64.tar.gz` (Linux x86-64)
+- `yaza-1.0.1-linux-arm64.tar.gz` (Linux ARM64)
+- `yaza-1.0.1-windows-x64.zip` (Windows x64, experimental)
 
 Extract the archive and add its `bin/` directory to your system `PATH`.
+Compiling `.yz` programs on Linux needs Clang and the libcurl development
+package (`libcurl4-openssl-dev` on Ubuntu/Debian). The one-line installer
+downloads binaries and does not install system development packages.
 
 ### Build from Source
 The repository includes compressed LLVM bootstrap files for immediate compilation:
 
 ```sh
 # Ubuntu / Debian dependencies
-sudo apt-get install clang xz-utils libargon2-dev
+sudo apt-get install clang xz-utils libargon2-dev libcurl4-openssl-dev
 
 # macOS Homebrew dependencies
 brew install argon2 xz
@@ -111,12 +114,14 @@ view render_card(title: Text, count: Number, body_html: Text):
 yaza new --mvc my_app
 cd my_app
 
-# Provision local YazaBase credentials
+# Provision separate database service and web-admin credentials
 mkdir -p data
-yaza db set-user ./data admin 'AdminPass_2026_Secure'
-export YAZABASE_USER=admin
-export YAZABASE_PASSWORD='AdminPass_2026_Secure'
+yaza db set-user ./data db_service 'DatabaseServicePass_2026'
+export YAZABASE_USER=db_service
+export YAZABASE_PASSWORD='DatabaseServicePass_2026'
 export YAZA_AUTH_SECRET="$(yaza secret token)"
+yaza build --release src/admin_setup.yz -o admin-setup
+YAZA_WEB_ADMIN_USER=admin YAZA_WEB_ADMIN_PASSWORD='DifferentWebPassword_2026' ./admin-setup
 
 # Enforce MVC layer boundaries, security CSP/XSS rules, and build
 yaza arch check
@@ -128,6 +133,15 @@ YAZA_SELF_TEST=1 ./my_app
 # Start live Fullstack MVC server on http://127.0.0.1:8080
 ./my_app
 ```
+
+The MVC template also includes a certificate-verified HTTPS client,
+Google/Brevo or local-relay SMTP, a YazaBase-backed mail outbox and worker,
+versioned migrations, latency metrics, login throttling, and single-admin
+password reset/email verification. Configure `YAZA_MAIL_PROVIDER` and related
+secrets as described in the generated project's `README.md`. Run the worker
+and migrations as separate build targets; see that README for their commands
+and the at-least-once delivery caveat. Direct outbound TLS currently needs
+libcurl on macOS/Linux; Windows reports that transport unavailable.
 
 For a lightweight SSR web site without a database layer, use `yaza new --web my_site`.
 

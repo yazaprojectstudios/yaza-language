@@ -1,0 +1,182 @@
+# Versioned YazaBase application migrations with drift and dirty-state checks.
+# DDL and bookkeeping currently use separate transactions. An interrupted
+# migration remains dirty and requires operator inspection before retry.
+use "std/db/yazabase"
+use "std/crypto/hash"
+use "std/csv"
+use "std/time"
+
+shape DbMigration:
+    version: Number
+    up_sql: Text
+    down_sql: Text
+
+shape DbMigrationRecord:
+    version: Number
+    checksum: Text
+    status: Text
+
+fn db_migration_checksum(migration: DbMigration) -> Text:
+    return crypto_sha256_hex(migration.up_sql + "\n--down--\n" + migration.down_sql)
+
+fn db_migration_prepare(conn: YazaBaseConnection) -> Result[Boolean, Text]:
+    let no_params: TextList = text_list()
+    let probe: Result[Text, Text] = yazabase_query_csv(conn, "SELECT version FROM schema_migrations LIMIT 1", no_params)
+    if result_is_ok(probe): return ok(true)
+    if text_find(result_unwrap_error(probe), "could not resolve table") < 0:
+        return err("migration metadata probe failed: " + result_unwrap_error(probe))
+    let create: Result[Boolean, Text] = yazabase_exec_sql(conn, "CREATE TABLE schema_migrations (version BIGINT PRIMARY KEY, checksum TEXT NOT NULL, status TEXT NOT NULL, applied_at_ms BIGINT NOT NULL)")
+    if result_is_ok(create): return ok(true)
+    let race_probe: Result[Text, Text] = yazabase_query_csv(conn, "SELECT version FROM schema_migrations LIMIT 1", no_params)
+    if result_is_ok(race_probe): return ok(true)
+    return err("could not initialize migration metadata: " + result_unwrap_error(create))
+
+fn db_migration_history(conn: YazaBaseConnection) -> Result[List[DbMigrationRecord], Text]:
+    let no_params: TextList = text_list()
+    let csv_text: Text = yazabase_query_csv(conn, "SELECT version, checksum, status FROM schema_migrations ORDER BY version", no_params)?
+    let raw: Bytes = bytes_try_from_text(csv_text)?
+    let rows: List[DbMigrationRecord] = List[DbMigrationRecord]()
+    var offset: Number = 0
+    var row_index: Number = 0
+    while offset < bytes_length(raw):
+        let record_opt: Option[CsvRecord] = csv_read_record(raw, offset)?
+        if not option_is_some(record_opt): break
+        let record: CsvRecord = option_unwrap(record_opt)
+        if record.next_offset <= offset: return err("migration metadata CSV did not advance")
+        set offset = record.next_offset
+        if row_index > 0:
+            if list_count(record.fields) != 3: return err("migration metadata row is malformed")
+            let version: Number = number_try_parse(list_get(record.fields, 0))?
+            if version < 1 or list_count(rows) >= 1024: return err("migration metadata version or count is invalid")
+            list_push(rows, DbMigrationRecord(version, list_get(record.fields, 1), list_get(record.fields, 2)))
+        set row_index = row_index + 1
+    return ok(rows)
+
+fn db_migration_find(migrations: List[DbMigration], version: Number) -> Option[DbMigration]:
+    var index: Number = 0
+    while index < list_count(migrations):
+        let candidate: DbMigration = list_get(migrations, index)
+        if candidate.version == version: return some(candidate)
+        set index = index + 1
+    return none
+
+fn db_migration_validate(migrations: List[DbMigration], history: List[DbMigrationRecord]) -> Result[Boolean, Text]:
+    var previous_version: Number = 0
+    var index: Number = 0
+    while index < list_count(migrations):
+        let migration: DbMigration = list_get(migrations, index)
+        if migration.version <= previous_version or text_length(migration.up_sql) == 0 or text_length(migration.down_sql) == 0:
+            return err("migration registry must have increasing positive versions and nonempty SQL")
+        if text_length(migration.up_sql) > 65536 or text_length(migration.down_sql) > 65536:
+            return err("migration SQL exceeds 64 KiB")
+        set previous_version = migration.version
+        set index = index + 1
+    set index = 0
+    while index < list_count(history):
+        let record: DbMigrationRecord = list_get(history, index)
+        let matching: Option[DbMigration] = db_migration_find(migrations, record.version)
+        if not option_is_some(matching): return err("database contains an unknown migration version " + number_text(record.version))
+        if db_migration_checksum(option_unwrap(matching)) != record.checksum:
+            return err("migration checksum drift at version " + number_text(record.version))
+        if record.status != "applied" and record.status != "rolled_back":
+            return err("migration version " + number_text(record.version) + " is dirty (" + record.status + "); inspect and repair manually")
+        set index = index + 1
+    return ok(true)
+
+fn db_migration_applied(history: List[DbMigrationRecord], version: Number) -> Boolean:
+    var index: Number = 0
+    while index < list_count(history):
+        if list_get(history, index).version == version and list_get(history, index).status == "applied": return true
+        set index = index + 1
+    return false
+
+fn db_migration_record_exists(history: List[DbMigrationRecord], version: Number) -> Boolean:
+    var index: Number = 0
+    while index < list_count(history):
+        if list_get(history, index).version == version: return true
+        set index = index + 1
+    return false
+
+fn db_migration_apply_all_unlocked(conn: YazaBaseConnection, migrations: List[DbMigration]) -> Result[Number, Text]:
+    let prepared: Boolean = db_migration_prepare(conn)?
+    let history: List[DbMigrationRecord] = db_migration_history(conn)?
+    let valid: Boolean = db_migration_validate(migrations, history)?
+    var applied_count: Number = 0
+    var index: Number = 0
+    while index < list_count(migrations):
+        let migration: DbMigration = list_get(migrations, index)
+        if not db_migration_applied(history, migration.version):
+            if db_migration_record_exists(history, migration.version):
+                let reopen_params: TextList = text_list()
+                list_push(reopen_params, "text:pending")
+                list_push(reopen_params, "bigint:" + number_text(time_now_unix_ms()))
+                list_push(reopen_params, "bigint:" + number_text(migration.version))
+                let reopened: Text = yazabase_exec_params(conn, "UPDATE schema_migrations SET status = $1, applied_at_ms = $2 WHERE version = $3", reopen_params)?
+            else:
+                let params: TextList = text_list()
+                list_push(params, "bigint:" + number_text(migration.version))
+                list_push(params, "text:" + db_migration_checksum(migration))
+                list_push(params, "text:pending")
+                list_push(params, "bigint:" + number_text(time_now_unix_ms()))
+                let inserted: Text = yazabase_exec_params(conn, "INSERT INTO schema_migrations (version, checksum, status, applied_at_ms) VALUES ($1, $2, $3, $4)", params)?
+            let applied: Result[Boolean, Text] = yazabase_exec_sql(conn, migration.up_sql)
+            if not result_is_ok(applied):
+                return err("migration " + number_text(migration.version) + " failed after its dirty marker was recorded: " + result_unwrap_error(applied))
+            let finish_params: TextList = text_list()
+            list_push(finish_params, "text:applied")
+            list_push(finish_params, "bigint:" + number_text(migration.version))
+            let finished: Text = yazabase_exec_params(conn, "UPDATE schema_migrations SET status = $1 WHERE version = $2", finish_params)?
+            set applied_count = applied_count + 1
+        set index = index + 1
+    return ok(applied_count)
+
+fn db_migration_rollback_last_unlocked(conn: YazaBaseConnection, migrations: List[DbMigration]) -> Result[Number, Text]:
+    let prepared: Boolean = db_migration_prepare(conn)?
+    let history: List[DbMigrationRecord] = db_migration_history(conn)?
+    let valid: Boolean = db_migration_validate(migrations, history)?
+    var last_version: Number = 0
+    var index: Number = 0
+    while index < list_count(history):
+        let row: DbMigrationRecord = list_get(history, index)
+        if row.status == "applied": set last_version = row.version
+        set index = index + 1
+    if last_version == 0: return ok(0)
+    let last: DbMigrationRecord = DbMigrationRecord(last_version, "", "applied")
+    let migration: DbMigration = option_unwrap(db_migration_find(migrations, last.version))
+    let mark_params: TextList = text_list()
+    list_push(mark_params, "text:rolling_back")
+    list_push(mark_params, "bigint:" + number_text(last.version))
+    let marked: Text = yazabase_exec_params(conn, "UPDATE schema_migrations SET status = $1 WHERE version = $2", mark_params)?
+    let rolled_back: Result[Boolean, Text] = yazabase_exec_sql(conn, migration.down_sql)
+    if not result_is_ok(rolled_back):
+        return err("rollback " + number_text(last.version) + " failed and remains dirty: " + result_unwrap_error(rolled_back))
+    let final_params: TextList = text_list()
+    list_push(final_params, "text:rolled_back")
+    list_push(final_params, "bigint:" + number_text(last.version))
+    let finalized: Text = yazabase_exec_params(conn, "UPDATE schema_migrations SET status = $1 WHERE version = $2", final_params)?
+    return ok(last.version)
+
+fn db_migration_close_lock(lock_fd: Number, root_fd: Number) -> Number:
+    let _lock_closed: Result[Boolean, Text] = vfs_close(lock_fd)
+    let _root_closed: Result[Boolean, Text] = vfs_close(root_fd)
+    return 0
+
+fn db_migration_apply_all(conn: YazaBaseConnection, migrations: List[DbMigration]) -> Result[Number, Text]:
+    let root_fd: Number = vfs_root_open(conn.db_dir)?
+    let lock_res: Result[Number, Text] = vfs_lock_exclusive(root_fd, ".schema_migrations.lock")
+    if not result_is_ok(lock_res):
+        let _closed: Result[Boolean, Text] = vfs_close(root_fd)
+        return err(result_unwrap_error(lock_res))
+    let lock_fd: Number = result_unwrap(lock_res)
+    defer db_migration_close_lock(lock_fd, root_fd)
+    return db_migration_apply_all_unlocked(conn, migrations)
+
+fn db_migration_rollback_last(conn: YazaBaseConnection, migrations: List[DbMigration]) -> Result[Number, Text]:
+    let root_fd: Number = vfs_root_open(conn.db_dir)?
+    let lock_res: Result[Number, Text] = vfs_lock_exclusive(root_fd, ".schema_migrations.lock")
+    if not result_is_ok(lock_res):
+        let _closed: Result[Boolean, Text] = vfs_close(root_fd)
+        return err(result_unwrap_error(lock_res))
+    let lock_fd: Number = result_unwrap(lock_res)
+    defer db_migration_close_lock(lock_fd, root_fd)
+    return db_migration_rollback_last_unlocked(conn, migrations)

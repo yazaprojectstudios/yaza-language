@@ -19,6 +19,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(YAZA_RT_V1_WITH_CURL)
+#include <curl/curl.h>
+#endif
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -395,6 +398,7 @@ static void yaza_rt_v1_asan_poison(const void *address, size_t size) {
     (void)size;
 #endif
 }
+
 
 static void yaza_rt_v1_asan_unpoison(const void *address, size_t size) {
 #if YAZA_RT_V1_WITH_ADDRESS_SANITIZER
@@ -8293,3 +8297,6 @@ static void yaza_rt_v1_cleanup_async_resources(void) {
         channel = next;
     }
 }
+
+#include "yaza_transport_curl_v1.inc"
+#include "yaza_security_login_v1.inc"

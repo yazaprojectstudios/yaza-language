@@ -209,6 +209,17 @@ int32_t yaza_net_v1_connect(const YazaTextV1 *host, int64_t port, int64_t timeou
 int32_t yaza_net_v1_accept(int64_t listener, int64_t timeout_ms, int64_t *out_handle, char **out_error);
 int32_t yaza_net_v1_read(int64_t connection, int64_t max_bytes, int64_t timeout_ms, YazaBytesV1 *out_bytes, char **out_error);
 int32_t yaza_net_v1_write(int64_t connection, const YazaBytesV1 *bytes, int64_t timeout_ms, int64_t *out_written, char **out_error);
+/* HTTPS only; result starts with a two-byte big-endian HTTP status. */
+int32_t yaza_net_v1_https_request(const YazaTextV1 *method, const YazaTextV1 *url,
+    const YazaBytesV1 *body, const YazaTextV1 *bearer_token,
+    int64_t timeout_ms, int64_t max_response_bytes, YazaBytesV1 *out_wire, char **out_error);
+/* Fixed Gmail/Brevo endpoints; STARTTLS and certificate verification required. */
+/* Process-local, bounded username-hash login limiter. Returns zero when denied. */
+int32_t yaza_security_v1_login_attempt(const YazaTextV1 *key_hex, int64_t now_ms, int32_t reset);
+int32_t yaza_net_v1_smtp_secure_send(const YazaTextV1 *provider, const YazaTextV1 *auth_mode,
+    const YazaTextV1 *username, const YazaTextV1 *credential,
+    const YazaTextV1 *from_address, const YazaTextV1 *to_address,
+    const YazaTextV1 *message, int64_t timeout_ms, char **out_error);
 int32_t yaza_net_v1_close(int64_t handle, char **out_error);
 int32_t yaza_net_v1_pair_create(int64_t *out_handle, char **out_error);
 int32_t yaza_net_v1_pair_peer(int64_t handle, int64_t *out_peer_handle, char **out_error);

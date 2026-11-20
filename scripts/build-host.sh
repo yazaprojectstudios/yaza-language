@@ -12,6 +12,19 @@ for tool in clang xz ar; do
   fi
 done
 
+# The compiler links libcurl into generated programs, including the compiler
+# itself. Check the development headers and linker before the expensive
+# bootstrap build so missing packages have an actionable error.
+CURL_PROBE=$(mktemp "${TMPDIR:-/tmp}/yaza-curl-probe.XXXXXX")
+if ! printf '#include <curl/curl.h>\nint main(void) { return curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK; }\n' \
+  | clang -x c - -lcurl -o "$CURL_PROBE" >/dev/null 2>&1; then
+  rm -f "$CURL_PROBE"
+  printf '%s\n' 'error: libcurl development headers and library are required.' >&2
+  printf '%s\n' 'Install libcurl4-openssl-dev (Ubuntu/Debian) or the Xcode Command Line Tools (macOS).' >&2
+  exit 1
+fi
+rm -f "$CURL_PROBE"
+
 HOST_OS=$(uname -s)
 HOST_ARCH=$(uname -m)
 case "$HOST_OS/$HOST_ARCH" in

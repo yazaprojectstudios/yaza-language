@@ -1,0 +1,97 @@
+# Concurrent fixed-bucket latency histogram. Quantiles are bucket upper bounds.
+use "std/sync"
+use "std/time"
+use "std/log"
+use "std/json"
+
+shape LatencyHistogram:
+    count: AtomicNumber
+    sum_ns: AtomicNumber
+    le_1ms: AtomicNumber
+    le_2ms: AtomicNumber
+    le_5ms: AtomicNumber
+    le_10ms: AtomicNumber
+    le_25ms: AtomicNumber
+    le_50ms: AtomicNumber
+    le_100ms: AtomicNumber
+    over_100ms: AtomicNumber
+
+fn telemetry_latency_new() -> LatencyHistogram:
+    return LatencyHistogram(atomic_create(0), atomic_create(0), atomic_create(0), atomic_create(0), atomic_create(0), atomic_create(0), atomic_create(0), atomic_create(0), atomic_create(0), atomic_create(0))
+
+fn telemetry_latency_record(hist: LatencyHistogram, duration_ns: Number) -> Boolean:
+    if duration_ns < 0: return false
+    let _count: AtomicNumber = atomic_add(hist.count, 1)
+    let _sum: AtomicNumber = atomic_add(hist.sum_ns, duration_ns)
+    if duration_ns <= 1000000:
+        let _b: AtomicNumber = atomic_add(hist.le_1ms, 1)
+    elif duration_ns <= 2000000:
+        let _b: AtomicNumber = atomic_add(hist.le_2ms, 1)
+    elif duration_ns <= 5000000:
+        let _b: AtomicNumber = atomic_add(hist.le_5ms, 1)
+    elif duration_ns <= 10000000:
+        let _b: AtomicNumber = atomic_add(hist.le_10ms, 1)
+    elif duration_ns <= 25000000:
+        let _b: AtomicNumber = atomic_add(hist.le_25ms, 1)
+    elif duration_ns <= 50000000:
+        let _b: AtomicNumber = atomic_add(hist.le_50ms, 1)
+    elif duration_ns <= 100000000:
+        let _b: AtomicNumber = atomic_add(hist.le_100ms, 1)
+    else:
+        let _b: AtomicNumber = atomic_add(hist.over_100ms, 1)
+    return true
+
+fn telemetry_latency_cumulative(hist: LatencyHistogram, bucket: Number) -> Number:
+    var total: Number = 0
+    if bucket >= 1: set total = total + atomic_load(hist.le_1ms)
+    if bucket >= 2: set total = total + atomic_load(hist.le_2ms)
+    if bucket >= 3: set total = total + atomic_load(hist.le_5ms)
+    if bucket >= 4: set total = total + atomic_load(hist.le_10ms)
+    if bucket >= 5: set total = total + atomic_load(hist.le_25ms)
+    if bucket >= 6: set total = total + atomic_load(hist.le_50ms)
+    if bucket >= 7: set total = total + atomic_load(hist.le_100ms)
+    if bucket >= 8: set total = total + atomic_load(hist.over_100ms)
+    return total
+
+fn telemetry_latency_percentile_upper_ms(hist: LatencyHistogram, percentile: Number) -> Number:
+    let count: Number = atomic_load(hist.count)
+    if count < 1 or percentile < 1 or percentile > 100: return 0
+    let target: Number = (count * percentile + 99) / 100
+    if telemetry_latency_cumulative(hist, 1) >= target: return 1
+    if telemetry_latency_cumulative(hist, 2) >= target: return 2
+    if telemetry_latency_cumulative(hist, 3) >= target: return 5
+    if telemetry_latency_cumulative(hist, 4) >= target: return 10
+    if telemetry_latency_cumulative(hist, 5) >= target: return 25
+    if telemetry_latency_cumulative(hist, 6) >= target: return 50
+    if telemetry_latency_cumulative(hist, 7) >= target: return 100
+    return 101
+
+fn telemetry_latency_prometheus(hist: LatencyHistogram) -> Text:
+    let parts: TextList = text_list()
+    list_push(parts, "# TYPE yaza_http_request_duration_ms histogram\n")
+    list_push(parts, "yaza_http_request_duration_ms_bucket{le=\"1\"} " + number_text(telemetry_latency_cumulative(hist, 1)) + "\n")
+    list_push(parts, "yaza_http_request_duration_ms_bucket{le=\"2\"} " + number_text(telemetry_latency_cumulative(hist, 2)) + "\n")
+    list_push(parts, "yaza_http_request_duration_ms_bucket{le=\"5\"} " + number_text(telemetry_latency_cumulative(hist, 3)) + "\n")
+    list_push(parts, "yaza_http_request_duration_ms_bucket{le=\"10\"} " + number_text(telemetry_latency_cumulative(hist, 4)) + "\n")
+    list_push(parts, "yaza_http_request_duration_ms_bucket{le=\"25\"} " + number_text(telemetry_latency_cumulative(hist, 5)) + "\n")
+    list_push(parts, "yaza_http_request_duration_ms_bucket{le=\"50\"} " + number_text(telemetry_latency_cumulative(hist, 6)) + "\n")
+    list_push(parts, "yaza_http_request_duration_ms_bucket{le=\"100\"} " + number_text(telemetry_latency_cumulative(hist, 7)) + "\n")
+    list_push(parts, "yaza_http_request_duration_ms_bucket{le=\"+Inf\"} " + number_text(telemetry_latency_cumulative(hist, 8)) + "\n")
+    list_push(parts, "yaza_http_request_duration_ms_count " + number_text(atomic_load(hist.count)) + "\n")
+    list_push(parts, "yaza_http_request_duration_ms_sum " + number_text(atomic_load(hist.sum_ns) / 1000000) + "\n")
+    list_push(parts, "# TYPE yaza_http_request_p95_upper_bound_ms gauge\n")
+    list_push(parts, "yaza_http_request_p95_upper_bound_ms " + number_text(telemetry_latency_percentile_upper_ms(hist, 95)) + "\n")
+    list_push(parts, "# TYPE yaza_http_request_p99_upper_bound_ms gauge\n")
+    list_push(parts, "yaza_http_request_p99_upper_bound_ms " + number_text(telemetry_latency_percentile_upper_ms(hist, 99)) + "\n")
+    return text_join(parts, "")
+
+# Opt-in, correlated timing spans. Keep logging out of the default hot path.
+fn telemetry_trace_start(request_id: Text) -> Number:
+    if request_id == "" or env_get("YAZA_TRACE_REQUESTS") != "1": return 0
+    return time_now_monotonic_ns()
+
+fn telemetry_trace_finish(request_id: Text, layer: Text, operation: Text, started_ns: Number) -> Boolean:
+    if started_ns <= 0: return false
+    let elapsed_ns: Number = time_now_monotonic_ns() - started_ns
+    let data: Text = "{\"request_id\":\"" + json_escape_text(request_id) + "\",\"layer\":\"" + json_escape_text(layer) + "\",\"operation\":\"" + json_escape_text(operation) + "\",\"duration_ns\":" + number_text(elapsed_ns) + "}"
+    return log_info(logger_create("yaza-mvc", "INFO"), "trace_span", data)

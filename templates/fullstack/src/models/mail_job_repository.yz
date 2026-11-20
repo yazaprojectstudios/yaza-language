@@ -1,0 +1,102 @@
+use "std/db/yazabase"
+use "std/db/migrations"
+use "std/csv"
+use "std/time"
+use "std/smtp"
+use "../migrations/registry"
+use "task_repository"
+
+shape MailJob:
+    id: Number
+    to_address: Text
+    subject: Text
+    body: Text
+    attempts: Number
+
+fn mail_job_connect() -> Result[YazaBaseConnection, Text]:
+    let conn: YazaBaseConnection = yazabase_connect_default(task_db_dir(), "monolith")?
+    let _applied: Number = db_migration_apply_all(conn, app_migrations())?
+    return ok(conn)
+
+fn mail_job_next_id() -> Number:
+    let random: Bytes = secure_random_bytes(4)
+    let suffix: Number = (bytes_get(random, 0) * 16777216 + bytes_get(random, 1) * 65536 + bytes_get(random, 2) * 256 + bytes_get(random, 3)) % 1000000
+    return time_now_unix_ms() * 1000000 + suffix
+
+fn mail_job_enqueue(to_address: Text, subject: Text, body: Text) -> Result[Number, Text]:
+    if not smtp_address_valid(to_address) or not smtp_subject_valid(subject):
+        return err("mail job recipient or subject is invalid")
+    if text_length(to_address) > 254 or text_length(subject) > 200 or text_length(body) > 16384:
+        return err("mail job exceeds configured size limit")
+    let conn: YazaBaseConnection = mail_job_connect()?
+    var attempt: Number = 0
+    while attempt < 5:
+        let id: Number = mail_job_next_id()
+        let params: TextList = text_list()
+        list_push(params, "bigint:" + number_text(id))
+        list_push(params, "text:" + to_address)
+        list_push(params, "text:" + subject)
+        list_push(params, "text:" + body)
+        list_push(params, "text:queued")
+        list_push(params, "bigint:0")
+        list_push(params, "bigint:" + number_text(time_now_unix_ms()))
+        let inserted: Result[Text, Text] = yazabase_exec_params(conn, "INSERT INTO mail_jobs (id, to_address, subject, body, status, attempts, next_attempt_ms) VALUES ($1, $2, $3, $4, $5, $6, $7)", params)
+        if result_is_ok(inserted): return ok(id)
+        if text_find(result_unwrap_error(inserted), "duplicate") < 0 and text_find(result_unwrap_error(inserted), "clustered key") < 0:
+            return err(result_unwrap_error(inserted))
+        set attempt = attempt + 1
+    return err("could not allocate a unique mail job id")
+
+fn mail_job_parse_first(csv_text: Text) -> Result[Option[MailJob], Text]:
+    let raw: Bytes = bytes_try_from_text(csv_text)?
+    if bytes_length(raw) == 0: return ok(none)
+    let header: Option[CsvRecord] = csv_read_record(raw, 0)?
+    if not option_is_some(header): return ok(none)
+    let row: Option[CsvRecord] = csv_read_record(raw, option_unwrap(header).next_offset)?
+    if not option_is_some(row): return ok(none)
+    let fields: TextList = option_unwrap(row).fields
+    if list_count(fields) != 5: return err("mail job row is malformed")
+    let id: Number = number_try_parse(list_get(fields, 0))?
+    let attempts: Number = number_try_parse(list_get(fields, 4))?
+    return ok(some(MailJob(id, list_get(fields, 1), list_get(fields, 2), list_get(fields, 3), attempts)))
+
+fn mail_job_claim(conn: YazaBaseConnection) -> Result[Option[MailJob], Text]:
+    let p: TextList = text_list()
+    list_push(p, "bigint:" + number_text(time_now_unix_ms()))
+    let csv: Text = yazabase_query_csv(conn, "SELECT id, to_address, subject, body, attempts FROM mail_jobs WHERE status = 'queued' AND next_attempt_ms <= $1 ORDER BY id LIMIT 1", p)?
+    let job: Option[MailJob] = mail_job_parse_first(csv)?
+    if not option_is_some(job): return ok(none)
+    let picked: MailJob = option_unwrap(job)
+    let mark: TextList = text_list()
+    list_push(mark, "text:sending")
+    list_push(mark, "bigint:" + number_text(picked.id))
+    let _updated: Text = yazabase_exec_params(conn, "UPDATE mail_jobs SET status = $1 WHERE id = $2", mark)?
+    return ok(some(picked))
+
+fn mail_job_recover_inflight(conn: YazaBaseConnection) -> Result[Boolean, Text]:
+    let p: TextList = text_list()
+    let _updated: Text = yazabase_exec_params(conn, "UPDATE mail_jobs SET status = 'queued' WHERE status = 'sending'", p)?
+    return ok(true)
+
+fn mail_job_complete(conn: YazaBaseConnection, job: MailJob) -> Result[Boolean, Text]:
+    let p: TextList = text_list()
+    list_push(p, "bigint:" + number_text(job.id))
+    let _updated: Text = yazabase_exec_params(conn, "UPDATE mail_jobs SET status = 'sent' WHERE id = $1", p)?
+    return ok(true)
+
+fn mail_job_retry(conn: YazaBaseConnection, job: MailJob) -> Result[Boolean, Text]:
+    let next_attempt: Number = job.attempts + 1
+    var status: Text = "queued"
+    if next_attempt >= 5: set status = "failed"
+    var delay_ms: Number = 1000
+    var i: Number = 1
+    while i < next_attempt:
+        set delay_ms = delay_ms * 2
+        set i = i + 1
+    let p: TextList = text_list()
+    list_push(p, "text:" + status)
+    list_push(p, "bigint:" + number_text(next_attempt))
+    list_push(p, "bigint:" + number_text(time_now_unix_ms() + delay_ms))
+    list_push(p, "bigint:" + number_text(job.id))
+    let _updated: Text = yazabase_exec_params(conn, "UPDATE mail_jobs SET status = $1, attempts = $2, next_attempt_ms = $3 WHERE id = $4", p)?
+    return ok(true)

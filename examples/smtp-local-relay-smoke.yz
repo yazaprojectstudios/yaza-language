@@ -1,0 +1,88 @@
+use "std/smtp"
+
+fn smtp_mock_receive_line(connection: Number) -> Text:
+    var text: Text = ""
+    while text_find(text, "\r\n") < 0 and text_length(text) < 8192:
+        let chunk: Result[Bytes, Text] = tcp_read(connection, 4096, 3000)
+        assert result_is_ok(chunk)
+        let payload: Bytes = result_unwrap(chunk)
+        assert bytes_length(payload) > 0
+        set text = text + bytes_to_text(payload)
+    return text
+
+async fn smtp_mock_relay(listener: Number) -> Boolean:
+    let accepted: Result[Number, Text] = tcp_accept(listener, 3000)
+    assert result_is_ok(accepted)
+    let connection: Number = result_unwrap(accepted)
+    let greeting1: Result[Number, Text] = tcp_write(connection, bytes_from_text("220-local mock\r\n220"), 3000)
+    assert result_is_ok(greeting1)
+    let greeting2: Result[Number, Text] = tcp_write(connection, bytes_from_text(" ready\r\n"), 3000)
+    assert result_is_ok(greeting2)
+    assert text_starts_with(smtp_mock_receive_line(connection), "EHLO localhost\r\n")
+    let ehlo: Result[Number, Text] = tcp_write(connection, bytes_from_text("250-localhost\r\n250 SIZE 1048576\r\n"), 3000)
+    assert result_is_ok(ehlo)
+    assert text_starts_with(smtp_mock_receive_line(connection), "MAIL FROM:<alice@example.com>\r\n")
+    let mail: Result[Number, Text] = tcp_write(connection, bytes_from_text("250 sender ok\r\n"), 3000)
+    assert result_is_ok(mail)
+    assert text_starts_with(smtp_mock_receive_line(connection), "RCPT TO:<bob@example.com>\r\n")
+    let rcpt: Result[Number, Text] = tcp_write(connection, bytes_from_text("251 forwarded\r\n"), 3000)
+    assert result_is_ok(rcpt)
+    assert text_starts_with(smtp_mock_receive_line(connection), "DATA\r\n")
+    let data: Result[Number, Text] = tcp_write(connection, bytes_from_text("354 send data\r\n"), 3000)
+    assert result_is_ok(data)
+    var message: Text = ""
+    while text_find(message, "\r\n.\r\n") < 0 and text_length(message) < 8192:
+        let chunk: Result[Bytes, Text] = tcp_read(connection, 4096, 3000)
+        assert result_is_ok(chunk)
+        let payload: Bytes = result_unwrap(chunk)
+        assert bytes_length(payload) > 0
+        set message = message + bytes_to_text(payload)
+    assert text_find(message, "Subject: Welcome\r\n") > 0
+    assert text_find(message, "Content-Transfer-Encoding: base64\r\n") > 0
+    assert text_find(message, "\r\n.unsafe") < 0
+    let accepted_data: Result[Number, Text] = tcp_write(connection, bytes_from_text("250 queued\r\n"), 3000)
+    assert result_is_ok(accepted_data)
+    let quit: Text = smtp_mock_receive_line(connection)
+    assert text_starts_with(quit, "QUIT\r\n")
+    let closed: Result[Boolean, Text] = tcp_close(connection)
+    return true
+
+async fn smtp_mock_reject_relay(listener: Number) -> Boolean:
+    let accepted: Result[Number, Text] = tcp_accept(listener, 3000)
+    assert result_is_ok(accepted)
+    let connection: Number = result_unwrap(accepted)
+    let greeting: Result[Number, Text] = tcp_write(connection, bytes_from_text("220 local mock\r\n"), 3000)
+    assert result_is_ok(greeting)
+    assert text_starts_with(smtp_mock_receive_line(connection), "EHLO localhost\r\n")
+    let ehlo: Result[Number, Text] = tcp_write(connection, bytes_from_text("250 ready\r\n"), 3000)
+    assert result_is_ok(ehlo)
+    assert text_starts_with(smtp_mock_receive_line(connection), "MAIL FROM:<alice@example.com>\r\n")
+    let mail: Result[Number, Text] = tcp_write(connection, bytes_from_text("250 sender ok\r\n"), 3000)
+    assert result_is_ok(mail)
+    assert text_starts_with(smtp_mock_receive_line(connection), "RCPT TO:<bob@example.com>\r\n")
+    let rcpt: Result[Number, Text] = tcp_write(connection, bytes_from_text("550 mailbox unavailable\r\n"), 3000)
+    assert result_is_ok(rcpt)
+    let closed: Result[Boolean, Text] = tcp_close(connection)
+    return true
+
+start:
+    let listener_result: Result[Number, Text] = tcp_listen("127.0.0.1", 19879, 2)
+    assert result_is_ok(listener_result)
+    let listener: Number = result_unwrap(listener_result)
+    let server: Task[Boolean] = spawn smtp_mock_relay(listener)
+    let message: SmtpMessage = SmtpMessage("alice@example.com", "bob@example.com", "Welcome", "hello\n.unsafe")
+    let sent: Result[Boolean, Text] = smtp_send_local(19879, message, 3000)
+    assert result_is_ok(sent)
+    assert result_unwrap(sent)
+    assert await server
+    let closed: Result[Boolean, Text] = tcp_close(listener)
+    let reject_listener_result: Result[Number, Text] = tcp_listen("127.0.0.1", 19880, 2)
+    assert result_is_ok(reject_listener_result)
+    let reject_listener: Number = result_unwrap(reject_listener_result)
+    let reject_server: Task[Boolean] = spawn smtp_mock_reject_relay(reject_listener)
+    let rejected: Result[Boolean, Text] = smtp_send_local(19880, message, 3000)
+    assert not result_is_ok(rejected)
+    assert text_find(result_unwrap_error(rejected), "550") >= 0
+    assert await reject_server
+    let reject_closed: Result[Boolean, Text] = tcp_close(reject_listener)
+    say "smtp-local-relay-smoke passed"

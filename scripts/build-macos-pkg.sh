@@ -63,6 +63,8 @@ fi
 
 if [ -f "$PROJECT_ROOT/runtime/src/yaza_runtime_v1.c" ]; then
     install -m 644 "$PROJECT_ROOT/runtime/src/yaza_runtime_v1.c" "$PAYLOAD/usr/local/share/yaza/runtime/src/yaza_runtime_v1.c"
+    install -m 644 "$PROJECT_ROOT/runtime/src/yaza_transport_curl_v1.inc" "$PAYLOAD/usr/local/share/yaza/runtime/src/yaza_transport_curl_v1.inc"
+    install -m 644 "$PROJECT_ROOT/runtime/src/yaza_security_login_v1.inc" "$PAYLOAD/usr/local/share/yaza/runtime/src/yaza_security_login_v1.inc"
 fi
 
 if [ -d "$PROJECT_ROOT/std" ]; then

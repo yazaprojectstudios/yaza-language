@@ -1,0 +1,72 @@
+# Durable, single-use token primitives for password reset and email verification.
+# Callers must apply the account_action_tokens migration before using these.
+use "std/db/yazabase"
+use "std/crypto/hash"
+use "std/csv"
+use "std/time"
+
+fn account_action_kind_valid(kind: Text) -> Boolean:
+    return kind == "password_reset" or kind == "email_verify"
+
+fn account_action_close_lock(lock_fd: Number, root_fd: Number) -> Number:
+    let _lock_closed: Result[Boolean, Text] = vfs_close(lock_fd)
+    let _root_closed: Result[Boolean, Text] = vfs_close(root_fd)
+    return 0
+
+fn account_action_issue(conn: YazaBaseConnection, kind: Text, subject: Text, ttl_ms: Number) -> Result[Text, Text]:
+    if not account_action_kind_valid(kind) or text_length(subject) < 1 or text_length(subject) > 128:
+        return err("account action kind or subject is invalid")
+    if ttl_ms < 60000 or ttl_ms > 86400000: return err("account action TTL must be 1 minute to 24 hours")
+    let random: Bytes = secure_random_bytes_try(32)?
+    let token: Text = crypto_bytes_to_hex(random)
+    let digest: Text = crypto_sha256_hex(token)
+    let now_ms: Number = time_now_unix_ms()
+    let id_suffix: Number = (bytes_get(random, 0) * 16777216 + bytes_get(random, 1) * 65536 + bytes_get(random, 2) * 256 + bytes_get(random, 3)) % 1000000
+    let id: Number = now_ms * 1000000 + id_suffix
+    let p: TextList = text_list()
+    list_push(p, "bigint:" + number_text(id))
+    list_push(p, "text:" + kind)
+    list_push(p, "text:" + subject)
+    list_push(p, "text:" + digest)
+    list_push(p, "text:issued")
+    list_push(p, "bigint:" + number_text(now_ms + ttl_ms))
+    let _inserted: Text = yazabase_exec_params(conn, "INSERT INTO account_action_tokens (id, kind, subject, digest, status, expires_ms) VALUES ($1, $2, $3, $4, $5, $6)", p)?
+    return ok(token)
+
+fn account_action_consume_locked(conn: YazaBaseConnection, kind: Text, subject: Text, token: Text) -> Result[Boolean, Text]:
+    let digest: Text = crypto_sha256_hex(token)
+    let p: TextList = text_list()
+    list_push(p, "text:" + kind)
+    list_push(p, "text:" + subject)
+    list_push(p, "text:" + digest)
+    let csv: Text = yazabase_query_csv(conn, "SELECT id, digest, status, expires_ms FROM account_action_tokens WHERE kind = $1 AND subject = $2 AND digest = $3 LIMIT 1", p)?
+    let raw: Bytes = bytes_try_from_text(csv)?
+    if bytes_length(raw) == 0: return ok(false)
+    let header: Option[CsvRecord] = csv_read_record(raw, 0)?
+    if not option_is_some(header): return ok(false)
+    let row: Option[CsvRecord] = csv_read_record(raw, option_unwrap(header).next_offset)?
+    if not option_is_some(row): return ok(false)
+    let fields: TextList = option_unwrap(row).fields
+    if list_count(fields) != 4: return err("account action token row is malformed")
+    let id: Number = number_try_parse(list_get(fields, 0))?
+    let expires_ms: Number = number_try_parse(list_get(fields, 3))?
+    if list_get(fields, 2) != "issued" or expires_ms <= time_now_unix_ms(): return ok(false)
+    if not crypto_constant_time_compare(digest, list_get(fields, 1)): return ok(false)
+    let update: TextList = text_list()
+    list_push(update, "text:used")
+    list_push(update, "bigint:" + number_text(id))
+    let _used: Text = yazabase_exec_params(conn, "UPDATE account_action_tokens SET status = $1 WHERE id = $2", update)?
+    return ok(true)
+
+fn account_action_consume(conn: YazaBaseConnection, kind: Text, subject: Text, token: Text) -> Result[Boolean, Text]:
+    if not account_action_kind_valid(kind) or text_length(subject) < 1 or text_length(subject) > 128:
+        return ok(false)
+    if text_length(token) != 64: return ok(false)
+    let root_fd: Number = vfs_root_open(conn.db_dir)?
+    let lock_res: Result[Number, Text] = vfs_lock_exclusive(root_fd, ".account_action.lock")
+    if not result_is_ok(lock_res):
+        let _closed: Result[Boolean, Text] = vfs_close(root_fd)
+        return err(result_unwrap_error(lock_res))
+    let lock_fd: Number = result_unwrap(lock_res)
+    defer account_action_close_lock(lock_fd, root_fd)
+    return account_action_consume_locked(conn, kind, subject, token)

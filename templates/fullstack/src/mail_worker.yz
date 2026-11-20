@@ -1,0 +1,33 @@
+use "models/mail_job_repository"
+use "services/mail_service"
+use "std/fs"
+
+fn mail_worker_close(handle: Number) -> Number:
+    let _closed: Result[Boolean, Text] = close(handle)
+    return 0
+
+fn mail_worker_run() -> Result[Boolean, Text]:
+    let conn: YazaBaseConnection = mail_job_connect()?
+    let root: Number = root_open(conn.db_dir)?
+    let lock: Number = lock_exclusive(root, ".mail_worker.lock")?
+    defer mail_worker_close(lock)
+    defer mail_worker_close(root)
+    let _recovered: Boolean = mail_job_recover_inflight(conn)?
+    while true:
+        arena_scope 1048576:
+            let picked: Result[Option[MailJob], Text] = mail_job_claim(conn)
+            if result_is_ok(picked) and option_is_some(result_unwrap(picked)):
+                let job: MailJob = option_unwrap(result_unwrap(picked))
+                let sent: Result[Boolean, Text] = mail_service_send(job.to_address, job.subject, job.body)
+                if result_is_ok(sent):
+                    let _done: Result[Boolean, Text] = mail_job_complete(conn, job)
+                else:
+                    let _retried: Result[Boolean, Text] = mail_job_retry(conn, job)
+        let _slept: Boolean = sleep_ms(250)
+    return ok(true)
+
+start:
+    let outcome: Result[Boolean, Text] = mail_worker_run()
+    if not result_is_ok(outcome):
+        say "mail worker: " + result_unwrap_error(outcome)
+        exit(1)

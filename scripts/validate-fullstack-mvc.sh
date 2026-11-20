@@ -10,7 +10,7 @@ TEMP_ROOT=${TEMP_ROOT%/}
 WORK_DIR=$(mktemp -d "$TEMP_ROOT/yaza-fullstack-mvc.XXXXXX")
 trap 'rm -rf "$WORK_DIR"' EXIT HUP INT TERM
 
-export YAZA_STDLIB_DIR="$PROJECT_DIR/std"
+export YAZA_STDLIB_DIR="$PROJECT_DIR"
 export YAZA_RUNTIME_DIR="$PROJECT_DIR/runtime"
 export YAZABASE_BIN="$YAZABASE_CLI"
 
@@ -27,6 +27,8 @@ mkdir -p data
 "$YAZABASE_CLI" set-user ./data admin 'Fullstack_CI_Pass_2026' >/dev/null
 export YAZABASE_USER=admin
 export YAZABASE_PASSWORD='Fullstack_CI_Pass_2026'
+"$YAZA_BIN" build --release src/admin_setup.yz -o admin_setup_ci
+YAZA_WEB_ADMIN_USER=admin YAZA_WEB_ADMIN_PASSWORD='Fullstack_Web_Admin_CI_2026' ./admin_setup_ci
 
 "$YAZA_BIN" arch check
 "$YAZA_BIN" audit --security

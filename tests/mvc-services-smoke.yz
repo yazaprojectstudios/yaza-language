@@ -1,0 +1,70 @@
+use "controllers/account_controller"
+use "models/mail_job_repository"
+
+fn check_services() -> Result[Boolean, Text]:
+    let conn: YazaBaseConnection = mail_job_connect()?
+    let job_id: Number = mail_job_enqueue("dev@example.com", "Test mail", "hello")?
+    let claimed: Option[MailJob] = mail_job_claim(conn)?
+    if not option_is_some(claimed): return err("mail job was not queued")
+    let job: MailJob = option_unwrap(claimed)
+    if job.id != job_id: return err("wrong mail job was claimed")
+    let _retried: Boolean = mail_job_retry(conn, job)?
+    let next: Option[MailJob] = mail_job_claim(conn)?
+    if option_is_some(next): return err("mail retry ignored backoff")
+
+    let old_session: Text = web_issue_session_token("admin", "admin")
+    let forgot_body: Text = "email=admin%40example.com"
+    let forgot_raw: Bytes = bytes_from_text("POST /forgot-password HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: " + number_text(text_length(forgot_body)) + "\r\n\r\n" + forgot_body)
+    let forgot_request: WebRequest = web_parse_request(forgot_raw)?
+    if account_request_password_reset(forgot_request).status_code != 200: return err("reset request failed")
+    let reset_mail_opt: Option[MailJob] = mail_job_claim(conn)?
+    if not option_is_some(reset_mail_opt): return err("reset email was not queued")
+    let reset_mail: MailJob = option_unwrap(reset_mail_opt)
+    if reset_mail.to_address != "admin@example.com": return err("reset email recipient mismatch")
+    let reset_pos: Number = text_find(reset_mail.body, "token=")
+    if reset_pos < 0 or text_length(reset_mail.body) < reset_pos + 70: return err("reset link missing")
+    let reset_token: Text = text_slice(reset_mail.body, reset_pos + 6, 64)
+    let _reset_mail_done: Boolean = mail_job_complete(conn, reset_mail)?
+    let body: Text = "token=" + reset_token + "&password=NewSecurePass_2026_Changed"
+    let raw: Bytes = bytes_from_text("POST /reset-password HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: " + number_text(text_length(body)) + "\r\n\r\n" + body)
+    let reset_request: WebRequest = web_parse_request(raw)?
+    let reset_response: WebResponse = account_submit_password_reset(reset_request)
+    if reset_response.status_code != 200: return err("password reset failed")
+    if admin_verify_credentials(task_db_dir(), "admin", "WebAdminPass_2026_Secure"): return err("old web password still works")
+    if not admin_verify_credentials(task_db_dir(), "admin", "NewSecurePass_2026_Changed"): return err("new web password does not work")
+    if not yazabase_verify_credentials(task_db_dir(), "db_service", "DatabaseServicePass_2026"):
+        return err("database service credentials changed")
+    let cookie_raw: Bytes = bytes_from_text("GET /dashboard HTTP/1.1\r\nHost: localhost\r\nCookie: yaza_session=" + old_session + "\r\n\r\n")
+    let cookie_request: WebRequest = web_parse_request(cookie_raw)?
+    if web_current_session(cookie_request).authenticated: return err("old web session was not revoked")
+    let replay: WebResponse = account_submit_password_reset(reset_request)
+    if text_find(bytes_to_text(replay.body), "already used") < 0: return err("password reset replay was accepted")
+
+    let email: Text = "admin@example.com"
+    let new_session: Text = web_issue_session_token("admin", "admin")
+    let csrf: Text = csrf_issue_token(new_session, web_session_signing_secret())
+    let verify_body: Text = "_csrf=" + csrf
+    let verify_submit_raw: Bytes = bytes_from_text("POST /email-verification HTTP/1.1\r\nHost: localhost\r\nCookie: yaza_session=" + new_session + "\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: " + number_text(text_length(verify_body)) + "\r\n\r\n" + verify_body)
+    let verify_submit_request: WebRequest = web_parse_request(verify_submit_raw)?
+    if account_request_email_verification(verify_submit_request).status_code != 200: return err("verification request failed")
+    let verify_mail_opt: Option[MailJob] = mail_job_claim(conn)?
+    if not option_is_some(verify_mail_opt): return err("verification email was not queued")
+    let verify_mail: MailJob = option_unwrap(verify_mail_opt)
+    let verify_pos: Number = text_find(verify_mail.body, "token=")
+    if verify_pos < 0 or text_length(verify_mail.body) < verify_pos + 70: return err("verification link missing")
+    let verify_token: Text = text_slice(verify_mail.body, verify_pos + 6, 64)
+    let _verify_mail_done: Boolean = mail_job_complete(conn, verify_mail)?
+    let verify_raw: Bytes = bytes_from_text("GET /verify-email?token=" + verify_token + " HTTP/1.1\r\nHost: localhost\r\n\r\n")
+    let verify_request: WebRequest = web_parse_request(verify_raw)?
+    if account_confirm_email_verification(verify_request).status_code != 200: return err("email verification failed")
+    let verified: Boolean = account_email_is_verified(conn, email)?
+    if not verified: return err("verified email was not recorded")
+    if account_confirm_email_verification(verify_request).status_code != 400: return err("email verification replay was accepted")
+    return ok(true)
+
+start:
+    let checked: Result[Boolean, Text] = check_services()
+    if not result_is_ok(checked):
+        say result_unwrap_error(checked)
+        exit(1)
+    say "mvc-services-smoke passed"

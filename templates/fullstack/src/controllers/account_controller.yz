@@ -1,0 +1,152 @@
+# Single-admin password recovery by emailed, durable, one-time token.
+use "std/web/request"
+use "std/web/response"
+use "std/web/form"
+use "std/html"
+use "std/csv"
+use "std/security/action_token"
+use "../middleware/web_security"
+use "../models/mail_job_repository"
+use "../services/mail_service"
+
+fn account_public_url() -> Text:
+    let base: Text = env_get("YAZA_PUBLIC_BASE_URL")
+    if text_length(base) > 256 or text_find(base, "\r") >= 0 or text_find(base, "\n") >= 0:
+        return ""
+    if web_is_production() and not text_starts_with(base, "https://"):
+        return ""
+    if not text_starts_with(base, "https://") and not text_starts_with(base, "http://"):
+        return ""
+    if text_ends_with(base, "/"): return text_slice(base, 0, text_length(base) - 1)
+    return base
+
+fn account_recovery_page(message: Text) -> WebResponse:
+    let escaped: Result[Text, Text] = html_escape_text(message)
+    if not result_is_ok(escaped): return web_html_status(500, "Internal Server Error", "<h1>Unavailable</h1>")
+    let html: Text = "<!doctype html><html><head><meta charset=\"utf-8\"><title>Reset password</title><link rel=\"stylesheet\" href=\"/public/yaza-ui.css\"></head><body><main class=\"yz-auth-wrap\"><section class=\"yz-auth-card\"><h1>Reset password</h1><p>" + result_unwrap(escaped) + "</p><form method=\"POST\" action=\"/forgot-password\"><label>Email <input name=\"email\" type=\"email\" required></label><button type=\"submit\">Send reset link</button></form></section></main></body></html>"
+    return web_html_status(200, "OK", html)
+
+fn account_reset_page(token: Text, message: Text) -> WebResponse:
+    let safe_token: Result[Text, Text] = html_escape_attribute(token)
+    let safe_message: Result[Text, Text] = html_escape_text(message)
+    if not result_is_ok(safe_token) or not result_is_ok(safe_message): return web_html_status(500, "Internal Server Error", "<h1>Unavailable</h1>")
+    let html: Text = "<!doctype html><html><head><meta charset=\"utf-8\"><title>Choose new password</title><link rel=\"stylesheet\" href=\"/public/yaza-ui.css\"></head><body><main class=\"yz-auth-wrap\"><section class=\"yz-auth-card\"><h1>Choose new password</h1><p>" + result_unwrap(safe_message) + "</p><form method=\"POST\" action=\"/reset-password\"><input type=\"hidden\" name=\"token\" value=\"" + result_unwrap(safe_token) + "\"><label>New password <input name=\"password\" type=\"password\" minlength=\"16\" required autocomplete=\"new-password\"></label><button type=\"submit\">Change password</button></form></section></main></body></html>"
+    return web_html_status(200, "OK", html)
+
+fn account_request_password_reset(req: WebRequest) -> WebResponse:
+    let generic: Text = "If this address belongs to the configured account, a reset link will arrive shortly."
+    let fields_res: Result[List[FormField], Text] = form_parse_urlencoded(req.http.body_text, 4)
+    if not result_is_ok(fields_res): return account_recovery_page(generic)
+    let email: Text = text_trim(form_get_or(result_unwrap(fields_res), "email", ""))
+    if text_length(email) < 3 or text_length(email) > 254: return account_recovery_page(generic)
+    if not web_login_limiter_take("recovery:" + email): return account_recovery_page(generic)
+    let configured_email: Text = env_get("YAZA_ADMIN_EMAIL")
+    let base: Text = account_public_url()
+    if configured_email == "" or email != configured_email or base == "": return account_recovery_page(generic)
+    let conn_res: Result[YazaBaseConnection, Text] = mail_job_connect()
+    if not result_is_ok(conn_res): return account_recovery_page(generic)
+    let username: Text = admin_current_username(task_db_dir())
+    let token_res: Result[Text, Text] = account_action_issue(result_unwrap(conn_res), "password_reset", username, 900000)
+    if not result_is_ok(token_res): return account_recovery_page(generic)
+    let link: Text = base + "/reset-password?token=" + result_unwrap(token_res)
+    let _queued: Result[Number, Text] = mail_service_enqueue(email, "Reset your password", "Open this link within 15 minutes: " + link)
+    return account_recovery_page(generic)
+
+fn account_submit_password_reset(req: WebRequest) -> WebResponse:
+    let fields_res: Result[List[FormField], Text] = form_parse_urlencoded(req.http.body_text, 4)
+    if not result_is_ok(fields_res): return account_reset_page("", "Invalid form.")
+    let fields: List[FormField] = result_unwrap(fields_res)
+    let token: Text = form_get_or(fields, "token", "")
+    let password: Text = form_get_or(fields, "password", "")
+    if text_length(password) < 16 or text_length(password) > 1024:
+        return account_reset_page(token, "Password must contain 16–1024 characters.")
+    let conn_res: Result[YazaBaseConnection, Text] = mail_job_connect()
+    if not result_is_ok(conn_res): return account_reset_page("", "Recovery is temporarily unavailable.")
+    let username: Text = admin_current_username(task_db_dir())
+    let consumed: Result[Boolean, Text] = account_action_consume(result_unwrap(conn_res), "password_reset", username, token)
+    if not result_is_ok(consumed) or not result_unwrap(consumed):
+        return account_reset_page("", "Reset link is invalid, expired, or already used.")
+    let changed: Result[Boolean, Text] = admin_set_credentials(task_db_dir(), username, password)
+    if not result_is_ok(changed): return account_reset_page("", "Password update failed. Request a new link.")
+    return web_html_status(200, "OK", "<h1>Password changed</h1><p>Existing web sessions have been revoked. <a href=\"/login\">Sign in</a>.</p>")
+
+fn account_email_is_verified(conn: YazaBaseConnection, email: Text) -> Result[Boolean, Text]:
+    let p: TextList = text_list()
+    list_push(p, "text:" + email)
+    let csv: Text = yazabase_query_csv(conn, "SELECT id FROM admin_email_verification WHERE email = $1 LIMIT 1", p)?
+    let raw: Bytes = bytes_try_from_text(csv)?
+    let header: Option[CsvRecord] = csv_read_record(raw, 0)?
+    if not option_is_some(header): return ok(false)
+    let row: Option[CsvRecord] = csv_read_record(raw, option_unwrap(header).next_offset)?
+    return ok(option_is_some(row))
+
+fn account_email_mark_verified(conn: YazaBaseConnection, email: Text) -> Result[Boolean, Text]:
+    let no_params: TextList = text_list()
+    let existing: Text = yazabase_query_csv(conn, "SELECT id FROM admin_email_verification WHERE id = 1 LIMIT 1", no_params)?
+    let raw: Bytes = bytes_try_from_text(existing)?
+    let header: Option[CsvRecord] = csv_read_record(raw, 0)?
+    if option_is_some(header):
+        let row: Option[CsvRecord] = csv_read_record(raw, option_unwrap(header).next_offset)?
+        if option_is_some(row):
+            let p: TextList = text_list()
+            list_push(p, "text:" + email)
+            list_push(p, "bigint:" + number_text(time_now_unix_ms()))
+            let _updated: Text = yazabase_exec_params(conn, "UPDATE admin_email_verification SET email = $1, verified_at_ms = $2 WHERE id = 1", p)?
+            return ok(true)
+    let p: TextList = text_list()
+    list_push(p, "bigint:1")
+    list_push(p, "text:" + email)
+    list_push(p, "bigint:" + number_text(time_now_unix_ms()))
+    let _inserted: Text = yazabase_exec_params(conn, "INSERT INTO admin_email_verification (id, email, verified_at_ms) VALUES ($1, $2, $3)", p)?
+    return ok(true)
+
+fn account_email_verification_page(req: WebRequest) -> WebResponse:
+    let sess: WebSession = web_current_session(req)
+    if not sess.authenticated: return web_redirect_see_other("/login")
+    let email: Text = env_get("YAZA_ADMIN_EMAIL")
+    var status: Text = "Configure YAZA_ADMIN_EMAIL before requesting verification."
+    if email != "":
+        set status = "A verification email can be sent to the configured admin address."
+        let conn_res: Result[YazaBaseConnection, Text] = mail_job_connect()
+        if result_is_ok(conn_res):
+            let verified: Result[Boolean, Text] = account_email_is_verified(result_unwrap(conn_res), email)
+            if result_is_ok(verified) and result_unwrap(verified): set status = "Admin email is verified."
+    let escaped: Result[Text, Text] = html_escape_text(status)
+    if not result_is_ok(escaped): return web_html_status(500, "Internal Server Error", "<h1>Unavailable</h1>")
+    let html: Text = "<!doctype html><html><head><meta charset=\"utf-8\"><title>Email verification</title></head><body><h1>Email verification</h1><p>" + result_unwrap(escaped) + "</p><form method=\"POST\" action=\"/email-verification\"><input type=\"hidden\" name=\"_csrf\" value=\"" + sess.csrf_token + "\"><button type=\"submit\">Send verification link</button></form></body></html>"
+    return web_html_ok(html)
+
+fn account_request_email_verification(req: WebRequest) -> WebResponse:
+    let sess: WebSession = web_current_session(req)
+    if not sess.authenticated: return web_redirect_see_other("/login")
+    let form: Result[List[FormField], Text] = form_parse_urlencoded(req.http.body_text, 4)
+    if not result_is_ok(form):
+        return web_html_status(403, "Forbidden", "<h1>CSRF verification failed</h1>")
+    if not web_verify_request_csrf(req, sess, result_unwrap(form)):
+        return web_html_status(403, "Forbidden", "<h1>CSRF verification failed</h1>")
+    let email: Text = env_get("YAZA_ADMIN_EMAIL")
+    let base: Text = account_public_url()
+    if email == "" or base == "": return web_html_status(503, "Service Unavailable", "<h1>Email configuration is incomplete</h1>")
+    if not web_login_limiter_take("verify:" + email): return web_html_status(429, "Too Many Requests", "<h1>Try again later</h1>")
+    let conn_res: Result[YazaBaseConnection, Text] = mail_job_connect()
+    if not result_is_ok(conn_res): return web_html_status(503, "Service Unavailable", "<h1>Database unavailable</h1>")
+    let token_res: Result[Text, Text] = account_action_issue(result_unwrap(conn_res), "email_verify", sess.username, 86400000)
+    if not result_is_ok(token_res): return web_html_status(503, "Service Unavailable", "<h1>Token unavailable</h1>")
+    let link: Text = base + "/verify-email?token=" + result_unwrap(token_res)
+    let queued: Result[Number, Text] = mail_service_enqueue(email, "Verify your email", "Open this link within 24 hours: " + link)
+    if not result_is_ok(queued): return web_html_status(503, "Service Unavailable", "<h1>Mail queue unavailable</h1>")
+    return web_html_ok("<h1>Verification link queued</h1>")
+
+fn account_confirm_email_verification(req: WebRequest) -> WebResponse:
+    let token: Text = http_query_param_text(req.http.query, "token", "")
+    let conn_res: Result[YazaBaseConnection, Text] = mail_job_connect()
+    if not result_is_ok(conn_res): return web_html_status(503, "Service Unavailable", "<h1>Database unavailable</h1>")
+    let conn: YazaBaseConnection = result_unwrap(conn_res)
+    let email: Text = env_get("YAZA_ADMIN_EMAIL")
+    let username: Text = admin_current_username(task_db_dir())
+    let consumed: Result[Boolean, Text] = account_action_consume(conn, "email_verify", username, token)
+    if not result_is_ok(consumed) or not result_unwrap(consumed):
+        return web_html_status(400, "Bad Request", "<h1>Verification link is invalid or expired</h1>")
+    let recorded: Result[Boolean, Text] = account_email_mark_verified(conn, email)
+    if not result_is_ok(recorded): return web_html_status(503, "Service Unavailable", "<h1>Could not record verification</h1>")
+    return web_html_ok("<h1>Email verified</h1><p><a href=\"/dashboard\">Continue</a></p>")

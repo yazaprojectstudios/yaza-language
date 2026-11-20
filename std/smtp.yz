@@ -1,0 +1,211 @@
+# SMTP submission through a trusted local IPv4 relay. This module never sends
+# credentials and intentionally does not offer remote plaintext SMTP.
+use "std/net"
+use "std/convert"
+use "std/time"
+
+shape SmtpMessage:
+    from_address: Text
+    to_address: Text
+    subject: Text
+    body: Text
+
+shape SmtpReply:
+    code: Number
+    pending: Text
+
+fn smtp_address_valid(address: Text) -> Boolean:
+    let length: Number = text_length(address)
+    if length < 3 or length > 254: return false
+    var at_count: Number = 0
+    var at_index: Number = -1
+    var previous_byte: Number = 0
+    var index: Number = 0
+    while index < length:
+        let byte: Number = text_byte(address, index)
+        if byte == 64:
+            set at_count = at_count + 1
+            set at_index = index
+        elif byte <= 32 or byte >= 127 or byte == 60 or byte == 62 or byte == 34 or byte == 40 or byte == 41 or byte == 44 or byte == 58 or byte == 59 or byte == 91 or byte == 92 or byte == 93:
+            return false
+        elif byte == 46 and previous_byte == 46:
+            return false
+        if at_count == 1 and index > at_index:
+            let domain_byte: Boolean = (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122) or (byte >= 48 and byte <= 57) or byte == 45 or byte == 46
+            if not domain_byte: return false
+            if byte == 46 and (previous_byte == 45 or previous_byte == 64): return false
+            if byte == 45 and (previous_byte == 46 or previous_byte == 64): return false
+        set previous_byte = byte
+        set index = index + 1
+    if at_count != 1 or at_index < 1 or at_index > 64 or at_index >= length - 3: return false
+    if text_byte(address, 0) == 46 or text_byte(address, at_index - 1) == 46: return false
+    if text_byte(address, at_index + 1) == 46 or text_byte(address, length - 1) == 46: return false
+    if text_byte(address, length - 1) == 45: return false
+    return text_find(text_slice(address, at_index + 1, length - at_index - 1), ".") >= 1
+
+fn smtp_subject_valid(subject: Text) -> Boolean:
+    let length: Number = text_length(subject)
+    if length < 1 or length > 200: return false
+    var index: Number = 0
+    while index < length:
+        let byte: Number = text_byte(subject, index)
+        if byte < 32 or byte > 126: return false
+        set index = index + 1
+    return true
+
+fn smtp_month_name(month: Number) -> Text:
+    if month == 1: return "Jan"
+    if month == 2: return "Feb"
+    if month == 3: return "Mar"
+    if month == 4: return "Apr"
+    if month == 5: return "May"
+    if month == 6: return "Jun"
+    if month == 7: return "Jul"
+    if month == 8: return "Aug"
+    if month == 9: return "Sep"
+    if month == 10: return "Oct"
+    if month == 11: return "Nov"
+    return "Dec"
+
+fn smtp_weekday_name(day: Number) -> Text:
+    if day == 0: return "Sun"
+    if day == 1: return "Mon"
+    if day == 2: return "Tue"
+    if day == 3: return "Wed"
+    if day == 4: return "Thu"
+    if day == 5: return "Fri"
+    return "Sat"
+
+fn smtp_rfc5322_date_from_unix_ms(unix_time_ms: Number) -> Text:
+    # Civil date from nonnegative Unix days; UTC keeps the wire date unambiguous.
+    let seconds: Number = unix_time_ms / 1000
+    let days: Number = seconds / 86400
+    let seconds_of_day: Number = seconds % 86400
+    let z: Number = days + 719468
+    let era: Number = z / 146097
+    let doe: Number = z - era * 146097
+    let yoe: Number = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    var year: Number = yoe + era * 400
+    let doy: Number = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp: Number = (5 * doy + 2) / 153
+    let day: Number = doy - (153 * mp + 2) / 5 + 1
+    var month: Number = mp + 3
+    if mp >= 10: set month = mp - 9
+    if month <= 2: set year = year + 1
+    return smtp_weekday_name((days + 4) % 7) + ", " + time_pad2(day) + " " + smtp_month_name(month) + " " + number_text(year) + " " + time_pad2(seconds_of_day / 3600) + ":" + time_pad2((seconds_of_day % 3600) / 60) + ":" + time_pad2(seconds_of_day % 60) + " +0000"
+
+fn smtp_format_message(message: SmtpMessage, unix_time_ms: Number) -> Result[Text, Text]:
+    if not smtp_address_valid(message.from_address): return err("SMTP sender address is invalid")
+    if not smtp_address_valid(message.to_address): return err("SMTP recipient address is invalid")
+    if not smtp_subject_valid(message.subject): return err("SMTP subject must be 1-200 printable ASCII bytes")
+    if text_length(message.body) > 524288: return err("SMTP body exceeds 512 KiB")
+    if unix_time_ms < 0: return err("SMTP date requires a nonnegative Unix timestamp")
+    let body_bytes: Bytes = bytes_try_from_text(message.body)?
+    let encoded: Text = convert_try_base64_encode(body_bytes)?
+    let parts_result: Result[TextList, Text] = text_list_try_new()
+    if not result_is_ok(parts_result): return err(result_unwrap_error(parts_result))
+    let parts: TextList = result_unwrap(parts_result)
+    if not list_try_push(parts, "From: <" + message.from_address + ">\r\nTo: <" + message.to_address + ">\r\nSubject: " + message.subject + "\r\nDate: " + smtp_rfc5322_date_from_unix_ms(unix_time_ms) + "\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n"):
+        return err("SMTP message header allocation failed")
+    var offset: Number = 0
+    while offset < text_length(encoded):
+        var chunk_length: Number = text_length(encoded) - offset
+        if chunk_length > 76: set chunk_length = 76
+        let encoded_line: Text = text_try_slice(encoded, offset, chunk_length)?
+        let terminated_line: Text = text_try_concat(encoded_line, "\r\n")?
+        if not list_try_push(parts, terminated_line):
+            return err("SMTP body allocation failed")
+        set offset = offset + chunk_length
+    if text_length(encoded) == 0:
+        if not list_try_push(parts, "\r\n"): return err("SMTP body allocation failed")
+    return text_try_join(parts, "")
+
+fn smtp_reply_digit(byte: Number) -> Boolean:
+    return byte >= 48 and byte <= 57
+
+fn smtp_read_reply(connection: Number, pending: Text, timeout_ms: Number) -> Result[SmtpReply, Text]:
+    var buffer: Text = pending
+    var code: Number = -1
+    var line_count: Number = 0
+    while true:
+        if text_length(buffer) > 8192: return err("SMTP reply exceeds 8192 bytes")
+        let end: Number = text_find(buffer, "\r\n")
+        if end >= 0:
+            if end < 4 or end > 1000: return err("SMTP reply line length is invalid")
+            let line: Text = text_try_slice(buffer, 0, end)?
+            let separator: Number = text_byte(line, 3)
+            if not smtp_reply_digit(text_byte(line, 0)) or not smtp_reply_digit(text_byte(line, 1)) or not smtp_reply_digit(text_byte(line, 2)) or (separator != 32 and separator != 45):
+                return err("SMTP reply code is malformed")
+            let line_code: Number = (text_byte(line, 0) - 48) * 100 + (text_byte(line, 1) - 48) * 10 + text_byte(line, 2) - 48
+            if line_code < 200 or line_code > 599: return err("SMTP reply code is outside the supported range")
+            var position: Number = 4
+            while position < text_length(line):
+                let byte: Number = text_byte(line, position)
+                if byte < 32 and byte != 9: return err("SMTP reply contains a control byte")
+                set position = position + 1
+            if code >= 0 and code != line_code: return err("SMTP multiline reply changed its status code")
+            set code = line_code
+            set line_count = line_count + 1
+            if line_count > 32: return err("SMTP reply has too many lines")
+            set buffer = text_try_slice(buffer, end + 2, text_length(buffer) - end - 2)?
+            if separator == 32: return ok(SmtpReply(code, buffer))
+        else:
+            let received: Bytes = tcp_read(connection, 2048, timeout_ms)?
+            if bytes_length(received) == 0: return err("SMTP connection closed before a complete reply")
+            let decoded: Option[Text] = bytes_to_text_checked(received)
+            if not option_is_some(decoded): return err("SMTP reply contains invalid UTF-8")
+            set buffer = text_try_concat(buffer, option_unwrap(decoded))?
+    return err("SMTP reply did not complete")
+
+fn smtp_write_text(connection: Number, payload: Text, timeout_ms: Number) -> Result[Boolean, Text]:
+    let bytes: Bytes = bytes_try_from_text(payload)?
+    let written: Number = tcp_write(connection, bytes, timeout_ms)?
+    if written != bytes_length(bytes): return err("SMTP connection accepted only part of a command")
+    return ok(true)
+
+fn smtp_expect(connection: Number, pending: Text, expected_code: Number, timeout_ms: Number) -> Result[Text, Text]:
+    let reply: SmtpReply = smtp_read_reply(connection, pending, timeout_ms)?
+    if reply.code != expected_code:
+        return err("SMTP server returned " + number_text(reply.code) + " instead of " + number_text(expected_code))
+    return ok(reply.pending)
+
+fn smtp_close_after_send(connection: Number) -> Number:
+    let closed: Result[Boolean, Text] = tcp_close(connection)
+    return 0
+
+fn smtp_send_local(port: Number, message: SmtpMessage, timeout_ms: Number) -> Result[Boolean, Text]:
+    # A local MTA (Postfix, OpenSMTPD, Mailpit, etc.) owns outbound TLS, auth,
+    # retries and delivery. Never point this function at a remote SMTP server.
+    if port < 1 or port > 65535: return err("SMTP relay port must be between 1 and 65535")
+    if timeout_ms < 1 or timeout_ms > 60000: return err("SMTP timeout must be between 1 and 60000 ms")
+    let payload: Text = smtp_format_message(message, time_now_unix_ms())?
+    let connection: Number = tcp_connect("127.0.0.1", port, timeout_ms)?
+    defer smtp_close_after_send(connection)
+    var pending: Text = smtp_expect(connection, "", 220, timeout_ms)?
+    let ehlo_written: Boolean = smtp_write_text(connection, "EHLO localhost\r\n", timeout_ms)?
+    set pending = smtp_expect(connection, pending, 250, timeout_ms)?
+    let from_written: Boolean = smtp_write_text(connection, "MAIL FROM:<" + message.from_address + ">\r\n", timeout_ms)?
+    set pending = smtp_expect(connection, pending, 250, timeout_ms)?
+    let recipient_written: Boolean = smtp_write_text(connection, "RCPT TO:<" + message.to_address + ">\r\n", timeout_ms)?
+    let recipient_reply: SmtpReply = smtp_read_reply(connection, pending, timeout_ms)?
+    if recipient_reply.code != 250 and recipient_reply.code != 251:
+        return err("SMTP relay rejected recipient with status " + number_text(recipient_reply.code))
+    set pending = recipient_reply.pending
+    let data_written: Boolean = smtp_write_text(connection, "DATA\r\n", timeout_ms)?
+    set pending = smtp_expect(connection, pending, 354, timeout_ms)?
+    let terminated_payload: Text = text_try_concat(payload, ".\r\n")?
+    let message_written: Boolean = smtp_write_text(connection, terminated_payload, timeout_ms)?
+    set pending = smtp_expect(connection, pending, 250, timeout_ms)?
+    let quit_written: Result[Boolean, Text] = smtp_write_text(connection, "QUIT\r\n", timeout_ms)
+    return ok(true)
+
+fn smtp_send_secure(provider: Text, auth_mode: Text, username: Text, credential: Text, message: SmtpMessage, timeout_ms: Number) -> Result[Boolean, Text]:
+    # Google: OAuth2 bearer token (preferred), or an available app password.
+    # Brevo: SMTP login and SMTP key. The transport always requires STARTTLS.
+    if provider != "google" and provider != "brevo": return err("SMTP provider must be google or brevo")
+    if auth_mode != "password" and auth_mode != "oauth2": return err("SMTP authentication mode must be password or oauth2")
+    if provider == "brevo" and auth_mode != "password": return err("Brevo SMTP requires an SMTP key")
+    if text_length(username) == 0 or text_length(credential) == 0: return err("SMTP credentials are required")
+    if timeout_ms < 1 or timeout_ms > 60000: return err("SMTP timeout must be between 1 and 60000 ms")
+    let payload: Text = smtp_format_message(message, time_now_unix_ms())?
+    return smtp_secure_send(provider, auth_mode, username, credential, message.from_address, message.to_address, payload, timeout_ms)

@@ -1,11 +1,13 @@
 # Application Router: Unifies Static Assets, Web MVC SSR, Hypermedia Fragments, JSON API & K8s Probes.
 use "std/http"
 use "std/sync"
+use "std/telemetry"
 use "std/web/request"
 use "std/web/response"
 use "std/web/static"
 use "services/task_service"
 use "controllers/auth_controller"
+use "controllers/account_controller"
 use "controllers/task_controller"
 use "controllers/media_controller"
 
@@ -19,6 +21,9 @@ fn extract_task_action_id(path: Text, suffix: Text) -> Text:
     return text_slice(path, start, end - start)
 
 fn app_dispatch_request(req: WebRequest, public_dir: Text, profile_label: Text, m_total: AtomicNumber, m_errors: AtomicNumber) -> WebResponse:
+    return app_dispatch_request_with_metrics(req, public_dir, profile_label, m_total, m_errors, telemetry_latency_new())
+
+fn app_dispatch_request_with_metrics(req: WebRequest, public_dir: Text, profile_label: Text, m_total: AtomicNumber, m_errors: AtomicNumber, m_latency: LatencyHistogram) -> WebResponse:
     let _inc: AtomicNumber = atomic_add(m_total, 1)
     let method: Text = req.http.method
     let path: Text = req.http.path
@@ -27,7 +32,7 @@ fn app_dispatch_request(req: WebRequest, public_dir: Text, profile_label: Text, 
     if path == "/healthz" or path == "/livez":
         return web_from_http_response(http_response_ok_json("{\"status\":\"ok\",\"service\":\"{{project_name}}\",\"mode\":\"fullstack-mvc\"}"))
     if path == "/readyz":
-        let ping: Result[Boolean, Text] = task_service_ping()
+        let ping: Result[Boolean, Text] = task_service_ping_traced(req.http.x_request_id)
         if not result_is_ok(ping):
             let _e: AtomicNumber = atomic_add(m_errors, 1)
             return web_from_http_response(http_response_service_unavailable("yazabase database is not ready", true))
@@ -41,6 +46,7 @@ fn app_dispatch_request(req: WebRequest, public_dir: Text, profile_label: Text, 
         set prom = prom + "# HELP yaza_http_errors_total Total 5xx or readiness errors\n"
         set prom = prom + "# TYPE yaza_http_errors_total counter\n"
         set prom = prom + "yaza_http_errors_total " + number_text(errs) + "\n"
+        set prom = prom + telemetry_latency_prometheus(m_latency)
         return web_from_http_response(HttpResponse(200, "OK", "text/plain; version=0.0.4", bytes_from_text(prom)))
 
     # 2. Confined Static Assets (/public/*)
@@ -66,6 +72,21 @@ fn app_dispatch_request(req: WebRequest, public_dir: Text, profile_label: Text, 
     if path == "/login":
         if method == "GET": return auth_controller_login_form(req)
         if method == "POST": return auth_controller_login_submit(req)
+        return web_html_status(405, "Method Not Allowed", "<h1>405 Method Not Allowed</h1>")
+    if path == "/forgot-password":
+        if method == "GET": return account_recovery_page("")
+        if method == "POST": return account_request_password_reset(req)
+        return web_html_status(405, "Method Not Allowed", "<h1>405 Method Not Allowed</h1>")
+    if path == "/reset-password":
+        if method == "GET": return account_reset_page(http_query_param_text(req.http.query, "token", ""), "")
+        if method == "POST": return account_submit_password_reset(req)
+        return web_html_status(405, "Method Not Allowed", "<h1>405 Method Not Allowed</h1>")
+    if path == "/email-verification":
+        if method == "GET": return account_email_verification_page(req)
+        if method == "POST": return account_request_email_verification(req)
+        return web_html_status(405, "Method Not Allowed", "<h1>405 Method Not Allowed</h1>")
+    if path == "/verify-email":
+        if method == "GET": return account_confirm_email_verification(req)
         return web_html_status(405, "Method Not Allowed", "<h1>405 Method Not Allowed</h1>")
     if path == "/logout" and method == "POST":
         return auth_controller_logout(req)
