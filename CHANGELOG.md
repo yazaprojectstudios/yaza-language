@@ -32,7 +32,7 @@ All notable changes to the **YAZA Programming Language**, **YazaBase SQL Engine*
      - **Hypermedia Fragment (`X-Yaza-Fragment` + `yaza-live.js`):** **`49,703 req/s`** (`p50 = 131 µs` vs Node.js v26 `37,612 req/s`)
      - **JSON API Parity (16 items):** **`69,571 req/s`** (`p50 = 113 µs`, `p95 = 195 µs`)
      - **Static CSS (`200 OK` / `304 ETag`):** **`59,683 req/s`** / **`75,454 req/s`**
-     - **Production App `yaza-quran` (`448.6 KB` binary, 114 Surahs / 6,236 Ayahs):** **`1,337.0 req/s`** full 114-surah SSR (`55,624 B`), **`5,951.4 req/s`** fragment filter, **`3,488.2 req/s`** JSON API.
+     - **Internal Multi-Route Content SSR App (`448.6 KB` binary, 114 sections / 6,236 records):** **`1,337.0 req/s`** full 114-section SSR (`55,624 B`), **`5,951.4 req/s`** fragment filter, **`3,488.2 req/s`** JSON API.
 
 3. **Security-by-Construction (Runtime & Standard Library Audit Hardening):**
    - **Auto HTML/Attribute Escaping (`std/web/view.yz`):** Context-aware escaping blocking `<svg>`, `<math>`, `srcdoc`, `javascript:`, `data:`, and `on*` event attributes by construction.

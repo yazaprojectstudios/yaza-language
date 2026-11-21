@@ -20,7 +20,7 @@
 2. **Arena-SSR MVC & HTML-over-the-Wire (`std/web/*`):**
    - **Zero-GC Per-Request Arena SSR** combined with partial DOM updates via **`X-Yaza-Fragment` + `yaza-live.js`** (~0.7 kB per interaction without heavy client JS bundles or SPA hydration), compiled type-safe HTML5 `view` syntax, binary `multipart/form-data` upload with magic-byte checks, HTTP 206 seekable streaming, and compile-time layer boundary checks (`yaza arch check`).
    - **6 Production CLI Project Templates:** `--minimal-api`, `--api`, `--web`, `--mvc` (alias `--fullstack`), `--microservice`, and `--mobile`.
-   - **Post-Audit Loopback Benchmarks vs Node.js `v26.0.0`:** **`53,668 req/s`** Full SSR HTML (`p50 142 µs`, `7.05 MB RSS` vs Node.js v26 `36,960 req/s` & `73.53 MB RSS`), **`49,703 req/s`** Hypermedia Fragment (`p50 131 µs` vs Node.js v26 `37,612 req/s`), **`69,571 req/s`** JSON API Parity (`113 µs` p50), plus live production app `yaza-quran` (**`1,337.0 req/s`** full 114-surah render / `55,624 B`, **`5,951.4 req/s`** fragment filter, **`3,488.2 req/s`** JSON API).
+   - **Post-Audit Loopback Benchmarks vs Node.js `v26.0.0`:** **`53,668 req/s`** Full SSR HTML (`p50 142 µs`, `7.05 MB RSS` vs Node.js v26 `36,960 req/s` & `73.53 MB RSS`), **`49,703 req/s`** Hypermedia Fragment (`p50 131 µs` vs Node.js v26 `37,612 req/s`), **`69,571 req/s`** JSON API Parity (`113 µs` p50), plus an internal multi-route Content SSR workload (**`1,337.0 req/s`** 114-section full index render / `55,624 B`, **`5,951.4 req/s`** fragment filter, **`3,488.2 req/s`** JSON API).
 3. **Security-by-Construction (Default in Runtime & Standard Library):**
    - Verified under `ASan+UBSan`, `TSan`, macOS `leaks --atExit` (`0 leaks`), and a hostile TCP soak of 10,000 valid requests + 200 malformed/smuggling/oversized payloads (`0` crashes, `0` FD leaks):
    - Auto HTML/attribute escaping (`std/web/view.yz`, blocking `svg`/`math`, `srcdoc`, `javascript:`/`data:`, and `on*` event attributes) + `yaza audit --security`.
@@ -30,7 +30,7 @@
    - **Transactional ACID SQL Engine (`YazaBase`):** Built-in B+Tree storage with ARIES WAL CRC32C recovery, parameterized query binding, and in-process embedded sessions (`std/db/yazabase_embedded.yz`) with per-statement `arena_scope` isolation (**`9,995.2 SELECT/s`** at `p50 = 0.099 ms`, **`882.7 rows/s`** batched transactional `INSERT` — **42.7×** faster than standalone `F_FULLFSYNC`, Peak RSS **`37.3 MiB`**).
    - **YAZA Binary Interchange Format (`YBIF`):** Length-prefixed binary wire format (`std/ybif.yz` & C direct encoder `yazabase_result_encode_ybif`) achieving **6.22× faster** encode+decode than JSON on scalar records (`3.26M ops/s`, 31.9% smaller) and **2.13× faster** on 16-row SQL result batches (`2.59M ops/s`, `896 B` vs `1,188 B`, 24.6% smaller).
    - **Pluggable External Database Adapters:** Native wire-protocol clients for **PostgreSQL** (v3 + SCRAM-SHA-256 + native socket TLS & 16-byte `CancelRequest`), **MySQL** (v10 + `caching_sha2_password`), **MSSQL** (TDS), and **NoSQL** (Redis RESP / MongoDB BSON).
-   - **Zero-GC Data Science, Statistical Computing, ML & Visualization (`std/data/*`):** Neumaier compensated summation, Welford 1-pass moments, partial-pivoting Gaussian linear algebra, Columnar Arena DataFrame, 30+ statistical/ML methods, **18 zero-JS Frontend SVG chart types**, and **6 Terminal CLI chart types**.
+   - **Zero-GC In-Process Statistical, DataFrame & Visualization Suite (`std/data/*`):** Built-in single-binary statistical and analytics toolkit combining Neumaier compensated summation, Welford 1-pass moments, partial-pivoting Gaussian linear algebra, Columnar Arena DataFrame, 30+ statistical/ML methods (`ml_ols_fit`, `ml_multiple_ols_fit`, `ml_logistic_fit`, `ml_pca_first_component`, `ml_knn_classify`, `ml_kmeans_1d`, `ml_roc_auc`), **18 zero-JS Frontend SVG chart types**, and **6 Terminal CLI chart types**.
 
 ---
 
@@ -362,20 +362,20 @@ Reproducible **8-framework HTTP/1.1 SSR & Web benchmark** (`darwin arm64`, `c = 
 
 See [docs/benchmarks/fullstack-ssr-2026-11-19.md](docs/benchmarks/fullstack-ssr-2026-11-19.md), `scripts/bench-web-frameworks.mjs`, and [yazastudios.id/benchmarks](https://yazastudios.id/benchmarks/#fullstack-ssr) for full methodology and reproduction steps.
 
-### Data Science, Statistical Computing & Numerical Accuracy (`std/data/*`, 19 Nov 2026)
+### Data Science, Statistical Computing & Numerical Accuracy (`std/data/*`, 19–21 Nov 2026)
 
-Executed via `scripts/bench-data-science.sh` and `scripts/validate-data-science.sh` on `darwin arm64` (`-O2`, `debug`, and `ASan+UBSan`):
+Executed via `scripts/bench-data-science.sh` and `scripts/validate-data-science.sh` on `darwin arm64` (`-O2`, `debug`, and `ASan+UBSan`). Timing rows compare compiled YAZA `std/data/*` against **pure Python (standard library / loops without NumPy/SciPy C extensions)**; accuracy rows compare YAZA's **default compensated/centered algorithms** against **naive textbook 1-pass/uncentered formulas** (Python's `math.fsum`, `statistics.variance`, and `scipy.stats.linregress` also avoid naive cancellation when explicitly selected):
 
-| Data Science Workload & IEEE-754 Accuracy Torture Test | YAZA v1.0 (`-O2` · `std/data/*`) | Python 3.14 (`statistics` / Standard IEEE-754) | YAZA Advantage |
+| Data Science Workload & IEEE-754 Default-Formula Stability Test | YAZA v1.0.2 (`-O2` · `std/data/*`) | Pure Python Reference (No NumPy/SciPy) / Naive Formula | YAZA Default Behavior |
 | :--- | :--- | :--- | :--- |
-| **Welford 4-Moment Statistics (Mean, StdDev, Skewness, Kurtosis · 1,000,000 pts)** | **`5.45–15.15 ms`** | `330.47–410.66 ms` | **`21.8×–75.4× faster`** |
-| **Centered 1-Pass OLS Linear Regression + R² + RMSE (1,000,000 pts)** | **`4.96–9.90 ms`** | `162.26–177.95 ms` | **`16.4×–35.9× faster`** |
-| **Silverman Gaussian KDE Density Estimation (5,000 obs × 64 grid = 320,000 evals)** | **`20.52 ms`** | `86.03 ms` | **`4.2× faster`** |
-| **Vector Z-Score Normalization + EWMA Time-Series + Compensated Dot (100,000 pts)** | **`3.78–6.03 ms`** | `16.65–23.22 ms` | **`3.9×–4.4× faster`** |
-| **Peak Memory Footprint (RSS · 100K Vector Pipeline)** | **`9.20–9.73 MB`** (0 GC pauses) | `26.03–27.75 MB` | **`2.8× lower RAM`** |
-| **Accuracy Torture #1: Ill-Conditioned Sum `[10¹⁶, 1.0 × 10,000, -10¹⁶]` (True = `10000.0`)** | **`10000.0`** (**0.0% error** · Neumaier) | `0.0` (100% error · naive `sum()`) | **Exact 53-bit compensation** |
-| **Accuracy Torture #2: 10⁹-Shifted Sample Variance `[10⁹+1, 10⁹+2, 10⁹+3]` (True = `1.0`)** | **`1.0`** (**0.0% error** · Welford 1-pass) | `0.0` (100% error · 2-term formula) | **Immune to cancellation** |
-| **Accuracy Torture #3: 10⁹-Shifted OLS Regression Slope (True = `2.0`, R² = `1.0`)** | **`2.0`** (**0.0% error** · Centered co-moments) | `NaN` (division by 0.0 in uncentered normal eq) | **Shift-invariant OLS** |
+| **Welford 4-Moment Statistics (Mean, StdDev, Skewness, Kurtosis · 1,000,000 pts)** | **`5.28–15.15 ms`** | `330.47–410.66 ms` (pure Python loop) | **`21.8×–68.8× faster vs pure Python`** |
+| **Centered 1-Pass OLS Linear Regression + R² + RMSE (1,000,000 pts)** | **`4.96–9.90 ms`** | `158.67–177.95 ms` (pure Python loop) | **`16.4×–35.9× faster vs pure Python`** |
+| **Silverman Gaussian KDE Density Estimation (5,000 obs × 64 grid = 320,000 evals)** | **`15.36–20.52 ms`** | `24.95–86.03 ms` (pure Python loop) | **`1.6×–4.2× faster vs pure Python`** |
+| **Vector Z-Score Normalization + EWMA Time-Series + Compensated Dot (100,000 pts)** | **`3.46–6.03 ms`** | `15.58–23.22 ms` (pure Python loop) | **`3.9×–4.8× faster vs pure Python`** |
+| **Peak Memory Footprint (RSS · 100K Vector Pipeline)** | **`9.20–9.75 MB`** (0 GC pauses) | `26.03–28.17 MB` | **`2.8× lower RAM`** |
+| **Default Sum Stability: Ill-Conditioned `[10¹⁶, 1.0 × 10,000, -10¹⁶]` (True = `10000.0`)** | **`10000.0`** (**0.0% error** · default Neumaier) | `0.0` (naive uncompensated `sum()`) | **Compensated by default** |
+| **Default Variance Stability: 10⁹-Shifted `[10⁹+1, 10⁹+2, 10⁹+3]` (True = `1.0`)** | **`1.0`** (**0.0% error** · default Welford 1-pass) | `0.0` (naive textbook $\sum x^2 - (\sum x)^2/n$) | **Welford 1-pass by default** |
+| **Default OLS Stability: 10⁹-Shifted Slope (True = `2.0`, R² = `1.0`)** | **`2.0`** (**0.0% error** · default centered co-moments) | `NaN` (naive uncentered normal equation) | **Centered OLS by default** |
 
 Run the terminal CLI chart showcase or full validation suite directly:
 ```sh
@@ -386,15 +386,15 @@ sh scripts/bench-data-science.sh
 
 ### Post-Audit Ecosystem Benchmarks (21 Nov 2026 · Apple M5 · macOS 26.5 arm64)
 
-Full reproducible audit measurements across the compiled toolchain (`YAZA LLVM 1.0.2`), Arena runtime, Arena-SSR, live `yaza-quran` web app, YazaBase SQL + YBIF, and the Mobile C ABI Engine ([full report](docs/benchmarks/audit-2026-11-21.md)):
+Full reproducible audit measurements across the compiled toolchain (`YAZA LLVM 1.0.2`), Arena runtime, Arena-SSR, internal multi-route Content SSR workload, YazaBase SQL + YBIF, and the Mobile C ABI Engine ([full report](docs/benchmarks/audit-2026-11-21.md)):
 
 | Subsystem | Measured Result (`-O2`) | Latency (`p50` / `p95`) | Memory / Artifact Footprint |
 | --- | --- | --- | --- |
 | **Arena 1M Scope Cycles** | **`38,064,786 scopes/sec`** (`26.27 ms`) | `26.27 ns/scope` | **`1.44 MiB`** Peak RSS · `0 B` retained |
 | **Multi-Worker Soak (200K reqs, 8 workers)** | **`4,023,821 req/sec`** (`0.050 s`) | `1.00 µs` / `4.00 µs` | `1.4 -> 4.8 MiB` RSS · `0` errors |
 | **Arena-SSR Full HTML / JSON API (`c=8`)** | **`53,668`** HTML · **`69,571`** JSON req/s | `142 µs` / `113 µs` (`p50`) | **`7.05 MB`** RSS · `246.4 KB` binary |
-| **Live `yaza-quran` SSR / Search / JSON API (`c=8`)** | `1,337` SSR · `5,951` Frag · `3,488` JSON req/s | `5.72 ms` · `1.20 ms` · `2.03 ms` | `218.2 MiB` plateau · `448.6 KB` binary |
-| **Data Science (1M Welford / 1M OLS)** | **`5.28 ms`** / **`4.99 ms`** (**68.8×** / **35.4×** Python) | `15.36 ms` KDE (320K) | **`9.75 MiB`** RSS · exact 53-bit sum/var |
+| **Internal Content SSR App (114-section / 6,236-record, `c=8`)** | `1,337` SSR · `5,951` Frag · `3,488` JSON req/s | `5.72 ms` · `1.20 ms` · `2.03 ms` | `218.2 MiB` plateau · `448.6 KB` binary |
+| **Data Science (1M Welford / 1M OLS vs Pure Python)** | **`5.28 ms`** / **`4.99 ms`** (**68.8×** / **35.4×** pure Python) | `15.36 ms` KDE (320K) | **`9.75 MiB`** RSS · Neumaier/Welford default |
 | **YazaBase Scoped PK `SELECT` / Batched `INSERT` / YBIF** | **`9,995`** `SELECT/s` · **`883`** `row/s` · **`2.59M`** `YBIF/s` | `0.099 ms` PK · `7.539 ms` cold CLI | **`37.3 MiB`** RSS · `1.90 MB` CLI |
 | **Mobile Native Engine C ABI (`1 B` / `1 KiB` / `32 KiB`)** | **`6.05M`** / **`1.37M`** / **`52.2K ops/s`** | `0.166 µs` / `0.708 µs` / `19.75 µs` | **`190 KB`** Android `.so` · **`237 KB`** iOS `.a` |
 

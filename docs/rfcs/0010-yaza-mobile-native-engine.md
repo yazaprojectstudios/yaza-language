@@ -110,7 +110,7 @@ promise zero-copy network parsing or zero-cycle decoding.
 ## 4. Developer experience (implemented command surface)
 
 ```text
-yaza new --mobile quran
+yaza new --mobile my_mobile_app
 yaza mobile doctor
 yaza mobile build --target android-arm64 --release
 yaza mobile build --target ios-arm64 --release
