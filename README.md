@@ -362,20 +362,34 @@ Reproducible **8-framework HTTP/1.1 SSR & Web benchmark** (`darwin arm64`, `c = 
 
 See [docs/benchmarks/fullstack-ssr-2026-11-19.md](docs/benchmarks/fullstack-ssr-2026-11-19.md), `scripts/bench-web-frameworks.mjs`, and [yazastudios.id/benchmarks](https://yazastudios.id/benchmarks/#fullstack-ssr) for full methodology and reproduction steps.
 
-### Data Science, Statistical Computing & Numerical Accuracy (`std/data/*`, 19–21 Nov 2026)
+### Data Science, Statistical Computing & SciPy Golden Cross-Validation (`std/data/*`, 21 Nov 2026)
 
-Executed via `scripts/bench-data-science.sh` and `scripts/validate-data-science.sh` on `darwin arm64` (`-O2`, `debug`, and `ASan+UBSan`). Timing rows compare compiled YAZA `std/data/*` against **pure Python (standard library / loops without NumPy/SciPy C extensions)**; accuracy rows compare YAZA's **default compensated/centered algorithms** against **naive textbook 1-pass/uncentered formulas** (Python's `math.fsum`, `statistics.variance`, and `scipy.stats.linregress` also avoid naive cancellation when explicitly selected):
+Executed via `scripts/bench-data-science.sh` and `scripts/validate-data-science.sh` on `darwin arm64` (Apple M5, `-O2`, `debug`, and `ASan+UBSan`), comparing compiled **YAZA v1.0.2 (`-O2` · `std/data/*`)** against **NumPy `2.5.5` / SciPy `1.18.1` (vectorized C / Accelerate BLAS)** and **Pure Python `3.14.5` (`stdlib` / loops)**:
 
-| Data Science Workload & IEEE-754 Default-Formula Stability Test | YAZA v1.0.2 (`-O2` · `std/data/*`) | Pure Python Reference (No NumPy/SciPy) / Naive Formula | YAZA Default Behavior |
+| Workload | YAZA v1.0.2 (`-O2` · `std/data/*`) | NumPy `2.5.5` / SciPy `1.18.1` | Pure Python `3.14.5` | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| **Welford 4-Moment Stats (Mean, Var, Skew, Kurt · 1M pts)** | **`15.05 ms`** (1-pass Welford) | `16.52 ms` (`scipy.stats.describe`) · `1.10 ms` (raw array ops) | `284.41 ms` | **1.10× faster** than `scipy.stats.describe`; **18.9×** vs pure Python |
+| **Centered 1-Pass OLS Regression + $R^2$ (1M pts)** | **`8.62 ms`** (1-pass `ml_ols_fit`) | **`2.37 ms`** (`scipy.stats.linregress`) | `147.29 ms` | SciPy vectorized BLAS is 3.6× faster; YAZA is **17.1×** vs pure Python |
+| **Vector Z-Score + Sequential EWMA + Dot (100K pts)** | **`6.15 ms`** | `13.13 ms` (vector Z-score/dot + EWMA recurrence) | `14.19 ms` | **2.13× faster** than NumPy + Python recurrence |
+| **Silverman Gaussian KDE (5,000 obs × 64 grid = 320K evals)** | **`21.16 ms`** | **`3.74 ms`** (`gaussian_kde`) · **`1.92 ms`** (2D broadcast) | `21.46 ms` | NumPy/SciPy SIMD batch `exp` leads on 2D grid evaluation |
+| **Columnar DataFrame ETL (5,000-row CSV Parse + FillNA + Filter + GroupBy + Inner Join)** | **`4.21 ms`** (`2.67 ms` parse + `1.55 ms` ops) | — | `5.13 ms` (`3.71 ms` `csv.DictReader` + `1.42 ms` dict ops) | **1.22× faster** total ETL (**1.39× faster** CSV parse) |
+| **Process Peak RSS (Full Benchmark + DataFrame ETL)** | **`17.98 MiB`** (`18,857,984 B` · 0 GC) | `128.89 MB` (Python + NumPy/SciPy runtime) | `28.17 MB` | **7.2× lower RAM** than Python + NumPy/SciPy |
+
+#### Automated 86-Case SciPy `1.18.1` Golden Cross-Validation (`tests/stdlib/data_science_golden.json`)
+
+Generated automatically via `scripts/generate-data-science-golden.py` and verified in CI across `debug`, `release (-O2)`, and `ASan+UBSan` by `tests/stdlib/data_science_golden_check.yz` (`scripts/validate-data-science.sh`):
+
+| Distribution / Statistical Function | Test Domain (Tails, Small $df$, Extreme Params) | Measured Max Error vs SciPy `1.18.1` | Enforced CI Tolerance |
 | :--- | :--- | :--- | :--- |
-| **Welford 4-Moment Statistics (Mean, StdDev, Skewness, Kurtosis · 1,000,000 pts)** | **`5.28–15.15 ms`** | `330.47–410.66 ms` (pure Python loop) | **`21.8×–68.8× faster vs pure Python`** |
-| **Centered 1-Pass OLS Linear Regression + R² + RMSE (1,000,000 pts)** | **`4.96–9.90 ms`** | `158.67–177.95 ms` (pure Python loop) | **`16.4×–35.9× faster vs pure Python`** |
-| **Silverman Gaussian KDE Density Estimation (5,000 obs × 64 grid = 320,000 evals)** | **`15.36–20.52 ms`** | `24.95–86.03 ms` (pure Python loop) | **`1.6×–4.2× faster vs pure Python`** |
-| **Vector Z-Score Normalization + EWMA Time-Series + Compensated Dot (100,000 pts)** | **`3.46–6.03 ms`** | `15.58–23.22 ms` (pure Python loop) | **`3.9×–4.8× faster vs pure Python`** |
-| **Peak Memory Footprint (RSS · 100K Vector Pipeline)** | **`9.20–9.75 MB`** (0 GC pauses) | `26.03–28.17 MB` | **`2.8× lower RAM`** |
-| **Default Sum Stability: Ill-Conditioned `[10¹⁶, 1.0 × 10,000, -10¹⁶]` (True = `10000.0`)** | **`10000.0`** (**0.0% error** · default Neumaier) | `0.0` (naive uncompensated `sum()`) | **Compensated by default** |
-| **Default Variance Stability: 10⁹-Shifted `[10⁹+1, 10⁹+2, 10⁹+3]` (True = `1.0`)** | **`1.0`** (**0.0% error** · default Welford 1-pass) | `0.0` (naive textbook $\sum x^2 - (\sum x)^2/n$) | **Welford 1-pass by default** |
-| **Default OLS Stability: 10⁹-Shifted Slope (True = `2.0`, R² = `1.0`)** | **`2.0`** (**0.0% error** · default centered co-moments) | `NaN` (naive uncentered normal equation) | **Centered OLS by default** |
+| **`stats_normal_ppf` (`qnorm` / `norm.ppf`)** | 23 quantiles: $p \in [10^{-12}, 1 - 10^{-12}]$ (Acklam + 3 Halley steps) | **`max_rel_err = 2.10e-15`** | `rel_err <= 1.0e-13` |
+| **`stats_normal_cdf` (`pnorm` / `norm.cdf`)** | 15 points: $z \in [-7.0, +7.0]$ (`erfc` lower-tail branch) | **`max_abs_err = 1.11e-16`** | `abs_err <= 1.0e-14` |
+| **`stats_normal_sf` (`1 - pnorm` / `norm.sf`)** | 15 points: $z \in [-7.0, +7.0]$ (deep upper tail $1.28 \times 10^{-12}$) | **`max_rel_err = 1.30e-14`** | `rel_err <= 1.0e-12` |
+| **`math_betainc_reg_float64` ($I_x(a,b)$ / `pbeta`)** | 11 cases: $(a,b) \in [(0.5, 0.5), (80.0, 0.5)]$ (Lentz CF) | **`max_abs_err = 5.00e-15`** | `abs_err <= 1.0e-12` |
+| **`math_gammainc_upper_reg_float64` ($Q(a,x)$ / `pgamma`)** | 10 cases: $(a,x) \in [(0.5, 0.05), (80.0, 95.0)]$ (Series / Lentz CF) | **`max_abs_err = 9.33e-15`** | `abs_err <= 1.0e-12` |
+| **`stats_student_t_p_two_tailed` (`pt` two-tailed)** | 13 cases: $df \in \{1, 2, 3.5, 5, 10, 30, 120\}$, $|t| \le 12.71$ | **`max_abs_err = 2.11e-15`** | `abs_err <= 1.0e-11` |
+| **`stats_f_dist_p_upper` (`pf` upper-tail)** | 6 cases: $(d_1, d_2) \in \{(1,2), (2,5), (3,12), (5,50), (10,100)\}$ | **`max_abs_err = 2.74e-16`** | `abs_err <= 1.0e-11` |
+| **`stats_chi2_p_upper` (`pchisq` upper-tail)** | 7 cases: $df \in \{1, 2, 3, 5, 10, 30\}$ | **`max_abs_err = 1.46e-16`** | `abs_err <= 1.0e-11` |
+| **End-to-End Welch $t$, One-Way ANOVA $F$, $\chi^2$ GoF, R Type-7 Quantiles** | Exact match vs `ttest_ind(equal_var=False)`, `f_oneway`, `chisquare`, `np.quantile` | **`rel_err <= 2.11e-15`** | `rel_err <= 1.0e-10` |
 
 Run the terminal CLI chart showcase or full validation suite directly:
 ```sh

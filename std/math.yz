@@ -146,10 +146,12 @@ fn math_ln_float64(x: Float64) -> Float64:
     if m > 1.41421356237309504880:
         set m = m * 0.5
         set e = e + 1
-    # Hyperbolic artanh series: ln(m) = 2 * sum_{k=0..9} u^(2k+1)/(2k+1), |u| <= 0.1716
+    # Hyperbolic artanh series: ln(m) = 2 * sum_{k=0..11} u^(2k+1)/(2k+1), |u| <= 0.1716 (< 0.5 ULP)
     let u: Float64 = (m - 1.0) / (m + 1.0)
     let u2: Float64 = u * u
-    var sum: Float64 = 1.0 / 19.0
+    var sum: Float64 = 1.0 / 23.0
+    set sum = sum * u2 + (1.0 / 21.0)
+    set sum = sum * u2 + (1.0 / 19.0)
     set sum = sum * u2 + (1.0 / 17.0)
     set sum = sum * u2 + (1.0 / 15.0)
     set sum = sum * u2 + (1.0 / 13.0)
@@ -232,6 +234,52 @@ fn math_cos_float64(x: Float64) -> Float64:
 fn math_tan_float64(x: Float64) -> Float64:
     return math_sin_float64(x) / math_cos_float64(x)
 
+fn math_erfc_float64(x: Float64) -> Float64:
+    if math_is_nan_float64(x): return x
+    if x < 0.0:
+        return 2.0 - math_erfc_float64(0.0 - x)
+    if x == 0.0:
+        return 1.0
+    if x >= 27.0:
+        return 0.0
+    # For 0 < x < 2.0 use power series of erf(x) (45 terms -> < 1e-16 accuracy), then 1 - erf(x)
+    if x < 2.0:
+        let x2: Float64 = x * x
+        var term: Float64 = x
+        var sum: Float64 = x
+        var k: Number = 1
+        while k <= 45:
+            let kf: Float64 = float64_from_number(k)
+            set term = (0.0 - term) * x2 / kf
+            let contrib: Float64 = term / (2.0 * kf + 1.0)
+            set sum = sum + contrib
+            if math_abs_float64(contrib) <= math_abs_float64(sum) * 0.0000000000000001:
+                set k = 100
+            set k = k + 1
+        let two_over_sqrt_pi: Float64 = 1.12837916709551257390
+        return 1.0 - (two_over_sqrt_pi * sum)
+    # For x >= 2.0 use Laplace / Lentz continued fraction for erfc(x) = (exp(-x^2)/sqrt(pi)) * CF
+    let tiny: Float64 = 0.000000000000000000000000000001
+    var b: Float64 = x
+    var c: Float64 = 1.0 / tiny
+    var d: Float64 = 1.0 / b
+    var h: Float64 = d
+    var i: Number = 1
+    while i <= 60:
+        let a: Float64 = float64_from_number(i) * 0.5
+        set d = b + a * d
+        if math_abs_float64(d) < tiny: set d = tiny
+        set c = b + (a / c)
+        if math_abs_float64(c) < tiny: set c = tiny
+        set d = 1.0 / d
+        let del: Float64 = c * d
+        set h = h * del
+        if math_abs_float64(del - 1.0) <= 0.0000000000000002:
+            set i = 100
+        set i = i + 1
+    let inv_sqrt_pi: Float64 = 0.56418958354775628695
+    return inv_sqrt_pi * math_exp_float64(0.0 - (x * x)) * h
+
 fn math_erf_float64(x: Float64) -> Float64:
     if math_is_nan_float64(x): return x
     var sign: Float64 = 1.0
@@ -239,19 +287,22 @@ fn math_erf_float64(x: Float64) -> Float64:
     if x < 0.0:
         set sign = -1.0
         set ax = 0.0 - x
-    if ax >= 6.0:
-        return sign
-    # Abramowitz & Stegun 7.1.26 rational approximation (max error <= 1.5e-7)
-    let p: Float64 = 0.3275911
-    let a1: Float64 = 0.254829592
-    let a2: Float64 = -0.284496736
-    let a3: Float64 = 1.421413741
-    let a4: Float64 = -1.453152027
-    let a5: Float64 = 1.061405429
-    let t: Float64 = 1.0 / (1.0 + p * ax)
-    let poly: Float64 = (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t
-    let y: Float64 = 1.0 - poly * math_exp_float64(0.0 - (ax * ax))
-    return sign * y
+    if ax < 1.5:
+        let x2: Float64 = ax * ax
+        var term: Float64 = ax
+        var sum: Float64 = ax
+        var k: Number = 1
+        while k <= 40:
+            let kf: Float64 = float64_from_number(k)
+            set term = (0.0 - term) * x2 / kf
+            let contrib: Float64 = term / (2.0 * kf + 1.0)
+            set sum = sum + contrib
+            if math_abs_float64(contrib) <= math_abs_float64(sum) * 0.0000000000000001:
+                set k = 100
+            set k = k + 1
+        let two_over_sqrt_pi: Float64 = 1.12837916709551257390
+        return sign * (two_over_sqrt_pi * sum)
+    return sign * (1.0 - math_erfc_float64(ax))
 
 fn math_is_nan_float64(value: Float64) -> Boolean:
     let bits: Number = float64_bits(value)
@@ -463,3 +514,101 @@ fn math_lbeta_float64(a: Float64, b: Float64) -> Float64:
 
 fn math_beta_float64(a: Float64, b: Float64) -> Float64:
     return math_exp_float64(math_lbeta_float64(a, b))
+
+# Regularized Incomplete Gamma P(a, x) (lower) and Q(a, x) (upper = 1 - P(a, x)) via series & Lentz continued fraction
+fn math_gammainc_lower_reg_float64(a: Float64, x: Float64) -> Float64:
+    if math_is_nan_float64(a) or math_is_nan_float64(x) or a <= 0.0 or x < 0.0:
+        return math_nan_float64()
+    if x == 0.0:
+        return 0.0
+    if x < a + 1.0:
+        var ap: Float64 = a
+        var del: Float64 = 1.0 / a
+        var sum: Float64 = del
+        var n: Number = 1
+        while n <= 200:
+            set ap = ap + 1.0
+            set del = del * (x / ap)
+            set sum = sum + del
+            if math_abs_float64(del) <= math_abs_float64(sum) * 0.0000000000000002:
+                set n = 300
+            set n = n + 1
+        return sum * math_exp_float64((0.0 - x) + a * math_ln_float64(x) - math_lgamma_float64(a))
+    return 1.0 - math_gammainc_upper_reg_float64(a, x)
+
+fn math_gammainc_upper_reg_float64(a: Float64, x: Float64) -> Float64:
+    if math_is_nan_float64(a) or math_is_nan_float64(x) or a <= 0.0 or x < 0.0:
+        return math_nan_float64()
+    if x == 0.0:
+        return 1.0
+    if x < a + 1.0:
+        return 1.0 - math_gammainc_lower_reg_float64(a, x)
+    let tiny: Float64 = 0.000000000000000000000000000001
+    var b: Float64 = x + 1.0 - a
+    var c: Float64 = 1.0 / tiny
+    var d: Float64 = 1.0 / b
+    var h: Float64 = d
+    var i: Number = 1
+    while i <= 200:
+        let ifl: Float64 = float64_from_number(i)
+        let an: Float64 = (0.0 - ifl) * (ifl - a)
+        set b = b + 2.0
+        set d = an * d + b
+        if math_abs_float64(d) < tiny: set d = tiny
+        set c = b + (an / c)
+        if math_abs_float64(c) < tiny: set c = tiny
+        set d = 1.0 / d
+        let del: Float64 = d * c
+        set h = h * del
+        if math_abs_float64(del - 1.0) <= 0.0000000000000002:
+            set i = 300
+        set i = i + 1
+    return math_exp_float64((0.0 - x) + a * math_ln_float64(x) - math_lgamma_float64(a)) * h
+
+# Lentz continued fraction helper for Regularized Incomplete Beta I_x(a, b)
+fn math_betacf_v1(a: Float64, b: Float64, x: Float64) -> Float64:
+    let tiny: Float64 = 0.000000000000000000000000000001
+    let qab: Float64 = a + b
+    let qap: Float64 = a + 1.0
+    let qam: Float64 = a - 1.0
+    var c: Float64 = 1.0
+    var d: Float64 = 1.0 - (qab * x / qap)
+    if math_abs_float64(d) < tiny: set d = tiny
+    set d = 1.0 / d
+    var h: Float64 = d
+    var m: Number = 1
+    while m <= 200:
+        let mf: Float64 = float64_from_number(m)
+        let m2: Float64 = 2.0 * mf
+        let aa1: Float64 = mf * (b - mf) * x / ((qam + m2) * (a + m2))
+        set d = 1.0 + aa1 * d
+        if math_abs_float64(d) < tiny: set d = tiny
+        set c = 1.0 + (aa1 / c)
+        if math_abs_float64(c) < tiny: set c = tiny
+        set d = 1.0 / d
+        set h = h * d * c
+        let aa2: Float64 = (0.0 - (a + mf)) * (qab + mf) * x / ((a + m2) * (qap + m2))
+        set d = 1.0 + aa2 * d
+        if math_abs_float64(d) < tiny: set d = tiny
+        set c = 1.0 + (aa2 / c)
+        if math_abs_float64(c) < tiny: set c = tiny
+        set d = 1.0 / d
+        let del: Float64 = d * c
+        set h = h * del
+        if math_abs_float64(del - 1.0) <= 0.0000000000000002:
+            set m = 300
+        set m = m + 1
+    return h
+
+# Regularized Incomplete Beta I_x(a, b) (R pbeta / scipy.special.betainc)
+fn math_betainc_reg_float64(a: Float64, b: Float64, x: Float64) -> Float64:
+    if math_is_nan_float64(a) or math_is_nan_float64(b) or math_is_nan_float64(x) or a <= 0.0 or b <= 0.0 or x < 0.0 or x > 1.0:
+        return math_nan_float64()
+    if x == 0.0:
+        return 0.0
+    if x == 1.0:
+        return 1.0
+    let bt: Float64 = math_exp_float64(a * math_ln_float64(x) + b * math_ln_float64(1.0 - x) - math_lbeta_float64(a, b))
+    if x < (a + 1.0) / (a + b + 2.0):
+        return bt * math_betacf_v1(a, b, x) / a
+    return 1.0 - (bt * math_betacf_v1(b, a, 1.0 - x) / b)

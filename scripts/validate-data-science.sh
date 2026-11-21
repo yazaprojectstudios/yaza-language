@@ -29,4 +29,20 @@ for mode in debug release asan; do
   printf '  [%s] data-science-smoke: PASS\n' "$mode"
 done
 
+printf '==> Data Science Gate 3: SciPy/NumPy 86-Case Golden Cross-Validation (debug, -O2, ASan/UBSan)...\n'
+"$YAZA_BIN" emit-llvm "$PROJECT_DIR/tests/stdlib/data_science_golden_check.yz" -o "$WORK_DIR/ds-golden.ll"
+clang -Wno-override-module -std=c11 -O0 -g "$WORK_DIR/ds-golden.ll" "$PROJECT_DIR/runtime/src/yaza_runtime_v1.c" -I"$PROJECT_DIR/runtime/include" -pthread -lm -o "$WORK_DIR/ds-golden-debug"
+clang -Wno-override-module -std=c11 -O2 "$WORK_DIR/ds-golden.ll" "$PROJECT_DIR/runtime/src/yaza_runtime_v1.c" -I"$PROJECT_DIR/runtime/include" -pthread -lm -o "$WORK_DIR/ds-golden-release"
+clang -Wno-override-module -std=c11 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer "$WORK_DIR/ds-golden.ll" "$PROJECT_DIR/runtime/src/yaza_runtime_v1.c" -I"$PROJECT_DIR/runtime/include" -pthread -lm -o "$WORK_DIR/ds-golden-asan"
+
+for mode in debug release asan; do
+  GOUT=$("$WORK_DIR/ds-golden-$mode")
+  if ! printf '%s\n' "$GOUT" | grep -q "GOLDEN_SCIPY_CROSS_VALIDATION_PASS cases=86 failures=0"; then
+    printf 'error: golden cross-validation failed in %s mode:\n%s\n' "$mode" "$GOUT" >&2
+    exit 1
+  fi
+  printf '  [%s] data-science-golden (86 SciPy cases): PASS\n' "$mode"
+done
+printf '%s\n' "$GOUT"
+
 printf 'data-science-validation-ok\n'
