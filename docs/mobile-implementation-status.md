@@ -1,0 +1,36 @@
+# YAZA mobile implementation status
+
+RFC 0010 is accepted and implementation is in progress. The C ABI bridge and the first Android/iOS app shells now exist in the source tree. Device acceptance gates remain open.
+
+## Implemented in the current source tree
+
+- `runtime/mobile/include/yaza_mobile_v1.h` defines a versioned host/engine/view/buffer ABI.
+- `runtime/mobile/src/yaza_mobile_v1.c` bounds event and response sizes, validates UTF-8, limits the process to four live engines and 16 MiB of outstanding result storage, serializes state transitions per engine, uses a reusable request arena, copies results into explicitly owned buffers, and rejects stale engine/buffer IDs. Public engine handles and buffer leases are monotonically increasing IDs and are never reused, avoiding allocator-address ABA.
+- `templates/mobile/src/mobile_engine.yz` provides the YAZA state reducer used by the bridge.
+- `tests/mobile/yaza_mobile_v1.c` covers reducer round-trips, error rollback, bounds, buffer ownership (including buffers outliving engine destruction), concurrent dispatch, and 150-engine / 2,000-dispatch lifecycle and arena soak tests.
+- `tests/mobile/yaza_mobile_jni_v1.c` tests the real `yaza_mobile_jni.c` adapter under a strict mock `JNIEnv` covering round-trips, OOM `NewByteArray` failures, `GetByteArrayRegion`/`SetByteArrayRegion` exceptions, `DeleteLocalRef` balance, and 100-lifecycle leak checks.
+- `scripts/validate-mobile-engine.sh` runs both the bridge and JNI suites across normal (`-O1 -g`), ASan+UBSan (with `detect_leaks=1` on Linux), TSan, and macOS `leaks --atExit` (0 leaked bytes), and `scripts/validate-mobile-yazabase.sh` verifies `examples/mobile-yazabase-smoke.yz` under normal, ASan+UBSan, and macOS `leaks --atExit`.
+- A host JVM smoke check compiles the Android `NativeEngine.kt`/JNI adapter and passes 200+ reducer round-trips through the real C bridge; this verifies JNI naming and buffer/status handling but does not qualify Android ABI or device behavior.
+- `yaza mobile doctor`, `yaza mobile build`, and `yaza mobile run` are wired to packaged helper scripts. Doctor/run discover Android SDK/NDK and adb at the standard SDK path, export `ANDROID_HOME` for Gradle, prefer JDK 17–23 for Gradle 8.13 compatibility, and use a cached Gradle 8.13 distribution or `YAZA_GRADLE_BIN` when Gradle is not on `PATH`.
+- `scripts/mobile/build-engine.sh` emits target-specific LLVM and links the YAZA runtime plus bridge into an Android `.so` or iOS `.a`.
+- Mobile runtime builds disable arbitrary child-process spawning, which is not a supported mobile sandbox capability.
+- The generated Android template includes a Kotlin UI and JNI adapter; the iOS template includes a SwiftUI app and bridging header.
+- `yaza new` skips common generated output/cache directories while copying templates, so a prior native/Gradle build inside the template cannot leak binary build files into a generated project.
+- The starter screens run reducer calls on a background/serial queue, limit UI dispatch to one in-flight event, and apply UI updates on the main thread. A read-only `snapshot` event returns the current engine state; Android refreshes on activity start, drops stale results after stop, and clears pending main-handler callbacks on destroy, while SwiftUI refreshes on task appear and `scenePhase == .active` and invalidates results on background/disappearance. This state is process-local, not durable. ABI v1 work itself cannot be interrupted, and this does not provide YAZA task cancellation or a general scheduler.
+- Generated Xcode builds choose the installed compiler from `~/.yaza/bin/yaza` by default and allow `YAZA_BIN` to select a checkout build. The Android Gradle template follows the same compiler selection and uses release optimization for release tasks.
+- `yaza mobile run` checks for an online Android device or booted iOS simulator before building/installing.
+- Unix release packaging includes the mobile bridge sources and helper scripts so the installed compiler can build app projects.
+- Android ARM64 shared engine (`libyaza_mobile.so`) and debug/release APK variants build from the current local compiler; the APK contains the matching `lib/arm64-v8a/libyaza_mobile.so`. Local artifact set `build/mobile/local-artifacts-20261121-r4/` was built and its debug APK installed on the Android 37 ARM64 test AVD. Increment changed the counter `0 → 1`, and Reset returned it to `0`; the preceding r3 build also passed background/resume snapshot (`1 → 1`). This exercises UI → Kotlin → JNI → YAZA reducer → UI. No physical Android device is connected.
+- `std/db/yazabase_embedded.yz` provides an in-process, capability-rooted adapter around the YazaBase session API (with per-statement `arena_scope` isolation and `yaza_db_embedded_sync_scalars_v1`), and re-exports `std/db/yazabase_mobile_kv.yz` (`yaza_db_embedded_kv_load_v1` / `yaza_db_embedded_kv_store_v1`), a request-safe (`--export-request` compatible) capability-rooted atomic KV persistence layer wired directly into `templates/mobile/src/mobile_engine.yz` (`YAZA_MOBILE_STORAGE_DIR`). Its host and mobile bridge test suites pass create, insert, close/checkpoint, reopen/recovery, and select with `0 leaks / 0 bytes` under ASan+UBSan, TSan, and macOS `leaks --atExit`. Release packages stage the `yazabase/` sources next to `std/` so this adapter's relative imports remain resolvable.
+- Generic iOS ARM64 device and Apple Silicon simulator libraries and unsigned Release apps compile and link with Xcode. A fresh `yaza new --mobile` app built, installed, and launched via `yaza mobile run --target ios-simulator` on the booted iOS 26.4 `iPhone 17 Pro` simulator, and `leaks` on the live simulator process reported `0 leaks for 0 total leaked bytes`. No physical iOS device is connected.
+- Android app packaging is pinned to AGP 8.13.1 and Java/Kotlin bytecode target 17. This host uses a cached Gradle 8.13 distribution because Gradle is not on `PATH`.
+
+## Remaining acceptance gates
+
+- M1 Android ARM64 app shell and device event round-trip on a physical device.
+- M2 iOS ARM64 app shell and device event round-trip on a physical device.
+- M3 lifecycle cancellation, task arenas, HTTPS and secure-storage adapters.
+- M4 make the YazaBase mobile-reachable SQL path request-safe, then qualify persistence, locking, recovery, quotas, and suspend/resume.
+- M5 CLI commands and Unix packaging are implemented in source; signing handoff and real-device profiling remain open.
+
+No mobile platform or production-readiness claim is made until the corresponding physical-device gate passes. This host has Xcode, iOS 26.4 Simulator runtime, Android SDK/NDK, JDK 17, cached Gradle 8.13, and adb. Fresh `yaza new --mobile` projects installed and launched cleanly via both `yaza mobile run --target android-emulator` (`Counter: 0 -> 15 -> 0` on `Pixel_UM_Test(AVD)`) and `yaza mobile run --target ios-simulator` (`iPhone 17 Pro`, live `leaks` 0 leaked bytes). RFC M1/M2 physical-device acceptance, lifecycle/cancellation, adapters, YazaBase qualification, signing, and performance measurements remain open.

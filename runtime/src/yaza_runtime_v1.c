@@ -75,6 +75,7 @@ static int yaza_stat64(const char *path, yaza_stat_t *st) { return _stat64(path,
 #include <signal.h>
 #include <sched.h>
 #include <termios.h>
+#include <dlfcn.h>
 typedef int yaza_net_sock_t;
 #define YAZA_NET_INVALID_SOCKET (-1)
 typedef struct stat yaza_stat_t;
@@ -1496,7 +1497,7 @@ int yaza_arena_v1_destroy(YazaArenaV1 *arena) {
     }
     YazaArenaV1 *root = arena->root;
     yaza_rt_v1_tree_lock(root);
-    if (arena->destroyed || arena->child_count != 0 || arena->active_leases != 0) {
+    if (arena->destroyed || arena->scope_active || arena->child_count != 0 || arena->active_leases != 0) {
         yaza_rt_v1_tree_unlock(root);
         return 0;
     }
@@ -1781,6 +1782,15 @@ void *yaza_rt_v1_alloc(uint64_t size) {
 void *yaza_rt_v1_try_alloc(uint64_t size) {
     yaza_rt_v1_init();
     return yaza_arena_v1_alloc(yaza_arena_v1_current(), size);
+}
+
+static void yaza_rt_v1_secure_zero(void *pointer, size_t length) {
+    if (pointer == NULL || length == 0) return;
+    volatile unsigned char *cursor = (volatile unsigned char *)pointer;
+    for (size_t index = 0; index < length; ++index) {
+        cursor[index] = 0;
+    }
+    atomic_signal_fence(memory_order_seq_cst);
 }
 
 static void yaza_text_v1_require(const YazaTextV1 *text, const char *operation) {
@@ -2127,7 +2137,6 @@ YazaTextV1 *yaza_rt_v1_try_int32_text(int32_t value) {
     char buffer[16];
     const int written = snprintf(buffer, sizeof(buffer), "%" PRId32, value);
     if (written < 0 || (size_t)written >= sizeof(buffer)) {
-        yaza_rt_v1_fail("Int32 formatting failed");
         return NULL;
     }
     return yaza_rt_v1_try_text_from_cstr(buffer);
@@ -2343,13 +2352,11 @@ int32_t yaza_rt_v1_try_float64_parse(const YazaTextV1 *text, double *out_value) 
 
 YazaTextV1 *yaza_rt_v1_try_float64_text(double value) {
     if (!isfinite(value)) {
-        yaza_rt_v1_fail("invalid Float64 value or arithmetic error in formatting");
         return NULL;
     }
     char buffer[64];
     const int written = snprintf(buffer, sizeof(buffer), "%.17g", value);
     if (written < 0 || (size_t)written >= sizeof(buffer)) {
-        yaza_rt_v1_fail("invalid Float64 value or arithmetic error in formatting");
         return NULL;
     }
     return yaza_rt_v1_try_text_from_cstr(buffer);
@@ -2763,10 +2770,11 @@ static void yaza_sw_hmac_sha256_parts_v1(const unsigned char *key, uint64_t key_
     yaza_sw_sha256_update_v1(&ctx, inner_digest, 32);
     yaza_sw_sha256_final_v1(&ctx, out_digest);
 
-    memset(key_block, 0, sizeof(key_block));
-    memset(ipad, 0, sizeof(ipad));
-    memset(opad, 0, sizeof(opad));
-    memset(inner_digest, 0, sizeof(inner_digest));
+    yaza_rt_v1_secure_zero(key_block, sizeof(key_block));
+    yaza_rt_v1_secure_zero(ipad, sizeof(ipad));
+    yaza_rt_v1_secure_zero(opad, sizeof(opad));
+    yaza_rt_v1_secure_zero(inner_digest, sizeof(inner_digest));
+    yaza_rt_v1_secure_zero(&ctx, sizeof(ctx));
 }
 
 static void yaza_sw_pbkdf2_sha256_raw_v1(const unsigned char *password, uint64_t password_len,
@@ -2796,8 +2804,8 @@ static void yaza_sw_pbkdf2_sha256_raw_v1(const unsigned char *password, uint64_t
         offset += take;
         remaining -= take;
         block_index += 1;
-        memset(u, 0, sizeof(u));
-        memset(t, 0, sizeof(t));
+        yaza_rt_v1_secure_zero(u, sizeof(u));
+        yaza_rt_v1_secure_zero(t, sizeof(t));
     }
 }
 #endif
@@ -2809,12 +2817,22 @@ void yaza_crypto_v1_sha256(const unsigned char *data, uint64_t length, YazaBytes
     const unsigned char *input_data = (data != NULL) ? data : (const unsigned char *)"";
     unsigned char digest[32];
 #if defined(__APPLE__) && !defined(YAZA_TEST_SOFTWARE_SHA256)
-    (void)CC_SHA256(input_data, (CC_LONG)length, digest);
+    CC_SHA256_CTX ctx;
+    (void)CC_SHA256_Init(&ctx);
+    uint64_t offset = 0;
+    while (offset < length) {
+        const uint64_t remaining = length - offset;
+        const CC_LONG chunk = remaining > (uint64_t)UINT32_MAX ? (CC_LONG)(1ULL << 30) : (CC_LONG)remaining;
+        (void)CC_SHA256_Update(&ctx, input_data + offset, chunk);
+        offset += (uint64_t)chunk;
+    }
+    (void)CC_SHA256_Final(digest, &ctx);
+    yaza_rt_v1_secure_zero(&ctx, sizeof(ctx));
 #else
     yaza_sw_sha256_raw_v1(input_data, length, digest);
 #endif
     *out_bytes = yaza_bytes_v1_copy(digest, 32);
-    memset(digest, 0, sizeof(digest));
+    yaza_rt_v1_secure_zero(digest, sizeof(digest));
 }
 
 void yaza_crypto_v1_hmac_sha256(const unsigned char *key, uint64_t key_length, const unsigned char *message, uint64_t message_length, YazaBytesV1 *out_bytes) {
@@ -2830,7 +2848,7 @@ void yaza_crypto_v1_hmac_sha256(const unsigned char *key, uint64_t key_length, c
     yaza_sw_hmac_sha256_parts_v1(k, key_length, m, message_length, NULL, 0, digest);
 #endif
     *out_bytes = yaza_bytes_v1_copy(digest, 32);
-    memset(digest, 0, sizeof(digest));
+    yaza_rt_v1_secure_zero(digest, sizeof(digest));
 }
 
 int32_t yaza_crypto_v1_pbkdf2_sha256(const unsigned char *password, uint64_t password_length, const unsigned char *salt, uint64_t salt_length, int64_t iterations, int64_t key_length, YazaBytesV1 *out_bytes, char **out_error) {
@@ -2859,7 +2877,7 @@ int32_t yaza_crypto_v1_pbkdf2_sha256(const unsigned char *password, uint64_t pas
                                       kCCPRFHmacAlgSHA256, (uint32_t)iterations,
                                       derived, (size_t)key_length);
     if (status != 0) {
-        memset(derived, 0, sizeof(derived));
+        yaza_rt_v1_secure_zero(derived, sizeof(derived));
         *out_error = (char *)"operating-system PBKDF2-SHA-256 provider failed";
         return 0;
     }
@@ -2867,7 +2885,7 @@ int32_t yaza_crypto_v1_pbkdf2_sha256(const unsigned char *password, uint64_t pas
     yaza_sw_pbkdf2_sha256_raw_v1(p, password_length, salt, salt_length, iterations, key_length, derived);
 #endif
     *out_bytes = yaza_bytes_v1_copy(derived, (uint64_t)key_length);
-    memset(derived, 0, sizeof(derived));
+    yaza_rt_v1_secure_zero(derived, sizeof(derived));
     return 1;
 }
 
@@ -2905,19 +2923,19 @@ int32_t yaza_crypto_v1_argon2id_hash(const unsigned char *password, uint64_t pas
         password != NULL ? password : (const unsigned char *)"", (size_t)password_length,
         salt, (size_t)salt_length, 32, encoded, sizeof(encoded));
     if (status != ARGON2_OK) {
-        memset(encoded, 0, sizeof(encoded));
+        yaza_rt_v1_secure_zero(encoded, sizeof(encoded));
         *out_error = (char *)"Argon2id password hashing failed";
         return 0;
     }
     const size_t encoded_length = strnlen(encoded, sizeof(encoded));
     if (encoded_length == 0 || encoded_length >= sizeof(encoded)) {
-        memset(encoded, 0, sizeof(encoded));
+        yaza_rt_v1_secure_zero(encoded, sizeof(encoded));
         *out_error = (char *)"Argon2id provider returned an invalid encoded hash";
         return 0;
     }
     *out_text = yaza_text_v1_copy_to_arena(yaza_arena_v1_current(),
         (const unsigned char *)encoded, (uint64_t)encoded_length);
-    memset(encoded, 0, sizeof(encoded));
+    yaza_rt_v1_secure_zero(encoded, sizeof(encoded));
     if (*out_text == NULL) {
         *out_error = (char *)"Argon2id output exceeded the active arena allocation limit";
         return 0;
@@ -3049,10 +3067,11 @@ int32_t yaza_bytes_v1_equal_constant_time(const unsigned char *left_data, uint64
     if (left_data == NULL || right_data == NULL) {
         yaza_bytes_v1_fail("constant-time Bytes equality received invalid storage");
     }
-    unsigned char difference = 0;
+    volatile unsigned char difference = 0;
     for (uint64_t index = 0; index < left_length; ++index) {
         difference |= (unsigned char)(left_data[index] ^ right_data[index]);
     }
+    atomic_signal_fence(memory_order_seq_cst);
     return difference == 0;
 }
 
@@ -3170,8 +3189,12 @@ static void yaza_console_redraw_line(const unsigned char *buf, size_t len, size_
 }
 
 static int yaza_console_read_byte_raw(unsigned char *out) {
-    ssize_t n = read(STDIN_FILENO, out, 1);
-    return n == 1 ? 1 : 0;
+    for (;;) {
+        ssize_t n = read(STDIN_FILENO, out, 1);
+        if (n == 1) return 1;
+        if (n < 0 && errno == EINTR) continue;
+        return 0;
+    }
 }
 
 static int yaza_console_read_tty_line(unsigned char *buffer, size_t capacity, size_t *out_len) {
@@ -5156,11 +5179,15 @@ int64_t yaza_rt_v1_file_remove(const YazaTextV1 *path) {
 }
 
 int64_t yaza_rt_v1_env_set(const YazaTextV1 *name, const YazaTextV1 *value) {
-    if (!yaza_rt_v1_path_text(name, "env_set") || value == NULL || value->data == NULL) return 1;
+    if (!yaza_rt_v1_path_text(name, "env_set") || value == NULL ||
+        (value->length > 0 && (value->data == NULL || memchr(value->data, '\0', (size_t)value->length) != NULL))) {
+        return 1;
+    }
+    const char *cval = (value->length > 0 && value->data != NULL) ? (const char *)value->data : "";
 #if defined(_WIN32)
-    return _putenv_s((const char *)name->data, (const char *)value->data) == 0 ? 0 : 1;
+    return _putenv_s((const char *)name->data, cval) == 0 ? 0 : 1;
 #else
-    return setenv((const char *)name->data, (const char *)value->data, 1) == 0 ? 0 : 1;
+    return setenv((const char *)name->data, cval, 1) == 0 ? 0 : 1;
 #endif
 }
 
@@ -5206,7 +5233,10 @@ void *yaza_rt_v1_directory_list(const YazaTextV1 *path) {
     }
     do {
         if (strcmp(find_data.cFileName, ".") != 0 && strcmp(find_data.cFileName, "..") != 0) {
-            yaza_list_v1_try_push_text_slice(entries, (const unsigned char *)find_data.cFileName, strlen(find_data.cFileName));
+            if (!yaza_list_v1_try_push_text_slice(entries, (const unsigned char *)find_data.cFileName, strlen(find_data.cFileName))) {
+                FindClose(find_handle);
+                return NULL;
+            }
         }
     } while (FindNextFileA(find_handle, &find_data));
     FindClose(find_handle);
@@ -5224,7 +5254,10 @@ void *yaza_rt_v1_directory_list(const YazaTextV1 *path) {
     struct dirent *entry;
     while ((entry = readdir(directory)) != NULL) {
         if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0) {
-            yaza_list_v1_try_push_text_slice(entries, (const unsigned char *)entry->d_name, strlen(entry->d_name));
+            if (!yaza_list_v1_try_push_text_slice(entries, (const unsigned char *)entry->d_name, strlen(entry->d_name))) {
+                closedir(directory);
+                return NULL;
+            }
         }
     }
     closedir(directory);
@@ -6704,9 +6737,16 @@ typedef struct YazaNetV1Slot {
     yaza_net_sock_t descriptor;
     uint32_t kind;
     uint32_t flags;
+    uint32_t active_operations;
+    uint32_t closing;
     uint32_t peer_slot;
+    uint32_t pg_cancel_pid;
+    uint32_t pg_cancel_secret;
+    uint32_t has_pg_cancel_key;
     uint64_t peer_generation;
     uint64_t generation;
+    void *tls_ssl;
+    void *tls_ctx;
 } YazaNetV1Slot;
 
 enum {
@@ -6719,6 +6759,142 @@ static atomic_flag yaza_net_v1_registry_lock = ATOMIC_FLAG_INIT;
 static YazaNetV1Slot yaza_net_v1_slots[YAZA_NET_V1_MAX_HANDLES];
 static uint64_t yaza_net_v1_next_generation = 1;
 
+typedef struct YazaNetTlsV1Api {
+    int ready;
+    void *lib_handle;
+    const void *(*TLS_client_method)(void);
+    void *(*SSL_CTX_new)(const void *method);
+    void (*SSL_CTX_free)(void *ctx);
+    void (*SSL_CTX_set_verify)(void *ctx, int mode, void *cb);
+    int (*SSL_CTX_set_default_verify_paths)(void *ctx);
+    int (*SSL_CTX_load_verify_locations)(void *ctx, const char *cafile, const char *capath);
+    long (*SSL_CTX_ctrl)(void *ctx, int cmd, long larg, void *parg);
+    void *(*SSL_CTX_get0_param)(void *ctx);
+    int (*X509_VERIFY_PARAM_set1_ip_asc)(void *param, const char *ipasc);
+    void *(*SSL_new)(void *ctx);
+    void (*SSL_free)(void *ssl);
+    int (*SSL_set_fd)(void *ssl, int fd);
+    long (*SSL_ctrl)(void *ssl, int cmd, long larg, void *parg);
+    int (*SSL_set1_host)(void *ssl, const char *hostname);
+    int (*SSL_connect)(void *ssl);
+    int (*SSL_read)(void *ssl, void *buf, int num);
+    int (*SSL_write)(void *ssl, const void *buf, int num);
+    int (*SSL_shutdown)(void *ssl);
+    int (*SSL_get_error)(const void *ssl, int ret);
+    long (*SSL_get_verify_result)(const void *ssl);
+    void *(*SSL_get1_peer_certificate)(const void *ssl);
+    void (*X509_free)(void *x);
+} YazaNetTlsV1Api;
+
+static YazaNetTlsV1Api yaza_net_tls_v1 = {0};
+static pthread_once_t yaza_net_tls_v1_once = PTHREAD_ONCE_INIT;
+
+#define YAZA_SSL_VERIFY_PEER 0x01
+#define YAZA_SSL_ERROR_WANT_READ 2
+#define YAZA_SSL_ERROR_WANT_WRITE 3
+#define YAZA_SSL_CTRL_SET_TLSEXT_HOSTNAME 55
+#define YAZA_SSL_CTRL_SET_MIN_PROTO_VERSION 123
+#define YAZA_TLS1_2_VERSION 0x0303L
+
+static void yaza_net_v1_tls_init_once(void) {
+#if !defined(_WIN32)
+    static const char *const candidates[] = {
+        "/opt/homebrew/opt/openssl/lib/libssl.dylib",
+        "/opt/homebrew/opt/openssl@3/lib/libssl.dylib",
+        "/opt/homebrew/lib/libssl.dylib",
+        "/usr/local/opt/openssl/lib/libssl.dylib",
+        "libssl.4.dylib",
+        "libssl.3.dylib",
+        "libssl.dylib",
+        "libssl.so.3",
+        "libssl.so.1.1",
+        "libssl.so",
+        NULL
+    };
+    void *handle = NULL;
+    for (size_t i = 0; candidates[i] != NULL; i++) {
+        handle = dlopen(candidates[i], RTLD_LAZY | RTLD_LOCAL);
+        if (handle != NULL) break;
+    }
+    if (handle == NULL) return;
+    struct {
+        const char *name;
+        void *dst;
+    } syms[] = {
+        {"TLS_client_method", &yaza_net_tls_v1.TLS_client_method},
+        {"SSL_CTX_new", &yaza_net_tls_v1.SSL_CTX_new},
+        {"SSL_CTX_free", &yaza_net_tls_v1.SSL_CTX_free},
+        {"SSL_CTX_set_verify", &yaza_net_tls_v1.SSL_CTX_set_verify},
+        {"SSL_CTX_set_default_verify_paths", &yaza_net_tls_v1.SSL_CTX_set_default_verify_paths},
+        {"SSL_CTX_load_verify_locations", &yaza_net_tls_v1.SSL_CTX_load_verify_locations},
+        {"SSL_CTX_ctrl", &yaza_net_tls_v1.SSL_CTX_ctrl},
+        {"SSL_CTX_get0_param", &yaza_net_tls_v1.SSL_CTX_get0_param},
+        {"X509_VERIFY_PARAM_set1_ip_asc", &yaza_net_tls_v1.X509_VERIFY_PARAM_set1_ip_asc},
+        {"SSL_new", &yaza_net_tls_v1.SSL_new},
+        {"SSL_free", &yaza_net_tls_v1.SSL_free},
+        {"SSL_set_fd", &yaza_net_tls_v1.SSL_set_fd},
+        {"SSL_ctrl", &yaza_net_tls_v1.SSL_ctrl},
+        {"SSL_set1_host", &yaza_net_tls_v1.SSL_set1_host},
+        {"SSL_connect", &yaza_net_tls_v1.SSL_connect},
+        {"SSL_read", &yaza_net_tls_v1.SSL_read},
+        {"SSL_write", &yaza_net_tls_v1.SSL_write},
+        {"SSL_shutdown", &yaza_net_tls_v1.SSL_shutdown},
+        {"SSL_get_error", &yaza_net_tls_v1.SSL_get_error},
+        {"SSL_get_verify_result", &yaza_net_tls_v1.SSL_get_verify_result},
+        {"X509_free", &yaza_net_tls_v1.X509_free},
+    };
+    for (size_t i = 0; i < sizeof(syms) / sizeof(syms[0]); i++) {
+        void *s = dlsym(handle, syms[i].name);
+        if (s == NULL) {
+            dlclose(handle);
+            memset(&yaza_net_tls_v1, 0, sizeof(yaza_net_tls_v1));
+            return;
+        }
+        memcpy(syms[i].dst, &s, sizeof(s));
+    }
+    void *peer_fn = dlsym(handle, "SSL_get1_peer_certificate");
+    if (peer_fn == NULL) peer_fn = dlsym(handle, "SSL_get_peer_certificate");
+    if (peer_fn == NULL) {
+        dlclose(handle);
+        memset(&yaza_net_tls_v1, 0, sizeof(yaza_net_tls_v1));
+        return;
+    }
+    memcpy(&yaza_net_tls_v1.SSL_get1_peer_certificate, &peer_fn, sizeof(peer_fn));
+    yaza_net_tls_v1.lib_handle = handle;
+    yaza_net_tls_v1.ready = 1;
+#endif
+}
+
+static int yaza_net_v1_tls_ensure(void) {
+    (void)pthread_once(&yaza_net_tls_v1_once, yaza_net_v1_tls_init_once);
+    return yaza_net_tls_v1.ready;
+}
+
+static void yaza_net_v1_tls_cleanup(void *ssl, void *ctx) {
+    if (ssl != NULL && yaza_net_tls_v1.ready) {
+        (void)yaza_net_tls_v1.SSL_shutdown(ssl);
+        yaza_net_tls_v1.SSL_free(ssl);
+    }
+    if (ctx != NULL && yaza_net_tls_v1.ready) {
+        yaza_net_tls_v1.SSL_CTX_free(ctx);
+    }
+}
+
+static void yaza_net_v1_reset_slot_locked(YazaNetV1Slot *slot) {
+    slot->descriptor = YAZA_NET_INVALID_SOCKET;
+    slot->kind = YAZA_NET_V1_KIND_FREE;
+    slot->flags = 0;
+    slot->active_operations = 0;
+    slot->closing = 0;
+    slot->peer_slot = YAZA_NET_V1_MAX_HANDLES;
+    slot->pg_cancel_pid = 0;
+    slot->pg_cancel_secret = 0;
+    slot->has_pg_cancel_key = 0;
+    slot->peer_generation = 0;
+    slot->tls_ssl = NULL;
+    slot->tls_ctx = NULL;
+}
+
 #if defined(_WIN32)
 static pthread_once_t yaza_net_v1_wsa_once = PTHREAD_ONCE_INIT;
 static void yaza_net_v1_wsa_init(void) {
@@ -6728,12 +6904,18 @@ static void yaza_net_v1_wsa_init(void) {
 static void yaza_net_v1_ensure_init(void) {
     (void)pthread_once(&yaza_net_v1_wsa_once, yaza_net_v1_wsa_init);
 }
-static void yaza_net_v1_close_sock(yaza_net_sock_t s) {
-    (void)closesocket(s);
+static int yaza_net_v1_close_sock(yaza_net_sock_t s) {
+    return closesocket(s);
+}
+static void yaza_net_v1_set_cloexec(yaza_net_sock_t s) {
+    (void)s;
 }
 static void yaza_net_v1_set_nonblocking(yaza_net_sock_t s) {
     u_long mode = 1;
     (void)ioctlsocket(s, FIONBIO, &mode);
+}
+static void yaza_net_v1_shutdown_sock(yaza_net_sock_t s) {
+    (void)shutdown(s, SD_BOTH);
 }
 static int yaza_net_v1_last_wouldblock(void) {
     int err = WSAGetLastError();
@@ -6751,12 +6933,19 @@ static int yaza_net_v1_poll_one(yaza_net_sock_t s, short events, int timeout_ms)
 }
 #else
 static void yaza_net_v1_ensure_init(void) {}
-static void yaza_net_v1_close_sock(yaza_net_sock_t s) {
-    (void)close(s);
+static int yaza_net_v1_close_sock(yaza_net_sock_t s) {
+    return close(s);
+}
+static void yaza_net_v1_set_cloexec(yaza_net_sock_t s) {
+    int fd_flags = fcntl(s, F_GETFD, 0);
+    if (fd_flags >= 0) (void)fcntl(s, F_SETFD, fd_flags | FD_CLOEXEC);
 }
 static void yaza_net_v1_set_nonblocking(yaza_net_sock_t s) {
     int fl = fcntl(s, F_GETFL, 0);
     if (fl >= 0) (void)fcntl(s, F_SETFL, fl | O_NONBLOCK);
+}
+static void yaza_net_v1_shutdown_sock(yaza_net_sock_t s) {
+    (void)shutdown(s, SHUT_RDWR);
 }
 static int yaza_net_v1_last_wouldblock(void) {
     return errno == EAGAIN || errno == EWOULDBLOCK;
@@ -6782,6 +6971,63 @@ static void yaza_net_v1_unlock(void) {
     atomic_flag_clear_explicit(&yaza_net_v1_registry_lock, memory_order_release);
 }
 
+static uint64_t yaza_net_v1_alloc_generation_locked(void) {
+    if (yaza_net_v1_next_generation > ((1ULL << 55) - 1ULL) || yaza_net_v1_next_generation == 0) {
+        yaza_net_v1_next_generation = 1;
+    }
+    return yaza_net_v1_next_generation++;
+}
+
+static int yaza_net_v1_acquire(int64_t handle, uint32_t expected_kind, const char *err_msg,
+                               uint32_t *out_index, yaza_net_sock_t *out_fd, char **out_error) {
+    if (handle <= 0) {
+        *out_error = (char *)err_msg;
+        return 0;
+    }
+    const uint64_t token = (uint64_t)handle;
+    const uint32_t index = (uint32_t)(token & 0xffU);
+    const uint64_t generation = token >> 8;
+    if (index >= YAZA_NET_V1_MAX_HANDLES) {
+        *out_error = (char *)err_msg;
+        return 0;
+    }
+    yaza_net_v1_lock();
+    YazaNetV1Slot *slot = &yaza_net_v1_slots[index];
+    if (slot->kind != expected_kind || slot->closing || slot->generation != generation ||
+        slot->descriptor == YAZA_NET_INVALID_SOCKET) {
+        yaza_net_v1_unlock();
+        *out_error = (char *)err_msg;
+        return 0;
+    }
+    slot->active_operations += 1U;
+    *out_index = index;
+    *out_fd = slot->descriptor;
+    yaza_net_v1_unlock();
+    return 1;
+}
+
+static void yaza_net_v1_release(uint32_t index) {
+    yaza_net_sock_t fd_to_close = YAZA_NET_INVALID_SOCKET;
+    void *tls_ssl_to_free = NULL;
+    void *tls_ctx_to_free = NULL;
+    yaza_net_v1_lock();
+    YazaNetV1Slot *slot = &yaza_net_v1_slots[index];
+    if (slot->active_operations > 0U) {
+        slot->active_operations -= 1U;
+    }
+    if (slot->closing && slot->active_operations == 0U) {
+        fd_to_close = slot->descriptor;
+        tls_ssl_to_free = slot->tls_ssl;
+        tls_ctx_to_free = slot->tls_ctx;
+        yaza_net_v1_reset_slot_locked(slot);
+    }
+    yaza_net_v1_unlock();
+    if (fd_to_close != YAZA_NET_INVALID_SOCKET) {
+        yaza_net_v1_tls_cleanup(tls_ssl_to_free, tls_ctx_to_free);
+        (void)yaza_net_v1_close_sock(fd_to_close);
+    }
+}
+
 int32_t yaza_net_v1_listen(const YazaTextV1 *host, int64_t port, int64_t backlog, int64_t *out_handle, char **out_error) {
     if (out_error == NULL) return 0;
     *out_error = (char *)"invalid network listen arguments";
@@ -6797,12 +7043,20 @@ int32_t yaza_net_v1_listen(const YazaTextV1 *host, int64_t port, int64_t backlog
     if (listen_backlog <= 0) listen_backlog = 128;
     if (listen_backlog > 1024) listen_backlog = 1024;
 
+    if (host != NULL && host->length > 0 &&
+        (host->data == NULL || host->length >= 256 ||
+         memchr(host->data, '\0', (size_t)host->length) != NULL)) {
+        *out_error = (char *)"network listen host address is invalid or too long";
+        return 0;
+    }
+
     yaza_net_v1_ensure_init();
     yaza_net_sock_t fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd == YAZA_NET_INVALID_SOCKET) {
         *out_error = (char *)"network socket creation failed";
         return 0;
     }
+    yaza_net_v1_set_cloexec(fd);
 
     int opt = 1;
     (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt));
@@ -6818,11 +7072,6 @@ int32_t yaza_net_v1_listen(const YazaTextV1 *host, int64_t port, int64_t backlog
 
     char host_buf[256];
     if (host != NULL && host->data != NULL && host->length > 0) {
-        if (host->length >= sizeof(host_buf)) {
-            yaza_net_v1_close_sock(fd);
-            *out_error = (char *)"network listen host address too long";
-            return 0;
-        }
         memcpy(host_buf, host->data, (size_t)host->length);
         host_buf[host->length] = '\0';
         if (strcmp(host_buf, "0.0.0.0") == 0 || strcmp(host_buf, "*") == 0) {
@@ -6831,7 +7080,7 @@ int32_t yaza_net_v1_listen(const YazaTextV1 *host, int64_t port, int64_t backlog
             addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         } else {
             if (inet_pton(AF_INET, host_buf, &addr.sin_addr) <= 0) {
-                yaza_net_v1_close_sock(fd);
+                (void)yaza_net_v1_close_sock(fd);
                 *out_error = (char *)"network listen host address is invalid IPv4";
                 return 0;
             }
@@ -6841,13 +7090,13 @@ int32_t yaza_net_v1_listen(const YazaTextV1 *host, int64_t port, int64_t backlog
     }
 
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        yaza_net_v1_close_sock(fd);
+        (void)yaza_net_v1_close_sock(fd);
         *out_error = (char *)"network listen bind failed";
         return 0;
     }
 
     if (listen(fd, listen_backlog) != 0) {
-        yaza_net_v1_close_sock(fd);
+        (void)yaza_net_v1_close_sock(fd);
         *out_error = (char *)"network listen failed";
         return 0;
     }
@@ -6862,15 +7111,15 @@ int32_t yaza_net_v1_listen(const YazaTextV1 *host, int64_t port, int64_t backlog
     }
     if (chosen >= YAZA_NET_V1_MAX_HANDLES) {
         yaza_net_v1_unlock();
-        yaza_net_v1_close_sock(fd);
+        (void)yaza_net_v1_close_sock(fd);
         *out_error = (char *)"network handle table exhausted";
         return 0;
     }
-    const uint64_t gen = yaza_net_v1_next_generation++;
+    const uint64_t gen = yaza_net_v1_alloc_generation_locked();
     YazaNetV1Slot *slot = &yaza_net_v1_slots[chosen];
+    yaza_net_v1_reset_slot_locked(slot);
     slot->descriptor = fd;
     slot->kind = YAZA_NET_V1_KIND_LISTENER;
-    slot->flags = 0;
     slot->generation = gen;
     *out_handle = (int64_t)((gen << 8) | (uint64_t)chosen);
     yaza_net_v1_unlock();
@@ -6888,6 +7137,12 @@ int32_t yaza_net_v1_connect(const YazaTextV1 *host, int64_t port, int64_t timeou
         *out_error = (char *)"network connect port must be between 1 and 65535";
         return 0;
     }
+    if (host != NULL && host->length > 0 &&
+        (host->data == NULL || host->length >= 256 ||
+         memchr(host->data, '\0', (size_t)host->length) != NULL)) {
+        *out_error = (char *)"network connect host address is invalid or too long";
+        return 0;
+    }
     int effective_timeout = (int)timeout_ms;
     if (effective_timeout <= 0) effective_timeout = 5000;
 
@@ -6897,6 +7152,7 @@ int32_t yaza_net_v1_connect(const YazaTextV1 *host, int64_t port, int64_t timeou
         *out_error = (char *)"network socket creation failed";
         return 0;
     }
+    yaza_net_v1_set_cloexec(fd);
 
 #if defined(SO_NOSIGPIPE)
     int opt = 1;
@@ -6911,18 +7167,13 @@ int32_t yaza_net_v1_connect(const YazaTextV1 *host, int64_t port, int64_t timeou
 
     char host_buf[256];
     if (host != NULL && host->data != NULL && host->length > 0) {
-        if (host->length >= sizeof(host_buf)) {
-            yaza_net_v1_close_sock(fd);
-            *out_error = (char *)"network connect host address too long";
-            return 0;
-        }
         memcpy(host_buf, host->data, (size_t)host->length);
         host_buf[host->length] = '\0';
         if (strcmp(host_buf, "127.0.0.1") == 0 || strcmp(host_buf, "localhost") == 0) {
             addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         } else {
             if (inet_pton(AF_INET, host_buf, &addr.sin_addr) <= 0) {
-                yaza_net_v1_close_sock(fd);
+                (void)yaza_net_v1_close_sock(fd);
                 *out_error = (char *)"network connect host address is invalid IPv4";
                 return 0;
             }
@@ -6941,19 +7192,19 @@ int32_t yaza_net_v1_connect(const YazaTextV1 *host, int64_t port, int64_t timeou
         if (in_progress) {
             int pr = yaza_net_v1_poll_one(fd, POLLOUT, effective_timeout);
             if (pr <= 0) {
-                yaza_net_v1_close_sock(fd);
+                (void)yaza_net_v1_close_sock(fd);
                 *out_error = pr == 0 ? (char *)"network connect timed out" : (char *)"network connect poll failed";
                 return 0;
             }
             int sock_err = 0;
             socklen_t err_len = sizeof(sock_err);
             if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *)&sock_err, &err_len) != 0 || sock_err != 0) {
-                yaza_net_v1_close_sock(fd);
+                (void)yaza_net_v1_close_sock(fd);
                 *out_error = (char *)"network connection refused or unreachable";
                 return 0;
             }
         } else {
-            yaza_net_v1_close_sock(fd);
+            (void)yaza_net_v1_close_sock(fd);
             *out_error = (char *)"network connect failed immediately";
             return 0;
         }
@@ -6969,18 +7220,16 @@ int32_t yaza_net_v1_connect(const YazaTextV1 *host, int64_t port, int64_t timeou
     }
     if (chosen >= YAZA_NET_V1_MAX_HANDLES) {
         yaza_net_v1_unlock();
-        yaza_net_v1_close_sock(fd);
+        (void)yaza_net_v1_close_sock(fd);
         *out_error = (char *)"network handle table exhausted";
         return 0;
     }
-    const uint64_t gen = yaza_net_v1_next_generation++;
+    const uint64_t gen = yaza_net_v1_alloc_generation_locked();
     YazaNetV1Slot *slot = &yaza_net_v1_slots[chosen];
+    yaza_net_v1_reset_slot_locked(slot);
     slot->descriptor = fd;
     slot->kind = YAZA_NET_V1_KIND_CONNECTION;
-    slot->flags = 0;
     slot->generation = gen;
-    slot->peer_slot = YAZA_NET_V1_MAX_HANDLES;
-    slot->peer_generation = 0;
     *out_handle = (int64_t)((gen << 8) | (uint64_t)chosen);
     yaza_net_v1_unlock();
     return 1;
@@ -6993,37 +7242,23 @@ int32_t yaza_net_v1_accept(int64_t listener, int64_t timeout_ms, int64_t *out_ha
     *out_handle = 0;
     *out_error = NULL;
 
-    if (listener <= 0) {
-        *out_error = (char *)"invalid network listener handle";
+    uint32_t index = 0;
+    yaza_net_sock_t server_fd = YAZA_NET_INVALID_SOCKET;
+    if (!yaza_net_v1_acquire(listener, YAZA_NET_V1_KIND_LISTENER, "invalid or closed network listener",
+                             &index, &server_fd, out_error)) {
         return 0;
     }
-    const uint64_t token = (uint64_t)listener;
-    const uint32_t index = (uint32_t)(token & 0xffU);
-    const uint64_t generation = token >> 8;
-    if (index >= YAZA_NET_V1_MAX_HANDLES) {
-        *out_error = (char *)"invalid network listener handle";
-        return 0;
-    }
-
-    yaza_net_v1_lock();
-    YazaNetV1Slot *slot = &yaza_net_v1_slots[index];
-    if (slot->kind != YAZA_NET_V1_KIND_LISTENER || slot->generation != generation ||
-        slot->descriptor == YAZA_NET_INVALID_SOCKET) {
-        yaza_net_v1_unlock();
-        *out_error = (char *)"invalid or closed network listener";
-        return 0;
-    }
-    const yaza_net_sock_t server_fd = slot->descriptor;
-    yaza_net_v1_unlock();
 
     if (timeout_ms >= 0) {
         int poll_timeout = timeout_ms > 60000 ? 60000 : (int)timeout_ms;
         int pr = yaza_net_v1_poll_one(server_fd, POLLIN, poll_timeout);
         if (pr == 0) {
+            yaza_net_v1_release(index);
             *out_error = (char *)"network accept timed out";
             return 0;
         }
         if (pr < 0) {
+            yaza_net_v1_release(index);
             if (yaza_net_v1_last_eintr()) {
                 *out_error = (char *)"network accept interrupted";
             } else {
@@ -7036,6 +7271,7 @@ int32_t yaza_net_v1_accept(int64_t listener, int64_t timeout_ms, int64_t *out_ha
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
     yaza_net_sock_t client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+    yaza_net_v1_release(index);
     if (client_fd == YAZA_NET_INVALID_SOCKET) {
         if (yaza_net_v1_last_wouldblock()) {
             *out_error = (char *)"network accept timed out";
@@ -7044,6 +7280,7 @@ int32_t yaza_net_v1_accept(int64_t listener, int64_t timeout_ms, int64_t *out_ha
         }
         return 0;
     }
+    yaza_net_v1_set_cloexec(client_fd);
 
     int opt = 1;
     (void)setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&opt, sizeof(opt));
@@ -7062,15 +7299,15 @@ int32_t yaza_net_v1_accept(int64_t listener, int64_t timeout_ms, int64_t *out_ha
     }
     if (chosen >= YAZA_NET_V1_MAX_HANDLES) {
         yaza_net_v1_unlock();
-        yaza_net_v1_close_sock(client_fd);
+        (void)yaza_net_v1_close_sock(client_fd);
         *out_error = (char *)"network handle table exhausted";
         return 0;
     }
-    const uint64_t gen = yaza_net_v1_next_generation++;
+    const uint64_t gen = yaza_net_v1_alloc_generation_locked();
     YazaNetV1Slot *client_slot = &yaza_net_v1_slots[chosen];
+    yaza_net_v1_reset_slot_locked(client_slot);
     client_slot->descriptor = client_fd;
     client_slot->kind = YAZA_NET_V1_KIND_CONNECTION;
-    client_slot->flags = 0;
     client_slot->generation = gen;
     *out_handle = (int64_t)((gen << 8) | (uint64_t)chosen);
     yaza_net_v1_unlock();
@@ -7085,51 +7322,19 @@ int32_t yaza_net_v1_read(int64_t connection, int64_t max_bytes, int64_t timeout_
     out_bytes->length = 0;
     *out_error = NULL;
 
-    if (connection <= 0) {
-        *out_error = (char *)"invalid network connection handle";
+    uint32_t index = 0;
+    yaza_net_sock_t fd = YAZA_NET_INVALID_SOCKET;
+    if (!yaza_net_v1_acquire(connection, YAZA_NET_V1_KIND_CONNECTION, "invalid or closed network connection",
+                             &index, &fd, out_error)) {
         return 0;
     }
-    const uint64_t token = (uint64_t)connection;
-    const uint32_t index = (uint32_t)(token & 0xffU);
-    const uint64_t generation = token >> 8;
-    if (index >= YAZA_NET_V1_MAX_HANDLES) {
-        *out_error = (char *)"invalid network connection handle";
-        return 0;
-    }
-
-    yaza_net_v1_lock();
-    YazaNetV1Slot *slot = &yaza_net_v1_slots[index];
-    if (slot->kind != YAZA_NET_V1_KIND_CONNECTION || slot->generation != generation ||
-        slot->descriptor == YAZA_NET_INVALID_SOCKET) {
-        yaza_net_v1_unlock();
-        *out_error = (char *)"invalid or closed network connection";
-        return 0;
-    }
-    const yaza_net_sock_t fd = slot->descriptor;
-    yaza_net_v1_unlock();
 
     if (max_bytes <= 0) {
+        yaza_net_v1_release(index);
         return 1;
     }
     if ((uint64_t)max_bytes > YAZA_NET_V1_MAX_TRANSFER_BYTES) {
         max_bytes = (int64_t)YAZA_NET_V1_MAX_TRANSFER_BYTES;
-    }
-
-    if (timeout_ms >= 0) {
-        int poll_timeout = timeout_ms > 60000 ? 60000 : (int)timeout_ms;
-        int pr = yaza_net_v1_poll_one(fd, POLLIN, poll_timeout);
-        if (pr == 0) {
-            *out_error = (char *)"network read timed out";
-            return 0;
-        }
-        if (pr < 0) {
-            if (yaza_net_v1_last_eintr()) {
-                *out_error = (char *)"network read interrupted";
-            } else {
-                *out_error = (char *)"network read poll failed";
-            }
-            return 0;
-        }
     }
 
     unsigned char stack_buf[65536];
@@ -7137,21 +7342,93 @@ int32_t yaza_net_v1_read(int64_t connection, int64_t max_bytes, int64_t timeout_
     if ((uint64_t)max_bytes > sizeof(stack_buf)) {
         temp_buf = (unsigned char *)malloc((size_t)max_bytes);
         if (temp_buf == NULL) {
+            yaza_net_v1_release(index);
             *out_error = (char *)"network read buffer allocation failed";
             return 0;
         }
     }
 
-    ssize_t bytes_read = (ssize_t)recv(fd, (char *)temp_buf, (int)max_bytes, 0);
-    if (bytes_read < 0) {
-        if (temp_buf != stack_buf) free(temp_buf);
-        if (yaza_net_v1_last_wouldblock()) {
-            *out_error = (char *)"network read timed out";
-        } else {
-            *out_error = (char *)"network read failed";
+    yaza_net_v1_lock();
+    void *tls_ssl = yaza_net_v1_slots[index].tls_ssl;
+    yaza_net_v1_unlock();
+
+    ssize_t bytes_read = -1;
+    if (tls_ssl != NULL && yaza_net_tls_v1.ready) {
+        int read_cap = max_bytes > (int64_t)INT_MAX ? INT_MAX : (int)max_bytes;
+        for (;;) {
+            int n = yaza_net_tls_v1.SSL_read(tls_ssl, temp_buf, read_cap);
+            if (n >= 0) {
+                bytes_read = (ssize_t)n;
+                break;
+            }
+            int ssl_err = yaza_net_tls_v1.SSL_get_error(tls_ssl, n);
+            if (ssl_err == YAZA_SSL_ERROR_WANT_READ || ssl_err == YAZA_SSL_ERROR_WANT_WRITE) {
+                short ev = (ssl_err == YAZA_SSL_ERROR_WANT_READ) ? POLLIN : POLLOUT;
+                int poll_timeout = timeout_ms < 0 ? -1 : (timeout_ms > 60000 ? 60000 : (int)timeout_ms);
+                int pr = yaza_net_v1_poll_one(fd, ev, poll_timeout);
+                if (pr == 0) {
+                    if (temp_buf != stack_buf) free(temp_buf);
+                    yaza_net_v1_release(index);
+                    *out_error = (char *)"network read timed out";
+                    return 0;
+                }
+                if (pr < 0 && !yaza_net_v1_last_eintr()) {
+                    if (temp_buf != stack_buf) free(temp_buf);
+                    yaza_net_v1_release(index);
+                    *out_error = (char *)"network read poll failed";
+                    return 0;
+                }
+                continue;
+            }
+            if (temp_buf != stack_buf) free(temp_buf);
+            yaza_net_v1_release(index);
+            *out_error = (char *)"network TLS read failed";
+            return 0;
         }
-        return 0;
+    } else {
+        for (;;) {
+            if (timeout_ms >= 0) {
+                int poll_timeout = timeout_ms > 60000 ? 60000 : (int)timeout_ms;
+                int pr = yaza_net_v1_poll_one(fd, POLLIN, poll_timeout);
+                if (pr == 0) {
+                    if (temp_buf != stack_buf) free(temp_buf);
+                    yaza_net_v1_release(index);
+                    *out_error = (char *)"network read timed out";
+                    return 0;
+                }
+                if (pr < 0) {
+                    if (yaza_net_v1_last_eintr()) continue;
+                    if (temp_buf != stack_buf) free(temp_buf);
+                    yaza_net_v1_release(index);
+                    *out_error = (char *)"network read poll failed";
+                    return 0;
+                }
+            }
+#if defined(_WIN32)
+            bytes_read = (ssize_t)recv(fd, (char *)temp_buf, (int)max_bytes, 0);
+#else
+            bytes_read = recv(fd, (char *)temp_buf, (size_t)max_bytes, 0);
+#endif
+            if (bytes_read >= 0) break;
+            if (yaza_net_v1_last_eintr()) continue;
+            if (yaza_net_v1_last_wouldblock()) {
+                if (timeout_ms < 0) {
+                    int pr = yaza_net_v1_poll_one(fd, POLLIN, -1);
+                    if (pr > 0 || (pr < 0 && yaza_net_v1_last_eintr())) continue;
+                }
+                if (temp_buf != stack_buf) free(temp_buf);
+                yaza_net_v1_release(index);
+                *out_error = (char *)"network read timed out";
+                return 0;
+            }
+            if (temp_buf != stack_buf) free(temp_buf);
+            yaza_net_v1_release(index);
+            *out_error = (char *)"network read failed";
+            return 0;
+        }
     }
+
+    yaza_net_v1_release(index);
 
     if (bytes_read == 0) {
         if (temp_buf != stack_buf) free(temp_buf);
@@ -7160,10 +7437,10 @@ int32_t yaza_net_v1_read(int64_t connection, int64_t max_bytes, int64_t timeout_
         return 1;
     }
 
-    unsigned char *buffer = (unsigned char *)yaza_rt_v1_alloc((uint64_t)bytes_read);
+    unsigned char *buffer = (unsigned char *)yaza_rt_v1_try_alloc((uint64_t)bytes_read);
     if (buffer == NULL) {
         if (temp_buf != stack_buf) free(temp_buf);
-        *out_error = (char *)"network read buffer allocation failed";
+        *out_error = (char *)"network read exceeded active arena limit";
         return 0;
     }
     memcpy(buffer, temp_buf, (size_t)bytes_read);
@@ -7181,68 +7458,105 @@ int32_t yaza_net_v1_write(int64_t connection, const YazaBytesV1 *bytes, int64_t 
     *out_written = 0;
     *out_error = NULL;
 
-    if (connection <= 0) {
-        *out_error = (char *)"invalid network connection handle";
+    uint32_t index = 0;
+    yaza_net_sock_t fd = YAZA_NET_INVALID_SOCKET;
+    if (!yaza_net_v1_acquire(connection, YAZA_NET_V1_KIND_CONNECTION, "invalid or closed network connection",
+                             &index, &fd, out_error)) {
         return 0;
     }
-    const uint64_t token = (uint64_t)connection;
-    const uint32_t index = (uint32_t)(token & 0xffU);
-    const uint64_t generation = token >> 8;
-    if (index >= YAZA_NET_V1_MAX_HANDLES) {
-        *out_error = (char *)"invalid network connection handle";
+
+    if (bytes == NULL || bytes->data == NULL || bytes->length == 0) {
+        yaza_net_v1_release(index);
+        return 1;
+    }
+    if (bytes->length > YAZA_NET_V1_MAX_TRANSFER_BYTES) {
+        yaza_net_v1_release(index);
+        *out_error = (char *)"network write exceeds maximum transfer bytes";
         return 0;
     }
 
     yaza_net_v1_lock();
-    YazaNetV1Slot *slot = &yaza_net_v1_slots[index];
-    if (slot->kind != YAZA_NET_V1_KIND_CONNECTION || slot->generation != generation ||
-        slot->descriptor == YAZA_NET_INVALID_SOCKET) {
-        yaza_net_v1_unlock();
-        *out_error = (char *)"invalid or closed network connection";
-        return 0;
-    }
-    const yaza_net_sock_t fd = slot->descriptor;
+    void *tls_ssl = yaza_net_v1_slots[index].tls_ssl;
     yaza_net_v1_unlock();
-
-    if (bytes == NULL || bytes->data == NULL || bytes->length == 0) {
-        return 1;
-    }
-    if (bytes->length > YAZA_NET_V1_MAX_TRANSFER_BYTES) {
-        *out_error = (char *)"network write exceeds maximum transfer bytes";
-        return 0;
-    }
 
     size_t total_written = 0;
     const size_t total_to_write = (size_t)bytes->length;
 
     while (total_written < total_to_write) {
+        size_t chunk = total_to_write - total_written;
+        if (chunk > (size_t)INT_MAX) chunk = (size_t)INT_MAX;
+
+        if (tls_ssl != NULL && yaza_net_tls_v1.ready) {
+            int n = yaza_net_tls_v1.SSL_write(tls_ssl, bytes->data + total_written, (int)chunk);
+            if (n > 0) {
+                total_written += (size_t)n;
+                continue;
+            }
+            int ssl_err = yaza_net_tls_v1.SSL_get_error(tls_ssl, n);
+            if (ssl_err == YAZA_SSL_ERROR_WANT_READ || ssl_err == YAZA_SSL_ERROR_WANT_WRITE) {
+                short ev = (ssl_err == YAZA_SSL_ERROR_WANT_READ) ? POLLIN : POLLOUT;
+                int poll_timeout = timeout_ms < 0 ? -1 : (timeout_ms > 60000 ? 60000 : (int)timeout_ms);
+                int pr = yaza_net_v1_poll_one(fd, ev, poll_timeout);
+                if (pr == 0) {
+                    yaza_net_v1_release(index);
+                    *out_error = (char *)"network write timed out";
+                    *out_written = (int64_t)total_written;
+                    return 0;
+                }
+                if (pr < 0 && !yaza_net_v1_last_eintr()) {
+                    yaza_net_v1_release(index);
+                    *out_error = (char *)"network write poll failed";
+                    *out_written = (int64_t)total_written;
+                    return 0;
+                }
+                continue;
+            }
+            yaza_net_v1_release(index);
+            *out_error = (char *)"network TLS write failed";
+            *out_written = (int64_t)total_written;
+            return 0;
+        }
+
         if (timeout_ms >= 0) {
             int poll_timeout = timeout_ms > 60000 ? 60000 : (int)timeout_ms;
             int pr = yaza_net_v1_poll_one(fd, POLLOUT, poll_timeout);
             if (pr == 0) {
+                yaza_net_v1_release(index);
                 *out_error = (char *)"network write timed out";
                 *out_written = (int64_t)total_written;
                 return 0;
             }
             if (pr < 0) {
                 if (yaza_net_v1_last_eintr()) continue;
+                yaza_net_v1_release(index);
                 *out_error = (char *)"network write poll failed";
                 *out_written = (int64_t)total_written;
                 return 0;
             }
         }
 
-        size_t chunk = total_to_write - total_written;
-        if (chunk > (size_t)INT_MAX) chunk = (size_t)INT_MAX;
+#if defined(_WIN32)
         ssize_t n = (ssize_t)send(fd, (const char *)(bytes->data + total_written), (int)chunk, MSG_NOSIGNAL);
+#else
+        ssize_t n = send(fd, (const char *)(bytes->data + total_written), chunk, MSG_NOSIGNAL);
+#endif
         if (n < 0) {
             if (yaza_net_v1_last_eintr()) continue;
-            if (yaza_net_v1_last_wouldblock()) continue;
+            if (yaza_net_v1_last_wouldblock()) {
+                if (timeout_ms < 0) {
+                    int pr = yaza_net_v1_poll_one(fd, POLLOUT, -1);
+                    if (pr > 0 || (pr < 0 && yaza_net_v1_last_eintr())) continue;
+                } else {
+                    continue;
+                }
+            }
+            yaza_net_v1_release(index);
             *out_error = (char *)"network write failed";
             *out_written = (int64_t)total_written;
             return 0;
         }
         if (n == 0) {
+            yaza_net_v1_release(index);
             *out_error = (char *)"network write connection closed";
             *out_written = (int64_t)total_written;
             return 0;
@@ -7250,6 +7564,7 @@ int32_t yaza_net_v1_write(int64_t connection, const YazaBytesV1 *bytes, int64_t 
         total_written += (size_t)n;
     }
 
+    yaza_net_v1_release(index);
     *out_written = (int64_t)total_written;
     return 1;
 }
@@ -7268,29 +7583,30 @@ int32_t yaza_net_v1_close(int64_t handle, char **out_error) {
 
     yaza_net_v1_lock();
     YazaNetV1Slot *slot = &yaza_net_v1_slots[index];
-    if (slot->kind == YAZA_NET_V1_KIND_FREE || slot->generation != generation ||
+    if (slot->kind == YAZA_NET_V1_KIND_FREE || slot->closing || slot->generation != generation ||
         slot->descriptor == YAZA_NET_INVALID_SOCKET) {
         yaza_net_v1_unlock();
         *out_error = (char *)"invalid or closed network handle";
         return 0;
     }
     const yaza_net_sock_t fd = slot->descriptor;
-    slot->descriptor = YAZA_NET_INVALID_SOCKET;
-    slot->kind = YAZA_NET_V1_KIND_FREE;
-    slot->flags = 0;
+    if (slot->active_operations > 0U) {
+        slot->closing = 1;
+        yaza_net_v1_unlock();
+        yaza_net_v1_shutdown_sock(fd);
+        *out_error = NULL;
+        return 1;
+    }
+    void *tls_ssl_to_free = slot->tls_ssl;
+    void *tls_ctx_to_free = slot->tls_ctx;
+    yaza_net_v1_reset_slot_locked(slot);
     yaza_net_v1_unlock();
 
-#if defined(_WIN32)
-    if (closesocket(fd) != 0) {
+    yaza_net_v1_tls_cleanup(tls_ssl_to_free, tls_ctx_to_free);
+    if (yaza_net_v1_close_sock(fd) != 0) {
         *out_error = (char *)"network close reported operating-system error";
         return 0;
     }
-#else
-    if (close(fd) != 0) {
-        *out_error = (char *)"network close reported operating-system error";
-        return 0;
-    }
-#endif
     *out_error = NULL;
     return 1;
 }
@@ -7319,22 +7635,22 @@ int32_t yaza_net_v1_pair_create(int64_t *out_handle, char **out_error) {
     if (bind(listener, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
         listen(listener, 1) != 0 ||
         getsockname(listener, (struct sockaddr *)&addr, &addr_len) != 0) {
-        yaza_net_v1_close_sock(listener);
+        (void)yaza_net_v1_close_sock(listener);
         *out_error = (char *)"socketpair creation failed";
         return 0;
     }
     fds[0] = socket(AF_INET, SOCK_STREAM, 0);
     if (fds[0] == YAZA_NET_INVALID_SOCKET ||
         connect(fds[0], (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        if (fds[0] != YAZA_NET_INVALID_SOCKET) yaza_net_v1_close_sock(fds[0]);
-        yaza_net_v1_close_sock(listener);
+        if (fds[0] != YAZA_NET_INVALID_SOCKET) (void)yaza_net_v1_close_sock(fds[0]);
+        (void)yaza_net_v1_close_sock(listener);
         *out_error = (char *)"socketpair creation failed";
         return 0;
     }
     fds[1] = accept(listener, NULL, NULL);
-    yaza_net_v1_close_sock(listener);
+    (void)yaza_net_v1_close_sock(listener);
     if (fds[1] == YAZA_NET_INVALID_SOCKET) {
-        yaza_net_v1_close_sock(fds[0]);
+        (void)yaza_net_v1_close_sock(fds[0]);
         *out_error = (char *)"socketpair creation failed";
         return 0;
     }
@@ -7346,6 +7662,7 @@ int32_t yaza_net_v1_pair_create(int64_t *out_handle, char **out_error) {
 #endif
 
     for (int i = 0; i < 2; i++) {
+        yaza_net_v1_set_cloexec(fds[i]);
         yaza_net_v1_set_nonblocking(fds[i]);
 #if defined(SO_NOSIGPIPE)
         int opt = 1;
@@ -7364,27 +7681,27 @@ int32_t yaza_net_v1_pair_create(int64_t *out_handle, char **out_error) {
     }
     if (slot_a == YAZA_NET_V1_MAX_HANDLES || slot_b == YAZA_NET_V1_MAX_HANDLES) {
         yaza_net_v1_unlock();
-        yaza_net_v1_close_sock(fds[0]);
-        yaza_net_v1_close_sock(fds[1]);
+        (void)yaza_net_v1_close_sock(fds[0]);
+        (void)yaza_net_v1_close_sock(fds[1]);
         *out_error = (char *)"network handle table exhausted";
         return 0;
     }
 
-    const uint64_t gen_a = yaza_net_v1_next_generation++;
-    const uint64_t gen_b = yaza_net_v1_next_generation++;
+    const uint64_t gen_a = yaza_net_v1_alloc_generation_locked();
+    const uint64_t gen_b = yaza_net_v1_alloc_generation_locked();
 
     YazaNetV1Slot *sa = &yaza_net_v1_slots[slot_a];
+    yaza_net_v1_reset_slot_locked(sa);
     sa->descriptor = fds[0];
     sa->kind = YAZA_NET_V1_KIND_CONNECTION;
-    sa->flags = 0;
     sa->generation = gen_a;
     sa->peer_slot = slot_b;
     sa->peer_generation = gen_b;
 
     YazaNetV1Slot *sb = &yaza_net_v1_slots[slot_b];
+    yaza_net_v1_reset_slot_locked(sb);
     sb->descriptor = fds[1];
     sb->kind = YAZA_NET_V1_KIND_CONNECTION;
-    sb->flags = 0;
     sb->generation = gen_b;
     sb->peer_slot = slot_a;
     sb->peer_generation = gen_a;
@@ -7415,14 +7732,386 @@ int32_t yaza_net_v1_pair_peer(int64_t handle, int64_t *out_peer_handle, char **o
 
     yaza_net_v1_lock();
     YazaNetV1Slot *slot = &yaza_net_v1_slots[index];
-    if (slot->kind != YAZA_NET_V1_KIND_CONNECTION || slot->generation != generation ||
-        slot->descriptor == YAZA_NET_INVALID_SOCKET) {
+    if (slot->kind != YAZA_NET_V1_KIND_CONNECTION || slot->closing || slot->generation != generation ||
+        slot->descriptor == YAZA_NET_INVALID_SOCKET ||
+        slot->peer_slot >= YAZA_NET_V1_MAX_HANDLES || slot->peer_generation == 0) {
         yaza_net_v1_unlock();
         *out_error = (char *)"invalid or closed network handle";
         return 0;
     }
     *out_peer_handle = (int64_t)((slot->peer_generation << 8) | (uint64_t)slot->peer_slot);
     yaza_net_v1_unlock();
+    return 1;
+}
+
+int32_t yaza_net_v1_peer_is_loopback(int64_t connection, char **out_error) {
+    if (out_error == NULL) return 0;
+    *out_error = NULL;
+    uint32_t index = 0;
+    yaza_net_sock_t fd = YAZA_NET_INVALID_SOCKET;
+    if (!yaza_net_v1_acquire(connection, YAZA_NET_V1_KIND_CONNECTION, "invalid or closed network connection",
+                             &index, &fd, out_error)) {
+        return 0;
+    }
+    yaza_net_v1_lock();
+    const uint32_t peer_slot = yaza_net_v1_slots[index].peer_slot;
+    const uint64_t peer_gen = yaza_net_v1_slots[index].peer_generation;
+    yaza_net_v1_unlock();
+    if (peer_slot < YAZA_NET_V1_MAX_HANDLES && peer_gen != 0) {
+        yaza_net_v1_release(index);
+        return 1;
+    }
+
+    struct sockaddr_storage addr;
+    socklen_t addr_len = sizeof(addr);
+    memset(&addr, 0, sizeof(addr));
+    int rc = getpeername(fd, (struct sockaddr *)&addr, &addr_len);
+    yaza_net_v1_release(index);
+    if (rc != 0) {
+        *out_error = (char *)"network peer lookup failed";
+        return 0;
+    }
+    if (addr.ss_family == AF_UNIX) return 1;
+    if (addr.ss_family == AF_INET) {
+        const struct sockaddr_in *in4 = (const struct sockaddr_in *)&addr;
+        uint32_t ip = ntohl(in4->sin_addr.s_addr);
+        if ((ip >> 24) == 127U) return 1;
+        *out_error = (char *)"network peer is not loopback";
+        return 0;
+    }
+    if (addr.ss_family == AF_INET6) {
+        const struct sockaddr_in6 *in6 = (const struct sockaddr_in6 *)&addr;
+        if (IN6_IS_ADDR_LOOPBACK(&in6->sin6_addr) ||
+            (IN6_IS_ADDR_V4MAPPED(&in6->sin6_addr) && in6->sin6_addr.s6_addr[12] == 127U)) {
+            return 1;
+        }
+        *out_error = (char *)"network peer is not loopback";
+        return 0;
+    }
+    *out_error = (char *)"network peer is not loopback";
+    return 0;
+}
+
+int32_t yaza_net_v1_tls_is_active(int64_t connection, char **out_error) {
+    if (out_error == NULL) return 0;
+    *out_error = NULL;
+    uint32_t index = 0;
+    yaza_net_sock_t fd = YAZA_NET_INVALID_SOCKET;
+    if (!yaza_net_v1_acquire(connection, YAZA_NET_V1_KIND_CONNECTION, "invalid or closed network connection",
+                             &index, &fd, out_error)) {
+        return 0;
+    }
+    (void)fd;
+    yaza_net_v1_lock();
+    int active = yaza_net_v1_slots[index].tls_ssl != NULL;
+    yaza_net_v1_unlock();
+    yaza_net_v1_release(index);
+    if (!active) {
+        *out_error = (char *)"TLS is not active";
+        return 0;
+    }
+    return 1;
+}
+
+int32_t yaza_net_v1_tls_client_with_ca(int64_t connection, const YazaTextV1 *host, const YazaTextV1 *root_cert,
+                                       int64_t timeout_ms, char **out_error) {
+    if (out_error == NULL) return 0;
+    *out_error = NULL;
+    if (timeout_ms < 1 || timeout_ms > 3600000 || host == NULL || host->data == NULL ||
+        host->length < 1 || host->length > 255 ||
+        memchr(host->data, '\0', (size_t)host->length) != NULL) {
+        *out_error = (char *)"invalid TLS host or timeout arguments";
+        return 0;
+    }
+    if (root_cert != NULL && root_cert->length > 0 &&
+        (root_cert->data == NULL || root_cert->length > 4095 ||
+         memchr(root_cert->data, '\0', (size_t)root_cert->length) != NULL)) {
+        *out_error = (char *)"invalid TLS CA certificate path";
+        return 0;
+    }
+    if (!yaza_net_v1_tls_ensure()) {
+        *out_error = (char *)"OpenSSL shared library is unavailable on this host";
+        return 0;
+    }
+
+    char host_buf[256];
+    memcpy(host_buf, host->data, (size_t)host->length);
+    host_buf[host->length] = '\0';
+
+    char ca_buf[4096];
+    const char *ca_path = NULL;
+    if (root_cert != NULL && root_cert->data != NULL && root_cert->length > 0) {
+        memcpy(ca_buf, root_cert->data, (size_t)root_cert->length);
+        ca_buf[root_cert->length] = '\0';
+        ca_path = ca_buf;
+    } else {
+        const char *env_ca = getenv("YAZA_TLS_CA_BUNDLE");
+        if (env_ca != NULL && env_ca[0] != '\0') ca_path = env_ca;
+    }
+
+    uint32_t index = 0;
+    yaza_net_sock_t fd = YAZA_NET_INVALID_SOCKET;
+    if (!yaza_net_v1_acquire(connection, YAZA_NET_V1_KIND_CONNECTION, "invalid or closed network connection",
+                             &index, &fd, out_error)) {
+        return 0;
+    }
+    yaza_net_v1_lock();
+    int already_tls = yaza_net_v1_slots[index].tls_ssl != NULL;
+    yaza_net_v1_unlock();
+    if (already_tls) {
+        yaza_net_v1_release(index);
+        *out_error = (char *)"TLS is already active on this connection";
+        return 0;
+    }
+
+    const void *method = yaza_net_tls_v1.TLS_client_method();
+    void *ctx = method != NULL ? yaza_net_tls_v1.SSL_CTX_new(method) : NULL;
+    if (ctx == NULL) {
+        yaza_net_v1_release(index);
+        *out_error = (char *)"TLS context initialization failed";
+        return 0;
+    }
+    (void)yaza_net_tls_v1.SSL_CTX_ctrl(ctx, YAZA_SSL_CTRL_SET_MIN_PROTO_VERSION, YAZA_TLS1_2_VERSION, NULL);
+    yaza_net_tls_v1.SSL_CTX_set_verify(ctx, YAZA_SSL_VERIFY_PEER, NULL);
+    if (ca_path != NULL) {
+        if (yaza_net_tls_v1.SSL_CTX_load_verify_locations(ctx, ca_path, NULL) != 1) {
+            yaza_net_tls_v1.SSL_CTX_free(ctx);
+            yaza_net_v1_release(index);
+            *out_error = (char *)"failed to load TLS CA certificate bundle";
+            return 0;
+        }
+    } else if (yaza_net_tls_v1.SSL_CTX_set_default_verify_paths(ctx) != 1) {
+#if defined(__APPLE__)
+        if (yaza_net_tls_v1.SSL_CTX_load_verify_locations(ctx, "/etc/ssl/cert.pem", NULL) != 1)
+#endif
+        {
+            yaza_net_tls_v1.SSL_CTX_free(ctx);
+            yaza_net_v1_release(index);
+            *out_error = (char *)"failed to load system default TLS CA certificates";
+            return 0;
+        }
+    }
+
+    void *ssl = yaza_net_tls_v1.SSL_new(ctx);
+    if (ssl == NULL) {
+        yaza_net_tls_v1.SSL_CTX_free(ctx);
+        yaza_net_v1_release(index);
+        *out_error = (char *)"TLS session allocation failed";
+        return 0;
+    }
+    if (yaza_net_tls_v1.SSL_set_fd(ssl, (int)fd) != 1) {
+        yaza_net_tls_v1.SSL_free(ssl);
+        yaza_net_tls_v1.SSL_CTX_free(ctx);
+        yaza_net_v1_release(index);
+        *out_error = (char *)"TLS socket attachment failed";
+        return 0;
+    }
+
+    struct in_addr ip4;
+    struct in6_addr ip6;
+    if (inet_pton(AF_INET, host_buf, &ip4) == 1 || inet_pton(AF_INET6, host_buf, &ip6) == 1) {
+        void *param = yaza_net_tls_v1.SSL_CTX_get0_param(ctx);
+        if (param == NULL || yaza_net_tls_v1.X509_VERIFY_PARAM_set1_ip_asc(param, host_buf) != 1) {
+            yaza_net_tls_v1.SSL_free(ssl);
+            yaza_net_tls_v1.SSL_CTX_free(ctx);
+            yaza_net_v1_release(index);
+            *out_error = (char *)"TLS IP verification configuration failed";
+            return 0;
+        }
+    } else {
+        (void)yaza_net_tls_v1.SSL_ctrl(ssl, YAZA_SSL_CTRL_SET_TLSEXT_HOSTNAME, 0, host_buf);
+        if (yaza_net_tls_v1.SSL_set1_host(ssl, host_buf) != 1) {
+            yaza_net_tls_v1.SSL_free(ssl);
+            yaza_net_tls_v1.SSL_CTX_free(ctx);
+            yaza_net_v1_release(index);
+            *out_error = (char *)"TLS hostname verification configuration failed";
+            return 0;
+        }
+    }
+
+    int64_t deadline = yaza_rt_v1_monotonic_ms() + timeout_ms;
+    for (;;) {
+        int rc = yaza_net_tls_v1.SSL_connect(ssl);
+        if (rc == 1) break;
+        int ssl_err = yaza_net_tls_v1.SSL_get_error(ssl, rc);
+        if (ssl_err == YAZA_SSL_ERROR_WANT_READ || ssl_err == YAZA_SSL_ERROR_WANT_WRITE) {
+            int64_t remaining = deadline - yaza_rt_v1_monotonic_ms();
+            if (remaining <= 0) {
+                yaza_net_tls_v1.SSL_free(ssl);
+                yaza_net_tls_v1.SSL_CTX_free(ctx);
+                yaza_net_v1_release(index);
+                *out_error = (char *)"TLS handshake timed out";
+                return 0;
+            }
+            int poll_ms = remaining > 60000 ? 60000 : (int)remaining;
+            int pr = yaza_net_v1_poll_one(fd, (ssl_err == YAZA_SSL_ERROR_WANT_READ) ? POLLIN : POLLOUT, poll_ms);
+            if (pr == 0) {
+                yaza_net_tls_v1.SSL_free(ssl);
+                yaza_net_tls_v1.SSL_CTX_free(ctx);
+                yaza_net_v1_release(index);
+                *out_error = (char *)"TLS handshake timed out";
+                return 0;
+            }
+            if (pr < 0 && !yaza_net_v1_last_eintr()) {
+                yaza_net_tls_v1.SSL_free(ssl);
+                yaza_net_tls_v1.SSL_CTX_free(ctx);
+                yaza_net_v1_release(index);
+                *out_error = (char *)"TLS handshake poll failed";
+                return 0;
+            }
+            continue;
+        }
+        yaza_net_tls_v1.SSL_free(ssl);
+        yaza_net_tls_v1.SSL_CTX_free(ctx);
+        yaza_net_v1_release(index);
+        *out_error = (char *)"TLS handshake or certificate verification failed";
+        return 0;
+    }
+
+    void *peer_cert = yaza_net_tls_v1.SSL_get1_peer_certificate(ssl);
+    if (peer_cert == NULL || yaza_net_tls_v1.SSL_get_verify_result(ssl) != 0) {
+        if (peer_cert != NULL) yaza_net_tls_v1.X509_free(peer_cert);
+        yaza_net_tls_v1.SSL_free(ssl);
+        yaza_net_tls_v1.SSL_CTX_free(ctx);
+        yaza_net_v1_release(index);
+        *out_error = (char *)"TLS peer certificate verification failed";
+        return 0;
+    }
+    yaza_net_tls_v1.X509_free(peer_cert);
+
+    yaza_net_v1_lock();
+    YazaNetV1Slot *slot = &yaza_net_v1_slots[index];
+    if (slot->closing) {
+        yaza_net_v1_unlock();
+        yaza_net_tls_v1.SSL_free(ssl);
+        yaza_net_tls_v1.SSL_CTX_free(ctx);
+        yaza_net_v1_release(index);
+        *out_error = (char *)"network connection closed during TLS handshake";
+        return 0;
+    }
+    slot->tls_ssl = ssl;
+    slot->tls_ctx = ctx;
+    yaza_net_v1_unlock();
+    yaza_net_v1_release(index);
+    return 1;
+}
+
+int32_t yaza_net_v1_pg_set_cancel_key(int64_t connection, int64_t pid, int64_t secret, char **out_error) {
+    if (out_error == NULL) return 0;
+    *out_error = NULL;
+    if (pid < 1 || pid > (int64_t)0xffffffffLL || secret < INT32_MIN || secret > (int64_t)0xffffffffLL) {
+        *out_error = (char *)"invalid PostgreSQL backend cancel key";
+        return 0;
+    }
+    uint32_t index = 0;
+    yaza_net_sock_t fd = YAZA_NET_INVALID_SOCKET;
+    if (!yaza_net_v1_acquire(connection, YAZA_NET_V1_KIND_CONNECTION, "invalid or closed network connection",
+                             &index, &fd, out_error)) {
+        return 0;
+    }
+    (void)fd;
+    yaza_net_v1_lock();
+    yaza_net_v1_slots[index].pg_cancel_pid = (uint32_t)pid;
+    yaza_net_v1_slots[index].pg_cancel_secret = secret < 0 ? (uint32_t)(int32_t)secret : (uint32_t)secret;
+    yaza_net_v1_slots[index].has_pg_cancel_key = 1U;
+    yaza_net_v1_unlock();
+    yaza_net_v1_release(index);
+    return 1;
+}
+
+int32_t yaza_net_v1_pg_cancel(int64_t connection, int64_t timeout_ms, char **out_error) {
+    if (out_error == NULL) return 0;
+    *out_error = NULL;
+    if (timeout_ms < 1 || timeout_ms > 60000) {
+        *out_error = (char *)"invalid PostgreSQL cancel timeout";
+        return 0;
+    }
+    uint32_t index = 0;
+    yaza_net_sock_t fd = YAZA_NET_INVALID_SOCKET;
+    if (!yaza_net_v1_acquire(connection, YAZA_NET_V1_KIND_CONNECTION, "invalid or closed network connection",
+                             &index, &fd, out_error)) {
+        return 0;
+    }
+    yaza_net_v1_lock();
+    uint32_t has_key = yaza_net_v1_slots[index].has_pg_cancel_key;
+    uint32_t pid = yaza_net_v1_slots[index].pg_cancel_pid;
+    uint32_t secret = yaza_net_v1_slots[index].pg_cancel_secret;
+    yaza_net_v1_unlock();
+    if (!has_key) {
+        yaza_net_v1_release(index);
+        *out_error = (char *)"PostgreSQL cancel key has not been registered";
+        return 0;
+    }
+
+    struct sockaddr_storage peer_addr;
+    socklen_t peer_len = sizeof(peer_addr);
+    memset(&peer_addr, 0, sizeof(peer_addr));
+    int peer_rc = getpeername(fd, (struct sockaddr *)&peer_addr, &peer_len);
+    yaza_net_v1_release(index);
+    if (peer_rc != 0 || (peer_addr.ss_family != AF_INET && peer_addr.ss_family != AF_INET6)) {
+        *out_error = (char *)"PostgreSQL cancel peer address is unavailable";
+        return 0;
+    }
+
+    yaza_net_sock_t cancel_fd = socket(peer_addr.ss_family, SOCK_STREAM, 0);
+    if (cancel_fd == YAZA_NET_INVALID_SOCKET) {
+        *out_error = (char *)"PostgreSQL cancel socket creation failed";
+        return 0;
+    }
+    yaza_net_v1_set_cloexec(cancel_fd);
+    yaza_net_v1_set_nonblocking(cancel_fd);
+
+    int rc = connect(cancel_fd, (const struct sockaddr *)&peer_addr, peer_len);
+    if (rc != 0) {
+#if defined(_WIN32)
+        int in_prog = (WSAGetLastError() == WSAEWOULDBLOCK || WSAGetLastError() == WSAEINPROGRESS);
+#else
+        int in_prog = (errno == EINPROGRESS);
+#endif
+        if (!in_prog || yaza_net_v1_poll_one(cancel_fd, POLLOUT, (int)timeout_ms) <= 0) {
+            (void)yaza_net_v1_close_sock(cancel_fd);
+            *out_error = (char *)"PostgreSQL cancel connect failed or timed out";
+            return 0;
+        }
+        int sock_err = 0;
+        socklen_t err_len = sizeof(sock_err);
+        if (getsockopt(cancel_fd, SOL_SOCKET, SO_ERROR, (char *)&sock_err, &err_len) != 0 || sock_err != 0) {
+            (void)yaza_net_v1_close_sock(cancel_fd);
+            *out_error = (char *)"PostgreSQL cancel connect refused";
+            return 0;
+        }
+    }
+
+    uint8_t pkt[16];
+    uint32_t len_be = htonl(16U);
+    uint32_t code_be = htonl(80877102U);
+    uint32_t pid_be = htonl(pid);
+    uint32_t sec_be = htonl(secret);
+    memcpy(pkt + 0, &len_be, 4);
+    memcpy(pkt + 4, &code_be, 4);
+    memcpy(pkt + 8, &pid_be, 4);
+    memcpy(pkt + 12, &sec_be, 4);
+
+    size_t sent = 0;
+    while (sent < sizeof(pkt)) {
+        int pr = yaza_net_v1_poll_one(cancel_fd, POLLOUT, (int)timeout_ms);
+        if (pr <= 0) {
+            if (pr < 0 && yaza_net_v1_last_eintr()) continue;
+            (void)yaza_net_v1_close_sock(cancel_fd);
+            *out_error = (char *)"PostgreSQL cancel write timed out";
+            return 0;
+        }
+        ssize_t n = send(cancel_fd, (const char *)(pkt + sent), sizeof(pkt) - sent, MSG_NOSIGNAL);
+        if (n < 0 && yaza_net_v1_last_eintr()) continue;
+        if (n <= 0) {
+            (void)yaza_net_v1_close_sock(cancel_fd);
+            *out_error = (char *)"PostgreSQL cancel write failed";
+            return 0;
+        }
+        sent += (size_t)n;
+    }
+
+    (void)yaza_net_v1_close_sock(cancel_fd);
     return 1;
 }
 
@@ -7493,11 +8182,14 @@ int64_t yaza_rt_v1_process(const YazaTextV1 *command, void *typed_text_list) {
             return 127;
         }
         total_bytes += argument->length;
-        arguments[index + 1] = (char *)argument->data;
+        arguments[index + 1] = (argument->length > 0 && argument->data != NULL) ? (char *)argument->data : (char *)"";
     }
     /* Keep parent status lines visible and ordered before child output. */
     (void)fflush(stdout);
-#if defined(_WIN32)
+#if defined(YAZA_RT_V1_DISABLE_PROCESS_SPAWN)
+    free(arguments);
+    return 127;
+#elif defined(_WIN32)
     char *cmdline = NULL;
     size_t cmdlen = 0;
     size_t cmdcap = 0;
@@ -8019,18 +8711,22 @@ YazaTaskV1 *yaza_rt_v1_task_spawn(YazaTaskThunkV1 thunk, void *context, uint64_t
     task->context = context;
     task->result_size = result_size;
     task->result_has_pointers = result_has_pointers;
+    task->started = 1;
+
+    const int status = pthread_create(&task->thread, NULL, yaza_rt_v1_task_worker_entry, task);
+    if (status != 0) {
+        (void)pthread_mutex_destroy(&task->join_mutex);
+        free(task->result_buffer);
+        free(context);
+        free(task);
+        yaza_rt_v1_fail("failed to spawn worker thread for task");
+        return NULL;
+    }
 
     pthread_mutex_lock(&yaza_rt_v1_async_registry_lock);
     task->registry_next = yaza_rt_v1_task_registry_head;
     yaza_rt_v1_task_registry_head = task;
     pthread_mutex_unlock(&yaza_rt_v1_async_registry_lock);
-
-    const int status = pthread_create(&task->thread, NULL, yaza_rt_v1_task_worker_entry, task);
-    if (status != 0) {
-        yaza_rt_v1_fail("failed to spawn worker thread for task");
-        return NULL;
-    }
-    task->started = 1;
     return task;
 }
 
@@ -8143,7 +8839,8 @@ int32_t yaza_rt_v1_atomic_handle_store(int64_t handle_val, int64_t value) {
 int64_t yaza_rt_v1_atomic_handle_add(int64_t handle_val, int64_t delta) {
     if (handle_val == 0) return 0;
     YazaRtAtomicHandle *handle = (YazaRtAtomicHandle *)(intptr_t)handle_val;
-    return atomic_fetch_add_explicit(&handle->value, delta, memory_order_seq_cst) + delta;
+    const uint64_t prev = (uint64_t)atomic_fetch_add_explicit(&handle->value, delta, memory_order_seq_cst);
+    return (int64_t)(prev + (uint64_t)delta);
 }
 
 int64_t yaza_rt_v1_channel_create(int64_t capacity) {
@@ -8163,12 +8860,25 @@ int64_t yaza_rt_v1_channel_create(int64_t capacity) {
         yaza_rt_v1_fail("out of memory creating AsyncChannel buffer");
         return 0;
     }
-    if (pthread_mutex_init(&ch->lock, NULL) != 0 ||
-        pthread_cond_init(&ch->not_empty, NULL) != 0 ||
-        pthread_cond_init(&ch->not_full, NULL) != 0) {
+    if (pthread_mutex_init(&ch->lock, NULL) != 0) {
         free(ch->buffer);
         free(ch);
-        yaza_rt_v1_fail("failed to initialize AsyncChannel primitives");
+        yaza_rt_v1_fail("failed to initialize AsyncChannel mutex");
+        return 0;
+    }
+    if (pthread_cond_init(&ch->not_empty, NULL) != 0) {
+        (void)pthread_mutex_destroy(&ch->lock);
+        free(ch->buffer);
+        free(ch);
+        yaza_rt_v1_fail("failed to initialize AsyncChannel condition");
+        return 0;
+    }
+    if (pthread_cond_init(&ch->not_full, NULL) != 0) {
+        (void)pthread_cond_destroy(&ch->not_empty);
+        (void)pthread_mutex_destroy(&ch->lock);
+        free(ch->buffer);
+        free(ch);
+        yaza_rt_v1_fail("failed to initialize AsyncChannel condition");
         return 0;
     }
     ch->capacity = effective_capacity;

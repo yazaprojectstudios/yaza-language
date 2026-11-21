@@ -90,7 +90,9 @@ fn yaza_db_checkpoint_begin_payload_decode_v1(record: YazaDbWalRecordV1) -> Resu
     let next_commit_ts: Number = yaza_db_read_uint_le_v1(record.payload, 32, 8)?
     if page_count < 2 or next_txn_id < 1 or next_commit_ts < 1: return err("YDBv1 checkpoint begin counters are invalid")
     if catalog_root < 0 or (catalog_root != 0 and catalog_root >= page_count): return err("YDBv1 checkpoint begin catalog root is outside the page range")
-    return ok(YazaDbFileHeaderV1(bytes_from_text(""), 0, next_txn_id, next_commit_ts, catalog_root, page_count, 1))
+    let parsed: Result[Result[YazaDbFileHeaderV1, Text], Text] = ok_try(YazaDbFileHeaderV1(bytes_empty(), 0, next_txn_id, next_commit_ts, catalog_root, page_count, 1))
+    if not result_is_ok(parsed): return err(result_unwrap_error(parsed))
+    return result_unwrap(parsed)
 
 fn yaza_db_checkpoint_end_payload_encode_v1(begin_lsn: Number, redo_lsn: Number, header: YazaDbFileHeaderV1) -> Result[Bytes, Text]:
     if begin_lsn < 0 or redo_lsn != begin_lsn + yaza_db_wal_header_size_v1() + yaza_db_checkpoint_begin_payload_size_v1(): return err("YDBv1 checkpoint begin and redo LSNs are inconsistent")
@@ -123,7 +125,9 @@ fn yaza_db_checkpoint_end_payload_decode_v1(record: YazaDbWalRecordV1) -> Result
     if begin_lsn < 0 or redo_lsn != begin_lsn + yaza_db_wal_header_size_v1() + yaza_db_checkpoint_begin_payload_size_v1() or record.lsn < redo_lsn: return err("YDBv1 checkpoint end LSN chain is invalid")
     if page_count < 2 or next_txn_id < 1 or next_commit_ts < 1: return err("YDBv1 checkpoint end counters are invalid")
     if catalog_root < 0 or (catalog_root != 0 and catalog_root >= page_count): return err("YDBv1 checkpoint end catalog root is outside the page range")
-    return ok(YazaDbCheckpointSnapshotV1(begin_lsn, redo_lsn, page_count, catalog_root, next_txn_id, next_commit_ts))
+    let snapshot: Result[Result[YazaDbCheckpointSnapshotV1, Text], Text] = ok_try(YazaDbCheckpointSnapshotV1(begin_lsn, redo_lsn, page_count, catalog_root, next_txn_id, next_commit_ts))
+    if not result_is_ok(snapshot): return err(result_unwrap_error(snapshot))
+    return result_unwrap(snapshot)
 
 fn yaza_db_checkpoint_begin_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, target_header: YazaDbFileHeaderV1, active_transaction_count: Number) -> Result[YazaDbCheckpointStartV1, Text]:
     if active_transaction_count != 0: return err("YDBv1 clean checkpoint requires no active transactions")
@@ -142,7 +146,11 @@ fn yaza_db_checkpoint_begin_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLog
         return err(result_unwrap_error(append_result))
     let appended: YazaDbWalAppendV1 = result_unwrap(append_result)
     let redo_lsn: Number = appended.record.lsn + yaza_db_wal_header_size_v1() + bytes_length(appended.record.payload)
-    return ok(YazaDbCheckpointStartV1(appended.log, appended.record, redo_lsn, target_header))
+    let started: Result[Result[YazaDbCheckpointStartV1, Text], Text] = ok_try(YazaDbCheckpointStartV1(appended.log, appended.record, redo_lsn, target_header))
+    if not result_is_ok(started):
+        let ignored_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(appended.log)
+        return err(result_unwrap_error(started))
+    return result_unwrap(started)
 
 fn yaza_db_checkpoint_append_end_v1(storage: YazaDbStorageHandleV1, start: YazaDbCheckpointStartV1) -> Result[YazaDbCheckpointEndV1, Text]:
     if storage.root != start.wal.root or not bytes_equal(storage.header.db_uuid, start.wal.db_uuid):
@@ -180,7 +188,11 @@ fn yaza_db_checkpoint_append_end_v1(storage: YazaDbStorageHandleV1, start: YazaD
     if end_snapshot.begin_lsn != start.record.lsn or end_snapshot.redo_lsn != start.redo_lsn or end_snapshot.page_count != start.target_header.page_count or end_snapshot.catalog_root != start.target_header.catalog_root or end_snapshot.next_txn_id != start.target_header.next_txn_id or end_snapshot.next_commit_ts != start.target_header.next_commit_ts:
         let ignored_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(appended.log)
         return err("YDBv1 checkpoint end does not match its begin record")
-    return ok(YazaDbCheckpointEndV1(appended.log, start.record, appended.record))
+    let completed: Result[Result[YazaDbCheckpointEndV1, Text], Text] = ok_try(YazaDbCheckpointEndV1(appended.log, start.record, appended.record))
+    if not result_is_ok(completed):
+        let ignored_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(appended.log)
+        return err(result_unwrap_error(completed))
+    return result_unwrap(completed)
 
 fn yaza_db_checkpoint_finish_v1(storage: YazaDbStorageHandleV1, start: YazaDbCheckpointStartV1) -> Result[YazaDbCheckpointResultV1, Text]:
     let appended_result: Result[YazaDbCheckpointEndV1, Text] = yaza_db_checkpoint_append_end_v1(storage, start)
@@ -192,7 +204,9 @@ fn yaza_db_checkpoint_finish_v1(storage: YazaDbStorageHandleV1, start: YazaDbChe
         let ignored_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(appended.wal)
         return err("YDBv1 CHECKPOINT_END is durable but the file-header update failed; reopen and reconcile before further writes")
     let next_storage: YazaDbStorageHandleV1 = YazaDbStorageHandleV1(storage.root, storage.file, storage.lock, storage.identity_lock, committed_header)
-    return ok(YazaDbCheckpointResultV1(next_storage, appended.wal, start.record, appended.end_record))
+    let finished: Result[Result[YazaDbCheckpointResultV1, Text], Text] = ok_try(YazaDbCheckpointResultV1(next_storage, appended.wal, start.record, appended.end_record))
+    if not result_is_ok(finished): return err(result_unwrap_error(finished))
+    return result_unwrap(finished)
 
 fn yaza_db_checkpoint_publish_state_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, target_header: YazaDbFileHeaderV1) -> Result[YazaDbCheckpointResultV1, Text]:
     let start: YazaDbCheckpointStartV1 = yaza_db_checkpoint_begin_v1(storage, wal, target_header, 0)?
@@ -261,10 +275,20 @@ fn yaza_db_storage_extend_preallocated_chunk_v1(storage: YazaDbStorageHandleV1, 
         return err(result_unwrap_error(bitmap_init_result))
     return yaza_db_checkpoint_finish_v1(storage, start)
 
+fn yaza_db_checkpoint_wal_step_result_v1(record: YazaDbWalRecordV1, next_lsn: Number, has_record: Boolean) -> Result[YazaDbCheckpointWalStepV1, Text]:
+    let step: Result[Result[YazaDbCheckpointWalStepV1, Text], Text] = ok_try(YazaDbCheckpointWalStepV1(record, next_lsn, has_record))
+    if not result_is_ok(step): return err(result_unwrap_error(step))
+    return result_unwrap(step)
+
+fn yaza_db_checkpoint_recovery_result_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, applied_checkpoints: Number) -> Result[YazaDbCheckpointRecoveryV1, Text]:
+    let recovery: Result[Result[YazaDbCheckpointRecoveryV1, Text], Text] = ok_try(YazaDbCheckpointRecoveryV1(storage, wal, applied_checkpoints))
+    if not result_is_ok(recovery): return err(result_unwrap_error(recovery))
+    return result_unwrap(recovery)
+
 fn yaza_db_checkpoint_read_wal_step_v1(root: Number, db_uuid: Bytes, cursor_lsn: Number, segment_count: Number, log_end_lsn: Number) -> Result[YazaDbCheckpointWalStepV1, Text]:
-    let empty_record: YazaDbWalRecordV1 = YazaDbWalRecordV1(0, 0, 0, 0, 0, bytes_from_text(""))
+    let empty_record: YazaDbWalRecordV1 = YazaDbWalRecordV1(0, 0, 0, 0, 0, bytes_empty())
     if cursor_lsn < 0 or cursor_lsn > log_end_lsn: return err("YDBv1 checkpoint WAL scan cursor is outside the recovered log")
-    if cursor_lsn == log_end_lsn: return ok(YazaDbCheckpointWalStepV1(empty_record, cursor_lsn, false))
+    if cursor_lsn == log_end_lsn: return yaza_db_checkpoint_wal_step_result_v1(empty_record, cursor_lsn, false)
     let segment_size: Number = yaza_db_wal_segment_size_v1()
     let segment_index: Number = cursor_lsn / segment_size
     let segment_offset: Number = cursor_lsn - segment_index * segment_size
@@ -289,7 +313,7 @@ fn yaza_db_checkpoint_read_wal_step_v1(root: Number, db_uuid: Bytes, cursor_lsn:
         if padding >= yaza_db_wal_max_record_size_v1(): return err("YDBv1 checkpoint WAL segment gap is too large to justify rotation")
         let next_lsn: Number = (segment_index + 1) * segment_size
         if next_lsn > log_end_lsn: return err("YDBv1 checkpoint WAL implicit padding advances beyond its recovered end")
-        return ok(YazaDbCheckpointWalStepV1(empty_record, next_lsn, false))
+        return yaza_db_checkpoint_wal_step_result_v1(empty_record, next_lsn, false)
     let tail_bytes: Number = segment_size - segment_offset
     if tail_bytes < yaza_db_wal_header_size_v1():
         let tail_check: Result[Boolean, Text] = yaza_db_wal_validate_zero_tail_v1(file, segment_offset)
@@ -299,7 +323,7 @@ fn yaza_db_checkpoint_read_wal_step_v1(root: Number, db_uuid: Bytes, cursor_lsn:
         if segment_index + 1 >= segment_count: return err("YDBv1 checkpoint WAL has padding before its recovered end in the final segment")
         let next_lsn: Number = (segment_index + 1) * segment_size
         if next_lsn > log_end_lsn: return err("YDBv1 checkpoint WAL padding advances beyond its recovered end")
-        return ok(YazaDbCheckpointWalStepV1(empty_record, next_lsn, false))
+        return yaza_db_checkpoint_wal_step_result_v1(empty_record, next_lsn, false)
     let length_result: Result[Bytes, Text] = read_exact(file, segment_offset, 4)
     if not result_is_ok(length_result):
         let ignored_close: Result[Boolean, Text] = close(file)
@@ -317,7 +341,7 @@ fn yaza_db_checkpoint_read_wal_step_v1(root: Number, db_uuid: Bytes, cursor_lsn:
         if segment_index + 1 >= segment_count: return err("YDBv1 checkpoint WAL has a zero tail before its recovered end in the final segment")
         let next_lsn: Number = (segment_index + 1) * segment_size
         if next_lsn > log_end_lsn: return err("YDBv1 checkpoint WAL zero tail advances beyond its recovered end")
-        return ok(YazaDbCheckpointWalStepV1(empty_record, next_lsn, false))
+        return yaza_db_checkpoint_wal_step_result_v1(empty_record, next_lsn, false)
     if total_length < yaza_db_wal_header_size_v1() or total_length > tail_bytes:
         let ignored_close: Result[Boolean, Text] = close(file)
         return err("YDBv1 checkpoint WAL record length is invalid at the scan cursor")
@@ -328,7 +352,7 @@ fn yaza_db_checkpoint_read_wal_step_v1(root: Number, db_uuid: Bytes, cursor_lsn:
     let record: YazaDbWalRecordV1 = result_unwrap(decoded)
     let next_lsn: Number = record.lsn + yaza_db_wal_header_size_v1() + bytes_length(record.payload)
     if next_lsn > log_end_lsn: return err("YDBv1 checkpoint WAL record extends beyond the recovered log end")
-    return ok(YazaDbCheckpointWalStepV1(record, next_lsn, true))
+    return yaza_db_checkpoint_wal_step_result_v1(record, next_lsn, true)
 
 fn yaza_db_checkpoint_read_undo_record_v1(root: Number, db_uuid: Bytes, record_lsn: Number, segment_count: Number, log_end_lsn: Number) -> YazaDbCheckpointUndoRecordV1:
     var output: YazaDbCheckpointUndoRecordV1 = YazaDbCheckpointUndoRecordV1(-1, 0, 0, 0, 0, 0, 0, 0, 0, 0)
@@ -525,7 +549,9 @@ fn yaza_db_checkpoint_validate_pair_v1(begin: YazaDbWalRecordV1, ending: YazaDbW
     if snapshot.begin_lsn != begin.lsn or snapshot.redo_lsn != redo_lsn or ending.lsn < redo_lsn: return err("YDBv1 checkpoint BEGIN/END LSN pair is inconsistent")
     if snapshot.page_count != begin_header.page_count or snapshot.catalog_root != begin_header.catalog_root or snapshot.next_txn_id != begin_header.next_txn_id or snapshot.next_commit_ts != begin_header.next_commit_ts:
         return err("YDBv1 checkpoint BEGIN/END state does not match")
-    return ok(snapshot)
+    let validated: Result[Result[YazaDbCheckpointSnapshotV1, Text], Text] = ok_try(snapshot)
+    if not result_is_ok(validated): return err(result_unwrap_error(validated))
+    return result_unwrap(validated)
 
 fn yaza_db_checkpoint_validate_bitmap_growth_v1(file: Number, old_page_count: Number, new_page_count: Number, header: YazaDbFileHeaderV1) -> Result[Number, Text]:
     let expected_count: Number = yaza_db_storage_new_bitmap_range_count_v1(old_page_count, new_page_count)?
@@ -554,7 +580,7 @@ fn yaza_db_checkpoint_recovery_target_v1(storage: YazaDbStorageHandleV1, base: Y
     if not yaza_db_storage_file_has_header_capacity_v1(size, target): return err("YDBv1 recovered checkpoint exceeds physical file capacity or has invalid header fields")
     let ignored_bitmap_check: Number = yaza_db_checkpoint_validate_bitmap_growth_v1(storage.file, base.page_count, target.page_count, target)?
     let ignored_catalog_validation: Boolean = yaza_db_checkpoint_validate_catalog_root_v1(storage.file, target)?
-    return ok(target)
+    return yaza_db_storage_header_result_v1(target)
 
 fn yaza_db_checkpoint_verify_published_header_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, segment_count: Number) -> Result[Number, Text]:
     let ending_step: YazaDbCheckpointWalStepV1 = yaza_db_checkpoint_read_wal_step_v1(storage.root, storage.header.db_uuid, storage.header.checkpoint_lsn, segment_count, wal.next_lsn)?
@@ -564,7 +590,7 @@ fn yaza_db_checkpoint_verify_published_header_v1(storage: YazaDbStorageHandleV1,
     let begin_step: YazaDbCheckpointWalStepV1 = yaza_db_checkpoint_read_wal_step_v1(storage.root, storage.header.db_uuid, snapshot.begin_lsn, segment_count, wal.next_lsn)?
     if not begin_step.has_record or begin_step.record.rec_type != yaza_db_wal_type_checkpoint_begin_v1() or begin_step.record.lsn != snapshot.begin_lsn: return err("YDBv1 published checkpoint is missing its CHECKPOINT_BEGIN record")
     var pair_cursor: Number = begin_step.next_lsn
-    var paired_step: YazaDbCheckpointWalStepV1 = YazaDbCheckpointWalStepV1(YazaDbWalRecordV1(0, 0, 0, 0, 0, bytes_from_text("")), pair_cursor, false)
+    var paired_step: YazaDbCheckpointWalStepV1 = YazaDbCheckpointWalStepV1(YazaDbWalRecordV1(0, 0, 0, 0, 0, bytes_empty()), pair_cursor, false)
     while pair_cursor < wal.next_lsn and not paired_step.has_record:
         set paired_step = yaza_db_checkpoint_read_wal_step_v1(storage.root, storage.header.db_uuid, pair_cursor, segment_count, wal.next_lsn)?
         set pair_cursor = paired_step.next_lsn
@@ -581,7 +607,7 @@ fn yaza_db_checkpoint_reconcile_impl_v1(storage: YazaDbStorageHandleV1, wal: Yaz
         set scan_lsn = yaza_db_checkpoint_verify_published_header_v1(storage, wal, segment_count)?
     if wal.next_lsn - scan_lsn > yaza_db_checkpoint_recovery_max_tail_bytes_v1(): return err("YDBv1 WAL recovery tail exceeds 64 MiB; publish a checkpoint before reopening")
     var candidate_header: YazaDbFileHeaderV1 = storage.header
-    var pending_begin: YazaDbWalRecordV1 = YazaDbWalRecordV1(0, 0, 0, 0, 0, bytes_from_text(""))
+    var pending_begin: YazaDbWalRecordV1 = YazaDbWalRecordV1(0, 0, 0, 0, 0, bytes_empty())
     var has_pending_begin: Boolean = false
     var applied_count: Number = 0
     while scan_lsn < wal.next_lsn:
@@ -609,15 +635,16 @@ fn yaza_db_checkpoint_reconcile_impl_v1(storage: YazaDbStorageHandleV1, wal: Yaz
         if not synced: return err("YDBv1 checkpoint recovery could not sync data before header publication")
         let ignored_written: Number = yaza_db_storage_write_header_v1(storage.file, candidate_header)?
         let next_storage: YazaDbStorageHandleV1 = YazaDbStorageHandleV1(storage.root, storage.file, storage.lock, storage.identity_lock, candidate_header)
-        return ok(YazaDbCheckpointRecoveryV1(next_storage, wal, applied_count))
-    return ok(YazaDbCheckpointRecoveryV1(storage, wal, 0))
+        return yaza_db_checkpoint_recovery_result_v1(next_storage, wal, applied_count)
+    return yaza_db_checkpoint_recovery_result_v1(storage, wal, 0)
 
 fn yaza_db_checkpoint_reconcile_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1) -> Result[YazaDbCheckpointRecoveryV1, Text]:
     let reconciled: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_checkpoint_reconcile_impl_v1(storage, wal)
     if not result_is_ok(reconciled):
         let ignored_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(wal)
         return err(result_unwrap_error(reconciled))
-    return ok(result_unwrap(reconciled))
+    let recovered: YazaDbCheckpointRecoveryV1 = result_unwrap(reconciled)
+    return yaza_db_checkpoint_recovery_result_v1(recovered.storage, recovered.wal, recovered.applied_checkpoint_count)
 
 fn yaza_db_checkpoint_validate_page_space_tail_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1) -> Result[Boolean, Text]:
     if storage.root != wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid): return err("YDBv1 page-space recovery requires the matching database root and UUID-scoped WAL")
@@ -994,7 +1021,7 @@ fn yaza_db_checkpoint_undo_losers_v1(storage: YazaDbStorageHandleV1, initial_wal
             let txn_id: Number = list_get(keys, selected_slot)
             let transaction_head_lsn: Number = list_get(transaction_heads, selected_slot)
             if selected_lsn == 0:
-                let abort_input: YazaDbWalRecordV1 = YazaDbWalRecordV1(0, transaction_head_lsn, txn_id, yaza_db_wal_type_abort_v1(), 0, bytes_from_text(""))
+                let abort_input: YazaDbWalRecordV1 = YazaDbWalRecordV1(0, transaction_head_lsn, txn_id, yaza_db_wal_type_abort_v1(), 0, bytes_empty())
                 let aborted: Result[YazaDbWalAppendV1, Text] = yaza_db_wal_log_append_v1(current_wal, abort_input)
                 if not result_is_ok(aborted):
                     let ignored_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(current_wal)
@@ -1077,7 +1104,7 @@ fn yaza_db_checkpoint_recover_transaction_tail_v1(storage: YazaDbStorageHandleV1
     if wal.next_lsn > 0 and segment_count == 0: return err("YDBv1 transaction recovery found an LSN without a WAL segment")
     var scan_lsn: Number = 0
     if storage.header.checkpoint_lsn > 0: set scan_lsn = yaza_db_checkpoint_verify_published_header_v1(storage, wal, segment_count)?
-    if scan_lsn >= wal.next_lsn: return ok(YazaDbCheckpointRecoveryV1(storage, wal, previously_applied_checkpoints))
+    if scan_lsn >= wal.next_lsn: return yaza_db_checkpoint_recovery_result_v1(storage, wal, previously_applied_checkpoints)
     if wal.next_lsn - scan_lsn > yaza_db_checkpoint_recovery_max_tail_bytes_v1(): return err("YDBv1 transaction recovery tail exceeds the 64 MiB bound")
     var analysis_code: Number = 0
     var abort_code: Number = 0
@@ -1222,7 +1249,7 @@ fn yaza_db_checkpoint_recover_transaction_tail_v1(storage: YazaDbStorageHandleV1
     if undo_code != 0: return err("YDBv1 loser transaction undo failed; reopen to resume recovery")
     if publish_code == 1: return err("YDBv1 recovered commit counter exceeds the signed timestamp range")
     if publish_code == 2: return err("YDBv1 recovery replay and undo completed but checkpoint publication failed; reopen to reconcile")
-    return ok(YazaDbCheckpointRecoveryV1(updated_storage, updated_wal, result_checkpoint_count))
+    return yaza_db_checkpoint_recovery_result_v1(updated_storage, updated_wal, result_checkpoint_count)
 
 fn yaza_db_open_recovered_v1(root: Number, name: Text) -> Result[YazaDbCheckpointRecoveryV1, Text]:
     let opened_storage: Result[YazaDbStorageHandleV1, Text] = yaza_db_storage_open_v1(root, name)

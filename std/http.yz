@@ -99,9 +99,17 @@ fn http_sanitize_header_value(value: Text) -> Text:
 
 fn http_format_response_with_cors(response: HttpResponse, request_id: Text, keep_alive: Boolean, allow_origin: Text) -> Bytes:
     let p: TextList = text_list()
-    list_push(p, "HTTP/1.1 " + number_text(response.status_code) + " " + response.status_text + "\r\n")
-    list_push(p, "Content-Type: " + response.content_type + "\r\n")
-    list_push(p, "Content-Length: " + number_text(bytes_length(response.body)) + "\r\n")
+    var safe_status: Text = http_sanitize_header_value(response.status_text)
+    if safe_status == "":
+        set safe_status = "OK"
+    list_push(p, "HTTP/1.1 " + number_text(response.status_code) + " " + safe_status + "\r\n")
+    let has_no_body: Boolean = (response.status_code >= 100 and response.status_code < 200) or response.status_code == 204 or response.status_code == 304
+    if not has_no_body:
+        var safe_ct: Text = http_sanitize_header_value(response.content_type)
+        if safe_ct == "":
+            set safe_ct = "application/octet-stream"
+        list_push(p, "Content-Type: " + safe_ct + "\r\n")
+        list_push(p, "Content-Length: " + number_text(bytes_length(response.body)) + "\r\n")
     let safe_origin: Text = http_sanitize_header_value(allow_origin)
     if text_length(safe_origin) > 0:
         list_push(p, "Access-Control-Allow-Origin: " + safe_origin + "\r\n")
@@ -114,12 +122,17 @@ fn http_format_response_with_cors(response: HttpResponse, request_id: Text, keep
     let safe_req_id: Text = http_sanitize_header_value(request_id)
     if text_length(safe_req_id) > 0:
         list_push(p, "X-Request-Id: " + safe_req_id + "\r\n")
-    list_push(p, "Vary: Accept\r\n")
+    if text_length(safe_origin) > 0 and safe_origin != "*":
+        list_push(p, "Vary: Origin, Accept\r\n")
+    else:
+        list_push(p, "Vary: Accept\r\n")
     if keep_alive:
         list_push(p, "Connection: keep-alive\r\nKeep-Alive: timeout=5, max=64\r\n\r\n")
     else:
         list_push(p, "Connection: close\r\n\r\n")
     let header_bytes: Bytes = bytes_from_text(text_join(p, ""))
+    if has_no_body:
+        return header_bytes
     return bytes_concat(header_bytes, response.body)
 
 fn http_format_response_keep_alive(response: HttpResponse, request_id: Text, keep_alive: Boolean) -> Bytes:
@@ -213,6 +226,8 @@ fn http_parse_request_internal(raw_bytes: Bytes, require_complete_body: Boolean)
     if line_end < 0:
         set line_end = text_length(raw_text)
     let request_line: Text = text_slice(raw_text, 0, line_end)
+    if text_find(request_line, "\r") >= 0 or text_find(request_line, "\n") >= 0:
+        return err("bare CR or LF is not allowed in HTTP request line")
     let first_space: Number = text_find(request_line, " ")
     if first_space <= 0: return err("invalid HTTP request line format")
     let after_method: Text = text_slice(request_line, first_space + 1, text_length(request_line) - first_space - 1)
@@ -249,7 +264,24 @@ fn http_parse_request_internal(raw_bytes: Bytes, require_complete_body: Boolean)
     var saw_content_type: Boolean = false
     var saw_request_id: Boolean = false
 
-    let header_lines: TextList = text_lines(headers_part)
+    let header_lines: TextList = text_list()
+    let hpart_len: Number = text_length(headers_part)
+    var hpos: Number = 0
+    var hline_start: Number = 0
+    while hpos < hpart_len:
+        let hb: Number = text_byte(headers_part, hpos)
+        if hb == 13:
+            if hpos + 1 >= hpart_len or text_byte(headers_part, hpos + 1) != 10:
+                return err("bare CR is not allowed in HTTP headers")
+            list_push(header_lines, text_slice(headers_part, hline_start, hpos - hline_start))
+            set hpos = hpos + 2
+            set hline_start = hpos
+        else:
+            if hb == 10:
+                return err("bare LF is not allowed in HTTP headers")
+            set hpos = hpos + 1
+    if hline_start < hpart_len:
+        list_push(header_lines, text_slice(headers_part, hline_start, hpart_len - hline_start))
     var h: Number = 0
     let hcount: Number = list_count(header_lines)
     while h < hcount:
@@ -340,28 +372,40 @@ fn http_extract_multipart_boundary(content_type: Text) -> Text:
         set end = end + 1
     return text_trim(text_slice(content_type, start, end - start))
 
+fn http_find_disp_param_value(part_headers: Text, param: Text) -> Text:
+    let hlen: Number = text_length(part_headers)
+    let pattern: Text = param + "=\""
+    let plen: Number = text_length(pattern)
+    var i: Number = 0
+    var in_quotes: Boolean = false
+    while i + plen <= hlen:
+        let b: Number = text_byte(part_headers, i)
+        if in_quotes:
+            if b == 92 and i + 1 < hlen:
+                set i = i + 2
+                continue
+            if b == 34:
+                set in_quotes = false
+            set i = i + 1
+            continue
+        if b == 34:
+            set in_quotes = true
+            set i = i + 1
+            continue
+        let prev_ok: Boolean = i == 0 or text_byte(part_headers, i - 1) == 59 or text_byte(part_headers, i - 1) == 32 or text_byte(part_headers, i - 1) == 9 or text_byte(part_headers, i - 1) == 58 or text_byte(part_headers, i - 1) == 10 or text_byte(part_headers, i - 1) == 13
+        if prev_ok and text_slice(part_headers, i, plen) == pattern:
+            let val_start: Number = i + plen
+            var val_end: Number = val_start
+            while val_end < hlen and text_byte(part_headers, val_end) != 34:
+                set val_end = val_end + 1
+            return text_slice(part_headers, val_start, val_end - val_start)
+        set i = i + 1
+    return ""
+
 fn http_parse_uploaded_file(part_headers: Text, part_bytes: Bytes) -> HttpUploadedFile:
-    var field_name: Text = ""
-    var filename: Text = ""
+    var field_name: Text = http_find_disp_param_value(part_headers, "name")
+    var filename: Text = http_find_disp_param_value(part_headers, "filename")
     var part_content_type: Text = "application/octet-stream"
-
-    let fn_pos: Number = text_find(part_headers, "filename=\"")
-    if fn_pos >= 0:
-        let fn_start: Number = fn_pos + 10
-        var fn_end: Number = fn_start
-        let hlen: Number = text_length(part_headers)
-        while fn_end < hlen and text_byte(part_headers, fn_end) != 34:
-            set fn_end = fn_end + 1
-        set filename = text_slice(part_headers, fn_start, fn_end - fn_start)
-
-    let name_pos: Number = text_find(part_headers, "name=\"")
-    if name_pos >= 0:
-        let name_start: Number = name_pos + 6
-        var name_end: Number = name_start
-        let hlen2: Number = text_length(part_headers)
-        while name_end < hlen2 and text_byte(part_headers, name_end) != 34:
-            set name_end = name_end + 1
-        set field_name = text_slice(part_headers, name_start, name_end - name_start)
 
     let ct_pos: Number = text_find(part_headers, "Content-Type:")
     if ct_pos >= 0:

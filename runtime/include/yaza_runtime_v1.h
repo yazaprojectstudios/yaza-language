@@ -223,6 +223,11 @@ int32_t yaza_net_v1_smtp_secure_send(const YazaTextV1 *provider, const YazaTextV
 int32_t yaza_net_v1_close(int64_t handle, char **out_error);
 int32_t yaza_net_v1_pair_create(int64_t *out_handle, char **out_error);
 int32_t yaza_net_v1_pair_peer(int64_t handle, int64_t *out_peer_handle, char **out_error);
+int32_t yaza_net_v1_peer_is_loopback(int64_t connection, char **out_error);
+int32_t yaza_net_v1_tls_is_active(int64_t connection, char **out_error);
+int32_t yaza_net_v1_tls_client_with_ca(int64_t connection, const YazaTextV1 *host, const YazaTextV1 *root_cert, int64_t timeout_ms, char **out_error);
+int32_t yaza_net_v1_pg_set_cancel_key(int64_t connection, int64_t pid, int64_t secret, char **out_error);
+int32_t yaza_net_v1_pg_cancel(int64_t connection, int64_t timeout_ms, char **out_error);
 void yaza_crypto_v1_sha256(const unsigned char *data, uint64_t length, YazaBytesV1 *out_bytes);
 void yaza_crypto_v1_hmac_sha256(const unsigned char *key, uint64_t key_length, const unsigned char *message, uint64_t message_length, YazaBytesV1 *out_bytes);
 int32_t yaza_crypto_v1_pbkdf2_sha256(const unsigned char *password, uint64_t password_length, const unsigned char *salt, uint64_t salt_length, int64_t iterations, int64_t key_length, YazaBytesV1 *out_bytes, char **out_error);

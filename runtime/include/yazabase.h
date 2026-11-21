@@ -59,6 +59,12 @@ YAZA_API int yazabase_result_is_null(const yazabase_result_t *res, int row_idx, 
 YAZA_API int64_t yazabase_result_affected_rows(const yazabase_result_t *res);
 YAZA_API void yazabase_free_result(yazabase_result_t *res);
 
+/* Direct Binary YBIF Result Encoding (zero JSON intermediate) */
+YAZA_API int yazabase_result_encode_ybif(const yazabase_result_t *res,
+                                         uint8_t **out_buf,
+                                         size_t *out_len);
+YAZA_API void yazabase_free_buffer(void *buf);
+
 /* Backup and Maintenance */
 YAZA_API int yazabase_backup(yazabase_t *db, const char *dest_dir);
 YAZA_API int yazabase_checkpoint(yazabase_t *db);

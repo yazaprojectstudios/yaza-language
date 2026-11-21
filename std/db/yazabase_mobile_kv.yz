@@ -1,0 +1,177 @@
+# Request-safe (--export-request compatible) capability-rooted atomic KV store for mobile reducers.
+# Uses fallible Core operations, VFS root confinement, exclusive flock, and CRC32C/YDBv1 checksums.
+use "std/fs"
+
+fn yaza_db_embedded_component_valid_v1(value: Text) -> Boolean:
+    let length: Number = text_length(value)
+    if length < 1 or length > 255 or value == "." or value == "..": return false
+    var index: Number = 0
+    while index < length:
+        let byte: Number = text_byte(value, index)
+        if byte == 0 or byte == 47 or byte == 92 or byte < 32 or byte == 127: return false
+        set index = index + 1
+    return true
+
+fn yaza_db_embedded_root_path_valid_v1(path: Text) -> Boolean:
+    let length: Number = text_length(path)
+    if length < 1 or length > 4096: return false
+    var index: Number = 0
+    while index < length:
+        if text_byte(path, index) == 0: return false
+        set index = index + 1
+    return true
+
+fn yaza_db_embedded_kv_encode_u32_le(dst: Bytes, offset: Number, val: Number) -> Boolean:
+    if offset < 0 or offset > bytes_length(dst) - 4 or val < 0 or val > 4294967295:
+        return false
+    let b0: Boolean = bytes_try_set(dst, offset + 0, val % 256)
+    let b1: Boolean = bytes_try_set(dst, offset + 1, (val / 256) % 256)
+    let b2: Boolean = bytes_try_set(dst, offset + 2, (val / 65536) % 256)
+    let b3: Boolean = bytes_try_set(dst, offset + 3, (val / 16777216) % 256)
+    return b0 and b1 and b2 and b3
+
+fn yaza_db_embedded_kv_decode_u32_le(src: Bytes, offset: Number) -> Number:
+    if offset < 0 or offset > bytes_length(src) - 4:
+        return -1
+    let b0: Number = bytes_get(src, offset + 0)
+    let b1: Number = bytes_get(src, offset + 1)
+    let b2: Number = bytes_get(src, offset + 2)
+    let b3: Number = bytes_get(src, offset + 3)
+    return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+
+fn yaza_db_embedded_kv_store_v1(root_path: Text, database_name: Text, key: Text, value: Text) -> Result[Boolean, Text]:
+    if not yaza_db_embedded_root_path_valid_v1(root_path): return err("YDBv1 embedded root path is invalid")
+    if not yaza_db_embedded_component_valid_v1(database_name): return err("YDBv1 embedded database name is invalid")
+    let key_bytes: Bytes = bytes_try_from_text(key)?
+    let val_bytes: Bytes = bytes_try_from_text(value)?
+    let key_len: Number = bytes_length(key_bytes)
+    let val_len: Number = bytes_length(val_bytes)
+    if key_len > 4096 or val_len > 65536:
+        return err("YDBv1 embedded KV record exceeds bounds")
+
+    let header_and_csum: Bytes = bytes_try_new_zeroed(16)?
+    let _m0: Boolean = bytes_try_set(header_and_csum, 0, 89)
+    let _m1: Boolean = bytes_try_set(header_and_csum, 1, 68)
+    let _m2: Boolean = bytes_try_set(header_and_csum, 2, 66)
+    let _m3: Boolean = bytes_try_set(header_and_csum, 3, 75)
+    let _m4: Boolean = bytes_try_set(header_and_csum, 4, 86)
+    let _m5: Boolean = bytes_try_set(header_and_csum, 5, 49)
+    let _m6: Boolean = bytes_try_set(header_and_csum, 6, 0)
+    let _m7: Boolean = bytes_try_set(header_and_csum, 7, 1)
+
+    let klen_buf: Bytes = bytes_try_new_zeroed(4)?
+    if not yaza_db_embedded_kv_encode_u32_le(klen_buf, 0, key_len): return err("YDBv1 KV key length out of bounds")
+    let vlen_buf: Bytes = bytes_try_new_zeroed(4)?
+    if not yaza_db_embedded_kv_encode_u32_le(vlen_buf, 0, val_len): return err("YDBv1 KV value length out of bounds")
+
+    let p1: Bytes = bytes_try_concat(klen_buf, key_bytes)?
+    let p2: Bytes = bytes_try_concat(p1, vlen_buf)?
+    let payload: Bytes = bytes_try_concat(p2, val_bytes)?
+    let checksum: Number = bytes_ydbv1_checksum(payload)
+    if not yaza_db_embedded_kv_encode_u32_le(header_and_csum, 8, checksum):
+        return err("YDBv1 KV checksum encoding failed")
+    let frame: Bytes = bytes_try_concat(header_and_csum, payload)?
+
+    let lock_name: Text = text_try_concat(database_name, ".lock")?
+    let tmp_name: Text = text_try_concat(database_name, ".tmp")?
+    let root: Number = root_open(root_path)?
+    let lock_res: Result[Number, Text] = vfs_lock_exclusive(root, lock_name)
+    if not result_is_ok(lock_res):
+        let _rc: Result[Boolean, Text] = close(root)
+        return err(result_unwrap_error(lock_res))
+    let lock_fd: Number = result_unwrap(lock_res)
+
+    let _pre_rm: Result[Boolean, Text] = vfs_remove(root, tmp_name)
+    let tmp_res: Result[Number, Text] = vfs_create_exclusive(root, tmp_name)
+    if not result_is_ok(tmp_res):
+        let _lc: Result[Boolean, Text] = close(lock_fd)
+        let _rc: Result[Boolean, Text] = close(root)
+        return err(result_unwrap_error(tmp_res))
+    let tmp_fd: Number = result_unwrap(tmp_res)
+
+    let wr_res: Result[Number, Text] = vfs_write_exact(tmp_fd, 0, frame)
+    if not result_is_ok(wr_res) or result_unwrap(wr_res) != bytes_length(frame):
+        let _tc: Result[Boolean, Text] = close(tmp_fd)
+        let _rm: Result[Boolean, Text] = vfs_remove(root, tmp_name)
+        let _lc: Result[Boolean, Text] = close(lock_fd)
+        let _rc: Result[Boolean, Text] = close(root)
+        return err("YDBv1 KV store write failed")
+
+    let sy_res: Result[Boolean, Text] = vfs_sync(tmp_fd)
+    let _tc2: Result[Boolean, Text] = close(tmp_fd)
+    if not result_is_ok(sy_res):
+        let _rm: Result[Boolean, Text] = vfs_remove(root, tmp_name)
+        let _lc: Result[Boolean, Text] = close(lock_fd)
+        let _rc: Result[Boolean, Text] = close(root)
+        return err(result_unwrap_error(sy_res))
+
+    let rn_res: Result[Boolean, Text] = vfs_rename(root, tmp_name, database_name)
+    if not result_is_ok(rn_res):
+        let _rm: Result[Boolean, Text] = vfs_remove(root, tmp_name)
+        let _lc: Result[Boolean, Text] = close(lock_fd)
+        let _rc: Result[Boolean, Text] = close(root)
+        return err(result_unwrap_error(rn_res))
+
+    let ds_res: Result[Boolean, Text] = vfs_sync_directory(root)
+    let _lc2: Result[Boolean, Text] = close(lock_fd)
+    let _rc2: Result[Boolean, Text] = close(root)
+    if not result_is_ok(ds_res): return err(result_unwrap_error(ds_res))
+    return ok(true)
+
+fn yaza_db_embedded_kv_load_v1(root_path: Text, database_name: Text, key: Text) -> Result[Text, Text]:
+    if not yaza_db_embedded_root_path_valid_v1(root_path): return err("YDBv1 embedded root path is invalid")
+    if not yaza_db_embedded_component_valid_v1(database_name): return err("YDBv1 embedded database name is invalid")
+    let key_bytes: Bytes = bytes_try_from_text(key)?
+    let lock_name: Text = text_try_concat(database_name, ".lock")?
+    let root: Number = root_open(root_path)?
+    let lock_res: Result[Number, Text] = vfs_lock_exclusive(root, lock_name)
+    if not result_is_ok(lock_res):
+        let _rc: Result[Boolean, Text] = close(root)
+        return err(result_unwrap_error(lock_res))
+    let lock_fd: Number = result_unwrap(lock_res)
+
+    let rd_open: Result[Number, Text] = vfs_open_read(root, database_name)
+    if not result_is_ok(rd_open):
+        let _lc: Result[Boolean, Text] = close(lock_fd)
+        let _rc: Result[Boolean, Text] = close(root)
+        return err("not_found")
+    let file_fd: Number = result_unwrap(rd_open)
+
+    let sz_res: Result[Number, Text] = vfs_file_size(file_fd)
+    if not result_is_ok(sz_res):
+        let _fc: Result[Boolean, Text] = close(file_fd)
+        let _lc: Result[Boolean, Text] = close(lock_fd)
+        let _rc: Result[Boolean, Text] = close(root)
+        return err(result_unwrap_error(sz_res))
+    let fsize: Number = result_unwrap(sz_res)
+    if fsize < 24 or fsize > 131072:
+        let _fc: Result[Boolean, Text] = close(file_fd)
+        let _lc: Result[Boolean, Text] = close(lock_fd)
+        let _rc: Result[Boolean, Text] = close(root)
+        return err("YDBv1 embedded KV file size is corrupt or out of bounds")
+
+    let data_res: Result[Bytes, Text] = vfs_read_exact(file_fd, 0, fsize)
+    let _fc2: Result[Boolean, Text] = close(file_fd)
+    let _lc2: Result[Boolean, Text] = close(lock_fd)
+    let _rc2: Result[Boolean, Text] = close(root)
+    if not result_is_ok(data_res): return err(result_unwrap_error(data_res))
+    let frame: Bytes = result_unwrap(data_res)
+
+    if bytes_get(frame, 0) != 89 or bytes_get(frame, 1) != 68 or bytes_get(frame, 2) != 66 or bytes_get(frame, 3) != 75 or bytes_get(frame, 4) != 86 or bytes_get(frame, 5) != 49 or bytes_get(frame, 6) != 0 or bytes_get(frame, 7) != 1:
+        return err("YDBv1 embedded KV file header is corrupt")
+    let payload: Bytes = bytes_try_slice(frame, 16, fsize - 16)?
+    let computed: Number = bytes_ydbv1_checksum(payload)
+    let stored_csum: Number = yaza_db_embedded_kv_decode_u32_le(frame, 8)
+    if stored_csum != computed:
+        return err("YDBv1 embedded KV checksum mismatch")
+    let stored_klen: Number = yaza_db_embedded_kv_decode_u32_le(payload, 0)
+    if stored_klen < 0 or stored_klen > 4096 or 8 + stored_klen > bytes_length(payload):
+        return err("YDBv1 embedded KV key length is corrupt")
+    let stored_key: Bytes = bytes_try_slice(payload, 4, stored_klen)?
+    if not bytes_equal(stored_key, key_bytes):
+        return err("not_found")
+    let stored_vlen: Number = yaza_db_embedded_kv_decode_u32_le(payload, 4 + stored_klen)
+    if stored_vlen < 0 or stored_vlen > 65536 or 8 + stored_klen + stored_vlen != bytes_length(payload):
+        return err("YDBv1 embedded KV value length is corrupt")
+    let val_bytes: Bytes = bytes_try_slice(payload, 8 + stored_klen, stored_vlen)?
+    return bytes_try_to_text(val_bytes)

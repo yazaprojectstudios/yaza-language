@@ -1,0 +1,40 @@
+use "std/db/yazabase_embedded"
+
+fn yaza_mobile_db_assert(condition: Boolean, message: Text) -> Number:
+    if condition: return 0
+    fail("mobile YazaBase smoke: " + message)
+    return 1
+
+fn yaza_mobile_db_exec(database: YazaBaseEmbeddedSessionV1, source: Text) -> YazaBaseEmbeddedStatementV1:
+    let executed: Result[YazaBaseEmbeddedStatementV1, Text] = yaza_db_embedded_execute_v1(database, source, List[YazaSqlValueV1]())
+    if not result_is_ok(executed): fail("mobile YazaBase smoke SQL failed: " + result_unwrap_error(executed))
+    return result_unwrap(executed)
+
+start:
+    let root_path: Text = env_get("YAZA_MOBILE_DB_TEST_DIR")
+    if root_path == "": fail("YAZA_MOBILE_DB_TEST_DIR must name an existing private directory")
+
+    let opened: Result[YazaBaseEmbeddedSessionV1, Text] = yaza_db_embedded_open_or_create_v1(root_path, "mobile-smoke.ydb")
+    if not result_is_ok(opened): fail("could not create/open embedded database: " + result_unwrap_error(opened))
+    var database: YazaBaseEmbeddedSessionV1 = result_unwrap(opened)
+
+    let created: YazaBaseEmbeddedStatementV1 = yaza_mobile_db_exec(database, "CREATE TABLE mobile_notes (id BIGINT PRIMARY KEY, body TEXT)")
+    set database = created.database
+    let inserted: YazaBaseEmbeddedStatementV1 = yaza_mobile_db_exec(database, "INSERT INTO mobile_notes (id, body) VALUES (1, 'durable')")
+    set database = inserted.database
+    let closed: Result[Boolean, Text] = yaza_db_embedded_close_v1(database)
+    if not result_is_ok(closed) or not result_unwrap(closed): fail("database session did not close cleanly")
+
+    let reopened: Result[YazaBaseEmbeddedSessionV1, Text] = yaza_db_embedded_open_or_create_v1(root_path, "mobile-smoke.ydb")
+    if not result_is_ok(reopened): fail("could not recover/reopen embedded database: " + result_unwrap_error(reopened))
+    set database = result_unwrap(reopened)
+    let selected: YazaBaseEmbeddedStatementV1 = yaza_mobile_db_exec(database, "SELECT body FROM mobile_notes WHERE id = 1")
+    set database = selected.database
+    if not option_is_some(selected.statement.query_result): fail("SELECT did not return a query result")
+    let query: YazaSqlQueryResultV1 = option_unwrap(selected.statement.query_result)
+    if list_count(query.rows) != 1: fail("expected one durable row after reopen")
+    let row: List[YazaSqlValueV1] = list_get(query.rows, 0)
+    if list_count(row) != 1 or list_get(row, 0).text_value != "durable": fail("persisted value did not round-trip")
+    let final_close: Result[Boolean, Text] = yaza_db_embedded_close_v1(database)
+    if not result_is_ok(final_close) or not result_unwrap(final_close): fail("reopened database session did not close cleanly")
+    say "mobile YazaBase embedded smoke passed: create, insert, checkpoint, reopen/recover, select"

@@ -20,9 +20,15 @@ int32_t yaza_security_v1_login_attempt(const YazaTextV1 *key_hex, int64_t now_ms
     int spare = -1;
     for (int i = 0; i < 256; i++) {
         YazaLoginAttemptV1 *item = &yaza_login_attempts_v1[i];
-        if (item->used && memcmp(item->key, key_hex->data, 64) == 0) {
-            match = i;
-            break;
+        if (item->used) {
+            volatile unsigned char diff = 0;
+            for (size_t k = 0; k < 64; k++) {
+                diff |= (unsigned char)(item->key[k] ^ key_hex->data[k]);
+            }
+            if (diff == 0) {
+                match = i;
+                break;
+            }
         }
         if (spare < 0 && (!item->used || now_ms < item->started_ms ||
             now_ms - item->started_ms >= 900000)) spare = i;

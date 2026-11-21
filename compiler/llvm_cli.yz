@@ -139,7 +139,16 @@ fn read_llvm_target_data_layout(target_triple: Text, output_path: Text) -> Text:
     if file_write(probe_source_path, "int yaza_llvm_target_probe;\n") != 0:
         if file_exists(probe_source_path): file_remove(probe_source_path)
         fail("LLVM driver: could not write Clang target probe")
+    var driver: Text = "clang"
     let arguments: TextList = text_list()
+    if text_find(target_triple, "apple-ios") >= 0:
+        set driver = "xcrun"
+        list_push(arguments, "--sdk")
+        if text_find(target_triple, "simulator") >= 0:
+            list_push(arguments, "iphonesimulator")
+        else:
+            list_push(arguments, "iphoneos")
+        list_push(arguments, "clang")
     list_push(arguments, "--target=" + target_triple)
     list_push(arguments, "-std=c11")
     list_push(arguments, "-S")
@@ -149,7 +158,7 @@ fn read_llvm_target_data_layout(target_triple: Text, output_path: Text) -> Text:
     list_push(arguments, probe_source_path)
     list_push(arguments, "-o")
     list_push(arguments, probe_ir_path)
-    let status: Number = process("clang", arguments)
+    let status: Number = process(driver, arguments)
     if status != 0:
         if file_exists(probe_source_path): file_remove(probe_source_path)
         if file_exists(probe_ir_path): file_remove(probe_ir_path)
@@ -197,6 +206,12 @@ fn emit_core_llvm_module(source_path: Text, export_name: Text, output_path: Text
 fn emit_core_llvm_request_module(source_path: Text, export_name: Text, output_path: Text) -> Number:
     let program: YirProgram = load_core_yir(source_path)
     return write_core_text(output_path, lower_core_yir_to_llvm_request_module(program, export_name))
+
+fn emit_core_llvm_request_module_for_target(source_path: Text, export_name: Text, output_path: Text, target_triple: Text) -> Number:
+    let data_layout: Text = read_llvm_target_data_layout(target_triple, output_path)
+    let program: YirProgram = load_core_yir(source_path)
+    let module_ir: Text = add_llvm_target_metadata(lower_core_yir_to_llvm_request_module(program, export_name), target_triple, data_layout)
+    return write_core_text(output_path, module_ir)
 
 fn remove_core_build_artifacts(output_path: Text) -> Number:
     if file_exists(output_path): file_remove(output_path)
@@ -458,6 +473,9 @@ fn yaza_fs_list_directory(path: Text) -> TextList:
 fn yaza_env_set_var(name: Text, value: Text) -> Number:
     return env_set(name, value)
 
+fn is_generated_template_directory(name: Text) -> Boolean:
+    return name == "build" or name == ".gradle" or name == ".idea" or name == "DerivedData" or name == "node_modules" or name == "target" or name == "out"
+
 fn render_template_entry(source_path: Text, destination_path: Text, project_name: Text, template_name: Text) -> Number:
     var generated_count: Number = 0
     if is_directory(source_path):
@@ -468,8 +486,10 @@ fn render_template_entry(source_path: Text, destination_path: Text, project_name
         var entry_index: Number = 0
         while entry_index < list_count(entries):
             let entry_name: Text = list_get(entries, entry_index)
-            if entry_name != ".DS_Store" and not text_starts_with(entry_name, "._"):
-                let child_count: Number = render_template_entry(path_join(source_path, entry_name), path_join(destination_path, entry_name), project_name, template_name)
+            let child_source: Text = path_join(source_path, entry_name)
+            let skip_generated: Boolean = is_directory(child_source) and is_generated_template_directory(entry_name)
+            if entry_name != ".DS_Store" and not text_starts_with(entry_name, "._") and not skip_generated:
+                let child_count: Number = render_template_entry(child_source, path_join(destination_path, entry_name), project_name, template_name)
                 set generated_count = generated_count + child_count
             set entry_index = entry_index + 1
     else:
@@ -1060,6 +1080,118 @@ fn build_from_arguments() -> Number:
         else:
             set output_path = "build/app"
     return build_core_program_ex(source_path, output_path, optimization, target_triple, sanitize)
+
+fn mobile_script_path(script_name: Text) -> Text:
+    let runtime_root: Text = core_llvm_runtime_root()
+    let packaged_script: Text = runtime_root + "/../scripts/mobile/" + script_name
+    if file_exists(packaged_script): return packaged_script
+    let local_script: Text = "scripts/mobile/" + script_name
+    if file_exists(local_script): return local_script
+    fail("yaza mobile: required helper script is missing: " + script_name)
+    return ""
+
+fn mobile_from_arguments() -> Number:
+    let count: Number = arg_count()
+    if count < 2 or arg(2) == "--help" or arg(2) == "-h" or arg(2) == "help":
+        say "YAZA Mobile — native Android and iOS app tooling"
+        say "Usage: yaza mobile <doctor | build | run> [options]"
+        say ""
+        say "  doctor                         Show required platform tools"
+        say "  build --target <target> [file.yz] [--release|--debug]"
+        say "                                 Build the YAZA native engine"
+        say "  run --target <android-emulator|ios-simulator>"
+        say "                                 Build, install, and launch the starter"
+        say ""
+        say "Build targets: android-arm64, ios-arm64, ios-simulator-arm64"
+        return 0
+
+    let subcommand: Text = arg(2)
+    if subcommand == "doctor":
+        if count != 2: fail("Usage: yaza mobile doctor")
+        if yaza_host_is_windows():
+            say "YAZA Mobile toolchain doctor"
+            say "  Host: Windows"
+            say "  Android builds: not supported by this release's POSIX build helper"
+            say "  iOS builds: require macOS and Xcode"
+            return 0
+        let script: Text = mobile_script_path("doctor.sh")
+        let arguments: TextList = text_list()
+        list_push(arguments, script)
+        list_push(arguments, executable_path())
+        return process("sh", arguments)
+
+    if subcommand == "build":
+        var target: Text = ""
+        var source: Text = ""
+        var build_mode: Text = "release"
+        var index: Number = 3
+        while index <= count:
+            let value: Text = arg(index)
+            if value == "--target":
+                if index + 1 > count: fail("Usage: yaza mobile build --target <android-arm64|ios-arm64|ios-simulator-arm64> [file.yz] [--release|--debug]")
+                set target = arg(index + 1)
+                set index = index + 2
+            else:
+                if value == "--debug":
+                    set build_mode = "debug"
+                    set index = index + 1
+                else:
+                    if value == "--release":
+                        set build_mode = "release"
+                        set index = index + 1
+                    else:
+                        if value == "--help" or value == "-h":
+                            say "Usage: yaza mobile build --target <android-arm64|ios-arm64|ios-simulator-arm64> [file.yz] [--release|--debug]"
+                            return 0
+                        if text_starts_with(value, "-"):
+                            fail("yaza mobile build: unrecognized option: " + value)
+                        if source != "": fail("yaza mobile build: provide at most one source file")
+                        set source = value
+                        set index = index + 1
+        if target == "": fail("yaza mobile build: --target is required")
+        if target != "android-arm64" and target != "ios-arm64" and target != "ios-simulator-arm64":
+            fail("yaza mobile build: unsupported target '" + target + "'")
+        if yaza_host_is_windows(): fail("yaza mobile build currently requires a macOS or Linux build host")
+        let script: Text = mobile_script_path("build-engine.sh")
+        let runtime_root: Text = core_llvm_runtime_root()
+        yaza_env_set_var("YAZA_RUNTIME_DIR", runtime_root)
+        yaza_env_set_var("YAZA_STDLIB_DIR", runtime_root + "/../std")
+        yaza_env_set_var("YAZA_MOBILE_BUILD_MODE", build_mode)
+        let arguments: TextList = text_list()
+        list_push(arguments, script)
+        list_push(arguments, executable_path())
+        list_push(arguments, target)
+        if source != "": list_push(arguments, source)
+        return process("sh", arguments)
+
+    if subcommand == "run":
+        var target: Text = ""
+        var index: Number = 3
+        while index <= count:
+            let value: Text = arg(index)
+            if value == "--target":
+                if index + 1 > count: fail("Usage: yaza mobile run --target <android-emulator|ios-simulator>")
+                set target = arg(index + 1)
+                set index = index + 2
+            else:
+                if value == "--help" or value == "-h":
+                    say "Usage: yaza mobile run --target <android-emulator|ios-simulator>"
+                    return 0
+                fail("yaza mobile run: unrecognized option: " + value)
+        if target == "": fail("yaza mobile run: --target is required")
+        if target != "android-emulator" and target != "ios-simulator":
+            fail("yaza mobile run: unsupported target '" + target + "'")
+        if yaza_host_is_windows(): fail("yaza mobile run currently requires a macOS or Linux build host")
+        yaza_env_set_var("YAZA_BIN", executable_path())
+        let script: Text = mobile_script_path("run.sh")
+        let arguments: TextList = text_list()
+        list_push(arguments, script)
+        list_push(arguments, executable_path())
+        list_push(arguments, target)
+        return process("sh", arguments)
+
+    fail("yaza mobile: unknown command '" + subcommand + "'; run 'yaza mobile --help'")
+    return 2
 
 fn run_yazabase_cli() -> Number:
     let env_cli: Text = env_get("YAZABASE_BIN")
@@ -1751,6 +1883,9 @@ fn print_yaza_llvm_help() -> Number:
     say "  config [project] [--format json]  Show parsed API and resource settings"
     say "  test [directory] [--format json]  Run test suite"
     say "  bench [source.yz] [count]  Measure repeated native runs"
+    say "  mobile doctor             Check mobile development toolchains"
+    say "  mobile build --target <t> [file.yz] [--release|--debug]"
+    say "  mobile run --target <android-emulator|ios-simulator>"
     say ""
     say "DATABASE (YAZABASE)"
     say "  db [shell] [<dir> <db> | :memory:]  Interactive SQL REPL"
@@ -1769,8 +1904,8 @@ fn print_yaza_llvm_help() -> Number:
     say "INSPECT COMPILER OUTPUT"
     say "  emit-yir <source.yz> -o <file.yir>"
     say "  emit-llvm [--target <triple>] <source.yz> -o <file.ll>"
-    say "  emit-llvm-module <source.yz> --export-number <fn> -o <file.ll>"
-    say "  emit-llvm-module <source.yz> --export-request <fn> -o <file.ll>"
+    say "  emit-llvm-module [--target <triple>] <source.yz> --export-number <fn> -o <file.ll>"
+    say "  emit-llvm-module [--target <triple>] <source.yz> --export-request <fn> -o <file.ll>"
     say ""
     say "HELP"
     say "  --help, -h               Show this help"
@@ -1826,7 +1961,7 @@ start:
         print_yaza_llvm_help()
         exit(0)
     if count == 1 and cmd == "--version":
-        say "YAZA LLVM 1.0.1 (Official Release, Native LLVM Backend)"
+        say "YAZA LLVM 1.0.2 (Official Release, Native LLVM Backend)"
         exit(0)
     if cmd == "check":
         let status: Number = check_from_arguments()
@@ -1861,6 +1996,9 @@ start:
     if cmd == "build":
         let status: Number = build_from_arguments()
         exit(status)
+    if cmd == "mobile":
+        let status: Number = mobile_from_arguments()
+        exit(status)
     if cmd == "emit-yir":
         if count == 4 and arg(3) == "-o":
             exit(emit_core_yir(arg(2), arg(4)))
@@ -1872,11 +2010,13 @@ start:
             exit(emit_core_llvm(arg(2), arg(4)))
         fail("Usage: yaza-llvm emit-llvm [--target <triple>] <source.yz> -o <file.ll>")
     if cmd == "emit-llvm-module":
+        if count == 8 and arg(2) == "--target" and arg(5) == "--export-request" and arg(7) == "-o":
+            exit(emit_core_llvm_request_module_for_target(arg(4), arg(6), arg(8), arg(3)))
         if count == 6 and arg(3) == "--export-number" and arg(5) == "-o":
             exit(emit_core_llvm_module(arg(2), arg(4), arg(6)))
         if count == 6 and arg(3) == "--export-request" and arg(5) == "-o":
             exit(emit_core_llvm_request_module(arg(2), arg(4), arg(6)))
-        fail("Usage: yaza-llvm emit-llvm-module <source.yz> --export-number|--export-request <fn> -o <file.ll>")
+        fail("Usage: yaza-llvm emit-llvm-module [--target <triple>] <source.yz> --export-number|--export-request <fn> -o <file.ll>")
     if cmd == "db":
         if count == 1:
             exit(run_yazabase_cli())

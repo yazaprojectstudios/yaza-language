@@ -32,17 +32,24 @@ fn yaza_db_storage_uuid_hex_v1(db_uuid: Bytes) -> Result[Text, Text]:
     var index: Number = 0
     while index < 16:
         let value: Number = bytes_get(db_uuid, index)
-        set hex = hex + text_slice(digits, value / 16, 1) + text_slice(digits, value % 16, 1)
+        let high: Text = text_try_slice(digits, value / 16, 1)?
+        let low: Text = text_try_slice(digits, value % 16, 1)?
+        let pair: Text = text_try_concat(high, low)?
+        set hex = text_try_concat(hex, pair)?
         set index = index + 1
     return ok(hex)
 
 fn yaza_db_storage_uuid_lock_name_v1(db_uuid: Bytes) -> Result[Text, Text]:
     let hex: Text = yaza_db_storage_uuid_hex_v1(db_uuid)?
-    return ok("ydb-uuid-" + hex + "-exclusive")
+    let prefix: Text = text_try_concat("ydb-uuid-", hex)?
+    let name: Text = text_try_concat(prefix, "-exclusive")?
+    return ok(name)
 
 fn yaza_db_storage_uuid_owner_name_v1(db_uuid: Bytes) -> Result[Text, Text]:
     let hex: Text = yaza_db_storage_uuid_hex_v1(db_uuid)?
-    return ok(".ydb-uuid-" + hex + ".owner")
+    let prefix: Text = text_try_concat(".ydb-uuid-", hex)?
+    let name: Text = text_try_concat(prefix, ".owner")?
+    return ok(name)
 
 fn yaza_db_storage_cleanup_uuid_owner_v1(root: Number, marker_name: Text, file: Number) -> Number:
     let ignored_close: Result[Boolean, Text] = close(file)
@@ -53,7 +60,7 @@ fn yaza_db_storage_cleanup_uuid_owner_v1(root: Number, marker_name: Text, file: 
 fn yaza_db_storage_register_uuid_owner_v1(root: Number, database_name: Text, db_uuid: Bytes) -> Result[Boolean, Text]:
     if text_length(database_name) == 0 or text_length(database_name) > 255: return err("YDBv1 database identity name is outside the VFS component limit")
     let marker_name: Text = yaza_db_storage_uuid_owner_name_v1(db_uuid)?
-    let expected_owner: Bytes = bytes_from_text(database_name)
+    let expected_owner: Bytes = bytes_try_from_text(database_name)?
     let created: Result[Number, Text] = create_exclusive(root, marker_name)
     if result_is_ok(created):
         let file: Number = result_unwrap(created)
@@ -117,6 +124,11 @@ fn yaza_db_storage_file_has_header_capacity_v1(file_size: Number, header: YazaDb
 fn yaza_db_storage_headers_equal_v1(left: YazaDbFileHeaderV1, right: YazaDbFileHeaderV1) -> Boolean:
     return bytes_equal(left.db_uuid, right.db_uuid) and left.checkpoint_lsn == right.checkpoint_lsn and left.next_txn_id == right.next_txn_id and left.next_commit_ts == right.next_commit_ts and left.catalog_root == right.catalog_root and left.page_count == right.page_count and left.flags == right.flags
 
+fn yaza_db_storage_header_result_v1(header: YazaDbFileHeaderV1) -> Result[YazaDbFileHeaderV1, Text]:
+    let wrapped: Result[Result[YazaDbFileHeaderV1, Text], Text] = ok_try(header)
+    if not result_is_ok(wrapped): return err(result_unwrap_error(wrapped))
+    return result_unwrap(wrapped)
+
 fn yaza_db_storage_validate_header_capacity_v1(file: Number, header: YazaDbFileHeaderV1) -> Result[Number, Text]:
     let size: Number = file_size(file)?
     if not yaza_db_storage_file_has_header_capacity_v1(size, header): return err("YDBv1 file length is unaligned or shorter than the logical page count")
@@ -151,8 +163,8 @@ fn yaza_db_storage_read_header_v1(file: Number) -> Result[YazaDbFileHeaderV1, Te
     let second_result: Result[YazaDbFileHeaderV1, Text] = yaza_db_read_file_header_v1(second_bytes)
     var first_valid: Boolean = result_is_ok(first_result)
     var second_valid: Boolean = result_is_ok(second_result)
-    var first_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_from_text(""), 0, 0, 0, 0, 0, 0)
-    var second_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_from_text(""), 0, 0, 0, 0, 0, 0)
+    var first_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_empty(), 0, 0, 0, 0, 0, 0)
+    var second_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_empty(), 0, 0, 0, 0, 0, 0)
     if first_valid:
         set first_header = result_unwrap(first_result)
         if not yaza_db_storage_file_has_header_capacity_v1(file_size, first_header): set first_valid = false
@@ -160,13 +172,13 @@ fn yaza_db_storage_read_header_v1(file: Number) -> Result[YazaDbFileHeaderV1, Te
         set second_header = result_unwrap(second_result)
         if not yaza_db_storage_file_has_header_capacity_v1(file_size, second_header): set second_valid = false
     if not first_valid and not second_valid: return err("both YDBv1 file-header copies are invalid or exceed the physical file length")
-    if first_valid and not second_valid: return ok(first_header)
-    if second_valid and not first_valid: return ok(second_header)
+    if first_valid and not second_valid: return yaza_db_storage_header_result_v1(first_header)
+    if second_valid and not first_valid: return yaza_db_storage_header_result_v1(second_header)
     if not bytes_equal(first_header.db_uuid, second_header.db_uuid): return err("YDBv1 file-header copies identify different databases")
-    if first_header.checkpoint_lsn > second_header.checkpoint_lsn: return ok(first_header)
-    if second_header.checkpoint_lsn > first_header.checkpoint_lsn: return ok(second_header)
+    if first_header.checkpoint_lsn > second_header.checkpoint_lsn: return yaza_db_storage_header_result_v1(first_header)
+    if second_header.checkpoint_lsn > first_header.checkpoint_lsn: return yaza_db_storage_header_result_v1(second_header)
     if not yaza_db_storage_headers_equal_v1(first_header, second_header): return err("YDBv1 file-header copies disagree at the same checkpoint LSN")
-    return ok(first_header)
+    return yaza_db_storage_header_result_v1(first_header)
 
 fn yaza_db_storage_write_header_v1(file: Number, header: YazaDbFileHeaderV1) -> Result[Number, Text]:
     let encoded: Bytes = yaza_db_write_file_header_v1(header)?
@@ -195,7 +207,9 @@ fn yaza_db_storage_read_page_validated_with_header_file_v1(file: Number, header:
     let page: Bytes = read_exact(file, offset, yaza_db_page_size_v1())?
     let page_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, page_id)?
     let ignored_page_role: Boolean = yaza_db_storage_validate_page_role_v1(file, header, page, page_header)?
-    return ok(YazaDbValidatedPageV1(page, page_header))
+    let validated: Result[Result[YazaDbValidatedPageV1, Text], Text] = ok_try(YazaDbValidatedPageV1(page, page_header))
+    if not result_is_ok(validated): return err(result_unwrap_error(validated))
+    return result_unwrap(validated)
 
 fn yaza_db_storage_read_page_validated_file_v1(file: Number, header: YazaDbFileHeaderV1, page_id: Number) -> Result[Bytes, Text]:
     let validated: YazaDbValidatedPageV1 = yaza_db_storage_read_page_validated_with_header_file_v1(file, header, page_id)?
@@ -290,6 +304,7 @@ fn yaza_db_storage_create_empty_unlocked_v1(root: Number, name: Text, header: Ya
 
 fn yaza_db_storage_create_empty_v1(root: Number, name: Text, header: YazaDbFileHeaderV1) -> Result[YazaDbStorageHandleV1, Text]:
     let identity_lock_name: Text = yaza_db_storage_uuid_lock_name_v1(header.db_uuid)?
+    let owner_marker_name: Text = yaza_db_storage_uuid_owner_name_v1(header.db_uuid)?
     let lock: Number = lock_exclusive(root, name)?
     let identity_lock_result: Result[Number, Text] = lock_exclusive(root, identity_lock_name)
     if not result_is_ok(identity_lock_result):
@@ -313,7 +328,15 @@ fn yaza_db_storage_create_empty_v1(root: Number, name: Text, header: YazaDbFileH
         let ignored_lock_close: Result[Boolean, Text] = close(lock)
         return err(result_unwrap_error(registered))
     let initialized_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(header.db_uuid, header.checkpoint_lsn, header.next_txn_id, header.next_commit_ts, 0, yaza_db_storage_preallocated_page_count_v1(), header.flags)
-    return ok(YazaDbStorageHandleV1(root, result_unwrap(created), lock, identity_lock, initialized_header))
+    let created_handle: Result[Result[YazaDbStorageHandleV1, Text], Text] = ok_try(YazaDbStorageHandleV1(root, result_unwrap(created), lock, identity_lock, initialized_header))
+    if not result_is_ok(created_handle):
+        let ignored_cleanup: Number = yaza_db_storage_cleanup_failed_create_v1(root, name, result_unwrap(created))
+        let ignored_owner_remove: Result[Boolean, Text] = remove(root, owner_marker_name)
+        let ignored_owner_sync: Result[Boolean, Text] = sync_directory(root)
+        let ignored_identity_close: Result[Boolean, Text] = close(identity_lock)
+        let ignored_lock_close: Result[Boolean, Text] = close(lock)
+        return err(result_unwrap_error(created_handle))
+    return result_unwrap(created_handle)
 
 fn yaza_db_storage_open_v1(root: Number, name: Text) -> Result[YazaDbStorageHandleV1, Text]:
     let lock: Number = lock_exclusive(root, name)?
@@ -345,7 +368,13 @@ fn yaza_db_storage_open_v1(root: Number, name: Text) -> Result[YazaDbStorageHand
         let ignored_identity_close: Result[Boolean, Text] = close(identity_lock)
         let ignored_lock_close: Result[Boolean, Text] = close(lock)
         return err(result_unwrap_error(registered))
-    return ok(YazaDbStorageHandleV1(root, file, lock, identity_lock, header))
+    let opened_handle: Result[Result[YazaDbStorageHandleV1, Text], Text] = ok_try(YazaDbStorageHandleV1(root, file, lock, identity_lock, header))
+    if not result_is_ok(opened_handle):
+        let ignored_file_close: Result[Boolean, Text] = close(file)
+        let ignored_identity_close: Result[Boolean, Text] = close(identity_lock)
+        let ignored_lock_close: Result[Boolean, Text] = close(lock)
+        return err(result_unwrap_error(opened_handle))
+    return result_unwrap(opened_handle)
 
 fn yaza_db_storage_close_v1(handle: YazaDbStorageHandleV1) -> Result[Boolean, Text]:
     let file_result: Result[Boolean, Text] = close(handle.file)

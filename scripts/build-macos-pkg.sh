@@ -12,6 +12,18 @@ MACHINE=$(uname -m)
 VERSION=${YAZA_VERSION:-$(cat "$PROJECT_ROOT/VERSION")}
 PACKAGE="$DIST_DIR/yaza-$VERSION-macos-arm64.pkg"
 
+copy_template_tree() {
+    tar -C "$1" \
+        --exclude='build' --exclude='*/build' \
+        --exclude='.gradle' --exclude='*/.gradle' \
+        --exclude='.idea' --exclude='*/.idea' \
+        --exclude='DerivedData' --exclude='*/DerivedData' \
+        --exclude='node_modules' --exclude='*/node_modules' \
+        --exclude='target' --exclude='*/target' \
+        --exclude='out' --exclude='*/out' \
+        -cf - . | tar -C "$2" -xf -
+}
+
 if [ "$MACHINE" != "arm64" ]; then
     printf '%s\n' "This package targets Apple Silicon arm64; current machine is $MACHINE." >&2
     exit 1
@@ -40,7 +52,10 @@ install -d "$PAYLOAD/usr/local/bin" \
     "$PAYLOAD/usr/local/lib" \
     "$PAYLOAD/usr/local/share/yaza/runtime/src" \
     "$PAYLOAD/usr/local/share/yaza/runtime/include" \
+    "$PAYLOAD/usr/local/share/yaza/runtime/mobile" \
+    "$PAYLOAD/usr/local/share/yaza/scripts/mobile" \
     "$PAYLOAD/usr/local/share/yaza/std" \
+    "$PAYLOAD/usr/local/share/yaza/yazabase" \
     "$PAYLOAD/usr/local/share/yaza/templates"
 
 install -m 755 "$PROJECT_ROOT/build/yaza-llvm" "$PAYLOAD/usr/local/bin/yaza"
@@ -69,12 +84,24 @@ fi
 
 install -m 644 "$PROJECT_ROOT/runtime/watch-run.sh" "$PAYLOAD/usr/local/share/yaza/runtime/watch-run.sh"
 
+if [ -d "$PROJECT_ROOT/runtime/mobile" ]; then
+    cp -R -X "$PROJECT_ROOT/runtime/mobile/." "$PAYLOAD/usr/local/share/yaza/runtime/mobile/"
+fi
+if [ -d "$PROJECT_ROOT/scripts/mobile" ]; then
+    cp -R -X "$PROJECT_ROOT/scripts/mobile/." "$PAYLOAD/usr/local/share/yaza/scripts/mobile/"
+    chmod 755 "$PAYLOAD/usr/local/share/yaza/scripts/mobile/"*.sh
+fi
+
 if [ -d "$PROJECT_ROOT/std" ]; then
     cp -R -X "$PROJECT_ROOT/std/." "$PAYLOAD/usr/local/share/yaza/std/"
 fi
 
+if [ -d "$PROJECT_ROOT/yazabase" ]; then
+    cp -R -X "$PROJECT_ROOT/yazabase/." "$PAYLOAD/usr/local/share/yaza/yazabase/"
+fi
+
 if [ -d "$PROJECT_ROOT/templates" ]; then
-    cp -R -X "$PROJECT_ROOT/templates/." "$PAYLOAD/usr/local/share/yaza/templates/"
+    copy_template_tree "$PROJECT_ROOT/templates" "$PAYLOAD/usr/local/share/yaza/templates"
 fi
 
 if [ -n "$ARGON2_PREFIX" ] && [ -f "$ARGON2_PREFIX/include/argon2.h" ]; then
@@ -100,7 +127,7 @@ cat <<'EOF' > "$PKG_SCRIPTS/postinstall"
 #!/bin/sh
 printf '\n'
 printf '  ███▄      ▄███    Welcome to YAZA Programming Language!\n'
-printf '   ▀███▄  ▄███▀     Version 1.0.1 · Zero-GC Arena · Native LLVM · YazaBase\n'
+printf '   ▀███▄  ▄███▀     Version 1.0.2 · Zero-GC Arena · Native LLVM · YazaBase\n'
 printf '     ▀███▄ ▀█▀\n'
 printf '     ▄███▀          Installed CLI tools to: /usr/local/bin/yaza & yazabase\n'
 printf '   ▄███▀            Docs: https://yazastudios.id/docs/\n\n'

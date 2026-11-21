@@ -1,0 +1,204 @@
+use "std/http"
+use "std/web/view"
+use "std/web/media"
+use "std/web/multipart"
+use "std/web/response"
+use "std/security/admin_credentials"
+use "std/crypto/hash"
+use "std/pg/transport"
+use "std/pg/protocol"
+use "std/mysql/protocol"
+use "std/mysql/uri"
+use "std/mssql/protocol"
+use "std/mssql/uri"
+use "std/nosql/kv"
+use "std/nosql/document"
+use "std/nosql/uri"
+use "std/math"
+use "std/data/stats"
+use "std/data/matrix"
+use "std/data/frame"
+use "std/data/random"
+use "std/json"
+use "std/ybif"
+use "std/compress"
+use "std/fs"
+
+start:
+    let tmp_dir: Text = temp_directory()
+
+    arena_scope 67108864:
+        # 1. std/http: CRLF sanitization, 204/304 Content-Length omission, Vary, bare CR/LF, multipart filename="name=\"evil\""
+        let inj_resp: HttpResponse = HttpResponse(200, "OK\r\nX-Injected: 1", "text/plain\r\nEvil: 2", bytes_from_text("hi"))
+        let inj_wire: Text = bytes_to_text(http_format_response_with_cors(inj_resp, "req-1\r\nBad: 3", false, "https://app.example"))
+        assert(text_find(inj_wire, "X-Injected:") < 0)
+        assert(text_find(inj_wire, "Evil:") < 0)
+        assert(text_find(inj_wire, "X-Request-Id:") < 0)
+        assert(text_find(inj_wire, "Vary: Origin, Accept\r\n") >= 0)
+
+        let r204: HttpResponse = HttpResponse(204, "No Content", "", bytes_from_text("ignored"))
+        let w204: Text = bytes_to_text(http_format_response_with_id(r204, "r204"))
+        assert(text_find(w204, "Content-Length:") < 0)
+        assert(text_find(w204, "ignored") < 0)
+
+        let r304: HttpResponse = HttpResponse(304, "Not Modified", "", bytes_empty())
+        let w304: Text = bytes_to_text(http_format_response_with_id(r304, "r304"))
+        assert(text_find(w304, "Content-Length:") < 0)
+
+        let bare_lf: Bytes = bytes_from_text("GET / HTTP/1.1\nHost: localhost\r\n\r\n")
+        assert(not result_is_ok(http_parse_request(bare_lf)))
+        let bare_cr_hdr: Bytes = bytes_from_text("GET / HTTP/1.1\r\nHost: localhost\rX-Evil: 1\r\n\r\n")
+        assert(not result_is_ok(http_parse_request(bare_cr_hdr)))
+
+        let mp_hdr: Text = "Content-Disposition: form-data; filename=\"name=\\\"evil\\\"\"; name=\"avatar\""
+        let up: HttpUploadedFile = http_parse_uploaded_file(mp_hdr, bytes_from_text("data"))
+        assert(up.field_name == "avatar")
+
+        # 2. std/web/view: block svg/math, strip srcdoc, sanitize javascript: URLs
+        assert(not view_tag_name_is_safe("svg"))
+        assert(not view_tag_name_is_safe("SVG"))
+        assert(not view_tag_name_is_safe("math"))
+        assert(not view_tag_name_is_safe("Math"))
+        assert(view_attr("srcdoc", "<script>1</script>") == "")
+        assert(view_attr("href", "javascript:alert(1)") == " href=\"#\"")
+        assert(view_attr("src", "data:text/html,<script>1</script>") == " src=\"#\"")
+        assert(view_attr("action", "javascript:void(0)") == " action=\"#\"")
+        assert(view_attr("formaction", "javascript:void(0)") == " formaction=\"#\"")
+        assert(view_attr("data", "javascript:void(0)") == " data=\"#\"")
+        assert(view_attr("poster", "javascript:void(0)") == " poster=\"#\"")
+        assert(view_attr("href", "/surah/2") == " href=\"/surah/2\"")
+
+        # 3. std/web/media: auto-206 SVG attachment header
+        assert(media_is_active_content_mime("image/svg+xml"))
+        let root_fd: Number = result_unwrap(vfs_root_open(tmp_dir))
+        let svg_fd: Number = result_unwrap(vfs_create_exclusive(root_fd, "large.svg"))
+        assert(result_is_ok(vfs_truncate(svg_fd, 16800000)))
+        assert(result_is_ok(vfs_write_exact(svg_fd, 0, bytes_from_text("<svg/>"))))
+        assert(result_is_ok(vfs_close(svg_fd)))
+        assert(result_is_ok(vfs_close(root_fd)))
+        let svg_resp_res: Result[WebResponse, Text] = media_serve_vfs(tmp_dir, "large.svg", "", "", false, 65536)
+        assert(result_is_ok(svg_resp_res))
+        let svg_resp: WebResponse = result_unwrap(svg_resp_res)
+        assert(svg_resp.status_code == 206)
+        assert(text_starts_with(svg_resp.content_disposition, "attachment;"))
+
+        # 4. std/security/admin_credentials + std/crypto/hash
+        assert(result_is_ok(admin_set_credentials(tmp_dir, "auditadmin", "VeryStrongPassphrase123!")))
+        assert(admin_verify_credentials(tmp_dir, "auditadmin", "VeryStrongPassphrase123!"))
+        assert(not admin_verify_credentials(tmp_dir, "wronguser", "VeryStrongPassphrase123!"))
+        assert(not admin_verify_credentials(tmp_dir, "auditadmin", "WrongPassword123456!"))
+        let mac: Text = crypto_hmac_sha256_hex("secret-key", "hello-audit")
+        assert(text_length(mac) == 64)
+
+        # 5. std/pg/transport & std/pg/protocol
+        assert(not net_peer_is_loopback(1))
+        assert(not net_tls_is_active(1))
+        assert(not net_pg_set_cancel_key_native(1, 123, 456))
+        assert(not result_is_ok(net_tls_client_with_ca(1, "db.example.com", "", 1000)))
+        let pair_res: Result[Number, Text] = net_pair_create()
+        assert(result_is_ok(pair_res))
+        let pair_a: Number = result_unwrap(pair_res)
+        let pair_b: Number = result_unwrap(net_pair_peer(pair_a))
+        assert(net_peer_is_loopback(pair_a))
+        assert(not net_tls_is_active(pair_a))
+        assert(net_pg_set_cancel_key_native(pair_a, 4242, 999999))
+        let _cp_a: Number = pg_net_close(pair_a)
+        let _cp_b: Number = pg_net_close(pair_b)
+        let pg_params: PgParameters = pg_parameters_new()
+        assert(not result_is_ok(pg_parameters_add_float64(pg_params, math_nan_float64())))
+        assert(not result_is_ok(pg_parameters_add_float64(pg_params, math_positive_infinity_float64())))
+        assert(result_is_ok(pg_parameters_add_float64(pg_params, 2.5)))
+        assert(result_is_ok(pg_parameters_add_bytes(pg_params, bytes_from_text("AB"))))
+        assert(list_get(pg_params.values, 1) == "\\x4142")
+
+        # 6. std/mysql/protocol & std/mysql/uri
+        let le_buf: Bytes = result_unwrap(bytes_try_new_zeroed(9))
+        assert(bytes_try_set(le_buf, 0, 254))
+        assert(bytes_try_set(le_buf, 5, 1))
+        let le_ok: Result[MysqlLenencInt, Text] = mysql_read_lenenc_int(le_buf, 0)
+        assert(result_is_ok(le_ok) and result_unwrap(le_ok).value == 4294967296)
+        let le_ovf: Bytes = result_unwrap(bytes_try_new_zeroed(9))
+        assert(bytes_try_set(le_ovf, 0, 254))
+        assert(bytes_try_set(le_ovf, 8, 128))
+        assert(not result_is_ok(mysql_read_lenenc_int(le_ovf, 0)))
+
+        let big_auth: Bytes = result_unwrap(bytes_try_new_zeroed(256))
+        assert(not result_is_ok(mysql_handshake_response_41("user", big_auth, none, "caching_sha2_password", 1)))
+        let my_uri_res: Result[MysqlConnectionConfig, Text] = mysql_parse_uri("mysql://db.local:3306/app?email=a@b.com&connect_timeout=10")
+        assert(result_is_ok(my_uri_res) and result_unwrap(my_uri_res).host == "db.local" and result_unwrap(my_uri_res).user == "root" and result_unwrap(my_uri_res).connect_timeout_seconds == 10)
+        assert(not result_is_ok(mysql_parse_uri("mysql://db.local:3306/app?connect_timeout=99999")))
+        assert(not result_is_ok(mysql_parse_uri("mysql://bad host:3306/app")))
+
+        # 7. std/mssql/protocol & std/mssql/uri
+        assert(not result_is_ok(tds_decode_utf16le(bytes_from_text("abcd"), 0, 99999999)))
+        assert(bytes_length(tds_scramble_password("Secret123!")) == 20)
+        let ms_uri: Result[MssqlConnectionConfig, Text] = mssql_parse_uri("mssql://sql.local:1433/app?user=u@domain.com")
+        assert(result_is_ok(ms_uri) and result_unwrap(ms_uri).host == "sql.local" and result_unwrap(ms_uri).user == "sa")
+
+        # 8. std/nosql/kv, document & uri
+        let bad_resp: Bytes = bytes_from_text("$9999999999\r\nab\r\n")
+        assert(not result_is_ok(kv_parse_response(bad_resp, 0)))
+        let bs_ok: Result[Bytes, Text] = bson_encode_element(bson_field_string("title", "ok"))
+        assert(result_is_ok(bs_ok))
+        let bs_hdr: Bytes = result_unwrap(bson_u32_le(16))
+        let bs_pinf: Bytes = result_unwrap(bson_i64_le(math_positive_infinity_bits_v1()))
+        let bs_doc: Bytes = bytes_concat(bytes_concat(bs_hdr, bytes_from_number(1)), bytes_concat(bytes_concat(bytes_from_text("x"), bytes_from_number(0)), bytes_concat(bs_pinf, bytes_from_number(0))))
+        let bs_dec: Result[BsonParsedDocument, Text] = bson_decode_document(bs_doc, 0)
+        assert(result_is_ok(bs_dec) and list_get(result_unwrap(bs_dec).fields, 0).str_val == "Infinity")
+        let rd_uri: Result[RedisConnectionConfig, Text] = redis_parse_uri("redis://cache.local:6379/1")
+        assert(result_is_ok(rd_uri) and result_unwrap(rd_uri).host == "cache.local")
+        assert(not result_is_ok(redis_parse_uri("redis://cache.local:99999/0")))
+        let mg_uri: Result[MongoConnectionConfig, Text] = mongo_parse_uri("mongodb://mongo.local:27017/mydb?email=x@y.z")
+        assert(result_is_ok(mg_uri) and result_unwrap(mg_uri).host == "mongo.local")
+        assert(not result_is_ok(mongo_parse_uri("mongodb://mongo.local:abc/mydb")))
+
+        # 9. std/math subnormal sqrt, extreme ldexp, lgamma(+Inf)
+        let sub_sq: Float64 = math_sqrt_float64(float64_from_bits(1))
+        assert(math_is_finite_float64(sub_sq) and sub_sq > 0.0)
+        assert(math_ldexp_float64(1.0, 1000000) == math_positive_infinity_float64())
+        assert(math_ldexp_float64(1.0, -1000000) == 0.0)
+        assert(math_lgamma_float64(math_positive_infinity_float64()) == math_positive_infinity_float64())
+
+        # 10. std/data NaN/Inf guards
+        let nan_v: Float64 = math_nan_float64()
+        let inf_v: Float64 = math_positive_infinity_float64()
+        let xs: List[Float64] = List[Float64]()
+        list_push(xs, 1.0)
+        list_push(xs, 2.0)
+        list_push(xs, 3.0)
+        assert(not result_is_ok(stats_quantile_sorted(xs, nan_v)))
+        assert(not result_is_ok(stats_trimmed_mean(xs, nan_v)))
+        assert(not result_is_ok(stats_winsorized_mean(xs, nan_v)))
+        assert(not result_is_ok(stats_normal_ppf(nan_v)))
+        assert(not result_is_ok(stats_confidence_interval(xs, nan_v)))
+        let xs_inf: List[Float64] = List[Float64]()
+        list_push(xs_inf, 1.0)
+        list_push(xs_inf, inf_v)
+        assert(not result_is_ok(stats_histogram(xs_inf, 4)))
+        assert(not result_is_ok(vec_ewma(xs, nan_v)))
+        let nan_mat: DenseMatrix = mat_zeros(2, 2)
+        assert(mat_set(nan_mat, 0, 0, nan_v) and mat_set(nan_mat, 1, 1, 1.0))
+        let rhs: List[Float64] = List[Float64]()
+        list_push(rhs, 1.0)
+        list_push(rhs, 2.0)
+        assert(not result_is_ok(mat_solve_linear(nan_mat, rhs)))
+        let df: DataFrame = result_unwrap(df_add_numeric_column(df_empty(), "val", xs_inf))
+        assert(text_find(df_to_html_table(df, 10), "Inf") >= 0)
+        assert(text_find(df_describe_text(df), "Float64") >= 0)
+        assert(not result_is_ok(rng_exponential_vec(1, 4, nan_v)))
+        assert(not result_is_ok(rng_poisson_vec(1, 4, nan_v)))
+        assert(not result_is_ok(rng_train_test_split(xs, nan_v, 1)))
+
+        # 11. std/json, std/ybif, std/compress
+        assert(json_float(nan_v) == "null")
+        assert(json_float(inf_v) == "null")
+        assert(not option_is_some(json_extract_string("{\"k\":\"\\uZZZZ\"}", "k")))
+        assert(option_is_some(json_extract_string("{\"k\":\"\\u0041\"}", "k")))
+        assert(ybif_read_u32_le(bytes_from_text("abcd"), -1) == 0)
+        assert(ybif_read_u32_le(bytes_from_text("abcd"), 9000000000000000000) == 0)
+        let lz_big: CompressionResult = compress_lz4_estimate(9000000000000000000)
+        let gz_big: CompressionResult = compress_gzip_estimate(9000000000000000000)
+        assert(lz_big.compressed_bytes > 0 and gz_big.compressed_bytes > 0)
+
+    let _rm_tmp: Number = test_temp_directory_remove(tmp_dir)
+    say("stdlib-audit-smoke: ALL Phase 2 security, protocol, numeric & stdlib checks PASSED")

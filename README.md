@@ -1,26 +1,36 @@
 # YAZA
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Release](https://img.shields.io/badge/Release-v1.0.1-green.svg)](https://github.com/yazaprojectstudios/yaza-language/releases)
-[![Build Matrix](https://img.shields.io/badge/Platforms-macOS%20%7C%20Linux%20%7C%20Windows%20experimental-yellow.svg)](https://github.com/yazaprojectstudios/yaza-language/actions)
+[![Release](https://img.shields.io/badge/Release-v1.0.2-green.svg)](https://github.com/yazaprojectstudios/yaza-language/releases)
+[![Build Matrix](https://img.shields.io/badge/Platforms-macOS%20%7C%20Linux%20%7C%20Windows%20experimental%20%7C%20Android%20%26%20iOS%20ARM64-yellow.svg)](https://github.com/yazaprojectstudios/yaza-language/actions)
 [![Zero-GC](https://img.shields.io/badge/Memory-Zero--GC%20%28Scoped%20Arenas%29-mint.svg)](#memory-model-arena_scope)
-[![Benchmarks](https://img.shields.io/badge/HTTP%2F1.1-93%2C854%20req%2Fs%20%40%2078%C2%B5s-yellowgreen.svg)](#benchmarks)
-[![Arena-SSR](https://img.shields.io/badge/Arena--SSR%20MVC-6.5x%20Next.js%20%40%203.17%20MB%20RSS-teal.svg)](#fullstack-web--mvc-arena-ssr-19-nov-2026)
+[![Benchmarks](https://img.shields.io/badge/Arena--SSR%20HTML-53%2C668%20req%2Fs%20%40%207.05%20MB%20RSS-yellowgreen.svg)](#post-audit-ecosystem-benchmarks-21-nov-2026--apple-m5--macos-265-arm64)
+[![YBIF](https://img.shields.io/badge/YBIF%20Binary%20Format-6.22x%20Scalar%20%7C%202.13x%20SQL%20vs%20JSON-teal.svg)](#database-support)
 
-**YAZA** is a self-hosted systems programming language designed for high-concurrency cloud backends and single-binary fullstack web applications. It compiles to native machine code via **LLVM 18**, eliminates garbage collection pauses using deterministic **Scoped Arenas (`arena_scope`)**, and ships with **YazaBase**, a built-in ACID B+Tree SQL storage engine.
+**YAZA** is a self-hosted systems programming language designed for high-concurrency cloud backends, single-binary fullstack web applications, and native mobile engines. It compiles to native machine code via **LLVM**, eliminates garbage collection pauses using deterministic **Scoped Arenas (`arena_scope`)**, and ships with **YazaBase** (a built-in ACID B+Tree SQL storage engine), the **YBIF** binary interchange format, and the **Mobile Native Engine (RFC 0010)** for Android and iOS.
 
 ---
 
-## Key Features
+## Key Features & Four Core Technology Pillars (`v1.0.2`)
 
-- **Self-Hosted Compiler & Native LLVM Backend:** Generates optimized binaries for macOS (`arm64`, `x86_64`) and Linux (`x86_64`, `aarch64`). Windows (`x86_64 PE32+`) support is experimental.
-- **Zero-GC Scoped Arena Architecture:** Replaces global garbage collection with bounded `arena_scope` blocks. Allocate with $O(1)$ bump pointers, rewind memory in a single step upon request exit (1,000,000 scopes reclaimed in 521 ms, 1.56 MB Peak RSS).
-- **Single-Binary Fullstack MVC (`--mvc` / `--fullstack` & `--web`):** Built-in `std/web/*` stack (compiled type-safe HTML5 Arena-SSR views, Hypermedia Fragments via `X-Yaza-Fragment`, YAZA UI v1.0 design system, binary `multipart/form-data` media upload with magic-byte validation, HTTP 206 seekable video streaming, signed `HttpOnly` cookies, constant-time CSRF, strict Web CSP, and safe ETag static file serving) with compile-time layer boundary enforcement (`yaza arch check`).
-- **Zero-GC Data Science, Statistical Computing, ML & Visualization (`std/data/*`):** Built-in R/Python alternative combining Neumaier (1974) compensated summation, Welford 1-pass moments, partial-pivoting Gaussian matrix linear algebra, Columnar Arena DataFrame (`df_from_csv`, `df_fillna_mean`, `df_inner_join`, `df_groupby_agg`, `df_to_html_table`), 30+ parametric/non-parametric/Bayesian statistical methods, ML (`ml_ols_fit`, `ml_multiple_ols_fit`, `ml_logistic_fit`, `ml_pca_first_component`, `ml_knn_classify`, `ml_kmeans_1d`, `ml_roc_auc`), **18 zero-JS Frontend SVG chart types**, and **6 Terminal CLI chart types**.
-- **Embedded ACID SQL Engine (YazaBase):** Built-in B+Tree indexed storage with ARIES WAL recovery, parameterized query binding, non-reparse VFS path confinement, and zero external database dependencies.
-- **Pluggable Database Adapters:** Native wire-protocol clients for **PostgreSQL** (v3 + SCRAM-SHA-256), **MySQL** (v10 + caching_sha2_password), **MSSQL** (TDS), and **NoSQL** (Redis RESP / MongoDB BSON).
-- **API Resource Profiles:** `low_memory`, `balanced`, and `throughput` validate resource settings; the fullstack server applies request concurrency and CPU-aware worker counts. Arena budget values are not wired to its allocator yet.
-- **Enterprise-Grade Security (11/11 CI Safety Gates):** Compile-time borrow checker, AddressSanitizer reset poisoning, ThreadSanitizer concurrency isolation (0 data races across 200k scopes on 8 workers), static web XSS/CSP audit (`yaza audit --security`), and constant-time HMAC-SHA256 JWT/YWT + Argon2id authentication.
+1. **Mobile Native Engine (RFC 0010 — Android & iOS ARM64):**
+   - **LLVM AOT ARM64 Native Core Engine** (zero JIT, zero Garbage Collector) running domain logic, state reducers, task arenas, and embedded `YazaBase` (`--export-request` via `std/db/yazabase_mobile_kv`), connected to 100% native UI (**Kotlin** on Android, **Swift / SwiftUI** on iOS) through the versioned **Thin C ABI Bridge** (`runtime/mobile/include/yaza_mobile_v1.h`, explicit buffer ownership, monotonic refcounted handle registry, `0` memory leaks).
+   - **CLI Tooling:** `yaza new <dir> --mobile` and `yaza mobile doctor` produce production ARM64 artifacts: `android-arm64/libyaza_mobile.so` (`190,432 B` / ~190 KB), `ios-arm64/libyaza_mobile.a` (`237,480 B` / ~237 KB), and `ios-simulator-arm64/libyaza_mobile.a` (`233,440 B` / ~233 KB).
+   - **Measured C ABI Bridge Performance:** `0.125 µs` (`create+destroy`, `6.24M ops/s`), `0.166 µs` (`1 B dispatch`, `6.05M ops/s`), `0.708 µs` (`1 KiB snapshot`, `1.37M ops/s`), `19.750 µs` (`32 KiB snapshot`, `52.2K ops/s`) at `~2.141 MiB RSS`.
+2. **Arena-SSR MVC & HTML-over-the-Wire (`std/web/*`):**
+   - **Zero-GC Per-Request Arena SSR** combined with partial DOM updates via **`X-Yaza-Fragment` + `yaza-live.js`** (~0.7 kB per interaction without heavy client JS bundles or SPA hydration), compiled type-safe HTML5 `view` syntax, binary `multipart/form-data` upload with magic-byte checks, HTTP 206 seekable streaming, and compile-time layer boundary checks (`yaza arch check`).
+   - **6 Production CLI Project Templates:** `--minimal-api`, `--api`, `--web`, `--mvc` (alias `--fullstack`), `--microservice`, and `--mobile`.
+   - **Post-Audit Loopback Benchmarks vs Node.js `v26.0.0`:** **`53,668 req/s`** Full SSR HTML (`p50 142 µs`, `7.05 MB RSS` vs Node.js v26 `36,960 req/s` & `73.53 MB RSS`), **`49,703 req/s`** Hypermedia Fragment (`p50 131 µs` vs Node.js v26 `37,612 req/s`), **`69,571 req/s`** JSON API Parity (`113 µs` p50), plus live production app `yaza-quran` (**`1,337.0 req/s`** full 114-surah render / `55,624 B`, **`5,951.4 req/s`** fragment filter, **`3,488.2 req/s`** JSON API).
+3. **Security-by-Construction (Default in Runtime & Standard Library):**
+   - Verified under `ASan+UBSan`, `TSan`, macOS `leaks --atExit` (`0 leaks`), and a hostile TCP soak of 10,000 valid requests + 200 malformed/smuggling/oversized payloads (`0` crashes, `0` FD leaks):
+   - Auto HTML/attribute escaping (`std/web/view.yz`, blocking `svg`/`math`, `srcdoc`, `javascript:`/`data:`, and `on*` event attributes) + `yaza audit --security`.
+   - Session-bound CSRF token with constant-time comparison, `HttpOnly`/`Secure`/`SameSite` cookies, and automatic CSP, `X-Frame-Options: DENY`, and `X-Content-Type-Options: nosniff` headers.
+   - Strict `\r\n` HTTP parser against request smuggling & keep-alive desync, capability-rooted VFS (`O_NOFOLLOW` anti-symlink/path traversal), magic-byte verification on multipart uploads, and compiler-optimization-resistant cryptographic zeroization (`volatile` wipe + memory fence).
+4. **YazaBase & Binary Format YBIF (`std/ybif.yz` + C Direct Encoder):**
+   - **Transactional ACID SQL Engine (`YazaBase`):** Built-in B+Tree storage with ARIES WAL CRC32C recovery, parameterized query binding, and in-process embedded sessions (`std/db/yazabase_embedded.yz`) with per-statement `arena_scope` isolation (**`9,995.2 SELECT/s`** at `p50 = 0.099 ms`, **`882.7 rows/s`** batched transactional `INSERT` — **42.7×** faster than standalone `F_FULLFSYNC`, Peak RSS **`37.3 MiB`**).
+   - **YAZA Binary Interchange Format (`YBIF`):** Length-prefixed binary wire format (`std/ybif.yz` & C direct encoder `yazabase_result_encode_ybif`) achieving **6.22× faster** encode+decode than JSON on scalar records (`3.26M ops/s`, 31.9% smaller) and **2.13× faster** on 16-row SQL result batches (`2.59M ops/s`, `896 B` vs `1,188 B`, 24.6% smaller).
+   - **Pluggable External Database Adapters:** Native wire-protocol clients for **PostgreSQL** (v3 + SCRAM-SHA-256 + native socket TLS & 16-byte `CancelRequest`), **MySQL** (v10 + `caching_sha2_password`), **MSSQL** (TDS), and **NoSQL** (Redis RESP / MongoDB BSON).
+   - **Zero-GC Data Science, Statistical Computing, ML & Visualization (`std/data/*`):** Neumaier compensated summation, Welford 1-pass moments, partial-pivoting Gaussian linear algebra, Columnar Arena DataFrame, 30+ statistical/ML methods, **18 zero-JS Frontend SVG chart types**, and **6 Terminal CLI chart types**.
 
 ---
 
@@ -39,12 +49,14 @@ irm https://yazastudios.id/install.ps1 | iex
 ```
 
 ### Manual Release Archives
-Pre-built archives for the released targets are available on the [Releases](https://github.com/yazaprojectstudios/yaza-language/releases) page:
-- `yaza-1.0.1-darwin-arm64.tar.gz` (Apple Silicon)
-- `yaza-1.0.1-darwin-x64.tar.gz` (macOS Intel)
-- `yaza-1.0.1-linux-x64.tar.gz` (Linux x86-64)
-- `yaza-1.0.1-linux-arm64.tar.gz` (Linux ARM64)
-- `yaza-1.0.1-windows-x64.zip` (Windows x64, experimental)
+Pre-built archives for the released targets are available on the [Releases](https://github.com/yazaprojectstudios/yaza-language/releases/tag/v1.0.2) page and [yazastudios.id/docs/install](https://yazastudios.id/docs/install/):
+- `yaza-1.0.2-darwin-arm64.tar.gz` & `yaza-1.0.2-macos-arm64.pkg` (Apple Silicon)
+- `yaza-1.0.2-darwin-x64.tar.gz` (macOS Intel)
+- `yaza-1.0.2-linux-x64.tar.gz` (Linux x86-64)
+- `yaza-1.0.2-linux-arm64.tar.gz` (Linux ARM64)
+- `yaza-1.0.2-windows-x64.zip` (Windows x64, experimental)
+- `yaza-1.0.2-mobile-sdk.tar.gz` (Mobile Native Engine SDK: `android-arm64/libyaza_mobile.so`, `ios-arm64/libyaza_mobile.a`, `ios-simulator-arm64/libyaza_mobile.a`, and `include/yaza_mobile_v1.h`)
+- `yaza-language-support-1.0.2.vsix` (VS Code Extension)
 
 Extract the archive and add its `bin/` directory to your system `PATH`.
 Compiling `.yz` programs on Linux needs Clang and the libcurl development
@@ -187,6 +199,27 @@ yaza check
 yaza run
 ```
 
+### Native Mobile Starter (`--mobile` · RFC 0010)
+Generates a native Android (Kotlin + JNI) and iOS (Swift / SwiftUI) UI shell connected to an **LLVM AOT ARM64 YAZA Native Core Engine** (domain logic, state reducer, task arenas, and `--export-request` embedded `YazaBase` KV persistence via `std/db/yazabase_mobile_kv`) through the versioned C ABI (`yaza_mobile_v1.h`):
+
+```sh
+yaza new --mobile my_mobile_app
+cd my_mobile_app
+yaza mobile doctor
+yaza mobile build --target android-arm64 --release
+yaza mobile build --target ios-arm64 --release
+yaza mobile build --target ios-simulator-arm64 --release
+```
+
+`yaza mobile run --target android-emulator` installs and launches on a connected Android device/AVD (`android-arm64/libyaza_mobile.so`, `190,432 B`); `yaza mobile run --target ios-simulator` launches on a booted Apple Silicon iOS Simulator (`ios-simulator-arm64/libyaza_mobile.a`, `233,440 B`; device archive `ios-arm64/libyaza_mobile.a`, `237,480 B`). Verified with `0 leaks / 0 bytes` under `ASan+UBSan`, `TSan`, and `leaks --atExit`.
+
+### Minimal API & SSR Web Starters (`--minimal-api` & `--web`)
+For zero-boilerplate JSON microservices or lightweight SSR sites without an embedded SQL layer:
+```sh
+yaza new --minimal-api fast_service
+yaza new --web content_site
+```
+
 ### Specification Generators
 Export interactive OpenAPI 3.1 Swagger and Postman collections directly from declared route contracts:
 ```sh
@@ -252,15 +285,16 @@ process arena hard cap, the current runtime reads
 
 ---
 
-## Database Support
+## Database Support & Binary Format YBIF
 
-YAZA provides first-class standard library drivers with wire-protocol implementations:
+YAZA provides first-class standard library drivers with wire-protocol implementations plus the **YBIF** binary interchange format:
 
-1. **YazaBase (`std/db/yazabase`):** Embedded ACID SQL engine. Features B+Tree indexing, write-ahead logging (ARIES), parameterized SQL binding (`$1, $2, ...`), and transactional safety.
-2. **PostgreSQL (`std/db/postgres`):** Pure YAZA client implementing PostgreSQL Wire Protocol v3, SCRAM-SHA-256 authentication, and typed `DbValue` mapping.
-3. **MySQL (`std/db/mysql`):** Wire Protocol v10 client with `caching_sha2_password` scramble and command batching.
-4. **Microsoft SQL Server (`std/db/mssql`):** Tabular Data Stream (TDS) wire protocol with prelogin handshake and batch execution.
-5. **NoSQL Stores (`std/db/nosql`):** Redis RESP serialization for key-value storage and MongoDB BSON / `OP_MSG` wire framing for document stores.
+1. **YazaBase (`std/db/yazabase` & `std/db/yazabase_embedded`):** Embedded ACID SQL engine with B+Tree indexing, ARIES write-ahead logging, parameterized SQL binding (`$1, $2, ...`), per-statement `arena_scope` memory isolation (`9,995.2 SELECT/s` at `p50 = 0.099 ms`, `882.7 rows/s` batched transactional `INSERT`, `37.3 MiB` Peak RSS), and `--export-request` mobile KV persistence (`std/db/yazabase_mobile_kv`).
+2. **YBIF Binary Format (`std/ybif` & `yazabase_result_encode_ybif`):** Deterministic binary wire format with 4-byte magic (`YBIF`), versioned header, and length-prefixed typed cells — **6.22× faster** than JSON on scalar records (`3.26M ops/s`, 31.9% smaller) and **2.13× faster** on 16-row SQL result sets (`2.59M ops/s`, `896 B` vs `1,188 B`, 24.6% smaller).
+3. **PostgreSQL (`std/db/postgres` & `std/pg/transport`):** Pure YAZA client implementing PostgreSQL Wire Protocol v3, SCRAM-SHA-256 authentication with channel-binding support, native socket TLS (`SSLRequest` + `libcurl` TLS upgrade + loopback `getpeername` inspection), native 16-byte `CancelRequest`, and typed `DbValue` mapping.
+4. **MySQL (`std/db/mysql`):** Wire Protocol v10 client with `caching_sha2_password` scramble and command batching.
+5. **Microsoft SQL Server (`std/db/mssql`):** Tabular Data Stream (TDS) wire protocol with prelogin handshake and batch execution.
+6. **NoSQL Stores (`std/db/nosql`):** Redis RESP serialization for key-value storage and MongoDB BSON / `OP_MSG` wire framing for document stores.
 
 ### YazaBase CLI
 Inspect and manipulate databases directly from the terminal:
@@ -349,6 +383,20 @@ yaza run examples/data-science-cli-charts.yz
 sh scripts/validate-data-science.sh
 sh scripts/bench-data-science.sh
 ```
+
+### Post-Audit Ecosystem Benchmarks (21 Nov 2026 · Apple M5 · macOS 26.5 arm64)
+
+Full reproducible audit measurements across the compiled toolchain (`YAZA LLVM 1.0.2`), Arena runtime, Arena-SSR, live `yaza-quran` web app, YazaBase SQL + YBIF, and the Mobile C ABI Engine ([full report](docs/benchmarks/audit-2026-11-21.md)):
+
+| Subsystem | Measured Result (`-O2`) | Latency (`p50` / `p95`) | Memory / Artifact Footprint |
+| --- | --- | --- | --- |
+| **Arena 1M Scope Cycles** | **`38,064,786 scopes/sec`** (`26.27 ms`) | `26.27 ns/scope` | **`1.44 MiB`** Peak RSS · `0 B` retained |
+| **Multi-Worker Soak (200K reqs, 8 workers)** | **`4,023,821 req/sec`** (`0.050 s`) | `1.00 µs` / `4.00 µs` | `1.4 -> 4.8 MiB` RSS · `0` errors |
+| **Arena-SSR Full HTML / JSON API (`c=8`)** | **`53,668`** HTML · **`69,571`** JSON req/s | `142 µs` / `113 µs` (`p50`) | **`7.05 MB`** RSS · `246.4 KB` binary |
+| **Live `yaza-quran` SSR / Search / JSON API (`c=8`)** | `1,337` SSR · `5,951` Frag · `3,488` JSON req/s | `5.72 ms` · `1.20 ms` · `2.03 ms` | `218.2 MiB` plateau · `448.6 KB` binary |
+| **Data Science (1M Welford / 1M OLS)** | **`5.28 ms`** / **`4.99 ms`** (**68.8×** / **35.4×** Python) | `15.36 ms` KDE (320K) | **`9.75 MiB`** RSS · exact 53-bit sum/var |
+| **YazaBase Scoped PK `SELECT` / Batched `INSERT` / YBIF** | **`9,995`** `SELECT/s` · **`883`** `row/s` · **`2.59M`** `YBIF/s` | `0.099 ms` PK · `7.539 ms` cold CLI | **`37.3 MiB`** RSS · `1.90 MB` CLI |
+| **Mobile Native Engine C ABI (`1 B` / `1 KiB` / `32 KiB`)** | **`6.05M`** / **`1.37M`** / **`52.2K ops/s`** | `0.166 µs` / `0.708 µs` / `19.75 µs` | **`190 KB`** Android `.so` · **`237 KB`** iOS `.a` |
 
 ---
 

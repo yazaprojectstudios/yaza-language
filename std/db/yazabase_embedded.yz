@@ -1,0 +1,116 @@
+# In-process YazaBase session adapter for embedded apps, including mobile.
+# The caller must pass an app-private directory (for mobile, filesDir/Documents)
+# and must serialize access to one database session. The session owns the root
+# capability and the exclusive YDBv1 lock until it is closed.
+use "std/fs"
+use "std/db/yazabase_mobile_kv"
+use "../../yazabase/catalog_init_v1"
+use "../../yazabase/session_v1"
+use "../../yazabase/sql_executor_v1"
+
+shape YazaBaseEmbeddedSessionV1:
+    session: YazaDbSessionV1
+    root_path: Text
+    database_name: Text
+    created_new: Boolean
+
+shape YazaBaseEmbeddedStatementV1:
+    database: YazaBaseEmbeddedSessionV1
+    statement: YazaDbSqlStatementResultV1
+
+fn yaza_db_embedded_create_close_v1(created: YazaDbCatalogBootstrapV1, root: Number) -> Result[Boolean, Text]:
+    let wal_closed: Result[Boolean, Text] = yaza_db_wal_log_close_v1(created.wal)
+    let storage_closed: Result[Boolean, Text] = yaza_db_storage_close_v1(created.storage)
+    let root_closed: Result[Boolean, Text] = close(root)
+    var cleanup_error: Text = ""
+    if not result_is_ok(wal_closed): set cleanup_error = text_try_concat("WAL close: ", result_unwrap_error(wal_closed))?
+    elif not result_unwrap(wal_closed): set cleanup_error = "WAL close returned false"
+    if not result_is_ok(storage_closed):
+        if text_length(cleanup_error) > 0: set cleanup_error = text_try_concat(cleanup_error, "; ")?
+        set cleanup_error = text_try_concat(cleanup_error, "storage close: ")?
+        set cleanup_error = text_try_concat(cleanup_error, result_unwrap_error(storage_closed))?
+    elif not result_unwrap(storage_closed):
+        if text_length(cleanup_error) > 0: set cleanup_error = text_try_concat(cleanup_error, "; ")?
+        set cleanup_error = text_try_concat(cleanup_error, "storage close returned false")?
+    if not result_is_ok(root_closed):
+        if text_length(cleanup_error) > 0: set cleanup_error = text_try_concat(cleanup_error, "; ")?
+        set cleanup_error = text_try_concat(cleanup_error, "root close: ")?
+        set cleanup_error = text_try_concat(cleanup_error, result_unwrap_error(root_closed))?
+    elif not result_unwrap(root_closed):
+        if text_length(cleanup_error) > 0: set cleanup_error = text_try_concat(cleanup_error, "; ")?
+        set cleanup_error = text_try_concat(cleanup_error, "root close returned false")?
+    if text_length(cleanup_error) > 0:
+        let error: Text = text_try_concat("YDBv1 embedded database was created but handle cleanup failed: ", cleanup_error)?
+        return err(error)
+    return ok(true)
+
+fn yaza_db_embedded_open_v1(root_path: Text, database_name: Text) -> Result[YazaBaseEmbeddedSessionV1, Text]:
+    if not yaza_db_embedded_root_path_valid_v1(root_path): return err("YDBv1 embedded root path is outside its bound")
+    if not yaza_db_embedded_component_valid_v1(database_name): return err("YDBv1 embedded database name must be one safe path component")
+    let root_result: Result[Number, Text] = root_open(root_path)
+    if not result_is_ok(root_result):
+        let error: Text = text_try_concat("YDBv1 embedded database directory could not be opened: ", result_unwrap_error(root_result))?
+        return err(error)
+    let root: Number = result_unwrap(root_result)
+    let session_result: Result[YazaDbSessionV1, Text] = yaza_db_session_open_v1(root, database_name)
+    if not result_is_ok(session_result):
+        let error: Text = text_try_concat("YDBv1 embedded database could not be opened or recovered: ", result_unwrap_error(session_result))?
+        return err(error)
+    return ok(YazaBaseEmbeddedSessionV1(result_unwrap(session_result), root_path, database_name, false))
+
+fn yaza_db_embedded_open_or_create_v1(root_path: Text, database_name: Text) -> Result[YazaBaseEmbeddedSessionV1, Text]:
+    if not yaza_db_embedded_root_path_valid_v1(root_path): return err("YDBv1 embedded root path is outside its bound")
+    if not yaza_db_embedded_component_valid_v1(database_name): return err("YDBv1 embedded database name must be one safe path component")
+    let root_result: Result[Number, Text] = root_open(root_path)
+    if not result_is_ok(root_result):
+        let error: Text = text_try_concat("YDBv1 embedded database directory could not be opened: ", result_unwrap_error(root_result))?
+        return err(error)
+    let root: Number = result_unwrap(root_result)
+    let created_result: Result[YazaDbCatalogBootstrapV1, Text] = yaza_db_catalog_create_v1(root, database_name)
+    if result_is_ok(created_result):
+        let closed: Result[Boolean, Text] = yaza_db_embedded_create_close_v1(result_unwrap(created_result), root)
+        if not result_is_ok(closed): return err(result_unwrap_error(closed))
+        let reopened: Result[YazaBaseEmbeddedSessionV1, Text] = yaza_db_embedded_open_v1(root_path, database_name)
+        if not result_is_ok(reopened): return err(result_unwrap_error(reopened))
+        let database: YazaBaseEmbeddedSessionV1 = result_unwrap(reopened)
+        return ok(YazaBaseEmbeddedSessionV1(database.session, root_path, database_name, true))
+    let create_error: Text = result_unwrap_error(created_result)
+    if create_error == "YDBv1 database name already exists":
+        let session_result: Result[YazaDbSessionV1, Text] = yaza_db_session_open_v1(root, database_name)
+        if not result_is_ok(session_result):
+            let error: Text = text_try_concat("YDBv1 embedded database could not be opened or recovered: ", result_unwrap_error(session_result))?
+            return err(error)
+        return ok(YazaBaseEmbeddedSessionV1(result_unwrap(session_result), root_path, database_name, false))
+    let root_closed: Result[Boolean, Text] = close(root)
+    if not result_is_ok(root_closed):
+        let detail: Text = text_try_concat("; root close failed: ", result_unwrap_error(root_closed))?
+        let error: Text = text_try_concat(create_error, detail)?
+        return err(error)
+    if not result_unwrap(root_closed):
+        let error: Text = text_try_concat(create_error, "; root close returned false")?
+        return err(error)
+    return err(create_error)
+
+fn yaza_db_embedded_execute_v1(database: YazaBaseEmbeddedSessionV1, source: Text, parameters: List[YazaSqlValueV1]) -> Result[YazaBaseEmbeddedStatementV1, Text]:
+    if not database.session.is_open: return err("YDBv1 embedded database session is closed")
+    let executed: Result[YazaDbSessionStatementV1, Text] = yaza_db_session_execute_v1(database.session, source, parameters)
+    if not result_is_ok(executed): return err(result_unwrap_error(executed))
+    let session_statement: YazaDbSessionStatementV1 = result_unwrap(executed)
+    let next_database: YazaBaseEmbeddedSessionV1 = YazaBaseEmbeddedSessionV1(session_statement.session, database.root_path, database.database_name, database.created_new)
+    return ok(YazaBaseEmbeddedStatementV1(next_database, session_statement.statement))
+
+fn yaza_db_embedded_sync_scalars_v1(database: YazaBaseEmbeddedSessionV1, checkpoint_lsn: Number, next_txn_id: Number, next_commit_ts: Number, catalog_root: Number, page_count: Number, flags: Number, wal_file: Number, wal_seg_index: Number, wal_seg_base: Number, wal_next_lsn: Number, clear_cache: Boolean) -> YazaBaseEmbeddedSessionV1:
+    let h: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(database.session.storage.header.db_uuid, checkpoint_lsn, next_txn_id, next_commit_ts, catalog_root, page_count, flags)
+    let s: YazaDbStorageHandleV1 = YazaDbStorageHandleV1(database.session.storage.root, database.session.storage.file, database.session.storage.lock, database.session.storage.identity_lock, h)
+    let w: YazaDbWalLogV1 = YazaDbWalLogV1(database.session.wal.root, database.session.wal.db_uuid, wal_file, wal_seg_index, wal_seg_base, wal_next_lsn)
+    var next_cat: Option[YazaDbCatalogSnapshotWithRootsV1] = database.session.catalog_cache
+    var next_idx: Option[List[YazaDbRowV1]] = database.session.index_rows_cache
+    if clear_cache:
+        set next_cat = none
+        set next_idx = none
+    let next_sess: YazaDbSessionV1 = YazaDbSessionV1(database.session.root, s, w, next_cat, next_idx, database.session.is_open)
+    return YazaBaseEmbeddedSessionV1(next_sess, database.root_path, database.database_name, database.created_new)
+
+fn yaza_db_embedded_close_v1(database: YazaBaseEmbeddedSessionV1) -> Result[Boolean, Text]:
+    if not database.session.is_open: return err("YDBv1 embedded database session is already closed")
+    return yaza_db_session_close_v1(database.session)

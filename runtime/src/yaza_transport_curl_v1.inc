@@ -7,6 +7,7 @@ static char *yaza_transport_copy_text_v1(const YazaTextV1 *value, size_t maximum
     for (uint64_t i = 0; i < value->length; i++) {
         const unsigned char ch = value->data[i];
         if (ch == 0 || ch == '\r' || ch == '\n') {
+            yaza_rt_v1_secure_zero(copy, (size_t)i);
             free(copy);
             return NULL;
         }
@@ -98,6 +99,13 @@ static size_t yaza_transport_read_v1(char *output, size_t size, size_t count, vo
     input->cursor += left;
     return left;
 }
+
+static void yaza_transport_free_secret_cstr_v1(char *secret) {
+    if (secret != NULL) {
+        yaza_rt_v1_secure_zero(secret, strlen(secret));
+        free(secret);
+    }
+}
 #endif
 
 int32_t yaza_net_v1_https_request(const YazaTextV1 *method, const YazaTextV1 *url,
@@ -126,18 +134,18 @@ int32_t yaza_net_v1_https_request(const YazaTextV1 *method, const YazaTextV1 *ur
         !(strcmp(method_c, "GET") == 0 || strcmp(method_c, "HEAD") == 0 ||
           strcmp(method_c, "POST") == 0 || strcmp(method_c, "PUT") == 0 ||
           strcmp(method_c, "PATCH") == 0 || strcmp(method_c, "DELETE") == 0)) {
-        free(method_c); free(url_c); free(bearer_c);
+        free(method_c); free(url_c); yaza_transport_free_secret_cstr_v1(bearer_c);
         *out_error = (char *)"HTTPS method, URL, or bearer token is invalid";
         return 0;
     }
     if ((strcmp(method_c, "GET") == 0 || strcmp(method_c, "HEAD") == 0) && body->length > 0) {
-        free(method_c); free(url_c); free(bearer_c);
+        free(method_c); free(url_c); yaza_transport_free_secret_cstr_v1(bearer_c);
         *out_error = (char *)"GET and HEAD requests cannot carry a body";
         return 0;
     }
     (void)pthread_once(&yaza_transport_curl_once_v1, yaza_transport_curl_init_v1);
     if (!yaza_transport_curl_ready_v1) {
-        free(method_c); free(url_c); free(bearer_c);
+        free(method_c); free(url_c); yaza_transport_free_secret_cstr_v1(bearer_c);
         *out_error = (char *)"HTTPS transport initialization failed";
         return 0;
     }
@@ -146,7 +154,7 @@ int32_t yaza_net_v1_https_request(const YazaTextV1 *method, const YazaTextV1 *ur
     struct curl_slist *headers = NULL;
     if (curl == NULL || response == NULL) {
         if (curl != NULL) curl_easy_cleanup(curl);
-        free(response); free(method_c); free(url_c); free(bearer_c);
+        free(response); free(method_c); free(url_c); yaza_transport_free_secret_cstr_v1(bearer_c);
         *out_error = (char *)"HTTPS transport allocation failed";
         return 0;
     }
@@ -156,6 +164,7 @@ int32_t yaza_net_v1_https_request(const YazaTextV1 *method, const YazaTextV1 *ur
     YAZA_CURL_SET(CURLOPT_URL, url_c);
     YAZA_CURL_SET(CURLOPT_PROTOCOLS_STR, "https");
     YAZA_CURL_SET(CURLOPT_FOLLOWLOCATION, 0L);
+    YAZA_CURL_SET(CURLOPT_SSLVERSION, (long)CURL_SSLVERSION_TLSv1_2);
     YAZA_CURL_SET(CURLOPT_SSL_VERIFYPEER, 1L);
     YAZA_CURL_SET(CURLOPT_SSL_VERIFYHOST, 2L);
     const char *ca_bundle = yaza_transport_ca_bundle_v1();
@@ -172,7 +181,9 @@ int32_t yaza_net_v1_https_request(const YazaTextV1 *method, const YazaTextV1 *ur
         strcmp(method_c, "PATCH") == 0) {
         YAZA_CURL_SET(CURLOPT_POSTFIELDS, body->length > 0 ? (const char *)body->data : "");
         YAZA_CURL_SET(CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)body->length);
-        headers = curl_slist_append(headers, "Content-Type: application/json");
+        struct curl_slist *next_ct = curl_slist_append(headers, "Content-Type: application/json");
+        if (next_ct == NULL) setup = CURLE_OUT_OF_MEMORY;
+        else headers = next_ct;
     }
     if (bearer_c[0] != '\0') {
         const size_t length = strlen(bearer_c);
@@ -184,6 +195,7 @@ int32_t yaza_net_v1_https_request(const YazaTextV1 *method, const YazaTextV1 *ur
             struct curl_slist *next = curl_slist_append(headers, authorization);
             if (next == NULL) setup = CURLE_OUT_OF_MEMORY;
             else headers = next;
+            yaza_rt_v1_secure_zero(authorization, length + 23);
             free(authorization);
         }
     }
@@ -193,7 +205,7 @@ int32_t yaza_net_v1_https_request(const YazaTextV1 *method, const YazaTextV1 *ur
     if (result == CURLE_OK) result = curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
     if (result == CURLE_OK && (status < 100 || status > 599)) result = CURLE_HTTP_RETURNED_ERROR;
     if (result == CURLE_OK) {
-        unsigned char *wire = (unsigned char *)yaza_rt_v1_alloc(output.length + 2);
+        unsigned char *wire = (unsigned char *)yaza_rt_v1_try_alloc(output.length + 2);
         if (wire == NULL) result = CURLE_OUT_OF_MEMORY;
         else {
             wire[0] = (unsigned char)((status >> 8) & 0xff);
@@ -205,7 +217,7 @@ int32_t yaza_net_v1_https_request(const YazaTextV1 *method, const YazaTextV1 *ur
     }
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
-    free(response); free(method_c); free(url_c); free(bearer_c);
+    free(response); free(method_c); free(url_c); yaza_transport_free_secret_cstr_v1(bearer_c);
     if (result != CURLE_OK) {
         *out_error = output.exceeded ? (char *)"HTTPS response exceeds configured byte limit"
             : (char *)curl_easy_strerror(result);
@@ -244,7 +256,7 @@ int32_t yaza_net_v1_smtp_secure_send(const YazaTextV1 *provider, const YazaTextV
         !yaza_transport_mailbox_valid_v1(from_c) ||
         !yaza_transport_mailbox_valid_v1(to_c) ||
         (strcmp(auth_c, "password") != 0 && strcmp(auth_c, "oauth2") != 0)) {
-        free(provider_c); free(auth_c); free(username_c); free(credential_c); free(from_c); free(to_c);
+        free(provider_c); free(auth_c); free(username_c); yaza_transport_free_secret_cstr_v1(credential_c); free(from_c); free(to_c);
         *out_error = (char *)"SMTP provider, authentication, or address is invalid";
         return 0;
     }
@@ -253,13 +265,13 @@ int32_t yaza_net_v1_smtp_secure_send(const YazaTextV1 *provider, const YazaTextV
     if (strcmp(provider_c, "brevo") == 0 && strcmp(auth_c, "password") == 0)
         url = "smtp://smtp-relay.brevo.com:587";
     if (url == NULL) {
-        free(provider_c); free(auth_c); free(username_c); free(credential_c); free(from_c); free(to_c);
+        free(provider_c); free(auth_c); free(username_c); yaza_transport_free_secret_cstr_v1(credential_c); free(from_c); free(to_c);
         *out_error = (char *)"SMTP provider or authentication mode is unsupported";
         return 0;
     }
     (void)pthread_once(&yaza_transport_curl_once_v1, yaza_transport_curl_init_v1);
     if (!yaza_transport_curl_ready_v1) {
-        free(provider_c); free(auth_c); free(username_c); free(credential_c); free(from_c); free(to_c);
+        free(provider_c); free(auth_c); free(username_c); yaza_transport_free_secret_cstr_v1(credential_c); free(from_c); free(to_c);
         *out_error = (char *)"SMTP transport initialization failed";
         return 0;
     }
@@ -270,7 +282,7 @@ int32_t yaza_net_v1_smtp_secure_send(const YazaTextV1 *provider, const YazaTextV
     if (curl == NULL || sender == NULL || recipient == NULL) {
         if (curl != NULL) curl_easy_cleanup(curl);
         free(sender); free(recipient);
-        free(provider_c); free(auth_c); free(username_c); free(credential_c); free(from_c); free(to_c);
+        free(provider_c); free(auth_c); free(username_c); yaza_transport_free_secret_cstr_v1(credential_c); free(from_c); free(to_c);
         *out_error = (char *)"SMTP transport allocation failed";
         return 0;
     }
@@ -280,7 +292,7 @@ int32_t yaza_net_v1_smtp_secure_send(const YazaTextV1 *provider, const YazaTextV
     if (recipients == NULL) {
         curl_easy_cleanup(curl);
         free(sender); free(recipient);
-        free(provider_c); free(auth_c); free(username_c); free(credential_c); free(from_c); free(to_c);
+        free(provider_c); free(auth_c); free(username_c); yaza_transport_free_secret_cstr_v1(credential_c); free(from_c); free(to_c);
         *out_error = (char *)"SMTP recipient allocation failed";
         return 0;
     }
@@ -290,6 +302,7 @@ int32_t yaza_net_v1_smtp_secure_send(const YazaTextV1 *provider, const YazaTextV
     YAZA_SMTP_SET(CURLOPT_URL, url);
     YAZA_SMTP_SET(CURLOPT_PROTOCOLS_STR, "smtp");
     YAZA_SMTP_SET(CURLOPT_USE_SSL, CURLUSESSL_ALL);
+    YAZA_SMTP_SET(CURLOPT_SSLVERSION, (long)CURL_SSLVERSION_TLSv1_2);
     YAZA_SMTP_SET(CURLOPT_SSL_VERIFYPEER, 1L);
     YAZA_SMTP_SET(CURLOPT_SSL_VERIFYHOST, 2L);
     const char *ca_bundle = yaza_transport_ca_bundle_v1();
@@ -315,10 +328,7 @@ int32_t yaza_net_v1_smtp_secure_send(const YazaTextV1 *provider, const YazaTextV
     curl_easy_cleanup(curl);
     free(sender); free(recipient);
     free(provider_c); free(auth_c); free(username_c);
-    if (credential_c != NULL) {
-        memset(credential_c, 0, strlen(credential_c));
-        free(credential_c);
-    }
+    yaza_transport_free_secret_cstr_v1(credential_c);
     free(from_c); free(to_c);
     if (result != CURLE_OK) {
         *out_error = (char *)curl_easy_strerror(result);

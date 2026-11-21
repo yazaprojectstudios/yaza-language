@@ -13,6 +13,18 @@ BUILD_DIR=${YAZA_BUILD_DIR:-"$PROJECT_DIR/build"}
 DIST_DIR=${YAZA_DIST_DIR:-"$PROJECT_DIR/dist"}
 VERSION=${YAZA_VERSION:-$(cat "$PROJECT_DIR/VERSION")}
 
+copy_template_tree() {
+  tar -C "$1" \
+    --exclude='build' --exclude='*/build' \
+    --exclude='.gradle' --exclude='*/.gradle' \
+    --exclude='.idea' --exclude='*/.idea' \
+    --exclude='DerivedData' --exclude='*/DerivedData' \
+    --exclude='node_modules' --exclude='*/node_modules' \
+    --exclude='target' --exclude='*/target' \
+    --exclude='out' --exclude='*/out' \
+    -cf - . | tar -C "$2" -xf -
+}
+
 case "$PLATFORM" in
   linux-x64) EXPECTED_OS=Linux; EXPECTED_ARCH=x86_64 ;;
   linux-arm64) EXPECTED_OS=Linux; EXPECTED_ARCH=arm64 ;;
@@ -53,8 +65,9 @@ YAZA_STAGE="$DIST_DIR/yaza-$VERSION-$PLATFORM"
 YB_STAGE="$DIST_DIR/yazabase-$VERSION-$PLATFORM"
 rm -rf "$YAZA_STAGE" "$YB_STAGE"
 mkdir -p "$YAZA_STAGE/bin" "$YAZA_STAGE/runtime/src" \
-  "$YAZA_STAGE/runtime/include" "$YAZA_STAGE/std" "$YAZA_STAGE/templates" \
-  "$YAZA_STAGE/include" "$YAZA_STAGE/lib" "$YAZA_STAGE/bindings"
+  "$YAZA_STAGE/runtime/include" "$YAZA_STAGE/runtime/mobile" \
+  "$YAZA_STAGE/scripts/mobile" "$YAZA_STAGE/std" "$YAZA_STAGE/templates" \
+  "$YAZA_STAGE/yazabase" "$YAZA_STAGE/include" "$YAZA_STAGE/lib" "$YAZA_STAGE/bindings"
 
 cp "$BUILD_DIR/yaza-llvm" "$YAZA_STAGE/bin/yaza"
 cp "$BUILD_DIR/yaza-llvm" "$YAZA_STAGE/bin/yaza-llvm"
@@ -67,12 +80,16 @@ cp "$PROJECT_DIR/runtime/src/yaza_runtime_v1.c" "$YAZA_STAGE/runtime/src/"
 cp "$PROJECT_DIR/runtime/src/yaza_transport_curl_v1.inc" "$YAZA_STAGE/runtime/src/"
 cp "$PROJECT_DIR/runtime/src/yaza_security_login_v1.inc" "$YAZA_STAGE/runtime/src/"
 cp "$PROJECT_DIR/runtime/watch-run.sh" "$YAZA_STAGE/runtime/"
+cp -R "$PROJECT_DIR/runtime/mobile/." "$YAZA_STAGE/runtime/mobile/"
+cp -R "$PROJECT_DIR/scripts/mobile/." "$YAZA_STAGE/scripts/mobile/"
 cp -R "$PROJECT_DIR/std/." "$YAZA_STAGE/std/"
-cp -R "$PROJECT_DIR/templates/." "$YAZA_STAGE/templates/"
+cp -R "$PROJECT_DIR/yazabase/." "$YAZA_STAGE/yazabase/"
+copy_template_tree "$PROJECT_DIR/templates" "$YAZA_STAGE/templates"
 cp -R "$PROJECT_DIR/bindings/." "$YAZA_STAGE/bindings/"
 cp "$PROJECT_DIR/README.md" "$YAZA_STAGE/"
 cp "$PROJECT_DIR/VERSION" "$YAZA_STAGE/"
 chmod 755 "$YAZA_STAGE/bin/"*
+chmod 755 "$YAZA_STAGE/scripts/mobile/"*.sh
 
 YB_STAGE_BIN="$YB_STAGE/bin"
 mkdir -p "$YB_STAGE_BIN" "$YB_STAGE/lib" "$YB_STAGE/include" "$YB_STAGE/bindings"

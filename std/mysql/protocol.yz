@@ -196,10 +196,16 @@ fn mysql_read_lenenc_int(payload: Bytes, offset: Number) -> Result[MysqlLenencIn
             return err(result_unwrap_error(u24_val))
         return ok(MysqlLenencInt(result_unwrap(u24_val), false, 4))
     if first == 254:
-        let u32_val: Result[Number, Text] = mysql_read_u32_le(payload, offset + 1)
-        if not result_is_ok(u32_val):
-            return err(result_unwrap_error(u32_val))
-        return ok(MysqlLenencInt(result_unwrap(u32_val), false, 9))
+        let lo_res: Result[Number, Text] = mysql_read_u32_le(payload, offset + 1)
+        if not result_is_ok(lo_res):
+            return err(result_unwrap_error(lo_res))
+        let hi_res: Result[Number, Text] = mysql_read_u32_le(payload, offset + 5)
+        if not result_is_ok(hi_res):
+            return err(result_unwrap_error(hi_res))
+        let hi_val: Number = result_unwrap(hi_res)
+        if hi_val > 2147483647:
+            return err("MySQL 8-byte lenenc integer exceeds signed 64-bit maximum")
+        return ok(MysqlLenencInt(result_unwrap(lo_res) + hi_val * 4294967296, false, 9))
     return err("MySQL invalid lenenc integer prefix 0xFF")
 
 fn mysql_encode_lenenc_string(text: Text) -> Result[Bytes, Text]:
@@ -256,6 +262,8 @@ fn mysql_parse_handshake_v10(payload: Bytes) -> Result[MysqlHandshakeV10, Text]:
         return err(result_unwrap_error(cap_low_res))
     let cap_low: Number = result_unwrap(cap_low_res)
     set cursor = cursor + 2
+    if cursor >= total:
+        return err("MySQL handshake underflow reading charset")
     let charset: Number = bytes_get(payload, cursor)
     set cursor = cursor + 1
     let status_res: Result[Number, Text] = mysql_read_u16_le(payload, cursor)
@@ -269,6 +277,8 @@ fn mysql_parse_handshake_v10(payload: Bytes) -> Result[MysqlHandshakeV10, Text]:
     let cap_high: Number = result_unwrap(cap_high_res)
     set cursor = cursor + 2
     let full_cap: Number = cap_low + cap_high * 65536
+    if cursor >= total:
+        return err("MySQL handshake underflow reading auth plugin data length")
     let auth_plugin_data_len: Number = bytes_get(payload, cursor)
     set cursor = cursor + 1
     set cursor = cursor + 10
@@ -290,7 +300,23 @@ fn mysql_parse_handshake_v10(payload: Bytes) -> Result[MysqlHandshakeV10, Text]:
             set plugin_name = result_unwrap(plugin_str_res).value
     return ok(MysqlHandshakeV10(proto_ver, server_ver_item.value, conn_id, salt_bytes, full_cap, charset, status_val, plugin_name))
 
+fn mysql_text_has_nul(value: Text) -> Boolean:
+    let raw: Bytes = bytes_from_text(value)
+    var i: Number = 0
+    while i < bytes_length(raw):
+        if bytes_get(raw, i) == 0:
+            return true
+        set i = i + 1
+    return false
+
 fn mysql_handshake_response_41(username: Text, auth_data: Bytes, database: Option[Text], plugin_name: Text, sequence_id: Number) -> Result[Bytes, Text]:
+    if mysql_text_has_nul(username) or mysql_text_has_nul(plugin_name):
+        return err("MySQL handshake text parameter contains embedded NUL")
+    if option_is_some(database) and mysql_text_has_nul(option_unwrap(database)):
+        return err("MySQL handshake database name contains embedded NUL")
+    let auth_len: Number = bytes_length(auth_data)
+    if auth_len > 255:
+        return err("MySQL handshake auth_data exceeds 255-byte length prefix")
     var client_flags: Number = 512 + 1 + 2 + 32768 + 524288
     if option_is_some(database):
         set client_flags = client_flags + 8
@@ -307,7 +333,6 @@ fn mysql_handshake_response_41(username: Text, auth_data: Bytes, database: Optio
         set reserved = bytes_concat(reserved, bytes_from_number(0))
         set r_idx = r_idx + 1
     let user_cstring: Bytes = mysql_cstring(username)
-    let auth_len: Number = bytes_length(auth_data)
     let auth_with_len: Bytes = bytes_concat(bytes_from_number(auth_len), auth_data)
     var payload: Bytes = bytes_concat(result_unwrap(cap_res), result_unwrap(max_pkt_res))
     set payload = bytes_concat(payload, charset_byte)
@@ -421,7 +446,7 @@ fn mysql_read_lenenc_string(payload: Bytes, offset: Number) -> Result[MysqlCStri
         return err(result_unwrap_error(len_res))
     let item: MysqlLenencInt = result_unwrap(len_res)
     let cursor: Number = offset + item.bytes_consumed
-    if cursor + item.value > bytes_length(payload):
+    if item.value < 0 or item.value > bytes_length(payload) - cursor:
         return err("MySQL buffer underflow reading lenenc string")
     let raw: Bytes = bytes_slice(payload, cursor, item.value)
     let str_opt: Option[Text] = bytes_to_text_checked(raw)
@@ -430,6 +455,7 @@ fn mysql_read_lenenc_string(payload: Bytes, offset: Number) -> Result[MysqlCStri
     return ok(MysqlCString(option_unwrap(str_opt), item.bytes_consumed + item.value))
 
 fn mysql_parse_column_definition(payload: Bytes) -> Result[MysqlColumnDefinition, Text]:
+    let total: Number = bytes_length(payload)
     var cursor: Number = 0
     let cat_res: Result[MysqlCString, Text] = mysql_read_lenenc_string(payload, cursor)
     if not result_is_ok(cat_res): return err(result_unwrap_error(cat_res))
@@ -466,12 +492,14 @@ fn mysql_parse_column_definition(payload: Bytes) -> Result[MysqlColumnDefinition
     if not result_is_ok(col_len_res): return err(result_unwrap_error(col_len_res))
     let col_len: Number = result_unwrap(col_len_res)
     set cursor = cursor + 4
+    if cursor >= total: return err("MySQL column definition truncated before column type")
     let col_type: Number = bytes_get(payload, cursor)
     set cursor = cursor + 1
     let flags_res: Result[Number, Text] = mysql_read_u16_le(payload, cursor)
     if not result_is_ok(flags_res): return err(result_unwrap_error(flags_res))
     let flags: Number = result_unwrap(flags_res)
     set cursor = cursor + 2
+    if cursor >= total: return err("MySQL column definition truncated before decimals")
     let decimals: Number = bytes_get(payload, cursor)
     return ok(MysqlColumnDefinition(catalog, schema, table, org_table, name, org_name, charset, col_len, col_type, flags, decimals))
 

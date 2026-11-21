@@ -12,16 +12,16 @@ The editor extension is JavaScript that calls the YAZA native CLI for checks. It
 
 ## Install locally
 
-Install from the packaged `.vsix` downloaded from [GitHub Releases](https://github.com/yazaprojectstudios/yaza-language/releases/tag/v1.0.0):
+Install from the packaged `.vsix` downloaded from [GitHub Releases](https://github.com/yazaprojectstudios/yaza-language/releases/tag/v1.0.2):
 
 ```sh
-code --install-extension yaza-language-support-1.0.0.vsix
+code --install-extension yaza-language-support-1.0.2.vsix
 ```
 
 Or copy this folder to:
 
 ```text
-~/.vscode/extensions/yaza-language.yaza-language-support-1.0.0
+~/.vscode/extensions/yaza-language.yaza-language-support-1.0.2
 ```
 
 Restart VS Code, then open a `.yz` file. For VS Code Insiders, use `~/.vscode-insiders/extensions/` instead.
