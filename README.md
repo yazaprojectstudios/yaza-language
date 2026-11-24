@@ -206,12 +206,14 @@ Generates (with `yaza new --mobile` or `yaza init --mobile`) a pure native Andro
 yaza new --mobile my_mobile_app     # or: mkdir existing && yaza init --mobile existing
 cd my_mobile_app
 yaza mobile doctor
-yaza mobile run --target android     # auto-detects/boots AVD, builds, deploys & live-reloads
-yaza mobile run --target ios         # auto-detects/boots Simulator, builds, deploys & live-reloads
+yaza mobile run android             # auto-detects/boots AVD, builds debug, & live hot-swaps
+yaza mobile run ios                 # auto-detects/boots Simulator, builds debug, & live hot-swaps
 yaza mobile run --target android --once
+yaza mobile build --target android-arm64 --debug    # emits libyaza_mobile.so + libyaza_mobile_hotswap.so
+yaza mobile build --target android-arm64 --release  # production -O2 static/shared build (no hot-swap)
 ```
 
-`yaza mobile run --target android` (alias: `android-emulator`) and `yaza mobile run --target ios` (alias: `ios-simulator`) support automatic single-device selection, interactive multi-device selection, auto-booting an AVD or iPhone simulator when idle, and a live file watcher (`src/**/*.yz`, `yaza.toml`, `mobile/android/**`, `mobile/ios/**`) that incrementally rebuilds and hot-reloads without exiting on compile errors. Verified with `0 leaks / 0 bytes` under `ASan+UBSan`, `TSan`, and `leaks --atExit`.
+`yaza mobile run [android|ios]` (also `--target android|ios` and aliases `android-emulator` / `ios-simulator`) defaults to **debug mode** (`YAZA_MOBILE_BUILD_MODE=debug`, `-O0`) with **Debug Dynamic Core Hot-Swap (`dlopen`)**: edits inside `src/**/*.yz` or `yaza.toml` recompile the core and swap `yaza_mobile_v1_*` pointers in-process without closing or restarting the app (`⚡ <file> changed -> hot-swapped in ...ms, no restart`), while native UI edits under `mobile/android/**` or `mobile/ios/**` trigger a full rebuild and relaunch (`Ctrl+C` stops cleanly, `--once` disables watching). Verified with `0 leaks / 0 bytes` under `ASan+UBSan`, `TSan`, and `leaks --atExit`.
 
 ### Minimal API & SSR Web Starters (`--minimal-api` & `--web`)
 For zero-boilerplate JSON microservices or lightweight SSR sites without an embedded SQL layer:
