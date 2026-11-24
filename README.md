@@ -200,18 +200,18 @@ yaza run
 ```
 
 ### Native Mobile Starter (`--mobile` · RFC 0010)
-Generates a native Android (Kotlin + JNI) and iOS (Swift / SwiftUI) UI shell connected to an **LLVM AOT ARM64 YAZA Native Core Engine** (domain logic, state reducer, task arenas, and `--export-request` embedded `YazaBase` KV persistence via `std/db/yazabase_mobile_kv`) through the versioned C ABI (`yaza_mobile_v1.h`):
+Generates (with `yaza new --mobile` or `yaza init --mobile`) a pure native Android (Kotlin + JNI) and iOS (Swift / SwiftUI) **Dumb UI** shell connected to a modular **MVI / Outbox LLVM AOT ARM64 YAZA Core Engine** (`src/state/`, `src/actions/`, `src/domain/`, `src/effects/` + `std/ybif` binary snapshots & `std/db/yazabase_mobile_kv` persistence) through the versioned C ABI (`yaza_mobile_v1.h`):
 
 ```sh
-yaza new --mobile my_mobile_app
+yaza new --mobile my_mobile_app     # or: mkdir existing && yaza init --mobile existing
 cd my_mobile_app
 yaza mobile doctor
-yaza mobile build --target android-arm64 --release
-yaza mobile build --target ios-arm64 --release
-yaza mobile build --target ios-simulator-arm64 --release
+yaza mobile run --target android     # auto-detects/boots AVD, builds, deploys & live-reloads
+yaza mobile run --target ios         # auto-detects/boots Simulator, builds, deploys & live-reloads
+yaza mobile run --target android --once
 ```
 
-`yaza mobile run --target android-emulator` installs and launches on a connected Android device/AVD (`android-arm64/libyaza_mobile.so`, `190,432 B`); `yaza mobile run --target ios-simulator` launches on a booted Apple Silicon iOS Simulator (`ios-simulator-arm64/libyaza_mobile.a`, `233,440 B`; device archive `ios-arm64/libyaza_mobile.a`, `237,480 B`). Verified with `0 leaks / 0 bytes` under `ASan+UBSan`, `TSan`, and `leaks --atExit`.
+`yaza mobile run --target android` (alias: `android-emulator`) and `yaza mobile run --target ios` (alias: `ios-simulator`) support automatic single-device selection, interactive multi-device selection, auto-booting an AVD or iPhone simulator when idle, and a live file watcher (`src/**/*.yz`, `yaza.toml`, `mobile/android/**`, `mobile/ios/**`) that incrementally rebuilds and hot-reloads without exiting on compile errors. Verified with `0 leaks / 0 bytes` under `ASan+UBSan`, `TSan`, and `leaks --atExit`.
 
 ### Minimal API & SSR Web Starters (`--minimal-api` & `--web`)
 For zero-boilerplate JSON microservices or lightweight SSR sites without an embedded SQL layer:

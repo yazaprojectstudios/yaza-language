@@ -27,6 +27,7 @@ android {
 }
 
 val buildYazaEngine by tasks.registering(Exec::class) {
+    onlyIf { System.getenv("YAZA_SKIP_ENGINE_BUILD") != "1" }
     workingDir(rootProject.projectDir.parentFile.parentFile)
     val envYaza = System.getenv("YAZA_BIN")?.takeIf { File(it).canExecute() }
     val homeYaza = File(System.getProperty("user.home"), ".yaza/bin/yaza")

@@ -1,0 +1,556 @@
+#!/usr/bin/env python3
+"""YAZA Mobile smart target selector, emulator/simulator runner, and live reload loop."""
+
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from typing import Dict, List, Optional, Tuple
+
+
+STOP_REQUESTED = False
+ACTIVE_CHILD: Optional[subprocess.Popen] = None
+
+
+def handle_signal(signum: int, _frame: object) -> None:
+    global STOP_REQUESTED
+    STOP_REQUESTED = True
+    if ACTIVE_CHILD is not None and ACTIVE_CHILD.poll() is None:
+        try:
+            ACTIVE_CHILD.terminate()
+        except OSError:
+            pass
+
+
+def now_hms() -> str:
+    return time.strftime("%H:%M:%S")
+
+
+def is_interactive() -> bool:
+    return sys.stdin.isatty() or os.environ.get("YAZA_MOBILE_FORCE_TTY") == "1"
+
+
+def prompt_choice(title: str, options: List[str]) -> int:
+    print(title, flush=True)
+    for idx, label in enumerate(options, 1):
+        print(f"  [{idx}] {label}", flush=True)
+    while not STOP_REQUESTED:
+        try:
+            raw = input(f"Pilih nomor [1-{len(options)}]: ").strip()
+        except KeyboardInterrupt:
+            raise SystemExit(0)
+        except EOFError:
+            raise SystemExit(1)
+        if raw.isdigit():
+            val = int(raw)
+            if 1 <= val <= len(options):
+                return val - 1
+        print(f"Pilihan tidak valid; masukkan angka 1 sampai {len(options)}.", file=sys.stderr, flush=True)
+    raise SystemExit(0)
+
+
+def normalize_target(raw_target: str) -> str:
+    if raw_target == "android-emulator" or raw_target == "android":
+        return "android"
+    if raw_target == "ios-simulator" or raw_target == "ios":
+        return "ios"
+    if raw_target in ("", "auto"):
+        if not is_interactive():
+            print("Usage: yaza mobile run [--target <android|ios>] [--once]", file=sys.stderr)
+            print("  --target android   Jalankan & pantau di emulator/perangkat Android", file=sys.stderr)
+            print("  --target ios       Jalankan & pantau di simulator iOS (macOS)", file=sys.stderr)
+            print("  --once             Jalankan build & launch satu kali tanpa live watcher", file=sys.stderr)
+            raise SystemExit(2)
+        choice = prompt_choice("Pilih target platform mobile:", ["android (Android Emulator / Device)", "ios (iOS Simulator)"])
+        return "android" if choice == 0 else "ios"
+    print(f"error: unsupported mobile run target: {raw_target}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def run_cmd(cmd: List[str], cwd: Optional[str] = None, env: Optional[Dict[str, str]] = None, capture: bool = False) -> Tuple[int, str]:
+    global ACTIVE_CHILD
+    if capture:
+        proc = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        return proc.returncode, proc.stdout or ""
+    proc = subprocess.Popen(cmd, cwd=cwd, env=env)
+    ACTIVE_CHILD = proc
+    try:
+        rc = proc.wait()
+    finally:
+        ACTIVE_CHILD = None
+    return rc, ""
+
+
+def find_adb() -> str:
+    adb = os.environ.get("YAZA_ADB_BIN") or shutil.which("adb") or ""
+    if not adb:
+        sdk = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT") or ""
+        if sdk and os.path.isfile(os.path.join(sdk, "platform-tools", "adb")):
+            adb = os.path.join(sdk, "platform-tools", "adb")
+    if not adb:
+        print("error: Android platform-tools (adb) are required", file=sys.stderr)
+        raise SystemExit(1)
+    return adb
+
+
+def find_emulator() -> str:
+    emu = os.environ.get("YAZA_EMULATOR_BIN") or shutil.which("emulator") or ""
+    if not emu:
+        sdk = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT") or ""
+        if sdk and os.path.isfile(os.path.join(sdk, "emulator", "emulator")):
+            emu = os.path.join(sdk, "emulator", "emulator")
+    return emu
+
+
+def find_gradle() -> str:
+    gradle = os.environ.get("YAZA_GRADLE_BIN") or shutil.which("gradle") or ""
+    if not gradle:
+        print("error: Gradle is required; install it or set YAZA_GRADLE_BIN", file=sys.stderr)
+        raise SystemExit(1)
+    return gradle
+
+
+def parse_adb_devices(output: str, adb_bin: str) -> List[Tuple[str, str]]:
+    devices: List[Tuple[str, str]] = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line or line.startswith("List of devices"):
+            continue
+        parts = line.split()
+        if len(parts) < 2 or parts[1] != "device":
+            continue
+        serial = parts[0]
+        model = ""
+        for token in parts[2:]:
+            if token.startswith("model:"):
+                model = token.split(":", 1)[1].replace("_", " ")
+                break
+        if serial.startswith("emulator-"):
+            rc, avd_out = run_cmd([adb_bin, "-s", serial, "emu", "avd", "name"], capture=True)
+            avd_lines = [ln.strip() for ln in avd_out.splitlines() if ln.strip() and ln.strip() != "OK"]
+            if rc == 0 and avd_lines:
+                model = avd_lines[0]
+        label = model or "Android device"
+        devices.append((serial, label))
+    return devices
+
+
+def detect_android_device(adb_bin: str) -> Tuple[str, str]:
+    rc, out = run_cmd([adb_bin, "devices", "-l"], capture=True)
+    if rc != 0:
+        print(f"error: failed to list Android devices: {out.strip()}", file=sys.stderr)
+        raise SystemExit(1)
+    active = parse_adb_devices(out, adb_bin)
+    if len(active) == 1:
+        serial, label = active[0]
+        print(f"✓ Target terdeteksi otomatis: {serial} ({label})", flush=True)
+        return serial, label
+    if len(active) > 1:
+        idx = prompt_choice(
+            "Ditemukan beberapa perangkat/emulator Android aktif:",
+            [f"{s} ({lbl})" for s, lbl in active],
+        )
+        return active[idx]
+
+    # 0 active devices -> inspect available AVDs via emulator -list-avds
+    emu_bin = find_emulator()
+    if not emu_bin:
+        print("error: tidak ada perangkat/emulator Android aktif dan binary 'emulator' tidak ditemukan.", file=sys.stderr)
+        raise SystemExit(1)
+    rc_avd, avd_out = run_cmd([emu_bin, "-list-avds"], capture=True)
+    avds = [ln.strip() for ln in avd_out.splitlines() if ln.strip()]
+    if rc_avd != 0 or not avds:
+        print("error: tidak ada AVD Android tersedia. Buat AVD di Android Studio lalu coba lagi.", file=sys.stderr)
+        raise SystemExit(1)
+    if len(avds) == 1:
+        chosen_avd = avds[0]
+        print(f"↺ Tidak ada emulator aktif. Mem-boot AVD tunggal: {chosen_avd} ...", flush=True)
+    else:
+        idx = prompt_choice("Tidak ada emulator aktif. Pilih AVD untuk dijalankan:", avds)
+        chosen_avd = avds[idx]
+        print(f"↺ Mem-boot AVD: {chosen_avd} ...", flush=True)
+
+    subprocess.Popen(
+        [emu_bin, "-avd", chosen_avd],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+    timeout_s = float(os.environ.get("YAZA_MOBILE_BOOT_TIMEOUT", "180"))
+    poll_s = float(os.environ.get("YAZA_MOBILE_POLL_INTERVAL", "1.0"))
+    deadline = time.monotonic() + timeout_s
+    while not STOP_REQUESTED and time.monotonic() < deadline:
+        rc_d, out_d = run_cmd([adb_bin, "devices", "-l"], capture=True)
+        if rc_d == 0:
+            online = parse_adb_devices(out_d, adb_bin)
+            if online:
+                serial, label = online[0]
+                rc_b, prop_out = run_cmd([adb_bin, "-s", serial, "shell", "getprop", "sys.boot_completed"], capture=True)
+                if rc_b == 0 and prop_out.strip() == "1":
+                    print(f"✓ Emulator siap: {serial} ({chosen_avd})", flush=True)
+                    return serial, chosen_avd
+        time.sleep(poll_s)
+
+    print("error: timeout menunggu emulator Android selesai boot (sys.boot_completed != 1).", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def parse_simctl_runtime_label(runtime_key: str) -> str:
+    # Example: com.apple.CoreSimulator.SimRuntime.iOS-18-2 -> iOS 18.2
+    tail = runtime_key.rsplit(".", 1)[-1]
+    if "-" in tail:
+        parts = tail.split("-")
+        return f"{parts[0]} {'.'.join(parts[1:])}"
+    return tail
+
+
+def detect_ios_simulator() -> Tuple[str, str, str]:
+    rc, out = run_cmd(["xcrun", "simctl", "list", "devices", "available", "-j"], capture=True)
+    if rc != 0:
+        print(f"error: failed to query iOS simulators: {out.strip()}", file=sys.stderr)
+        raise SystemExit(1)
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError as exc:
+        print(f"error: invalid JSON from simctl: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+
+    booted: List[Tuple[str, str, str]] = []
+    available_iphones: List[Tuple[str, str, str]] = []
+    for runtime_key, dev_list in data.get("devices", {}).items():
+        rt_label = parse_simctl_runtime_label(runtime_key)
+        for dev in dev_list:
+            if dev.get("isAvailable") is False:
+                continue
+            udid = dev.get("udid", "")
+            name = dev.get("name", "iPhone Simulator")
+            state = dev.get("state", "")
+            if state == "Booted":
+                booted.append((udid, name, rt_label))
+            if "iPhone" in name or "iPhone" in dev.get("deviceTypeIdentifier", ""):
+                available_iphones.append((udid, name, rt_label))
+
+    if len(booted) == 1:
+        udid, name, rt = booted[0]
+        print(f"✓ Simulator terdeteksi otomatis: {name} ({rt} · {udid})", flush=True)
+        return udid, name, rt
+    if len(booted) > 1:
+        idx = prompt_choice(
+            "Ditemukan beberapa simulator iOS aktif (Booted):",
+            [f"{name} · {rt} ({udid})" for udid, name, rt in booted],
+        )
+        return booted[idx]
+
+    # 0 Booted
+    if not available_iphones:
+        print("error: tidak ada simulator iPhone iOS yang tersedia di Xcode.", file=sys.stderr)
+        raise SystemExit(1)
+    if len(available_iphones) == 1:
+        udid, name, rt = available_iphones[0]
+        print(f"↺ Tidak ada simulator Booted. Mem-boot simulator tunggal: {name} ({rt}) ...", flush=True)
+    else:
+        idx = prompt_choice(
+            "Tidak ada simulator Booted. Pilih simulator iPhone untuk dijalankan:",
+            [f"{name} · {rt} ({udid})" for udid, name, rt in available_iphones],
+        )
+        udid, name, rt = available_iphones[idx]
+        print(f"↺ Mem-boot simulator: {name} ({rt}) ...", flush=True)
+
+    run_cmd(["xcrun", "simctl", "boot", udid], capture=True)
+    run_cmd(["open", "-a", "Simulator"], capture=True)
+    rc_wait, wait_out = run_cmd(["xcrun", "simctl", "bootstatus", udid, "-b"], capture=True)
+    if rc_wait != 0:
+        print(f"error: simulator gagal bootstatus: {wait_out.strip()}", file=sys.stderr)
+        raise SystemExit(1)
+    print(f"✓ Simulator siap: {name} ({rt} · {udid})", flush=True)
+    return udid, name, rt
+
+
+def discover_android_metadata(project_root: pathlib.Path) -> Tuple[str, str]:
+    app_id = "dev.yaza.mobile"
+    activity = ".MainActivity"
+    gradle_kts = project_root / "mobile" / "android" / "app" / "build.gradle.kts"
+    if gradle_kts.is_file():
+        m = re.search(r'applicationId\s*=\s*"([^"]+)"', gradle_kts.read_text(encoding="utf-8", errors="ignore"))
+        if m:
+            app_id = m.group(1)
+    manifest = project_root / "mobile" / "android" / "app" / "src" / "main" / "AndroidManifest.xml"
+    if manifest.is_file():
+        m = re.search(r'<activity[^>]*android:name="([^"]+)"', manifest.read_text(encoding="utf-8", errors="ignore"))
+        if m:
+            activity = m.group(1)
+    return app_id, activity
+
+
+def discover_ios_metadata(project_root: pathlib.Path) -> Tuple[pathlib.Path, str, str]:
+    ios_dir = project_root / "mobile" / "ios"
+    projs = sorted(ios_dir.glob("*.xcodeproj"))
+    proj_path = projs[0] if projs else (ios_dir / "YazaMobile.xcodeproj")
+    scheme = proj_path.stem
+    schemes_dir = proj_path / "xcshareddata" / "xcschemes"
+    if schemes_dir.is_dir():
+        schemes = sorted(schemes_dir.glob("*.xcscheme"))
+        if schemes:
+            scheme = schemes[0].stem
+    bundle_id = "dev.yaza.mobile"
+    pbxproj = proj_path / "project.pbxproj"
+    if pbxproj.is_file():
+        m = re.search(r'PRODUCT_BUNDLE_IDENTIFIER\s*=\s*([^;\s"]+)', pbxproj.read_text(encoding="utf-8", errors="ignore"))
+        if m:
+            bundle_id = m.group(1)
+    return proj_path, scheme, bundle_id
+
+
+def find_apk(project_root: pathlib.Path) -> pathlib.Path:
+    apk_dir = project_root / "mobile" / "android" / "app" / "build" / "outputs" / "apk" / "debug"
+    apks = sorted(apk_dir.glob("*.apk"))
+    if apks:
+        return apks[0]
+    return apk_dir / "app-debug.apk"
+
+
+def build_core_engine(yaza_bin: str, core_target: str, project_root: str) -> Tuple[bool, int, str]:
+    t0 = time.monotonic()
+    rc, out = run_cmd([yaza_bin, "mobile", "build", "--target", core_target, "--debug"], cwd=project_root, capture=True)
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    return rc == 0, elapsed_ms, out
+
+
+def deploy_android(
+    yaza_bin: str,
+    project_root: pathlib.Path,
+    adb_bin: str,
+    gradle_bin: str,
+    serial: str,
+    rebuild_apk: bool = True,
+) -> Tuple[bool, str]:
+    app_id, activity = discover_android_metadata(project_root)
+    env = os.environ.copy()
+    env["YAZA_SKIP_ENGINE_BUILD"] = "1"
+    if rebuild_apk:
+        rc, g_out = run_cmd([gradle_bin, "assembleDebug"], cwd=str(project_root / "mobile" / "android"), env=env, capture=True)
+        if rc != 0:
+            return False, f"Gradle build gagal:\n{g_out}"
+    apk_path = find_apk(project_root)
+    if not apk_path.is_file():
+        return False, f"APK debug tidak ditemukan: {apk_path}"
+    rc_in, in_out = run_cmd([adb_bin, "-s", serial, "install", "-r", "-t", str(apk_path)], capture=True)
+    if rc_in != 0:
+        return False, f"adb install gagal:\n{in_out}"
+    run_cmd([adb_bin, "-s", serial, "shell", "am", "force-stop", app_id], capture=True)
+    comp = f"{app_id}/{activity}"
+    rc_st, _ = run_cmd([adb_bin, "-s", serial, "shell", "am", "start", "-n", comp], capture=True)
+    if rc_st != 0:
+        rc_mk, mk_out = run_cmd([adb_bin, "-s", serial, "shell", "monkey", "-p", app_id, "1"], capture=True)
+        if rc_mk != 0:
+            return False, f"Gagal meluncurkan app Android:\n{mk_out}"
+    return True, app_id
+
+
+def deploy_ios(
+    project_root: pathlib.Path,
+    udid: str,
+) -> Tuple[bool, str]:
+    proj_path, scheme, bundle_id = discover_ios_metadata(project_root)
+    derived = project_root / "build" / "mobile" / "ios-derived"
+    env = os.environ.copy()
+    env["YAZA_SKIP_ENGINE_BUILD"] = "1"
+    rc_xb, xb_out = run_cmd(
+        [
+            "xcodebuild",
+            "-project",
+            str(proj_path),
+            "-scheme",
+            scheme,
+            "-configuration",
+            "Debug",
+            "-sdk",
+            "iphonesimulator",
+            "-destination",
+            f"id={udid}",
+            "-derivedDataPath",
+            str(derived),
+            "CODE_SIGNING_ALLOWED=NO",
+            "build",
+        ],
+        env=env,
+        capture=True,
+    )
+    if rc_xb != 0:
+        return False, f"xcodebuild gagal:\n{xb_out}"
+    app_path = derived / "Build" / "Products" / "Debug-iphonesimulator" / f"{scheme}.app"
+    if not app_path.is_dir():
+        apps = sorted((derived / "Build" / "Products" / "Debug-iphonesimulator").glob("*.app"))
+        if apps:
+            app_path = apps[0]
+    rc_in, in_out = run_cmd(["xcrun", "simctl", "install", udid, str(app_path)], capture=True)
+    if rc_in != 0:
+        return False, f"xcrun simctl install gagal:\n{in_out}"
+    rc_ln, ln_out = run_cmd(
+        ["xcrun", "simctl", "launch", "--terminate-running-process", udid, bundle_id],
+        capture=True,
+    )
+    if rc_ln != 0:
+        return False, f"xcrun simctl launch gagal:\n{ln_out}"
+    return True, bundle_id
+
+
+def snapshot_watch_files(project_root: pathlib.Path, platform: str) -> Dict[str, int]:
+    ignore_dirs = {"build", ".gradle", "DerivedData", ".git", ".idea", "node_modules"}
+    roots = [project_root / "src", project_root / "mobile" / platform]
+    mtimes: Dict[str, int] = {}
+    manifest = project_root / "yaza.toml"
+    if manifest.is_file():
+        mtimes["yaza.toml"] = manifest.stat().st_mtime_ns
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in ignore_dirs and not d.startswith(".")]
+            for fn in filenames:
+                if fn.startswith(".") or fn.endswith("~") or fn.endswith(".swp"):
+                    continue
+                full = pathlib.Path(dirpath) / fn
+                try:
+                    rel = str(full.relative_to(project_root))
+                    mtimes[rel] = full.stat().st_mtime_ns
+                except OSError:
+                    pass
+    return mtimes
+
+
+def changed_paths(prev: Dict[str, int], curr: Dict[str, int]) -> List[str]:
+    changed: List[str] = []
+    for k, v in curr.items():
+        if prev.get(k) != v:
+            changed.append(k)
+    for k in prev:
+        if k not in curr:
+            changed.append(k)
+    return sorted(changed)
+
+
+def watch_loop(
+    yaza_bin: str,
+    platform: str,
+    project_root: pathlib.Path,
+    device_id: str,
+    adb_bin: str = "",
+    gradle_bin: str = "",
+) -> None:
+    core_target = "android-arm64" if platform == "android" else "ios-simulator-arm64"
+    print(
+        f"\n👀 Live Watch aktif ({platform} · {device_id}) memantau src/**/*.yz, yaza.toml, mobile/{platform}/**. Tekan Ctrl+C untuk berhenti.",
+        flush=True,
+    )
+    last_snap = snapshot_watch_files(project_root, platform)
+    pending_changes: List[str] = []
+    last_change_ts = 0.0
+
+    while not STOP_REQUESTED:
+        time.sleep(0.10)
+        if STOP_REQUESTED:
+            break
+        curr_snap = snapshot_watch_files(project_root, platform)
+        diffs = changed_paths(last_snap, curr_snap)
+        if diffs:
+            last_snap = curr_snap
+            for d in diffs:
+                if d not in pending_changes:
+                    pending_changes.append(d)
+            last_change_ts = time.monotonic()
+            continue
+
+        if pending_changes and (time.monotonic() - last_change_ts) >= 0.25:
+            files = pending_changes[:]
+            pending_changes.clear()
+            primary = files[0]
+            t_start = time.monotonic()
+
+            ok_core, core_ms, core_out = build_core_engine(yaza_bin, core_target, str(project_root))
+            if not ok_core:
+                print(f"\n[{now_hms()}] ✗ Gagal kompilasi YAZA setelah {primary} berubah:", file=sys.stderr, flush=True)
+                print(core_out.rstrip(), file=sys.stderr, flush=True)
+                print(f"[{now_hms()}]   Menunggu perbaikan file berikutnya...", file=sys.stderr, flush=True)
+                continue
+
+            if platform == "android":
+                ok_dep, dep_msg = deploy_android(yaza_bin, project_root, adb_bin, gradle_bin, device_id, rebuild_apk=True)
+            else:
+                ok_dep, dep_msg = deploy_ios(project_root, device_id)
+
+            total_ms = int((time.monotonic() - t_start) * 1000)
+            if not ok_dep:
+                print(f"\n[{now_hms()}] ✗ Gagal deploy {platform} setelah {primary} berubah:", file=sys.stderr, flush=True)
+                print(dep_msg.rstrip(), file=sys.stderr, flush=True)
+                print(f"[{now_hms()}]   Watcher tetap aktif. Menunggu perubahan...", file=sys.stderr, flush=True)
+            else:
+                print(f"[{now_hms()}] ↻ {primary} berubah -> rebuilt dalam {total_ms}ms (core {core_ms}ms) & reloaded", flush=True)
+
+
+def main() -> int:
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    if len(sys.argv) < 3:
+        print("Usage: dev_runner.py <yaza_bin> <android|ios|auto>", file=sys.stderr)
+        return 2
+
+    yaza_bin = sys.argv[1]
+    raw_target = sys.argv[2]
+    platform = normalize_target(raw_target)
+    project_root = pathlib.Path.cwd().resolve()
+    watch_enabled = os.environ.get("YAZA_MOBILE_WATCH", "1") != "0"
+
+    if platform == "android":
+        adb_bin = find_adb()
+        gradle_bin = find_gradle()
+        serial, _label = detect_android_device(adb_bin)
+        print("↺ Membangun YAZA Native Core (android-arm64)...", flush=True)
+        ok_core, core_ms, core_out = build_core_engine(yaza_bin, "android-arm64", str(project_root))
+        if not ok_core:
+            print(core_out, file=sys.stderr, flush=True)
+            return 1
+        print(f"✓ Core selesai ({core_ms}ms). Memasang & menjalankan di {serial}...", flush=True)
+        ok_dep, dep_msg = deploy_android(yaza_bin, project_root, adb_bin, gradle_bin, serial, rebuild_apk=True)
+        if not ok_dep:
+            print(dep_msg, file=sys.stderr, flush=True)
+            return 1
+        print(f"✓ Aplikasi {dep_msg} berjalan di {serial}.", flush=True)
+        if watch_enabled:
+            watch_loop(yaza_bin, "android", project_root, serial, adb_bin=adb_bin, gradle_bin=gradle_bin)
+    else:
+        if not shutil.which("xcodebuild") or not shutil.which("xcrun"):
+            print("error: Xcode command-line tools are required to run iOS", file=sys.stderr)
+            return 1
+        udid, name, _rt = detect_ios_simulator()
+        print("↺ Membangun YAZA Native Core (ios-simulator-arm64)...", flush=True)
+        ok_core, core_ms, core_out = build_core_engine(yaza_bin, "ios-simulator-arm64", str(project_root))
+        if not ok_core:
+            print(core_out, file=sys.stderr, flush=True)
+            return 1
+        print(f"✓ Core selesai ({core_ms}ms). Memasang & menjalankan di {name}...", flush=True)
+        ok_dep, dep_msg = deploy_ios(project_root, udid)
+        if not ok_dep:
+            print(dep_msg, file=sys.stderr, flush=True)
+            return 1
+        print(f"✓ Aplikasi {dep_msg} berjalan di {name} ({udid}).", flush=True)
+        if watch_enabled:
+            watch_loop(yaza_bin, "ios", project_root, udid)
+
+    if STOP_REQUESTED:
+        print("\n✓ Live reload dihentikan dengan bersih.", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

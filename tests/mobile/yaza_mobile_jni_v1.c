@@ -127,6 +127,13 @@ int main(void) {
         assert(r_snap->length == 5 && memcmp(r_snap->bytes + 4, "3", 1) == 0);
         mock_free_byte_array(r_snap);
 
+        jbyteArray p_act = make_input(env, "INCREMENT|2");
+        jbyteArray r_act = Java_dev_yaza_mobile_NativeEngine_nativeDispatch(env, NULL, handle, YAZA_MOBILE_EVENT_V1_ACTION, p_act);
+        assert(decode_status(r_act) == YAZA_MOBILE_V1_OK);
+        assert(r_act->length > 9 && memcmp(r_act->bytes + 4, "YBIF", 4) == 0 && (uint8_t)r_act->bytes[8] == 1U);
+        mock_free_byte_array(p_act);
+        mock_free_byte_array(r_act);
+
         jbyteArray p_err = make_input(env, "1001");
         jbyteArray r_err = Java_dev_yaza_mobile_NativeEngine_nativeDispatch(env, NULL, handle, YAZA_MOBILE_EVENT_V1_INCREMENT, p_err);
         assert(decode_status(r_err) == YAZA_MOBILE_V1_APPLICATION_ERROR);

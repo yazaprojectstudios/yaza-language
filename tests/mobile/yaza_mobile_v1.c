@@ -103,6 +103,65 @@ static void test_lifecycle_and_arena_soak(const YazaMobileHostV1 *host) {
     assert(yaza_mobile_v1_destroy(soak_engine) == YAZA_MOBILE_V1_OK);
 }
 
+static void expect_ybif_counter(const YazaMobileBufferV1 *buffer, int64_t expected_counter, const char *expected_needle) {
+    assert(buffer->data != NULL && buffer->length >= 5ULL);
+    assert(buffer->data[0] == 0x59U && buffer->data[1] == 0x42U && buffer->data[2] == 0x49U && buffer->data[3] == 0x46U);
+    assert(buffer->data[4] == 1U);
+    uint64_t pos = 5ULL;
+    for (int f = 0; f < 2; ++f) {
+        assert(pos + 5ULL <= buffer->length && buffer->data[pos] == 4U);
+        uint32_t slen = (uint32_t)buffer->data[pos + 1] | ((uint32_t)buffer->data[pos + 2] << 8) |
+                        ((uint32_t)buffer->data[pos + 3] << 16) | ((uint32_t)buffer->data[pos + 4] << 24);
+        pos += 5ULL + (uint64_t)slen;
+    }
+    assert(pos + 9ULL <= buffer->length && buffer->data[pos] == 3U);
+    uint64_t raw = 0;
+    for (int i = 0; i < 8; ++i) raw |= ((uint64_t)buffer->data[pos + 1 + i]) << (8 * i);
+    assert((int64_t)raw == expected_counter);
+    if (expected_needle != NULL) {
+        assert(contains_bytes(buffer->data, (size_t)buffer->length, expected_needle, strlen(expected_needle)));
+    }
+}
+
+static void test_action_ybif_and_bounds(const YazaMobileHostV1 *host) {
+    YazaMobileEngineHandleV1 eng = 0;
+    assert(yaza_mobile_v1_create(host, &eng) == YAZA_MOBILE_V1_OK);
+
+    YazaMobileBufferV1 out = {0};
+    assert(yaza_mobile_v1_dispatch(eng, YAZA_MOBILE_EVENT_V1_ACTION, view_of("INIT"), &out) == YAZA_MOBILE_V1_OK);
+    expect_ybif_counter(&out, 0, "Welcome to YAZA Mobile");
+    assert(yaza_mobile_v1_buffer_release(&out) == YAZA_MOBILE_V1_OK);
+
+    assert(yaza_mobile_v1_dispatch(eng, YAZA_MOBILE_EVENT_V1_ACTION, view_of("GREET|Yaza"), &out) == YAZA_MOBILE_V1_OK);
+    expect_ybif_counter(&out, 0, "Halo, Yaza!");
+    assert(yaza_mobile_v1_buffer_release(&out) == YAZA_MOBILE_V1_OK);
+
+    assert(yaza_mobile_v1_dispatch(eng, YAZA_MOBILE_EVENT_V1_ACTION, view_of("INCREMENT|3"), &out) == YAZA_MOBILE_V1_OK);
+    expect_ybif_counter(&out, 3, "KV_SAVE|counter|3");
+    assert(yaza_mobile_v1_buffer_release(&out) == YAZA_MOBILE_V1_OK);
+
+    assert(yaza_mobile_v1_dispatch(eng, YAZA_MOBILE_EVENT_V1_ACTION, view_of("GREET|   "), &out) == YAZA_MOBILE_V1_APPLICATION_ERROR);
+    assert(yaza_mobile_v1_buffer_release(&out) == YAZA_MOBILE_V1_OK);
+
+    assert(yaza_mobile_v1_dispatch(eng, YAZA_MOBILE_EVENT_V1_ACTION, view_of("PERSIST"), &out) == YAZA_MOBILE_V1_OK);
+    expect_ybif_counter(&out, 3, "State tersimpan: counter=3");
+    assert(yaza_mobile_v1_buffer_release(&out) == YAZA_MOBILE_V1_OK);
+
+    assert(yaza_mobile_v1_dispatch(eng, YAZA_MOBILE_EVENT_V1_ACTION, view_of("RESET"), &out) == YAZA_MOBILE_V1_OK);
+    expect_ybif_counter(&out, 0, "Counter direset");
+    assert(yaza_mobile_v1_buffer_release(&out) == YAZA_MOBILE_V1_OK);
+
+    assert(yaza_mobile_v1_dispatch(eng, YAZA_MOBILE_EVENT_V1_INCREMENT, view_of("4"), &out) == YAZA_MOBILE_V1_OK);
+    expect_state(&out, "4");
+
+    static uint8_t max_event_buf[YAZA_MOBILE_V1_MAX_EVENT_BYTES];
+    memset(max_event_buf, '9', sizeof(max_event_buf));
+    assert(yaza_mobile_v1_dispatch(eng, YAZA_MOBILE_EVENT_V1_INCREMENT, (YazaMobileView){max_event_buf, (uint64_t)sizeof(max_event_buf)}, &out) == YAZA_MOBILE_V1_APPLICATION_ERROR);
+    assert(yaza_mobile_v1_buffer_release(&out) == YAZA_MOBILE_V1_OK);
+
+    assert(yaza_mobile_v1_destroy(eng) == YAZA_MOBILE_V1_OK);
+}
+
 int main(void) {
     const YazaMobileHostV1 host = {sizeof(YazaMobileHostV1), YAZA_MOBILE_V1_ABI_VERSION, NULL, NULL};
     YazaMobileEngineHandleV1 engine = 0;
@@ -182,6 +241,7 @@ int main(void) {
 
     assert(yaza_mobile_v1_destroy(engine) == YAZA_MOBILE_V1_OK);
     test_lifecycle_and_arena_soak(&host);
+    test_action_ybif_and_bounds(&host);
 
     {
         char persist_dir[256];

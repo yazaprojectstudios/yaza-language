@@ -1,0 +1,74 @@
+# YBIF v1 State Encoder & Decoder (Zero fail-fast allocations; safe for --export-request).
+use "std/ybif"
+use "app_state"
+
+fn codec_encode_ybif(state: AppState) -> Result[Bytes, Text]:
+    let hdr: Bytes = ybif_try_header()?
+    let f1: Bytes = ybif_try_encode_text(state.title)?
+    let f2: Bytes = ybif_try_encode_text(state.greeting)?
+    let f3: Bytes = ybif_try_encode_number(state.counter)?
+    let f4: Bytes = ybif_try_encode_text(state.status)?
+    let f5: Bytes = ybif_try_encode_text(state.effects)?
+
+    let b1: Bytes = bytes_try_concat(hdr, f1)?
+    let b2: Bytes = bytes_try_concat(b1, f2)?
+    let b3: Bytes = bytes_try_concat(b2, f3)?
+    let b4: Bytes = bytes_try_concat(b3, f4)?
+    return bytes_try_concat(b4, f5)
+
+fn codec_read_text_at(data: Bytes, pos: Number, fallback: Text) -> Text:
+    let total: Number = bytes_length(data)
+    if pos < 0 or pos + 5 > total: return fallback
+    if bytes_get(data, pos) != 4: return fallback
+    let slen: Number = ybif_read_u32_le(data, pos + 1)
+    if slen < 0 or pos + 5 + slen > total: return fallback
+    let slice_res: Result[Bytes, Text] = bytes_try_slice(data, pos + 5, slen)
+    if not result_is_ok(slice_res): return fallback
+    let txt_res: Result[Text, Text] = bytes_try_to_text(result_unwrap(slice_res))
+    if not result_is_ok(txt_res): return fallback
+    return result_unwrap(txt_res)
+
+fn codec_skip_field(data: Bytes, pos: Number) -> Number:
+    let total: Number = bytes_length(data)
+    if pos < 0 or pos >= total: return -1
+    let tag: Number = bytes_get(data, pos)
+    if tag == 3:
+        if pos + 9 > total: return -1
+        return pos + 9
+    if tag == 4 or tag == 5:
+        if pos + 5 > total: return -1
+        let flen: Number = ybif_read_u32_le(data, pos + 1)
+        if flen < 0 or pos + 5 + flen > total: return -1
+        return pos + 5 + flen
+    return -1
+
+fn codec_decode_state(raw: Bytes) -> AppState:
+    let init_state: AppState = app_state_initial()
+    if ybif_try_is_valid_header(raw):
+        let p0: Number = 5
+        let title: Text = codec_read_text_at(raw, p0, init_state.title)
+        let p1: Number = codec_skip_field(raw, p0)
+        if p1 < 0: return init_state
+        let greeting: Text = codec_read_text_at(raw, p1, init_state.greeting)
+        let p2: Number = codec_skip_field(raw, p1)
+        if p2 < 0 or p2 + 9 > bytes_length(raw) or bytes_get(raw, p2) != 3:
+            return AppState(title, greeting, init_state.counter, init_state.status, "")
+        let counter: Number = ybif_read_i64_le(raw, p2 + 1)
+        let p3: Number = p2 + 9
+        let status: Text = codec_read_text_at(raw, p3, init_state.status)
+        let p4: Number = codec_skip_field(raw, p3)
+        var effects: Text = ""
+        if p4 >= 0:
+            set effects = codec_read_text_at(raw, p4, "")
+        return AppState(title, greeting, counter, status, effects)
+
+    let txt_res: Result[Text, Text] = bytes_try_to_text(raw)
+    if result_is_ok(txt_res):
+        let n_res: Result[Number, Text] = number_try_parse(result_unwrap(txt_res))
+        if result_is_ok(n_res):
+            return AppState(init_state.title, init_state.greeting, result_unwrap(n_res), init_state.status, "")
+    return init_state
+
+fn codec_counter_from_state(raw: Bytes) -> Number:
+    let decoded: AppState = codec_decode_state(raw)
+    return decoded.counter

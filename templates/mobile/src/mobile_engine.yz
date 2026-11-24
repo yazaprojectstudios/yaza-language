@@ -1,36 +1,33 @@
-use "std/db/yazabase_mobile_kv"
+# C ABI Entry Point (--export-request mobile_reduce)
+use "state/app_state"
+use "state/codec"
+use "actions/home_actions"
+use "domain/greeting"
 
-fn mobile_reduce_load(storage_dir: Text, fallback_state: Text) -> Text:
-    if storage_dir == "": return fallback_state
-    let loaded: Result[Text, Text] = yaza_db_embedded_kv_load_v1(storage_dir, "mobile_state.ydb", "counter")
-    if result_is_ok(loaded): return result_unwrap(loaded)
-    return fallback_state
-
-fn mobile_reduce_persist(storage_dir: Text, next_state: Text) -> Result[Text, Text]:
-    if storage_dir != "":
-        let _saved: Boolean = yaza_db_embedded_kv_store_v1(storage_dir, "mobile_state.ydb", "counter", next_state)?
-    return ok(next_state)
-
-# Export this reducer with: yaza emit-llvm-module --export-request mobile_reduce.
-fn mobile_reduce(event: Text, payload: Text, current_state: Text) -> Result[Text, Text]:
+fn mobile_reduce(event: Text, payload: Text, current_state: Bytes) -> Result[Bytes, Text]:
     let storage_dir: Text = env_get("YAZA_MOBILE_STORAGE_DIR")
+    if event == "action":
+        let state: AppState = codec_decode_state(current_state)
+        return home_handle_action(state, payload, storage_dir)
+
     if event == "snapshot":
-        return ok(mobile_reduce_load(storage_dir, current_state))
+        let cur: Number = home_load_persisted_counter(storage_dir, codec_counter_from_state(current_state))
+        let txt: Text = number_try_text(cur)?
+        return bytes_try_from_text(txt)
+
     if event == "reset":
-        return mobile_reduce_persist(storage_dir, "0")
+        let _saved: Boolean = home_persist_counter(storage_dir, 0)?
+        return bytes_try_from_text("0")
+
     if event == "increment":
-        var step: Number = 1
-        if payload != "":
-            set step = number_try_parse(payload)?
-        if step < 1 or step > 1000:
-            return err("increment step must be between 1 and 1000")
-        let base_state: Text = mobile_reduce_load(storage_dir, current_state)
-        let current: Number = number_try_parse(base_state)?
-        if current < 0 or current > 9000000000000000000 - step:
-            return err("counter is outside the supported range")
-        let next_state: Text = number_try_text(current + step)?
-        return mobile_reduce_persist(storage_dir, next_state)
+        let step: Number = domain_validate_step(payload)?
+        let cur: Number = home_load_persisted_counter(storage_dir, codec_counter_from_state(current_state))
+        let next_val: Number = domain_next_counter(cur, step)?
+        let _saved: Boolean = home_persist_counter(storage_dir, next_val)?
+        let txt: Text = number_try_text(next_val)?
+        return bytes_try_from_text(txt)
+
     return err("unknown mobile event")
 
 start:
-    say "YAZA mobile reducer module"
+    say "YAZA mobile MVI reducer module"

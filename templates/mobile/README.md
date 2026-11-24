@@ -1,60 +1,44 @@
 # {{project_name}}
 
-Native Android and iOS starter backed by a YAZA compiled engine. The platform UI remains Kotlin/Android and SwiftUI/iOS; business state transitions run in the YAZA engine through the versioned `YazaMobile` C ABI.
+Native Android and iOS app built on **Shared YAZA Core (MVI + YBIF + Outbox Effect) + Pure Native Dumb UI**. All business logic, input validation, YBIF state encoding, and embedded YazaBase KV persistence live inside `src/`, while Android Kotlin and iOS SwiftUI render the screen ("Welcome to YAZA Mobile") and execute outbox effects through `yaza_mobile_v1.h`.
 
 ## Project layout
 
-- `src/mobile_engine.yz` contains the YAZA state reducer exported to native code.
-- `src/main.yz` runs a small CLI preview of the reducer.
-- `mobile/android/` contains the Android app shell and JNI adapter.
-- `mobile/ios/` contains the SwiftUI app shell and framework integration files.
-- `yaza.toml` stores project metadata.
+- `src/main.yz`: Desktop CLI smoke-test & verifier for state transitions and YBIF encoding.
+- `src/mobile_engine.yz`: C ABI entry point (`yaza emit-llvm-module --export-request mobile_reduce`).
+- `src/state/app_state.yz` & `src/state/codec.yz`: `AppState` model and binary **YBIF v1** (`std/ybif`) encoder/decoder.
+- `src/actions/home_actions.yz`: MVI action handlers (`INIT`, `GREET`, `INCREMENT`, `PERSIST`, `RESET`).
+- `src/domain/greeting.yz`: Pure business validation & counter domain rules.
+- `src/effects/outbox.yz`: Declarative outbox effect builders (`KV_SAVE`, `TOAST`, `HTTP`).
+- `mobile/android/`: Kotlin + JNI UI shell (Dumb View).
+- `mobile/ios/`: SwiftUI + Bridging Header UI shell (Dumb View).
 
-## Native engine bridge
-
-The bridge accepts bounded UTF-8 event payloads, runs one reducer call in a request-scoped arena, and returns an owned immutable buffer. Call `yaza_mobile_v1_buffer_release` for every returned buffer. Calls on one engine serialize state transitions. The state is held by the engine, so a reducer error does not change it. The starter submits reducer work to a background executor and updates UI state on the platform main thread; it allows one UI event at a time. This is platform-level dispatch, not YAZA `async`/`await` or a general task scheduler.
-
-The example supports snapshot, increment, and reset events. Android refreshes its visible state when the activity starts again; SwiftUI refreshes when the view task restarts. This snapshot is in-memory state for the lifetime of the YAZA engine, not durable storage. The starter discards stale UI results after screen/activity exit, but synchronous reducer work itself cannot be cancelled. It is a functional bridge demo, not yet a qualified store app: physical-device, storage, network, signing, and performance gates must pass before shipping.
-
-The mobile engine build disables the runtime's child-process launch primitive. Mobile OS sandboxes do not support desktop-style arbitrary process spawning; APIs that attempt it return exit status `127`.
-
-## Run the CLI preview
+## Run desktop smoke-test
 
 ```sh
 yaza run src/main.yz
 ```
 
-## Build and run the native app
-
-Check the platform tools from the generated project root:
+## Live development (Auto-Detect Device & Hot Reload)
 
 ```sh
 yaza mobile doctor
+yaza mobile run --target android
+yaza mobile run --target ios
 ```
 
-Build the engine library for Android ARM64, an iOS ARM64 device, or an Apple Silicon iOS simulator:
+### Features of `yaza mobile run`
+- **Compact `--target` flag:** Use `--target android` or `--target ios` (aliases `android-emulator` and `ios-simulator` remain supported; omit `--target` in a terminal to choose interactively).
+- **Smart device / simulator selection:**
+  - Automatically picks a single active emulator/simulator.
+  - Prompts for selection if multiple devices/simulators are running.
+  - Auto-boots (or prompts to boot) an Android AVD or iOS iPhone Simulator if none are running and waits for readiness.
+- **Live watch & reload loop:** Watches `src/**/*.yz`, `yaza.toml`, and `mobile/<platform>/**` (~250ms debounce), incrementally rebuilds native core + re-deploys on change, keeps running cleanly if a compile error occurs while editing, and stops cleanly on `Ctrl+C`. Use `--once` for a single build/launch cycle.
+
+## Direct native library builds
 
 ```sh
 yaza mobile build --target android-arm64 --release
 yaza mobile build --target ios-arm64 --release
 yaza mobile build --target ios-simulator-arm64 --release
 ```
-
-Run the starter on an Android emulator or a booted iOS simulator:
-
-```sh
-yaza mobile run --target android-emulator
-yaza mobile run --target ios-simulator
-```
-
-Android builds require Android SDK, NDK, Java, Gradle, and `adb`; iOS builds require macOS and Xcode. The current mobile build helper supports macOS/Linux hosts. The generated app is a bridge starter, not a production-qualified mobile framework; physical-device lifecycle, storage, network, signing, and performance gates remain open.
-
-When building from a YAZA source checkout, point the platform build at that checkout's compiler so an older installed `yaza` is not selected accidentally:
-
-```sh
-export YAZA_BIN="/path/to/yaza-language-public/build/yaza-llvm"
-```
-
-Android Gradle builds use the optimized YAZA engine for release tasks and a debug engine for debug-only tasks. If one invocation requests both build types, it uses the optimized engine artifact for both; the C ABI remains the same.
-
-From a YAZA source checkout, `sh scripts/validate-mobile-engine.sh` validates bridge round-trips, invalid input, output ownership, error rollback, and serialized concurrent dispatch.

@@ -46,10 +46,15 @@ IR="$OUT_DIR/mobile_engine.ll"
 BUILD_MODE=$(printenv YAZA_MOBILE_BUILD_MODE || true)
 if [ -z "$BUILD_MODE" ]; then BUILD_MODE=release; fi
 case "$BUILD_MODE" in
-  release|Release) OPT_FLAGS=-O2 ;;
-  debug|Debug) OPT_FLAGS=-O0 ;;
+  release|Release) BUILD_MODE=release; OPT_FLAGS=-O2 ;;
+  debug|Debug) BUILD_MODE=debug; OPT_FLAGS=-O0 ;;
   *) printf 'error: YAZA_MOBILE_BUILD_MODE must be release or debug\n' >&2; exit 2 ;;
 esac
+MODE_STAMP="$OUT_DIR/.build-mode"
+PREV_MODE=
+if [ -f "$MODE_STAMP" ]; then PREV_MODE=$(cat "$MODE_STAMP" || true); fi
+MODE_CHANGED=0
+if [ "$PREV_MODE" != "$BUILD_MODE" ]; then MODE_CHANGED=1; fi
 case "$TARGET_NAME" in
   ios-arm64)
     SDK=iphoneos
@@ -160,9 +165,25 @@ compile_object() {
       ;;
   esac
 }
+needs_c_rebuild() {
+  src=$1
+  obj=$2
+  if [ "$MODE_CHANGED" = 1 ] || [ ! -f "$obj" ] || [ "$src" -nt "$obj" ]; then
+    return 0
+  fi
+  if [ "$RUNTIME_DIR/include/yaza_runtime_v1.h" -nt "$obj" ] || [ "$BRIDGE_INCLUDE/yaza_mobile_v1.h" -nt "$obj" ]; then
+    return 0
+  fi
+  return 1
+}
+
 compile_object "$IR" "$OUT_DIR/mobile_engine.o"
-compile_object "$RUNTIME_SOURCE" "$OUT_DIR/yaza_runtime_v1.o"
-compile_object "$BRIDGE_SOURCE" "$OUT_DIR/yaza_mobile_v1.o"
+if needs_c_rebuild "$RUNTIME_SOURCE" "$OUT_DIR/yaza_runtime_v1.o"; then
+  compile_object "$RUNTIME_SOURCE" "$OUT_DIR/yaza_runtime_v1.o"
+fi
+if needs_c_rebuild "$BRIDGE_SOURCE" "$OUT_DIR/yaza_mobile_v1.o"; then
+  compile_object "$BRIDGE_SOURCE" "$OUT_DIR/yaza_mobile_v1.o"
+fi
 
 if [ "$IS_ANDROID" = 1 ]; then
   JNI_SOURCE="$PROJECT_ROOT/mobile/android/app/src/main/cpp/yaza_mobile_jni.c"
@@ -170,7 +191,9 @@ if [ "$IS_ANDROID" = 1 ]; then
     printf 'error: Android JNI adapter is missing: %s\n' "$JNI_SOURCE" >&2
     exit 1
   fi
-  compile_object "$JNI_SOURCE" "$OUT_DIR/yaza_mobile_jni.o"
+  if needs_c_rebuild "$JNI_SOURCE" "$OUT_DIR/yaza_mobile_jni.o"; then
+    compile_object "$JNI_SOURCE" "$OUT_DIR/yaza_mobile_jni.o"
+  fi
   "$CLANG" --target="$TRIPLE" "$OPT_FLAGS" -shared -fPIC -pthread -Wl,--no-undefined \
     "$OUT_DIR/mobile_engine.o" "$OUT_DIR/yaza_runtime_v1.o" \
     "$OUT_DIR/yaza_mobile_v1.o" "$OUT_DIR/yaza_mobile_jni.o" -lm \
@@ -181,6 +204,7 @@ else
   "$AR" rcs "$OUT_DIR/libyaza_mobile.a" "$OUT_DIR/mobile_engine.o" \
     "$OUT_DIR/yaza_runtime_v1.o" "$OUT_DIR/yaza_mobile_v1.o"
 fi
+printf '%s\n' "$BUILD_MODE" > "$MODE_STAMP"
 
 printf 'Built '
 if [ "$IS_ANDROID" = 1 ]; then

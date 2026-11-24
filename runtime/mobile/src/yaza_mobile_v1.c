@@ -8,8 +8,8 @@
 #include <string.h>
 
 #define YAZA_MOBILE_ENGINE_MAGIC UINT64_C(0x59415a414d4f4231)
-#define YAZA_MOBILE_PROCESS_ARENA_BYTES (8ULL * 1024ULL * 1024ULL)
-#define YAZA_MOBILE_REQUEST_ARENA_BYTES (1ULL * 1024ULL * 1024ULL)
+#define YAZA_MOBILE_PROCESS_ARENA_BYTES (16ULL * 1024ULL * 1024ULL)
+#define YAZA_MOBILE_REQUEST_ARENA_BYTES (4ULL * 1024ULL * 1024ULL)
 #define YAZA_MOBILE_INITIAL_STATE "0"
 #define YAZA_MOBILE_INITIAL_STATE_LENGTH 1ULL
 #define YAZA_MOBILE_MAX_OUTSTANDING_BUFFERS 4096ULL
@@ -36,6 +36,7 @@ struct YazaMobileEngine {
     YazaArenaCycleV1 *cycle;
     unsigned char *state;
     uint64_t state_length;
+    uint32_t state_input_kind;
     int closed;
     int closing;
 };
@@ -152,10 +153,16 @@ static int32_t yaza_mobile_buffer_create(const unsigned char *data, uint64_t len
     return YAZA_MOBILE_V1_OK;
 }
 
+static int yaza_mobile_is_ybif(const uint8_t *data, uint64_t length) {
+    return data != NULL && length >= 4ULL &&
+           data[0] == 0x59U && data[1] == 0x42U && data[2] == 0x49U && data[3] == 0x46U;
+}
+
 static int32_t yaza_mobile_event_text(uint32_t event_id, YazaMobileView *out_view) {
     static const unsigned char increment[] = "increment";
     static const unsigned char reset[] = "reset";
     static const unsigned char snapshot[] = "snapshot";
+    static const unsigned char action[] = "action";
     if (out_view == NULL) return YAZA_MOBILE_V1_INVALID_ARGUMENT;
     if (event_id == YAZA_MOBILE_EVENT_V1_INCREMENT) {
         out_view->data = increment;
@@ -170,6 +177,11 @@ static int32_t yaza_mobile_event_text(uint32_t event_id, YazaMobileView *out_vie
     if (event_id == YAZA_MOBILE_EVENT_V1_SNAPSHOT) {
         out_view->data = snapshot;
         out_view->length = sizeof(snapshot) - 1ULL;
+        return YAZA_MOBILE_V1_OK;
+    }
+    if (event_id == YAZA_MOBILE_EVENT_V1_ACTION) {
+        out_view->data = action;
+        out_view->length = sizeof(action) - 1ULL;
         return YAZA_MOBILE_V1_OK;
     }
     out_view->data = NULL;
@@ -285,7 +297,8 @@ int32_t yaza_mobile_v1_dispatch(YazaMobileEngineHandleV1 candidate, uint32_t eve
     }
     if (payload.length != 0 && payload.data == NULL) return YAZA_MOBILE_V1_INVALID_ARGUMENT;
     if (payload.length > YAZA_MOBILE_V1_MAX_EVENT_BYTES) return YAZA_MOBILE_V1_RESOURCE_LIMIT;
-    if (payload.length != 0 && !yaza_mobile_utf8_is_valid(payload.data, payload.length)) {
+    if (payload.length != 0 && !yaza_mobile_is_ybif(payload.data, payload.length) &&
+        !yaza_mobile_utf8_is_valid(payload.data, payload.length)) {
         return YAZA_MOBILE_V1_INVALID_ARGUMENT;
     }
 
@@ -310,10 +323,19 @@ int32_t yaza_mobile_v1_dispatch(YazaMobileEngineHandleV1 candidate, uint32_t eve
         return YAZA_MOBILE_V1_BUSY;
     }
 
-    const YazaModuleInputV1 inputs[3] = {
+    const uint32_t payload_kind = yaza_mobile_is_ybif(payload.data, payload.length)
+        ? YAZA_MODULE_INPUT_V1_BYTES
+        : YAZA_MODULE_INPUT_V1_TEXT;
+    const uint32_t initial_state_kind = engine->state_input_kind != 0
+        ? engine->state_input_kind
+        : (yaza_mobile_is_ybif(engine->state, engine->state_length)
+               ? YAZA_MODULE_INPUT_V1_BYTES
+               : YAZA_MODULE_INPUT_V1_TEXT);
+
+    YazaModuleInputV1 inputs[3] = {
         {YAZA_MODULE_INPUT_V1_ABI_VERSION, sizeof(YazaModuleInputV1), YAZA_MODULE_INPUT_V1_TEXT, 0, event.data, event.length},
-        {YAZA_MODULE_INPUT_V1_ABI_VERSION, sizeof(YazaModuleInputV1), YAZA_MODULE_INPUT_V1_TEXT, 0, payload.data, payload.length},
-        {YAZA_MODULE_INPUT_V1_ABI_VERSION, sizeof(YazaModuleInputV1), YAZA_MODULE_INPUT_V1_TEXT, 0, engine->state, engine->state_length}
+        {YAZA_MODULE_INPUT_V1_ABI_VERSION, sizeof(YazaModuleInputV1), payload_kind, 0, payload.data, payload.length},
+        {YAZA_MODULE_INPUT_V1_ABI_VERSION, sizeof(YazaModuleInputV1), initial_state_kind, 0, engine->state, engine->state_length}
     };
     YazaModuleResultV1 result = {
         YAZA_MODULE_RESULT_V1_ABI_VERSION, sizeof(YazaModuleResultV1),
@@ -321,14 +343,26 @@ int32_t yaza_mobile_v1_dispatch(YazaMobileEngineHandleV1 candidate, uint32_t eve
     };
 
     int32_t finish_status = yaza_export_mobile_reduce_v1(inputs, 3, &result);
+    if (engine->state_input_kind == 0 && finish_status == YAZA_MODULE_RESULT_V1_INVALID_INPUT) {
+        inputs[2].kind = (initial_state_kind == YAZA_MODULE_INPUT_V1_TEXT)
+            ? YAZA_MODULE_INPUT_V1_BYTES
+            : YAZA_MODULE_INPUT_V1_TEXT;
+        result = (YazaModuleResultV1){
+            YAZA_MODULE_RESULT_V1_ABI_VERSION, sizeof(YazaModuleResultV1),
+            YAZA_MODULE_RESULT_V1_OK, 0, NULL, 0
+        };
+        finish_status = yaza_export_mobile_reduce_v1(inputs, 3, &result);
+    }
     if (finish_status == YAZA_MODULE_RESULT_V1_OK) {
+        if (engine->state_input_kind == 0) engine->state_input_kind = inputs[2].kind;
         if (result.abi_version != YAZA_MODULE_RESULT_V1_ABI_VERSION ||
             result.struct_size < sizeof(YazaModuleResultV1)) {
             finish_status = YAZA_MOBILE_V1_ABI_MISMATCH;
         } else if (result.length > YAZA_MOBILE_V1_MAX_RESULT_BYTES ||
                    (result.length != 0 && result.data == NULL)) {
             finish_status = YAZA_MOBILE_V1_RESOURCE_LIMIT;
-        } else if (result.length != 0 && !yaza_mobile_utf8_is_valid(result.data, result.length)) {
+        } else if (result.length != 0 && !yaza_mobile_is_ybif(result.data, result.length) &&
+                   !yaza_mobile_utf8_is_valid(result.data, result.length)) {
             finish_status = YAZA_MOBILE_V1_INTERNAL_ERROR;
         } else if (result.status == YAZA_MODULE_RESULT_V1_OK) {
             finish_status = YAZA_MOBILE_V1_OK;

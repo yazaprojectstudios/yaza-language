@@ -479,9 +479,10 @@ fn is_generated_template_directory(name: Text) -> Boolean:
 fn render_template_entry(source_path: Text, destination_path: Text, project_name: Text, template_name: Text) -> Number:
     var generated_count: Number = 0
     if is_directory(source_path):
-        let directory_status: Number = yaza_fs_create_directory(destination_path)
-        if directory_status != 0:
-            fail("yaza new: cannot create project directory " + destination_path)
+        if destination_path != "." and not is_directory(destination_path):
+            let directory_status: Number = yaza_fs_create_directory(destination_path)
+            if directory_status != 0:
+                fail("yaza new: cannot create project directory " + destination_path)
         let entries: TextList = yaza_fs_list_directory(source_path)
         var entry_index: Number = 0
         while entry_index < list_count(entries):
@@ -502,9 +503,7 @@ fn render_template_entry(source_path: Text, destination_path: Text, project_name
         set generated_count = 1
     return generated_count
 
-fn create_project(project_name: Text, template_name: Text) -> Number:
-    if not valid_project_name(project_name):
-        fail("yaza new: project name must start with a letter and use letters, numbers, hyphens, or underscores; maximum 64 characters")
+fn resolve_template_root() -> Text:
     var template_root: Text = "templates"
     if not is_directory(template_root):
         let executable_dir: Text = yaza_executable_dir()
@@ -519,6 +518,43 @@ fn create_project(project_name: Text, template_name: Text) -> Number:
         set template_root = "/opt/homebrew/share/yaza/templates"
     if not is_directory(template_root):
         fail("yaza new: bundled templates are missing")
+    return template_root
+
+fn sanitize_init_project_name(raw_name: Text) -> Text:
+    var candidate: Text = ""
+    var idx: Number = 0
+    while idx < text_length(raw_name) and text_length(candidate) < 60:
+        let ch: Number = text_byte(raw_name, idx)
+        if ascii_letter(ch) or (ch >= 48 and ch <= 57) or ch == 45 or ch == 95:
+            set candidate = candidate + text_slice(raw_name, idx, 1)
+        else:
+            set candidate = candidate + "_"
+        set idx = idx + 1
+    if candidate == "" or not ascii_letter(text_byte(candidate, 0)):
+        set candidate = "app_" + candidate
+    if text_length(candidate) > 64:
+        set candidate = text_slice(candidate, 0, 64)
+    if not valid_project_name(candidate):
+        return "yaza_mobile_app"
+    return candidate
+
+fn path_basename_or_cwd(target_dir: Text) -> Text:
+    var path_val: Text = target_dir
+    if path_val == "" or path_val == ".":
+        set path_val = env_get("PWD")
+    while text_length(path_val) > 1 and text_ends_with(path_val, "/"):
+        set path_val = text_slice(path_val, 0, text_length(path_val) - 1)
+    let sep: Number = yaza_path_last_separator(path_val)
+    if sep > 0 and sep <= text_length(path_val):
+        return text_slice(path_val, sep, text_length(path_val) - sep)
+    if path_val != "" and path_val != ".":
+        return path_val
+    return "yaza_mobile_app"
+
+fn create_project(project_name: Text, template_name: Text) -> Number:
+    if not valid_project_name(project_name):
+        fail("yaza new: project name must start with a letter and use letters, numbers, hyphens, or underscores; maximum 64 characters")
+    let template_root: Text = resolve_template_root()
     let template_path: Text = path_join(template_root, template_name)
     if not is_directory(template_path):
         fail("yaza new: unknown project template '" + template_name + "'")
@@ -528,6 +564,24 @@ fn create_project(project_name: Text, template_name: Text) -> Number:
     say "Created " + template_name + " project: " + project_name
     say "Generated " + number_text(generated_count) + " files"
     say "Next: cd " + project_name
+    return 0
+
+fn init_project(target_dir: Text, template_name: Text) -> Number:
+    let manifest_path: Text = path_join(target_dir, "yaza.toml")
+    if file_exists(manifest_path):
+        fail("yaza init: yaza.toml already exists in target directory")
+    let template_root: Text = resolve_template_root()
+    let template_path: Text = path_join(template_root, template_name)
+    if not is_directory(template_path):
+        fail("yaza init: unknown project template '" + template_name + "'")
+    if target_dir != "." and file_exists(target_dir) and not is_directory(target_dir):
+        fail("yaza init: destination path exists and is not a directory")
+    let derived_name: Text = sanitize_init_project_name(path_basename_or_cwd(target_dir))
+    let generated_count: Number = render_template_entry(template_path, target_dir, derived_name, template_name)
+    say "Initialized " + template_name + " project '" + derived_name + "' in " + target_dir
+    say "Generated " + number_text(generated_count) + " files"
+    if target_dir != ".":
+        say "Next: cd " + target_dir
     return 0
 
 fn new_from_arguments() -> Number:
@@ -544,6 +598,26 @@ fn new_from_arguments() -> Number:
     if template_name == "":
         fail("Usage: yaza new --api <name> | --minimal-api <name> | --microservice <name> | --fullstack <name> | --mvc <name> | --web <name> | --mobile <name>")
     return create_project(project_name, template_name)
+
+fn init_from_arguments() -> Number:
+    let count: Number = arg_count()
+    if count == 2 and (arg(2) == "--help" or arg(2) == "-h" or arg(2) == "help"):
+        say "Usage: yaza init --mobile [directory]"
+        return 0
+    var target_dir: Text = "."
+    var template_name: Text = ""
+    if count == 2:
+        set template_name = template_choice(arg(2))
+    elif count == 3:
+        if text_starts_with(arg(2), "--"):
+            set template_name = template_choice(arg(2))
+            set target_dir = arg(3)
+        else:
+            set target_dir = arg(2)
+            set template_name = template_choice(arg(3))
+    if template_name == "":
+        fail("Usage: yaza init --api [dir] | --minimal-api [dir] | --microservice [dir] | --fullstack [dir] | --web [dir] | --mobile [dir]")
+    return init_project(target_dir, template_name)
 
 fn is_test_source(path: Text) -> Boolean:
     return text_ends_with(path, ".test.yz") or text_ends_with(path, "_test.yz")
@@ -1099,10 +1173,16 @@ fn mobile_from_arguments() -> Number:
         say "  doctor                         Show required platform tools"
         say "  build --target <target> [file.yz] [--release|--debug]"
         say "                                 Build the YAZA native engine"
-        say "  run --target <android-emulator|ios-simulator>"
-        say "                                 Build, install, and launch the starter"
+        say "  run [--target <android|ios>] [--once]"
+        say "                                 Auto-select/boot device, build, install, and live-reload on change"
+        say ""
+        say "Examples:"
+        say "  yaza mobile run --target android"
+        say "  yaza mobile run --target ios"
+        say "  yaza mobile run --target android --once"
         say ""
         say "Build targets: android-arm64, ios-arm64, ios-simulator-arm64"
+        say "Run aliases  : android-emulator -> android, ios-simulator -> ios"
         return 0
 
     let subcommand: Text = arg(2)
@@ -1166,23 +1246,36 @@ fn mobile_from_arguments() -> Number:
 
     if subcommand == "run":
         var target: Text = ""
+        var watch_mode: Text = "1"
         var index: Number = 3
         while index <= count:
             let value: Text = arg(index)
             if value == "--target":
-                if index + 1 > count: fail("Usage: yaza mobile run --target <android-emulator|ios-simulator>")
+                if index + 1 > count: fail("Usage: yaza mobile run [--target <android|ios>] [--once]")
                 set target = arg(index + 1)
                 set index = index + 2
+            elif value == "--once" or value == "--no-watch":
+                set watch_mode = "0"
+                set index = index + 1
+            elif value == "--watch":
+                set watch_mode = "1"
+                set index = index + 1
             else:
                 if value == "--help" or value == "-h":
-                    say "Usage: yaza mobile run --target <android-emulator|ios-simulator>"
+                    say "Usage: yaza mobile run [--target <android|ios>] [--once]"
+                    say "Aliases: --target android-emulator | --target ios-simulator"
                     return 0
                 fail("yaza mobile run: unrecognized option: " + value)
-        if target == "": fail("yaza mobile run: --target is required")
-        if target != "android-emulator" and target != "ios-simulator":
-            fail("yaza mobile run: unsupported target '" + target + "'")
+        if target == "":
+            set target = "auto"
+        elif target != "android" and target != "ios" and target != "android-emulator" and target != "ios-simulator":
+            fail("yaza mobile run: unsupported target '" + target + "' (expected android or ios)")
         if yaza_host_is_windows(): fail("yaza mobile run currently requires a macOS or Linux build host")
+        let runtime_root: Text = core_llvm_runtime_root()
         yaza_env_set_var("YAZA_BIN", executable_path())
+        yaza_env_set_var("YAZA_RUNTIME_DIR", runtime_root)
+        yaza_env_set_var("YAZA_STDLIB_DIR", runtime_root + "/../std")
+        yaza_env_set_var("YAZA_MOBILE_WATCH", watch_mode)
         let script: Text = mobile_script_path("run.sh")
         let arguments: TextList = text_list()
         list_push(arguments, script)
@@ -1872,6 +1965,7 @@ fn print_yaza_llvm_help() -> Number:
     say "  new --web <name>         Create web starter"
     say "  new --fullstack <name>   Create full-stack Arena-SSR MVC monolith (alias: --mvc)"
     say "  new --mobile <name>      Create mobile starter layout"
+    say "  init --mobile [dir]      Initialize mobile layout in existing/new directory"
     say ""
     say "DEVELOPMENT"
     say "  run [--release] [--watch] [--port <port>] [file.yz] [-- args...]  Build and run"
@@ -1885,7 +1979,7 @@ fn print_yaza_llvm_help() -> Number:
     say "  bench [source.yz] [count]  Measure repeated native runs"
     say "  mobile doctor             Check mobile development toolchains"
     say "  mobile build --target <t> [file.yz] [--release|--debug]"
-    say "  mobile run --target <android-emulator|ios-simulator>"
+    say "  mobile run [--target <android|ios>] [--once]"
     say ""
     say "DATABASE (YAZABASE)"
     say "  db [shell] [<dir> <db> | :memory:]  Interactive SQL REPL"
@@ -1974,6 +2068,9 @@ start:
         exit(status)
     if cmd == "new":
         let status: Number = new_from_arguments()
+        exit(status)
+    if cmd == "init":
+        let status: Number = init_from_arguments()
         exit(status)
     if cmd == "test":
         let status: Number = test_from_arguments()

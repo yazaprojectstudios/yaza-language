@@ -8221,15 +8221,44 @@ int64_t yaza_rt_v1_process(const YazaTextV1 *command, void *typed_text_list) {
     CloseHandle(pi.hThread);
     return (int64_t)exit_code;
 #else
+    struct sigaction ignore_sigint;
+    struct sigaction prev_sigint;
+    memset(&ignore_sigint, 0, sizeof(ignore_sigint));
+    ignore_sigint.sa_handler = SIG_IGN;
+    sigemptyset(&ignore_sigint.sa_mask);
+    const int sig_saved = (sigaction(SIGINT, &ignore_sigint, &prev_sigint) == 0);
+
+    posix_spawnattr_t spawn_attr;
+    posix_spawnattr_t *attr_ptr = NULL;
+    if (posix_spawnattr_init(&spawn_attr) == 0) {
+        sigset_t default_sigs;
+        sigemptyset(&default_sigs);
+        sigaddset(&default_sigs, SIGINT);
+        if (posix_spawnattr_setsigdefault(&spawn_attr, &default_sigs) == 0 &&
+            posix_spawnattr_setflags(&spawn_attr, POSIX_SPAWN_SETSIGDEF) == 0) {
+            attr_ptr = &spawn_attr;
+        } else {
+            posix_spawnattr_destroy(&spawn_attr);
+        }
+    }
+
     pid_t child = 0;
-    const int spawn_status = posix_spawnp(&child, (const char *)command->data, NULL, NULL, arguments, environ);
+    const int spawn_status = posix_spawnp(&child, (const char *)command->data, NULL, attr_ptr, arguments, environ);
+    if (attr_ptr != NULL) posix_spawnattr_destroy(&spawn_attr);
     free(arguments);
-    if (spawn_status != 0) return 127;
+    if (spawn_status != 0) {
+        if (sig_saved) (void)sigaction(SIGINT, &prev_sigint, NULL);
+        return 127;
+    }
     int wait_status = 0;
     for (;;) {
         if (waitpid(child, &wait_status, 0) >= 0) break;
-        if (errno != EINTR) return 127;
+        if (errno != EINTR) {
+            if (sig_saved) (void)sigaction(SIGINT, &prev_sigint, NULL);
+            return 127;
+        }
     }
+    if (sig_saved) (void)sigaction(SIGINT, &prev_sigint, NULL);
     if (WIFEXITED(wait_status)) return WEXITSTATUS(wait_status);
     if (WIFSIGNALED(wait_status)) return 128 + WTERMSIG(wait_status);
     return 127;

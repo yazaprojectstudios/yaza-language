@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 #define YAZA_MOBILE_V1_ABI_VERSION 1U
-#define YAZA_MOBILE_V1_MAX_EVENT_BYTES (64ULL * 1024ULL)
+#define YAZA_MOBILE_V1_MAX_EVENT_BYTES (512ULL * 1024ULL)
 #define YAZA_MOBILE_V1_MAX_RESULT_BYTES (1ULL * 1024ULL * 1024ULL)
 #define YAZA_MOBILE_V1_MAX_OUTSTANDING_BYTES (16ULL * 1024ULL * 1024ULL)
 #define YAZA_MOBILE_V1_MAX_ENGINES 4U
@@ -51,7 +51,8 @@ typedef enum YazaMobileStatusV1 {
 typedef enum YazaMobileEventV1 {
     YAZA_MOBILE_EVENT_V1_INCREMENT = 1,
     YAZA_MOBILE_EVENT_V1_RESET = 2,
-    YAZA_MOBILE_EVENT_V1_SNAPSHOT = 3
+    YAZA_MOBILE_EVENT_V1_SNAPSHOT = 3,
+    YAZA_MOBILE_EVENT_V1_ACTION = 4
 } YazaMobileEventV1;
 
 /* The host struct is copied during create. ABI v1 is synchronous and does not
