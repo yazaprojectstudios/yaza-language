@@ -1,3 +1,4 @@
+import Darwin
 import SwiftUI
 
 private let yazaEngineQueue = DispatchQueue(label: "dev.yaza.mobile.engine", qos: .userInitiated)
@@ -36,6 +37,8 @@ struct HomeView: View {
     @State private var toastBanner = ""
     @State private var dispatchPending = false
     @State private var lifecycleGeneration: UInt64 = 0
+    @State private var lastHotSwapMarker = ""
+    @State private var hotSwapTimer: Timer?
 
     var body: some View {
         VStack(spacing: 16) {
@@ -123,10 +126,65 @@ struct HomeView: View {
                 dispatchPending = false
             }
         }
+        .onAppear {
+            startHotSwapWatcherIfNeeded()
+        }
         .onDisappear {
+            hotSwapTimer?.invalidate()
+            hotSwapTimer = nil
             lifecycleGeneration &+= 1
             dispatchPending = false
         }
+    }
+
+    private func startHotSwapWatcherIfNeeded() {
+        #if DEBUG && targetEnvironment(simulator)
+        guard hotSwapTimer == nil else { return }
+        hotSwapTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { _ in
+            DispatchQueue.main.async {
+                self.pollHotSwapMarker()
+            }
+        }
+        #endif
+    }
+
+    private func pollHotSwapMarker() {
+        #if DEBUG && targetEnvironment(simulator)
+        guard let activeEngine = engine, !dispatchPending else { return }
+        let tmpDir = NSTemporaryDirectory()
+        let readyPath = (tmpDir as NSString).appendingPathComponent("yaza_hotswap_ready.txt")
+        guard let rawMarker = try? String(contentsOfFile: readyPath, encoding: .utf8) else { return }
+        let marker = rawMarker.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !marker.isEmpty, marker != lastHotSwapMarker else { return }
+        let dylibPath = (tmpDir as NSString).appendingPathComponent(marker)
+        guard FileManager.default.fileExists(atPath: dylibPath) else { return }
+
+        lastHotSwapMarker = marker
+        dispatchPending = true
+        let requestGeneration = lifecycleGeneration
+        errorMessage = ""
+        yazaEngineQueue.async {
+            let swapResult = Result<Void, Error> {
+                try activeEngine.hotSwap(dylibPath: dylibPath)
+                if let entries = try? FileManager.default.contentsOfDirectory(atPath: tmpDir) {
+                    for entry in entries where entry.hasPrefix("yaza_hotswap_") && entry.hasSuffix(".dylib") && entry != marker {
+                        let stalePath = (tmpDir as NSString).appendingPathComponent(entry)
+                        try? FileManager.default.removeItem(atPath: stalePath)
+                    }
+                }
+            }
+            DispatchQueue.main.async {
+                guard self.lifecycleGeneration == requestGeneration else { return }
+                self.dispatchPending = false
+                switch swapResult {
+                case .success:
+                    self.dispatchAction("INIT", showToast: false)
+                case .failure(let failure):
+                    self.errorMessage = failure.localizedDescription
+                }
+            }
+        }
+        #endif
     }
 
     private func dispatchAction(_ actionPayload: String, showToast: Bool) {
@@ -215,7 +273,17 @@ private func decodeYbifState(_ data: Data) throws -> MobileUiState {
 // The view sends every call through `yazaEngineQueue`; the handle is never
 // accessed concurrently, and the bridge also serializes each engine handle.
 private final class MobileEngine: @unchecked Sendable {
+    private typealias CreateFn = @convention(c) (UnsafePointer<YazaMobileHostV1>?, UnsafeMutablePointer<YazaMobileEngineHandleV1>?) -> Int32
+    private typealias DispatchFn = @convention(c) (YazaMobileEngineHandleV1, UInt32, YazaMobileView, UnsafeMutablePointer<YazaMobileBufferV1>?) -> Int32
+    private typealias ReleaseFn = @convention(c) (UnsafeMutablePointer<YazaMobileBufferV1>?) -> Int32
+    private typealias DestroyFn = @convention(c) (YazaMobileEngineHandleV1) -> Int32
+
     private var handle: Int64 = 0
+    private var dlHandle: UnsafeMutableRawPointer?
+    private var createFn: CreateFn = { yaza_mobile_v1_create($0, $1) }
+    private var dispatchFn: DispatchFn = { yaza_mobile_v1_dispatch($0, $1, $2, $3) }
+    private var releaseFn: ReleaseFn = { yaza_mobile_v1_buffer_release($0) }
+    private var destroyFn: DestroyFn = { yaza_mobile_v1_destroy($0) }
 
     init() throws {
         var host = YazaMobileHostV1(
@@ -224,10 +292,53 @@ private final class MobileEngine: @unchecked Sendable {
             context: nil,
             post_to_main_thread: nil
         )
-        let status = yaza_mobile_v1_create(&host, &handle)
+        let status = createFn(&host, &handle)
         guard status == Int32(YAZA_MOBILE_V1_OK.rawValue), handle > 0 else {
             throw MobileBridgeError(status: status, message: "Could not create YAZA engine")
         }
+    }
+
+    func hotSwap(dylibPath: String) throws {
+        guard let nextDl = dlopen(dylibPath, RTLD_NOW | RTLD_LOCAL) else {
+            let errMsg = dlerror().map { String(cString: $0) } ?? "dlopen failed for \(dylibPath)"
+            throw MobileBridgeError(status: Int32(YAZA_MOBILE_V1_INTERNAL_ERROR.rawValue), message: errMsg)
+        }
+        guard
+            let symCreate = dlsym(nextDl, "yaza_mobile_v1_create"),
+            let symDispatch = dlsym(nextDl, "yaza_mobile_v1_dispatch"),
+            let symRelease = dlsym(nextDl, "yaza_mobile_v1_buffer_release"),
+            let symDestroy = dlsym(nextDl, "yaza_mobile_v1_destroy")
+        else {
+            dlclose(nextDl)
+            throw MobileBridgeError(status: Int32(YAZA_MOBILE_V1_INTERNAL_ERROR.rawValue), message: "Hot-swap dylib is missing yaza_mobile_v1 symbols")
+        }
+
+        let nextCreate = unsafeBitCast(symCreate, to: CreateFn.self)
+        let nextDispatch = unsafeBitCast(symDispatch, to: DispatchFn.self)
+        let nextRelease = unsafeBitCast(symRelease, to: ReleaseFn.self)
+        let nextDestroy = unsafeBitCast(symDestroy, to: DestroyFn.self)
+
+        var host = YazaMobileHostV1(
+            struct_size: UInt32(MemoryLayout<YazaMobileHostV1>.size),
+            abi_version: UInt32(YAZA_MOBILE_V1_ABI_VERSION),
+            context: nil,
+            post_to_main_thread: nil
+        )
+        var nextHandle: YazaMobileEngineHandleV1 = 0
+        let status = nextCreate(&host, &nextHandle)
+        guard status == Int32(YAZA_MOBILE_V1_OK.rawValue), nextHandle > 0 else {
+            dlclose(nextDl)
+            throw MobileBridgeError(status: status, message: "Could not initialize hot-swapped YAZA engine")
+        }
+
+        if handle > 0 { _ = destroyFn(handle) }
+        if let prevDl = dlHandle { _ = dlclose(prevDl) }
+        dlHandle = nextDl
+        createFn = nextCreate
+        dispatchFn = nextDispatch
+        releaseFn = nextRelease
+        destroyFn = nextDestroy
+        handle = nextHandle
     }
 
     func dispatchBytes(event: UInt32, payload: String) throws -> Data {
@@ -238,9 +349,9 @@ private final class MobileEngine: @unchecked Sendable {
         var output = YazaMobileBufferV1(data: nil, length: 0, lease_id: 0)
         let status = bytes.withUnsafeBufferPointer { buffer -> Int32 in
             let view = YazaMobileView(data: buffer.baseAddress, length: UInt64(buffer.count))
-            return yaza_mobile_v1_dispatch(handle, event, view, &output)
+            return dispatchFn(handle, event, view, &output)
         }
-        defer { _ = yaza_mobile_v1_buffer_release(&output) }
+        defer { _ = releaseFn(&output) }
         let rawData: Data
         if let data = output.data, output.length > 0 {
             rawData = Data(bytes: data, count: Int(output.length))
@@ -260,7 +371,8 @@ private final class MobileEngine: @unchecked Sendable {
     }
 
     deinit {
-        if handle > 0 { _ = yaza_mobile_v1_destroy(handle) }
+        if handle > 0 { _ = destroyFn(handle) }
+        if let dl = dlHandle { _ = dlclose(dl) }
     }
 }
 

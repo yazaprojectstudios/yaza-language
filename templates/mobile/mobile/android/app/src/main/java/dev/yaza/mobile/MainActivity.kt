@@ -1,6 +1,7 @@
 package dev.yaza.mobile
 
 import android.app.Activity
+import android.content.pm.ApplicationInfo
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -10,6 +11,7 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import java.io.File
 import java.util.concurrent.Executors
 
 class MainActivity : Activity() {
@@ -19,6 +21,16 @@ class MainActivity : Activity() {
     private var dispatchPending = false
     private var disposed = false
     private var lifecycleGeneration = 0L
+    private var lastHotSwapMarker = ""
+    private val isDebuggable: Boolean by lazy { (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0 }
+
+    private val hotSwapPoller = object : Runnable {
+        override fun run() {
+            if (disposed || !isDebuggable) return
+            pollHotSwapMarker()
+            mainHandler.postDelayed(this, 300L)
+        }
+    }
 
     private lateinit var titleView: TextView
     private lateinit var greetingView: TextView
@@ -141,12 +153,52 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun pollHotSwapMarker() {
+        if (disposed || engine == 0L || dispatchPending) return
+        val readyFile = File(filesDir, "yaza_hotswap_ready.txt")
+        if (!readyFile.isFile) return
+        val marker = runCatching { readyFile.readText().trim() }.getOrNull() ?: return
+        if (marker.isEmpty() || marker == lastHotSwapMarker) return
+        val soFile = File(filesDir, marker)
+        if (!soFile.isFile) return
+
+        lastHotSwapMarker = marker
+        dispatchPending = true
+        val requestGeneration = lifecycleGeneration
+        val activeEngine = engine
+        errorView.text = ""
+        engineExecutor.execute {
+            val swapResult = runCatching {
+                val nextEngine = NativeEngine.hotSwap(activeEngine, soFile.absolutePath)
+                filesDir.listFiles { _, name ->
+                    name.startsWith("yaza_hotswap_") && name.endsWith(".so") && name != marker
+                }?.forEach { it.delete() }
+                nextEngine
+            }
+            mainHandler.post {
+                if (disposed || lifecycleGeneration != requestGeneration) return@post
+                dispatchPending = false
+                swapResult.onSuccess { nextEngine ->
+                    engine = nextEngine
+                    dispatchAction("INIT", showToast = false)
+                }.onFailure { failure ->
+                    errorView.text = failure.message ?: "YAZA hot-swap error"
+                }
+            }
+        }
+    }
+
     override fun onStart() {
         super.onStart()
         if (!disposed && engine != 0L) dispatchAction("INIT", showToast = false)
+        if (!disposed && isDebuggable) {
+            mainHandler.removeCallbacks(hotSwapPoller)
+            mainHandler.postDelayed(hotSwapPoller, 300L)
+        }
     }
 
     override fun onStop() {
+        mainHandler.removeCallbacks(hotSwapPoller)
         lifecycleGeneration++
         dispatchPending = false
         super.onStop()

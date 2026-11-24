@@ -196,13 +196,29 @@ if [ "$IS_ANDROID" = 1 ]; then
   fi
   "$CLANG" --target="$TRIPLE" "$OPT_FLAGS" -shared -fPIC -pthread -Wl,--no-undefined \
     "$OUT_DIR/mobile_engine.o" "$OUT_DIR/yaza_runtime_v1.o" \
-    "$OUT_DIR/yaza_mobile_v1.o" "$OUT_DIR/yaza_mobile_jni.o" -lm \
+    "$OUT_DIR/yaza_mobile_v1.o" "$OUT_DIR/yaza_mobile_jni.o" -lm -ldl \
     -o "$OUT_DIR/libyaza_mobile.so"
+  if [ "$BUILD_MODE" = debug ]; then
+    "$CLANG" --target="$TRIPLE" "$OPT_FLAGS" -shared -fPIC -pthread -Wl,--no-undefined \
+      "$OUT_DIR/mobile_engine.o" "$OUT_DIR/yaza_runtime_v1.o" \
+      "$OUT_DIR/yaza_mobile_v1.o" -lm \
+      -o "$OUT_DIR/libyaza_mobile_hotswap.so"
+  fi
   mkdir -p "$PROJECT_ROOT/mobile/android/app/build/generated/yazaJniLibs/arm64-v8a"
   cp "$OUT_DIR/libyaza_mobile.so" "$PROJECT_ROOT/mobile/android/app/build/generated/yazaJniLibs/arm64-v8a/libyaza_mobile.so"
 else
   "$AR" rcs "$OUT_DIR/libyaza_mobile.a" "$OUT_DIR/mobile_engine.o" \
     "$OUT_DIR/yaza_runtime_v1.o" "$OUT_DIR/yaza_mobile_v1.o"
+  if [ "$BUILD_MODE" = debug ] && [ "$TARGET_NAME" = ios-simulator-arm64 ]; then
+    "$CLANG" --target="$TRIPLE" -isysroot "$SDKROOT" "$OPT_FLAGS" -dynamiclib -fPIC -pthread \
+      -install_name "@rpath/libyaza_mobile_hotswap.dylib" \
+      "$OUT_DIR/mobile_engine.o" "$OUT_DIR/yaza_runtime_v1.o" \
+      "$OUT_DIR/yaza_mobile_v1.o" -lm \
+      -o "$OUT_DIR/libyaza_mobile_hotswap.dylib"
+    if command -v codesign >/dev/null 2>&1; then
+      codesign --force --sign - "$OUT_DIR/libyaza_mobile_hotswap.dylib" >/dev/null 2>&1 || true
+    fi
+  fi
 fi
 printf '%s\n' "$BUILD_MODE" > "$MODE_STAMP"
 

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import pathlib
@@ -346,6 +347,10 @@ def deploy_android(
     rc_in, in_out = run_cmd([adb_bin, "-s", serial, "install", "-r", "-t", str(apk_path)], capture=True)
     if rc_in != 0:
         return False, f"adb install failed:\n{in_out}"
+    run_cmd(
+        [adb_bin, "-s", serial, "shell", "run-as", app_id, "sh", "-c", "rm -f files/yaza_hotswap_ready.txt files/yaza_hotswap_*.so"],
+        capture=True,
+    )
     run_cmd([adb_bin, "-s", serial, "shell", "am", "force-stop", app_id], capture=True)
     comp = f"{app_id}/{activity}"
     rc_st, _ = run_cmd([adb_bin, "-s", serial, "shell", "am", "start", "-n", comp], capture=True)
@@ -395,12 +400,96 @@ def deploy_ios(
     rc_in, in_out = run_cmd(["xcrun", "simctl", "install", udid, str(app_path)], capture=True)
     if rc_in != 0:
         return False, f"xcrun simctl install failed:\n{in_out}"
+    rc_ctr, ctr_out = run_cmd(["xcrun", "simctl", "get_app_container", udid, bundle_id, "data"], capture=True)
+    if rc_ctr == 0 and ctr_out.strip():
+        tmp_dir = pathlib.Path(ctr_out.strip()) / "tmp"
+        if tmp_dir.is_dir():
+            for stale in list(tmp_dir.glob("yaza_hotswap_*")):
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
     rc_ln, ln_out = run_cmd(
         ["xcrun", "simctl", "launch", "--terminate-running-process", udid, bundle_id],
         capture=True,
     )
     if rc_ln != 0:
         return False, f"xcrun simctl launch failed:\n{ln_out}"
+    return True, bundle_id
+
+
+def hotswap_android(
+    project_root: pathlib.Path,
+    adb_bin: str,
+    serial: str,
+    gen: int,
+) -> Tuple[bool, str]:
+    so_src = project_root / "build" / "mobile" / "android-arm64" / "libyaza_mobile_hotswap.so"
+    if not so_src.is_file():
+        return False, "missing libyaza_mobile_hotswap.so"
+    app_id, _activity = discover_android_metadata(project_root)
+    so_name = f"yaza_hotswap_{gen}.so"
+    tmp_remote = f"/data/local/tmp/{so_name}"
+
+    rc_push, push_out = run_cmd([adb_bin, "-s", serial, "push", str(so_src), tmp_remote], capture=True)
+    copied = False
+    if rc_push == 0:
+        run_cmd([adb_bin, "-s", serial, "shell", "chmod", "644", tmp_remote], capture=True)
+        stage_cmd = (
+            f"mkdir -p files && cp {shlex.quote(tmp_remote)} files/{shlex.quote(so_name)} "
+            f"&& chmod 700 files/{shlex.quote(so_name)} "
+            f"&& printf '%s' {shlex.quote(so_name)} > files/yaza_hotswap_ready.txt.tmp "
+            f"&& mv files/yaza_hotswap_ready.txt.tmp files/yaza_hotswap_ready.txt"
+        )
+        rc_cp, cp_out = run_cmd([adb_bin, "-s", serial, "shell", "run-as", app_id, "sh", "-c", stage_cmd], capture=True)
+        run_cmd([adb_bin, "-s", serial, "shell", "rm", "-f", tmp_remote], capture=True)
+        copied = rc_cp == 0
+        last_err = cp_out
+    else:
+        last_err = push_out
+
+    if not copied:
+        b64_payload = base64.b64encode(so_src.read_bytes()).decode("ascii")
+        b64_cmd = (
+            f"mkdir -p files && base64 -d > files/{shlex.quote(so_name)} "
+            f"&& chmod 700 files/{shlex.quote(so_name)} "
+            f"&& printf '%s' {shlex.quote(so_name)} > files/yaza_hotswap_ready.txt.tmp "
+            f"&& mv files/yaza_hotswap_ready.txt.tmp files/yaza_hotswap_ready.txt"
+        )
+        proc = subprocess.run(
+            [adb_bin, "-s", serial, "shell", "run-as", app_id, "sh", "-c", b64_cmd],
+            input=b64_payload,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        if proc.returncode != 0:
+            return False, (proc.stdout or last_err or "adb run-as hot-swap failed").strip()
+
+    return True, app_id
+
+
+def hotswap_ios(
+    project_root: pathlib.Path,
+    udid: str,
+    gen: int,
+) -> Tuple[bool, str]:
+    dylib_src = project_root / "build" / "mobile" / "ios-simulator-arm64" / "libyaza_mobile_hotswap.dylib"
+    if not dylib_src.is_file():
+        return False, "missing libyaza_mobile_hotswap.dylib"
+    _proj, _scheme, bundle_id = discover_ios_metadata(project_root)
+    rc_ctr, ctr_out = run_cmd(["xcrun", "simctl", "get_app_container", udid, bundle_id, "data"], capture=True)
+    container_path = ctr_out.strip().splitlines()[-1].strip() if rc_ctr == 0 and ctr_out.strip() else ""
+    if rc_ctr != 0 or not container_path:
+        return False, (ctr_out or "xcrun simctl get_app_container failed").strip()
+    tmp_dir = pathlib.Path(container_path) / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    dylib_name = f"yaza_hotswap_{gen}.dylib"
+    shutil.copy2(dylib_src, tmp_dir / dylib_name)
+    tmp_marker = tmp_dir / "yaza_hotswap_ready.txt.tmp"
+    final_marker = tmp_dir / "yaza_hotswap_ready.txt"
+    tmp_marker.write_text(dylib_name, encoding="utf-8")
+    tmp_marker.replace(final_marker)
     return True, bundle_id
 
 
@@ -455,6 +544,7 @@ def watch_loop(
     last_snap = snapshot_watch_files(project_root, platform)
     pending_changes: List[str] = []
     last_change_ts = 0.0
+    hotswap_gen = 0
 
     while not STOP_REQUESTED:
         time.sleep(0.10)
@@ -482,6 +572,25 @@ def watch_loop(
                 print(core_out.rstrip(), file=sys.stderr, flush=True)
                 print(f"[{now_hms()}]   Waiting for the next file fix...", file=sys.stderr, flush=True)
                 continue
+
+            core_only = all(f == "yaza.toml" or f.startswith("src/") or f.startswith("src\\") for f in files)
+            if core_only:
+                hotswap_gen += 1
+                if platform == "android":
+                    ok_swap, swap_msg = hotswap_android(project_root, adb_bin, device_id, hotswap_gen)
+                else:
+                    ok_swap, swap_msg = hotswap_ios(project_root, device_id, hotswap_gen)
+                if ok_swap:
+                    total_ms = int((time.monotonic() - t_start) * 1000)
+                    print(
+                        f"[{now_hms()}] ⚡ {primary} changed -> hot-swapped in {total_ms}ms (core {core_ms}ms, no restart)",
+                        flush=True,
+                    )
+                    continue
+                print(
+                    f"[{now_hms()}] ↺ Hot-swap unavailable ({swap_msg}); falling back to full app reload...",
+                    flush=True,
+                )
 
             if platform == "android":
                 ok_dep, dep_msg = deploy_android(yaza_bin, project_root, adb_bin, gradle_bin, device_id, rebuild_apk=True)

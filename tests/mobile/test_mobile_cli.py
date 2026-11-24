@@ -67,7 +67,7 @@ print('BUILD SUCCESSFUL (mock gradle)')
 """,
     )
 
-    # Mock adb handles devices -l, emu avd name, shell getprop, install, am start
+    # Mock adb handles devices -l, emu avd name, shell getprop, install, am start, push, run-as
     write_exec(
         "adb",
         f"""#!/usr/bin/env python3
@@ -91,7 +91,7 @@ if '-s' in args:
     if rest == ['shell', 'getprop', 'sys.boot_completed']:
         print('1' if st.get('boot_completed', True) else '0')
         sys.exit(0)
-    if rest[:1] == ['install'] or rest[:2] == ['shell', 'am'] or rest[:2] == ['shell', 'monkey']:
+    if rest[:1] == ['push'] or rest[:1] == ['install'] or rest[:2] == ['shell', 'am'] or rest[:2] == ['shell', 'monkey'] or rest[:2] == ['shell', 'chmod'] or rest[:2] == ['shell', 'rm'] or rest[:2] == ['shell', 'run-as']:
         print('Success')
         sys.exit(0)
 sys.exit(0)
@@ -232,12 +232,14 @@ def test_mobile_build_cross_targets(proj: pathlib.Path) -> None:
         res_and = run_cli(["mobile", "build", "--target", "android-arm64", "--debug"], proj)
         assert res_and.returncode == 0, res_and.stdout
         assert (proj / "build/mobile/android-arm64/libyaza_mobile.so").is_file()
+        assert (proj / "build/mobile/android-arm64/libyaza_mobile_hotswap.so").is_file()
         assert (proj / "mobile/android/app/build/generated/yazaJniLibs/arm64-v8a/libyaza_mobile.so").is_file()
         print("   android-arm64 PASS")
     if "Xcode iOS SDK: found" in res_doc.stdout:
         res_ios = run_cli(["mobile", "build", "--target", "ios-simulator-arm64", "--debug"], proj)
         assert res_ios.returncode == 0, res_ios.stdout
         assert (proj / "build/mobile/ios-simulator-arm64/libyaza_mobile.a").is_file()
+        assert (proj / "build/mobile/ios-simulator-arm64/libyaza_mobile_hotswap.dylib").is_file()
         print("   ios-simulator-arm64 PASS")
 
 
@@ -356,7 +358,7 @@ def test_live_watch_and_reload(proj: pathlib.Path, tmp: pathlib.Path) -> None:
         "adb_devices": ["emulator-5554 device model:Pixel_Watch_Test"],
         "avd_names": {"emulator-5554": "Pixel_Watch_Test"},
     }))
-    make_mock_toolchain(mock_bin, state_file, "watch")
+    log_file = make_mock_toolchain(mock_bin, state_file, "watch")
     extra = base_env({
         "PATH": f"{mock_bin}:{os.environ['PATH']}",
         "YAZA_GRADLE_BIN": str(mock_bin / "gradle"),
@@ -387,12 +389,14 @@ def test_live_watch_and_reload(proj: pathlib.Path, tmp: pathlib.Path) -> None:
                 raise AssertionError(f"Timeout waiting for {substr!r}.\nLog:\n{out_log.read_text()}")
 
             wait_for("Live Watch active")
+            gradle_calls_before = log_file.read_text().count("gradle assembleDebug")
 
-            # 1) Valid edit in domain/greeting.yz -> triggers rebuild + reload
+            # 1) Valid edit in domain/greeting.yz -> triggers dynamic core hot-swap WITHOUT full Gradle rebuild/restart
             domain_file = proj / "src" / "domain" / "greeting.yz"
             orig_domain = domain_file.read_text(encoding="utf-8")
             domain_file.write_text(orig_domain.replace("Hello, ", "Hi, "), encoding="utf-8")
-            wait_for("changed -> rebuilt in")
+            wait_for("hot-swapped in")
+            assert log_file.read_text().count("gradle assembleDebug") == gradle_calls_before, "Hot-swap should skip Gradle!"
 
             # 2) Syntax/compile error -> watcher prints error WITHOUT exiting
             engine_file = proj / "src" / "mobile_engine.yz"
@@ -401,11 +405,18 @@ def test_live_watch_and_reload(proj: pathlib.Path, tmp: pathlib.Path) -> None:
             wait_for("YAZA compile failed after")
             assert proc.poll() is None, "Watcher should survive compile errors!"
 
-            # 3) Fix syntax error -> automatically rebuilds & reloads again
+            # 3) Fix syntax error -> automatically hot-swaps again
             engine_file.write_text(orig_engine + "\n", encoding="utf-8")
-            wait_for("src/mobile_engine.yz changed -> rebuilt in")
+            wait_for("src/mobile_engine.yz changed -> hot-swapped in")
 
-            # 4) Clean SIGINT shutdown (deliver to foreground process group like terminal Ctrl+C)
+            # 4) Native UI edit under mobile/android/ -> falls back to full Gradle rebuild + restart
+            activity_file = proj / "mobile" / "android" / "app" / "src" / "main" / "java" / "dev" / "yaza" / "mobile" / "MainActivity.kt"
+            orig_activity = activity_file.read_text(encoding="utf-8")
+            activity_file.write_text(orig_activity + "\n// native ui change\n", encoding="utf-8")
+            wait_for("MainActivity.kt changed -> rebuilt in")
+            assert log_file.read_text().count("gradle assembleDebug") == gradle_calls_before + 1
+
+            # 5) Clean SIGINT shutdown (deliver to foreground process group like terminal Ctrl+C)
             os.killpg(proc.pid, signal.SIGINT)
             rc = proc.wait(timeout=5)
             assert rc == 0, f"Expected clean SIGINT exit 0, got {rc}"

@@ -23,12 +23,19 @@ object NativeEngine {
 
     private external fun nativeCreate(): Long
     private external fun nativeDispatch(engine: Long, eventId: Int, payloadUtf8: ByteArray): ByteArray
+    private external fun nativeHotSwap(oldHandle: Long, pathUtf8: ByteArray): Long
     private external fun nativeDestroy(engine: Long)
 
     fun create(): Long {
         val engine = nativeCreate()
         if (engine == 0L) throw IllegalStateException("Could not create YAZA mobile engine")
         return engine
+    }
+
+    fun hotSwap(oldHandle: Long, soPath: String): Long {
+        val next = nativeHotSwap(oldHandle, soPath.toByteArray(Charsets.UTF_8))
+        if (next == 0L) throw IllegalStateException("Could not hot-swap YAZA mobile engine")
+        return next
     }
 
     fun dispatchBytes(engine: Long, eventId: Int, payload: String): ByteArray {

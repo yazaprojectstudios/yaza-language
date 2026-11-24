@@ -32,7 +32,7 @@ clang -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-override-module -pthread \
   -DYAZA_RT_V1_DISABLE_PROCESS_SPAWN=1 \
   -I"$PROJECT_DIR/runtime/include" -I"$PROJECT_DIR/runtime/mobile/include" -I"$PROJECT_DIR/tests/mobile/mock_jni" \
   "$ENGINE_LL" "$RUNTIME_C" "$BRIDGE_C" "$JNI_C" "$JNI_TEST_C" \
-  -lm -o "$WORK_DIR/mobile-jni-test"
+  -lm -ldl -o "$WORK_DIR/mobile-jni-test"
 "$WORK_DIR/mobile-jni-test"
 
 if [ "$(uname -s)" = "Linux" ]; then
@@ -54,7 +54,7 @@ clang -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-override-module -pthread \
   -fsanitize=address,undefined -fno-omit-frame-pointer \
   -I"$PROJECT_DIR/runtime/include" -I"$PROJECT_DIR/runtime/mobile/include" -I"$PROJECT_DIR/tests/mobile/mock_jni" \
   "$ENGINE_LL" "$RUNTIME_C" "$BRIDGE_C" "$JNI_C" "$JNI_TEST_C" \
-  -lm -o "$WORK_DIR/mobile-jni-asan"
+  -lm -ldl -o "$WORK_DIR/mobile-jni-asan"
 ASAN_OPTIONS="$MOBILE_ASAN_OPTIONS" "$WORK_DIR/mobile-jni-asan"
 
 clang -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-override-module -pthread \
