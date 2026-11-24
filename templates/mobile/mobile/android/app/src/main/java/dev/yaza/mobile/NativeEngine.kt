@@ -91,7 +91,7 @@ object NativeEngine {
         val legacyCounter = bytes.toString(Charsets.UTF_8).trim().toLongOrNull() ?: 0L
         return MobileUiState(
             title = "Welcome to YAZA Mobile",
-            greeting = "Shared YAZA Core aktif",
+            greeting = "Shared YAZA Core active",
             counter = legacyCounter,
             status = "ready",
             effects = emptyList()

@@ -133,7 +133,7 @@ static void test_action_ybif_and_bounds(const YazaMobileHostV1 *host) {
     assert(yaza_mobile_v1_buffer_release(&out) == YAZA_MOBILE_V1_OK);
 
     assert(yaza_mobile_v1_dispatch(eng, YAZA_MOBILE_EVENT_V1_ACTION, view_of("GREET|Yaza"), &out) == YAZA_MOBILE_V1_OK);
-    expect_ybif_counter(&out, 0, "Halo, Yaza!");
+    expect_ybif_counter(&out, 0, "Hello, Yaza!");
     assert(yaza_mobile_v1_buffer_release(&out) == YAZA_MOBILE_V1_OK);
 
     assert(yaza_mobile_v1_dispatch(eng, YAZA_MOBILE_EVENT_V1_ACTION, view_of("INCREMENT|3"), &out) == YAZA_MOBILE_V1_OK);
@@ -144,11 +144,11 @@ static void test_action_ybif_and_bounds(const YazaMobileHostV1 *host) {
     assert(yaza_mobile_v1_buffer_release(&out) == YAZA_MOBILE_V1_OK);
 
     assert(yaza_mobile_v1_dispatch(eng, YAZA_MOBILE_EVENT_V1_ACTION, view_of("PERSIST"), &out) == YAZA_MOBILE_V1_OK);
-    expect_ybif_counter(&out, 3, "State tersimpan: counter=3");
+    expect_ybif_counter(&out, 3, "State saved: counter=3");
     assert(yaza_mobile_v1_buffer_release(&out) == YAZA_MOBILE_V1_OK);
 
     assert(yaza_mobile_v1_dispatch(eng, YAZA_MOBILE_EVENT_V1_ACTION, view_of("RESET"), &out) == YAZA_MOBILE_V1_OK);
-    expect_ybif_counter(&out, 0, "Counter direset");
+    expect_ybif_counter(&out, 0, "Counter reset");
     assert(yaza_mobile_v1_buffer_release(&out) == YAZA_MOBILE_V1_OK);
 
     assert(yaza_mobile_v1_dispatch(eng, YAZA_MOBILE_EVENT_V1_INCREMENT, view_of("4"), &out) == YAZA_MOBILE_V1_OK);

@@ -37,7 +37,7 @@ class MainActivity : Activity() {
         greetingView = TextView(this).apply {
             textSize = 16f
             gravity = Gravity.CENTER
-            text = "Memuat Shared YAZA Core..."
+            text = "Loading Shared YAZA Core..."
         }
         counterView = TextView(this).apply {
             textSize = 28f
@@ -54,11 +54,11 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER
         }
         nameInput = EditText(this).apply {
-            hint = "Masukkan nama Anda"
+            hint = "Enter your name"
             setSingleLine(true)
         }
         val greetBtn = Button(this).apply {
-            text = "Sapa"
+            text = "Greet"
             setOnClickListener { dispatchAction("GREET|" + nameInput.text.toString(), showToast = true) }
         }
         val incrementBtn = Button(this).apply {
@@ -66,7 +66,7 @@ class MainActivity : Activity() {
             setOnClickListener { dispatchAction("INCREMENT|1", showToast = true) }
         }
         val persistBtn = Button(this).apply {
-            text = "Simpan State"
+            text = "Save State"
             setOnClickListener { dispatchAction("PERSIST", showToast = true) }
         }
         val resetBtn = Button(this).apply {

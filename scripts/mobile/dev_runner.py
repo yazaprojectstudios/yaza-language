@@ -44,7 +44,7 @@ def prompt_choice(title: str, options: List[str]) -> int:
         print(f"  [{idx}] {label}", flush=True)
     while not STOP_REQUESTED:
         try:
-            raw = input(f"Pilih nomor [1-{len(options)}]: ").strip()
+            raw = input(f"Select number [1-{len(options)}]: ").strip()
         except KeyboardInterrupt:
             raise SystemExit(0)
         except EOFError:
@@ -53,7 +53,7 @@ def prompt_choice(title: str, options: List[str]) -> int:
             val = int(raw)
             if 1 <= val <= len(options):
                 return val - 1
-        print(f"Pilihan tidak valid; masukkan angka 1 sampai {len(options)}.", file=sys.stderr, flush=True)
+        print(f"Invalid choice; enter a number from 1 to {len(options)}.", file=sys.stderr, flush=True)
     raise SystemExit(0)
 
 
@@ -64,12 +64,12 @@ def normalize_target(raw_target: str) -> str:
         return "ios"
     if raw_target in ("", "auto"):
         if not is_interactive():
-            print("Usage: yaza mobile run [--target <android|ios>] [--once]", file=sys.stderr)
-            print("  --target android   Jalankan & pantau di emulator/perangkat Android", file=sys.stderr)
-            print("  --target ios       Jalankan & pantau di simulator iOS (macOS)", file=sys.stderr)
-            print("  --once             Jalankan build & launch satu kali tanpa live watcher", file=sys.stderr)
+            print("Usage: yaza mobile run [android|ios] [--target <android|ios>] [--once]", file=sys.stderr)
+            print("  --target android   Build, run, and watch on an Android emulator/device", file=sys.stderr)
+            print("  --target ios       Build, run, and watch on an iOS Simulator (macOS)", file=sys.stderr)
+            print("  --once             Run build & launch once without live file watching", file=sys.stderr)
             raise SystemExit(2)
-        choice = prompt_choice("Pilih target platform mobile:", ["android (Android Emulator / Device)", "ios (iOS Simulator)"])
+        choice = prompt_choice("Select mobile target platform:", ["android (Android Emulator / Device)", "ios (iOS Simulator)"])
         return "android" if choice == 0 else "ios"
     print(f"error: unsupported mobile run target: {raw_target}", file=sys.stderr)
     raise SystemExit(2)
@@ -151,11 +151,11 @@ def detect_android_device(adb_bin: str) -> Tuple[str, str]:
     active = parse_adb_devices(out, adb_bin)
     if len(active) == 1:
         serial, label = active[0]
-        print(f"✓ Target terdeteksi otomatis: {serial} ({label})", flush=True)
+        print(f"✓ Auto-selected target: {serial} ({label})", flush=True)
         return serial, label
     if len(active) > 1:
         idx = prompt_choice(
-            "Ditemukan beberapa perangkat/emulator Android aktif:",
+            "Multiple active Android devices/emulators found:",
             [f"{s} ({lbl})" for s, lbl in active],
         )
         return active[idx]
@@ -163,20 +163,20 @@ def detect_android_device(adb_bin: str) -> Tuple[str, str]:
     # 0 active devices -> inspect available AVDs via emulator -list-avds
     emu_bin = find_emulator()
     if not emu_bin:
-        print("error: tidak ada perangkat/emulator Android aktif dan binary 'emulator' tidak ditemukan.", file=sys.stderr)
+        print("error: no active Android device/emulator found and the 'emulator' binary was not found.", file=sys.stderr)
         raise SystemExit(1)
     rc_avd, avd_out = run_cmd([emu_bin, "-list-avds"], capture=True)
     avds = [ln.strip() for ln in avd_out.splitlines() if ln.strip()]
     if rc_avd != 0 or not avds:
-        print("error: tidak ada AVD Android tersedia. Buat AVD di Android Studio lalu coba lagi.", file=sys.stderr)
+        print("error: no Android AVDs available. Create an AVD in Android Studio and try again.", file=sys.stderr)
         raise SystemExit(1)
     if len(avds) == 1:
         chosen_avd = avds[0]
-        print(f"↺ Tidak ada emulator aktif. Mem-boot AVD tunggal: {chosen_avd} ...", flush=True)
+        print(f"↺ No active emulator found. Booting single AVD: {chosen_avd} ...", flush=True)
     else:
-        idx = prompt_choice("Tidak ada emulator aktif. Pilih AVD untuk dijalankan:", avds)
+        idx = prompt_choice("No active emulator found. Select an AVD to boot:", avds)
         chosen_avd = avds[idx]
-        print(f"↺ Mem-boot AVD: {chosen_avd} ...", flush=True)
+        print(f"↺ Booting AVD: {chosen_avd} ...", flush=True)
 
     subprocess.Popen(
         [emu_bin, "-avd", chosen_avd],
@@ -196,11 +196,11 @@ def detect_android_device(adb_bin: str) -> Tuple[str, str]:
                 serial, label = online[0]
                 rc_b, prop_out = run_cmd([adb_bin, "-s", serial, "shell", "getprop", "sys.boot_completed"], capture=True)
                 if rc_b == 0 and prop_out.strip() == "1":
-                    print(f"✓ Emulator siap: {serial} ({chosen_avd})", flush=True)
+                    print(f"✓ Emulator ready: {serial} ({chosen_avd})", flush=True)
                     return serial, chosen_avd
         time.sleep(poll_s)
 
-    print("error: timeout menunggu emulator Android selesai boot (sys.boot_completed != 1).", file=sys.stderr)
+    print("error: timed out waiting for Android emulator to finish booting (sys.boot_completed != 1).", file=sys.stderr)
     raise SystemExit(1)
 
 
@@ -241,37 +241,37 @@ def detect_ios_simulator() -> Tuple[str, str, str]:
 
     if len(booted) == 1:
         udid, name, rt = booted[0]
-        print(f"✓ Simulator terdeteksi otomatis: {name} ({rt} · {udid})", flush=True)
+        print(f"✓ Auto-selected simulator: {name} ({rt} · {udid})", flush=True)
         return udid, name, rt
     if len(booted) > 1:
         idx = prompt_choice(
-            "Ditemukan beberapa simulator iOS aktif (Booted):",
+            "Multiple booted iOS simulators found:",
             [f"{name} · {rt} ({udid})" for udid, name, rt in booted],
         )
         return booted[idx]
 
     # 0 Booted
     if not available_iphones:
-        print("error: tidak ada simulator iPhone iOS yang tersedia di Xcode.", file=sys.stderr)
+        print("error: no available iPhone simulators found in Xcode.", file=sys.stderr)
         raise SystemExit(1)
     if len(available_iphones) == 1:
         udid, name, rt = available_iphones[0]
-        print(f"↺ Tidak ada simulator Booted. Mem-boot simulator tunggal: {name} ({rt}) ...", flush=True)
+        print(f"↺ No booted simulator found. Booting single simulator: {name} ({rt}) ...", flush=True)
     else:
         idx = prompt_choice(
-            "Tidak ada simulator Booted. Pilih simulator iPhone untuk dijalankan:",
+            "No booted simulator found. Select an iPhone simulator to boot:",
             [f"{name} · {rt} ({udid})" for udid, name, rt in available_iphones],
         )
         udid, name, rt = available_iphones[idx]
-        print(f"↺ Mem-boot simulator: {name} ({rt}) ...", flush=True)
+        print(f"↺ Booting simulator: {name} ({rt}) ...", flush=True)
 
     run_cmd(["xcrun", "simctl", "boot", udid], capture=True)
     run_cmd(["open", "-a", "Simulator"], capture=True)
     rc_wait, wait_out = run_cmd(["xcrun", "simctl", "bootstatus", udid, "-b"], capture=True)
     if rc_wait != 0:
-        print(f"error: simulator gagal bootstatus: {wait_out.strip()}", file=sys.stderr)
+        print(f"error: simulator bootstatus failed: {wait_out.strip()}", file=sys.stderr)
         raise SystemExit(1)
-    print(f"✓ Simulator siap: {name} ({rt} · {udid})", flush=True)
+    print(f"✓ Simulator ready: {name} ({rt} · {udid})", flush=True)
     return udid, name, rt
 
 
@@ -339,20 +339,20 @@ def deploy_android(
     if rebuild_apk:
         rc, g_out = run_cmd([gradle_bin, "assembleDebug"], cwd=str(project_root / "mobile" / "android"), env=env, capture=True)
         if rc != 0:
-            return False, f"Gradle build gagal:\n{g_out}"
+            return False, f"Gradle build failed:\n{g_out}"
     apk_path = find_apk(project_root)
     if not apk_path.is_file():
-        return False, f"APK debug tidak ditemukan: {apk_path}"
+        return False, f"Debug APK not found: {apk_path}"
     rc_in, in_out = run_cmd([adb_bin, "-s", serial, "install", "-r", "-t", str(apk_path)], capture=True)
     if rc_in != 0:
-        return False, f"adb install gagal:\n{in_out}"
+        return False, f"adb install failed:\n{in_out}"
     run_cmd([adb_bin, "-s", serial, "shell", "am", "force-stop", app_id], capture=True)
     comp = f"{app_id}/{activity}"
     rc_st, _ = run_cmd([adb_bin, "-s", serial, "shell", "am", "start", "-n", comp], capture=True)
     if rc_st != 0:
         rc_mk, mk_out = run_cmd([adb_bin, "-s", serial, "shell", "monkey", "-p", app_id, "1"], capture=True)
         if rc_mk != 0:
-            return False, f"Gagal meluncurkan app Android:\n{mk_out}"
+            return False, f"Failed to launch Android app:\n{mk_out}"
     return True, app_id
 
 
@@ -386,7 +386,7 @@ def deploy_ios(
         capture=True,
     )
     if rc_xb != 0:
-        return False, f"xcodebuild gagal:\n{xb_out}"
+        return False, f"xcodebuild failed:\n{xb_out}"
     app_path = derived / "Build" / "Products" / "Debug-iphonesimulator" / f"{scheme}.app"
     if not app_path.is_dir():
         apps = sorted((derived / "Build" / "Products" / "Debug-iphonesimulator").glob("*.app"))
@@ -394,13 +394,13 @@ def deploy_ios(
             app_path = apps[0]
     rc_in, in_out = run_cmd(["xcrun", "simctl", "install", udid, str(app_path)], capture=True)
     if rc_in != 0:
-        return False, f"xcrun simctl install gagal:\n{in_out}"
+        return False, f"xcrun simctl install failed:\n{in_out}"
     rc_ln, ln_out = run_cmd(
         ["xcrun", "simctl", "launch", "--terminate-running-process", udid, bundle_id],
         capture=True,
     )
     if rc_ln != 0:
-        return False, f"xcrun simctl launch gagal:\n{ln_out}"
+        return False, f"xcrun simctl launch failed:\n{ln_out}"
     return True, bundle_id
 
 
@@ -449,7 +449,7 @@ def watch_loop(
 ) -> None:
     core_target = "android-arm64" if platform == "android" else "ios-simulator-arm64"
     print(
-        f"\n👀 Live Watch aktif ({platform} · {device_id}) memantau src/**/*.yz, yaza.toml, mobile/{platform}/**. Tekan Ctrl+C untuk berhenti.",
+        f"\n👀 Live Watch active ({platform} · {device_id}) watching src/**/*.yz, yaza.toml, mobile/{platform}/**. Press Ctrl+C to stop.",
         flush=True,
     )
     last_snap = snapshot_watch_files(project_root, platform)
@@ -478,9 +478,9 @@ def watch_loop(
 
             ok_core, core_ms, core_out = build_core_engine(yaza_bin, core_target, str(project_root))
             if not ok_core:
-                print(f"\n[{now_hms()}] ✗ Gagal kompilasi YAZA setelah {primary} berubah:", file=sys.stderr, flush=True)
+                print(f"\n[{now_hms()}] ✗ YAZA compile failed after {primary} changed:", file=sys.stderr, flush=True)
                 print(core_out.rstrip(), file=sys.stderr, flush=True)
-                print(f"[{now_hms()}]   Menunggu perbaikan file berikutnya...", file=sys.stderr, flush=True)
+                print(f"[{now_hms()}]   Waiting for the next file fix...", file=sys.stderr, flush=True)
                 continue
 
             if platform == "android":
@@ -490,11 +490,11 @@ def watch_loop(
 
             total_ms = int((time.monotonic() - t_start) * 1000)
             if not ok_dep:
-                print(f"\n[{now_hms()}] ✗ Gagal deploy {platform} setelah {primary} berubah:", file=sys.stderr, flush=True)
+                print(f"\n[{now_hms()}] ✗ Deploy failed for {platform} after {primary} changed:", file=sys.stderr, flush=True)
                 print(dep_msg.rstrip(), file=sys.stderr, flush=True)
-                print(f"[{now_hms()}]   Watcher tetap aktif. Menunggu perubahan...", file=sys.stderr, flush=True)
+                print(f"[{now_hms()}]   Watcher remains active. Waiting for changes...", file=sys.stderr, flush=True)
             else:
-                print(f"[{now_hms()}] ↻ {primary} berubah -> rebuilt dalam {total_ms}ms (core {core_ms}ms) & reloaded", flush=True)
+                print(f"[{now_hms()}] ↻ {primary} changed -> rebuilt in {total_ms}ms (core {core_ms}ms) & reloaded", flush=True)
 
 
 def main() -> int:
@@ -515,17 +515,17 @@ def main() -> int:
         adb_bin = find_adb()
         gradle_bin = find_gradle()
         serial, _label = detect_android_device(adb_bin)
-        print("↺ Membangun YAZA Native Core (android-arm64)...", flush=True)
+        print("↺ Building YAZA Native Core (android-arm64)...", flush=True)
         ok_core, core_ms, core_out = build_core_engine(yaza_bin, "android-arm64", str(project_root))
         if not ok_core:
             print(core_out, file=sys.stderr, flush=True)
             return 1
-        print(f"✓ Core selesai ({core_ms}ms). Memasang & menjalankan di {serial}...", flush=True)
+        print(f"✓ Core built ({core_ms}ms). Installing & launching on {serial}...", flush=True)
         ok_dep, dep_msg = deploy_android(yaza_bin, project_root, adb_bin, gradle_bin, serial, rebuild_apk=True)
         if not ok_dep:
             print(dep_msg, file=sys.stderr, flush=True)
             return 1
-        print(f"✓ Aplikasi {dep_msg} berjalan di {serial}.", flush=True)
+        print(f"✓ App {dep_msg} running on {serial}.", flush=True)
         if watch_enabled:
             watch_loop(yaza_bin, "android", project_root, serial, adb_bin=adb_bin, gradle_bin=gradle_bin)
     else:
@@ -533,22 +533,22 @@ def main() -> int:
             print("error: Xcode command-line tools are required to run iOS", file=sys.stderr)
             return 1
         udid, name, _rt = detect_ios_simulator()
-        print("↺ Membangun YAZA Native Core (ios-simulator-arm64)...", flush=True)
+        print("↺ Building YAZA Native Core (ios-simulator-arm64)...", flush=True)
         ok_core, core_ms, core_out = build_core_engine(yaza_bin, "ios-simulator-arm64", str(project_root))
         if not ok_core:
             print(core_out, file=sys.stderr, flush=True)
             return 1
-        print(f"✓ Core selesai ({core_ms}ms). Memasang & menjalankan di {name}...", flush=True)
+        print(f"✓ Core built ({core_ms}ms). Installing & launching on {name}...", flush=True)
         ok_dep, dep_msg = deploy_ios(project_root, udid)
         if not ok_dep:
             print(dep_msg, file=sys.stderr, flush=True)
             return 1
-        print(f"✓ Aplikasi {dep_msg} berjalan di {name} ({udid}).", flush=True)
+        print(f"✓ App {dep_msg} running on {name} ({udid}).", flush=True)
         if watch_enabled:
             watch_loop(yaza_bin, "ios", project_root, udid)
 
     if STOP_REQUESTED:
-        print("\n✓ Live reload dihentikan dengan bersih.", flush=True)
+        print("\n✓ Live reload stopped cleanly.", flush=True)
     return 0
 
 

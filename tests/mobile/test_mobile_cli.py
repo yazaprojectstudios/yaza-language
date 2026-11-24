@@ -178,7 +178,7 @@ def test_help_and_templates(tmp: pathlib.Path) -> None:
     print("1. Testing --help & new/init --mobile modular structure...")
     res_help = run_cli(["mobile", "--help"], REPO_ROOT)
     assert res_help.returncode == 0, res_help.stdout
-    assert "run [--target <android|ios>] [--once]" in res_help.stdout, res_help.stdout
+    assert "run [android|ios] [--target <android|ios>] [--once]" in res_help.stdout, res_help.stdout
     assert "android-emulator -> android" in res_help.stdout, res_help.stdout
 
     # yaza new --mobile
@@ -255,7 +255,12 @@ def test_smart_detection_scenarios(proj: pathlib.Path, tmp: pathlib.Path) -> Non
     extra = {"PATH": f"{mock_bin}:{os.environ['PATH']}", "YAZA_GRADLE_BIN": str(mock_bin / "gradle"), "YAZA_ADB_BIN": str(mock_bin / "adb"), "YAZA_EMULATOR_BIN": str(mock_bin / "emulator"), "YAZA_MOBILE_BOOT_TIMEOUT": "10", "YAZA_MOBILE_POLL_INTERVAL": "0.05"}
     res = run_cli(["mobile", "run", "--target", "android", "--once"], proj, extra)
     assert res.returncode == 0, res.stdout
-    assert "Target terdeteksi otomatis: emulator-5554 (Pixel_8_API_35)" in res.stdout, res.stdout
+    assert "Auto-selected target: emulator-5554 (Pixel_8_API_35)" in res.stdout, res.stdout
+
+    # A2. Positional syntax `yaza mobile run android --once` (without --target)
+    res_pos = run_cli(["mobile", "run", "android", "--once"], proj, extra)
+    assert res_pos.returncode == 0, res_pos.stdout
+    assert "Auto-selected target: emulator-5554 (Pixel_8_API_35)" in res_pos.stdout, res_pos.stdout
 
     # B. Android 2 active devices (interactive pick #2 + legacy alias android-emulator)
     log_file.write_text("")
@@ -276,7 +281,7 @@ def test_smart_detection_scenarios(proj: pathlib.Path, tmp: pathlib.Path) -> Non
     state_file.write_text(json.dumps({"adb_devices": [], "avds": ["Auto_Pixel_AVD"]}))
     res = run_cli(["mobile", "run", "--target", "android", "--once"], proj, extra)
     assert res.returncode == 0, res.stdout
-    assert "Mem-boot AVD tunggal: Auto_Pixel_AVD" in res.stdout, res.stdout
+    assert "Booting single AVD: Auto_Pixel_AVD" in res.stdout, res.stdout
     assert "emulator -avd Auto_Pixel_AVD" in log_file.read_text(), log_file.read_text()
 
     # D. Android 0 active devices, 2 AVDs -> prompt #2
@@ -299,7 +304,7 @@ def test_smart_detection_scenarios(proj: pathlib.Path, tmp: pathlib.Path) -> Non
     }))
     res = run_cli(["mobile", "run", "--target", "ios", "--once"], proj, extra)
     assert res.returncode == 0, res.stdout
-    assert "Simulator terdeteksi otomatis: iPhone 16 Pro (iOS 18.2 · UDID-111)" in res.stdout, res.stdout
+    assert "Auto-selected simulator: iPhone 16 Pro (iOS 18.2 · UDID-111)" in res.stdout, res.stdout
 
     # F. iOS 2 Booted simulators -> prompt #2 + legacy alias ios-simulator
     log_file.write_text("")
@@ -381,31 +386,31 @@ def test_live_watch_and_reload(proj: pathlib.Path, tmp: pathlib.Path) -> None:
                     time.sleep(0.1)
                 raise AssertionError(f"Timeout waiting for {substr!r}.\nLog:\n{out_log.read_text()}")
 
-            wait_for("Live Watch aktif")
+            wait_for("Live Watch active")
 
             # 1) Valid edit in domain/greeting.yz -> triggers rebuild + reload
             domain_file = proj / "src" / "domain" / "greeting.yz"
             orig_domain = domain_file.read_text(encoding="utf-8")
-            domain_file.write_text(orig_domain.replace("Halo, ", "Assalamualaikum, "), encoding="utf-8")
-            wait_for("berubah -> rebuilt dalam")
+            domain_file.write_text(orig_domain.replace("Hello, ", "Hi, "), encoding="utf-8")
+            wait_for("changed -> rebuilt in")
 
             # 2) Syntax/compile error -> watcher prints error WITHOUT exiting
             engine_file = proj / "src" / "mobile_engine.yz"
             orig_engine = engine_file.read_text(encoding="utf-8")
             engine_file.write_text(orig_engine + "\nTHIS_IS_INVALID_SYNTAX(((\n", encoding="utf-8")
-            wait_for("Gagal kompilasi YAZA setelah")
+            wait_for("YAZA compile failed after")
             assert proc.poll() is None, "Watcher should survive compile errors!"
 
             # 3) Fix syntax error -> automatically rebuilds & reloads again
             engine_file.write_text(orig_engine + "\n", encoding="utf-8")
-            wait_for("src/mobile_engine.yz berubah -> rebuilt dalam")
+            wait_for("src/mobile_engine.yz changed -> rebuilt in")
 
             # 4) Clean SIGINT shutdown (deliver to foreground process group like terminal Ctrl+C)
             os.killpg(proc.pid, signal.SIGINT)
             rc = proc.wait(timeout=5)
             assert rc == 0, f"Expected clean SIGINT exit 0, got {rc}"
             final_log = out_log.read_text(encoding="utf-8")
-            assert "Live reload dihentikan dengan bersih." in final_log, final_log
+            assert "Live reload stopped cleanly." in final_log, final_log
         finally:
             if proc.poll() is None:
                 try:

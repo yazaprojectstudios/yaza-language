@@ -26,7 +26,7 @@ struct HomeView: View {
     @State private var engine: MobileEngine?
     @State private var uiState = MobileUiState(
         title: "Welcome to YAZA Mobile",
-        greeting: "Memuat Shared YAZA Core...",
+        greeting: "Loading Shared YAZA Core...",
         counter: 0,
         status: "ready",
         effects: []
@@ -74,9 +74,9 @@ struct HomeView: View {
             }
 
             HStack(spacing: 8) {
-                TextField("Masukkan nama Anda", text: $nameInput)
+                TextField("Enter your name", text: $nameInput)
                     .textFieldStyle(.roundedBorder)
-                Button("Sapa") {
+                Button("Greet") {
                     dispatchAction("GREET|\(nameInput)", showToast: true)
                 }
                 .buttonStyle(.bordered)
@@ -90,7 +90,7 @@ struct HomeView: View {
                 .buttonStyle(.borderedProminent)
                 .disabled(engine == nil || dispatchPending)
 
-                Button("Simpan") {
+                Button("Save") {
                     dispatchAction("PERSIST", showToast: true)
                 }
                 .buttonStyle(.bordered)
@@ -205,7 +205,7 @@ private func decodeYbifState(_ data: Data) throws -> MobileUiState {
     let fallback = Int64(String(decoding: bytes, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
     return MobileUiState(
         title: "Welcome to YAZA Mobile",
-        greeting: "Shared YAZA Core aktif",
+        greeting: "Shared YAZA Core active",
         counter: fallback,
         status: "ready",
         effects: []
