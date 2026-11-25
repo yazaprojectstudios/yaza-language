@@ -1,0 +1,170 @@
+# Read/Write Splitting Router, Lag-Aware Failover Topology Refresh,
+# Positive 31-Bit FNV-1a Hash-Sharding Ring, and Scatter-Gather SELECT (Phase C3)
+
+use "./server_v1"
+use "./session_v1"
+use "./sql_binder_v1"
+use "./sql_dispatch_v1"
+use "./sql_executor_v1"
+use "./sql_lexer_v1"
+
+shape YazaDbRouterNodeV1:
+    node_id: Text
+    endpoint: Text
+    role: Text
+    applied_lsn: Number
+    healthy: Boolean
+
+shape YazaDbRwRouterV1:
+    primary: YazaDbRouterNodeV1
+    replicas: List[YazaDbRouterNodeV1]
+    primary_lsn: Number
+    max_lag_bytes: Number
+    next_rr_index: Number
+
+shape YazaDbRouteDecisionV1:
+    router: YazaDbRwRouterV1
+    target: YazaDbRouterNodeV1
+    reason: Text
+
+shape YazaDbShardNodeV1:
+    shard_id: Number
+    node_id: Text
+    endpoint: Text
+
+shape YazaDbShardRingV1:
+    shards: List[YazaDbShardNodeV1]
+
+shape YazaDbScatterGatherResultV1:
+    sessions: List[YazaDbSessionV1]
+    columns: List[YazaSqlBoundProjectionV1]
+    rows: List[List[YazaSqlValueV1]]
+    shard_count: Number
+    total_rows: Number
+
+fn yaza_db_router_new_v1(primary: YazaDbRouterNodeV1, replicas: List[YazaDbRouterNodeV1], primary_lsn: Number, max_lag_bytes: Number) -> YazaDbRwRouterV1:
+    var lag_limit: Number = max_lag_bytes
+    if lag_limit < 0: set lag_limit = 0
+    return YazaDbRwRouterV1(primary, replicas, primary_lsn, lag_limit, 0)
+
+fn yaza_db_router_update_topology_v1(router: YazaDbRwRouterV1, new_primary: YazaDbRouterNodeV1, replicas: List[YazaDbRouterNodeV1], primary_lsn: Number) -> YazaDbRwRouterV1:
+    return YazaDbRwRouterV1(new_primary, replicas, primary_lsn, router.max_lag_bytes, 0)
+
+fn yaza_db_router_is_primary_only_sql_v1(sql: Text) -> Boolean:
+    if yaza_db_server_sql_is_write_v1(sql):
+        return true
+    let lex_res: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(sql)
+    if not result_is_ok(lex_res):
+        return false
+    let tx_res: Result[Option[YazaDbTxControlCommandV1], Text] = yaza_db_parse_tx_control_v1(sql, result_unwrap(lex_res))
+    if result_is_ok(tx_res):
+        let cmd_opt: Option[YazaDbTxControlCommandV1] = result_unwrap(tx_res)
+        if option_is_some(cmd_opt):
+            return true
+    return false
+
+fn yaza_db_router_select_target_v1(router: YazaDbRwRouterV1, sql: Text, min_lsn: Number) -> Result[YazaDbRouteDecisionV1, Text]:
+    if yaza_db_router_is_primary_only_sql_v1(sql):
+        return ok(YazaDbRouteDecisionV1(router, router.primary, "write_or_tx"))
+
+    let rep_count: Number = list_count(router.replicas)
+    if rep_count == 0:
+        return ok(YazaDbRouteDecisionV1(router, router.primary, "no_replicas"))
+
+    var start: Number = router.next_rr_index % rep_count
+    if start < 0: set start = 0
+    var offset: Number = 0
+    while offset < rep_count:
+        let idx: Number = (start + offset) % rep_count
+        let rep: YazaDbRouterNodeV1 = list_get(router.replicas, idx)
+        let lag: Number = router.primary_lsn - rep.applied_lsn
+        if rep.healthy and rep.role == "replica" and rep.applied_lsn >= min_lsn and lag <= router.max_lag_bytes:
+            let next_rr: Number = (idx + 1) % rep_count
+            let next_router: YazaDbRwRouterV1 = YazaDbRwRouterV1(router.primary, router.replicas, router.primary_lsn, router.max_lag_bytes, next_rr)
+            return ok(YazaDbRouteDecisionV1(next_router, rep, "replica_rr"))
+        set offset = offset + 1
+
+    return ok(YazaDbRouteDecisionV1(router, router.primary, "primary_fallback_lag_or_health"))
+
+fn yaza_db_byte_xor8_v1(a: Number, b: Number) -> Number:
+    var out: Number = 0
+    var weight: Number = 1
+    var va: Number = a % 256
+    var vb: Number = b % 256
+    var bit: Number = 0
+    while bit < 8:
+        let ba: Number = va % 2
+        let bb: Number = vb % 2
+        if ba != bb:
+            set out = out + weight
+        set va = va / 2
+        set vb = vb / 2
+        set weight = weight * 2
+        set bit = bit + 1
+    return out
+
+fn yaza_db_fnv1a_31_v1(key_text: Text) -> Number:
+    # Positive 31-bit FNV-1a over UTF-8 bytes; keeps intermediate hash modulo 2147483647
+    # before multiplying by FNV prime 16777619 so signed 64-bit never overflows.
+    let raw: Bytes = bytes_from_text(key_text)
+    var hash: Number = 18772614 # 2166136261 % 2147483647
+    var i: Number = 0
+    let n: Number = bytes_length(raw)
+    while i < n:
+        let b: Number = bytes_get(raw, i)
+        let low_xor: Number = yaza_db_byte_xor8_v1(hash % 256, b)
+        let mixed: Number = ((hash / 256) * 256 + low_xor) % 2147483647
+        set hash = (mixed * 16777619) % 2147483647
+        set i = i + 1
+    if hash < 0:
+        set hash = -hash
+    return hash % 2147483647
+
+fn yaza_db_shard_ring_new_v1(shards: List[YazaDbShardNodeV1]) -> Result[YazaDbShardRingV1, Text]:
+    if list_count(shards) < 1:
+        return err("YDBv1 shard ring requires at least 1 shard")
+    return ok(YazaDbShardRingV1(shards))
+
+fn yaza_db_shard_route_key_v1(ring: YazaDbShardRingV1, key_text: Text) -> Result[YazaDbShardNodeV1, Text]:
+    let count: Number = list_count(ring.shards)
+    if count < 1:
+        return err("YDBv1 shard ring is empty")
+    let h: Number = yaza_db_fnv1a_31_v1(key_text)
+    let idx: Number = h % count
+    return ok(list_get(ring.shards, idx))
+
+fn yaza_db_shard_scatter_gather_select_v1(sessions: List[YazaDbSessionV1], sql: Text) -> Result[YazaDbScatterGatherResultV1, Text]:
+    let shard_count: Number = list_count(sessions)
+    if shard_count < 1:
+        return err("YDBv1 scatter-gather SELECT requires at least 1 shard session")
+
+    let out_sessions_res: Result[List[YazaDbSessionV1], Text] = list_try_new()
+    let cols_res: Result[List[YazaSqlBoundProjectionV1], Text] = list_try_new()
+    let rows_res: Result[List[List[YazaSqlValueV1]], Text] = list_try_new()
+    if not result_is_ok(out_sessions_res) or not result_is_ok(cols_res) or not result_is_ok(rows_res):
+        return err("YDBv1 scatter-gather SELECT could not allocate output lists")
+    let out_sessions: List[YazaDbSessionV1] = result_unwrap(out_sessions_res)
+    var cols: List[YazaSqlBoundProjectionV1] = result_unwrap(cols_res)
+    let rows: List[List[YazaSqlValueV1]] = result_unwrap(rows_res)
+
+    var have_cols: Boolean = false
+    var i: Number = 0
+    while i < shard_count:
+        let s: YazaDbSessionV1 = list_get(sessions, i)
+        let exec_res: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(s, sql, List[YazaSqlValueV1]())?
+        let next_s: YazaDbSessionV1 = exec_res.session
+        if not list_try_push(out_sessions, next_s):
+            return err("YDBv1 scatter-gather failed updating shard session list")
+        if option_is_some(exec_res.statement.query_result):
+            let qr: YazaSqlQueryResultV1 = option_unwrap(exec_res.statement.query_result)
+            if not have_cols:
+                set cols = qr.columns
+                set have_cols = true
+            var r: Number = 0
+            while r < list_count(qr.rows):
+                if not list_try_push(rows, list_get(qr.rows, r)):
+                    return err("YDBv1 scatter-gather row append failed")
+                set r = r + 1
+        set i = i + 1
+
+    return ok(YazaDbScatterGatherResultV1(out_sessions, cols, rows, shard_count, list_count(rows)))

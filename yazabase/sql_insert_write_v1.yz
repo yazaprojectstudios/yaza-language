@@ -31,6 +31,21 @@ shape YazaDbSqlInsertIndexLeafGroupPlanV1:
     index_number: Number
     groups: List[YazaDbWriteLeafInsertGroupV1]
 
+shape YazaDbSqlInsertPreparedPlanV1:
+    transaction_row_count: Number
+    overflow_budget: YazaDbSqlInsertOverflowBudgetV1
+    reserve_pages: Number
+    prepared_rows: List[YazaDbWriteLeafInsertV1]
+    fast_insert_plan: YazaDbSqlInsertLeafGroupPlanV1
+    fast_index_plans: List[YazaDbSqlInsertIndexLeafGroupPlanV1]
+    fast_insert_eligible: Boolean
+    split_aware_base_eligible: Boolean
+
+shape YazaDbSqlInsertOverlayAttemptV1:
+    handled: Boolean
+    commit: Option[YazaDbWriteCommitV1]
+    overlay: YazaDbDirtyPageOverlayV1
+
 fn yaza_db_sql_insert_max_overflow_bytes_v1() -> Number:
     return 16777216
 
@@ -57,7 +72,7 @@ fn yaza_db_sql_insert_overflow_budget_v1(batch: YazaSqlInsertMaterializedV1) -> 
         set row_index = row_index + 1
     return ok(YazaDbSqlInsertOverflowBudgetV1(page_count, byte_count))
 
-fn yaza_db_sql_insert_preflight_leaf_v1(storage: YazaDbStorageHandleV1, tree_root_page_id: Number, key: Bytes, cached_page_id: Number, cached_page: Bytes) -> Result[YazaDbSqlInsertPreflightLeafV1, Text]:
+fn yaza_db_sql_insert_preflight_leaf_with_overlay_v1(storage: YazaDbStorageHandleV1, tree_root_page_id: Number, key: Bytes, cached_page_id: Number, cached_page: Bytes, overlay: Option[YazaDbDirtyPageOverlayV1]) -> Result[YazaDbSqlInsertPreflightLeafV1, Text]:
     var page_id: Number = -1
     var page: Bytes = bytes_from_text("")
     if cached_page_id >= 2:
@@ -70,14 +85,30 @@ fn yaza_db_sql_insert_preflight_leaf_v1(storage: YazaDbStorageHandleV1, tree_roo
             let high_fence: Bytes = yaza_db_btree_fence_bytes_v1(cached_page, cached_header, false)?
             if yaza_db_compare_bytes_v1(key, high_fence) >= 0: set within_cached_fences = false
         if within_cached_fences:
-            set page_id = cached_page_id
-            set page = cached_page
+            return ok(YazaDbSqlInsertPreflightLeafV1(cached_page_id, cached_page, cached_header))
     if page_id < 0:
+        if option_is_some(overlay):
+            let ov: YazaDbDirtyPageOverlayV1 = option_unwrap(overlay)
+            let root_ov_idx: Number = yaza_db_dirty_overlay_find_v1(ov, tree_root_page_id)
+            if root_ov_idx >= 0:
+                let root_ov_page: Bytes = list_get(ov.pages, root_ov_idx)
+                let root_ov_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(root_ov_page, tree_root_page_id)?
+                if root_ov_header.page_type == 1 and root_ov_header.level == 0:
+                    return ok(YazaDbSqlInsertPreflightLeafV1(tree_root_page_id, root_ov_page, root_ov_header))
         let seek: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(storage.file, storage.header, tree_root_page_id, key)?
-        set page_id = seek.leaf_page_id
-        set page = yaza_db_storage_read_page_v1(storage.file, storage.header, page_id)?
+        if option_is_some(overlay):
+            let ov: YazaDbDirtyPageOverlayV1 = option_unwrap(overlay)
+            let ov_idx: Number = yaza_db_dirty_overlay_find_v1(ov, seek.leaf_page_id)
+            if ov_idx >= 0:
+                let ov_page: Bytes = list_get(ov.pages, ov_idx)
+                let ov_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(ov_page, seek.leaf_page_id)?
+                return ok(YazaDbSqlInsertPreflightLeafV1(seek.leaf_page_id, ov_page, ov_header))
+        return ok(YazaDbSqlInsertPreflightLeafV1(seek.leaf_page_id, seek.leaf_page, seek.leaf_header))
     let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, page_id)?
     return ok(YazaDbSqlInsertPreflightLeafV1(page_id, page, header))
+
+fn yaza_db_sql_insert_preflight_leaf_v1(storage: YazaDbStorageHandleV1, tree_root_page_id: Number, key: Bytes, cached_page_id: Number, cached_page: Bytes) -> Result[YazaDbSqlInsertPreflightLeafV1, Text]:
+    return yaza_db_sql_insert_preflight_leaf_with_overlay_v1(storage, tree_root_page_id, key, cached_page_id, cached_page, none)
 
 fn yaza_db_sql_insert_leaf_group_ineligible_v1() -> Result[YazaDbSqlInsertLeafGroupPlanV1, Text]:
     let empty_result: Result[List[YazaDbWriteLeafInsertGroupV1], Text] = list_try_new()
@@ -127,9 +158,25 @@ fn yaza_db_sql_insert_sort_grouped_items_v1(items: List[YazaDbWriteLeafInsertV1]
         if not yaza_db_sql_insert_grouped_item_sift_down_v1(items, 0, end): return false
     return true
 
+fn yaza_db_sql_insert_slot_fits_v1(leaf_page: Bytes, header: YazaDbPageHeaderV1, sim_count: Number, sim_data_start: Number, key: Bytes, payload: Bytes) -> Result[Number, Text]:
+    let key_length: Number = bytes_length(key)
+    let payload_length: Number = bytes_length(payload)
+    if key_length < 1 or key_length > 2048 or payload_length > 4096:
+        return err("YDBv1 inserted slot key or payload exceeds its page limit")
+    if header.prefix_len > 0:
+        let prefix: Bytes = bytes_try_slice(leaf_page, yaza_db_page_size_v1() - header.prefix_len, header.prefix_len)?
+        if key_length < header.prefix_len or not yaza_db_page_bytes_have_prefix_v1(key, prefix):
+            return err("YDBv1 slot key does not contain the page's shared prefix")
+    if sim_count >= 1361: return ok(-1)
+    let stored_key_len: Number = key_length - header.prefix_len
+    let next_data_start: Number = sim_data_start - stored_key_len - payload_length
+    let slot_end: Number = yaza_db_page_header_size_v1() + (sim_count + 1) * yaza_db_page_slot_size_v1()
+    if next_data_start < slot_end: return ok(-1)
+    return ok(next_data_start)
+
 fn yaza_db_sql_insert_index_leaf_group_plan_v1(storage: YazaDbStorageHandleV1, index_number: Number, index: YazaDbSecondaryIndexV1, batch: YazaSqlInsertMaterializedV1) -> Result[YazaDbSqlInsertIndexLeafGroupPlanV1, Text]:
     let row_count: Number = list_count(batch.rows)
-    if index_number < 0 or index.root_page_id < 2 or row_count < 2 or row_count > 900: return yaza_db_sql_insert_index_leaf_group_ineligible_v1(index_number)
+    if index_number < 0 or index.root_page_id < 2 or row_count < 1 or row_count > 900: return yaza_db_sql_insert_index_leaf_group_ineligible_v1(index_number)
     let items_result: Result[List[YazaDbWriteLeafInsertV1], Text] = list_try_new()
     if not result_is_ok(items_result): return err("YDBv1 SQL INSERT could not allocate secondary-index leaf items")
     let items: List[YazaDbWriteLeafInsertV1] = result_unwrap(items_result)
@@ -152,6 +199,8 @@ fn yaza_db_sql_insert_index_leaf_group_plan_v1(storage: YazaDbStorageHandleV1, i
     var current_page: Bytes = first_seek.leaf_page
     var current_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(current_page, current_page_id)?
     if current_header.page_type != 1 or current_header.level != 0: return err("YDBv1 SQL INSERT secondary-index grouped plan reached a non-leaf page")
+    var sim_count: Number = current_header.count
+    var sim_data_start: Number = current_header.data_start
     var current_low_fence: Bytes = bytes_from_text("")
     var current_high_fence: Bytes = bytes_from_text("")
     if current_header.low_fence_len > 0: set current_low_fence = yaza_db_btree_fence_bytes_v1(current_page, current_header, true)?
@@ -176,6 +225,8 @@ fn yaza_db_sql_insert_index_leaf_group_plan_v1(storage: YazaDbStorageHandleV1, i
             set current_page = next_seek.leaf_page
             set current_header = yaza_db_page_header_decode_v1(current_page, current_page_id)?
             if current_header.page_type != 1 or current_header.level != 0: return err("YDBv1 SQL INSERT secondary-index grouped plan reached a non-leaf page")
+            set sim_count = current_header.count
+            set sim_data_start = current_header.data_start
             set current_low_fence = bytes_from_text("")
             set current_high_fence = bytes_from_text("")
             if current_header.low_fence_len > 0: set current_low_fence = yaza_db_btree_fence_bytes_v1(current_page, current_header, true)?
@@ -183,22 +234,19 @@ fn yaza_db_sql_insert_index_leaf_group_plan_v1(storage: YazaDbStorageHandleV1, i
             let next_group_result: Result[List[YazaDbWriteLeafInsertV1], Text] = list_try_new()
             if not result_is_ok(next_group_result): return err("YDBv1 SQL INSERT could not allocate a later secondary-index leaf group")
             set current_inserts = result_unwrap(next_group_result)
-        let inserted: Result[Bytes, Text] = yaza_db_page_insert_sorted_slot_v1(current_page, item.key, item.row_payload)
-        if not result_is_ok(inserted):
-            let message: Text = result_unwrap_error(inserted)
-            if text_starts_with(message, "YDBv1 page has insufficient free space") or text_starts_with(message, "YDBv1 inserted page cannot retain its fences within the free-space bound") or text_starts_with(message, "YDBv1 slot array is full") or text_starts_with(message, "YDBv1 cannot insert a duplicate page key"):
-                return yaza_db_sql_insert_index_leaf_group_ineligible_v1(index_number)
-            return err("YDBv1 SQL INSERT secondary-index grouped leaf preflight failed: " + message)
-        set current_page = result_unwrap(inserted)
+        let next_data_start: Number = yaza_db_sql_insert_slot_fits_v1(current_page, current_header, sim_count, sim_data_start, item.key, item.row_payload)?
+        if next_data_start < 0: return yaza_db_sql_insert_index_leaf_group_ineligible_v1(index_number)
+        set sim_count = sim_count + 1
+        set sim_data_start = next_data_start
         if not list_try_push(current_inserts, item): return err("YDBv1 SQL INSERT could not stage a secondary-index grouped leaf record")
         set previous_key = item.key
         set row_index = row_index + 1
     if not list_try_push(groups, YazaDbWriteLeafInsertGroupV1(current_page_id, current_inserts)): return err("YDBv1 SQL INSERT could not retain its final secondary-index leaf group")
     return ok(YazaDbSqlInsertIndexLeafGroupPlanV1(true, index_number, groups))
 
-fn yaza_db_sql_insert_leaf_group_plan_prepared_v1(storage: YazaDbStorageHandleV1, tree_root_page_id: Number, key_ordinals: List[Number], schema_version: Number, batch: YazaSqlInsertMaterializedV1, prepared_rows: List[YazaDbWriteLeafInsertV1]) -> Result[YazaDbSqlInsertLeafGroupPlanV1, Text]:
+fn yaza_db_sql_insert_leaf_group_plan_prepared_with_overlay_v1(storage: YazaDbStorageHandleV1, tree_root_page_id: Number, key_ordinals: List[Number], schema_version: Number, batch: YazaSqlInsertMaterializedV1, prepared_rows: List[YazaDbWriteLeafInsertV1], overlay: Option[YazaDbDirtyPageOverlayV1]) -> Result[YazaDbSqlInsertLeafGroupPlanV1, Text]:
     let row_count: Number = list_count(batch.rows)
-    if row_count < 2 or row_count > 900: return yaza_db_sql_insert_leaf_group_ineligible_v1()
+    if row_count < 1 or row_count > 900: return yaza_db_sql_insert_leaf_group_ineligible_v1()
     let groups_result: Result[List[YazaDbWriteLeafInsertGroupV1], Text] = list_try_new()
     if not result_is_ok(groups_result): return err("YDBv1 SQL INSERT could not allocate leaf groups")
     let groups: List[YazaDbWriteLeafInsertGroupV1] = result_unwrap(groups_result)
@@ -209,11 +257,13 @@ fn yaza_db_sql_insert_leaf_group_plan_prepared_v1(storage: YazaDbStorageHandleV1
     else:
         let first_row: YazaSqlInsertMaterializedRowV1 = list_get(batch.rows, 0)
         set first_key = yaza_db_key_encode_composite_v1(first_row.values, first_row.nulls, batch.columns, key_ordinals)?
-    let first_seek: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(storage.file, storage.header, tree_root_page_id, first_key)?
-    var current_page_id: Number = first_seek.leaf_page_id
-    var current_page: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, current_page_id)?
-    var current_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(current_page, current_page_id)?
+    let first_seek: YazaDbSqlInsertPreflightLeafV1 = yaza_db_sql_insert_preflight_leaf_with_overlay_v1(storage, tree_root_page_id, first_key, -1, bytes_from_text(""), overlay)?
+    var current_page_id: Number = first_seek.page_id
+    var current_page: Bytes = first_seek.page
+    var current_header: YazaDbPageHeaderV1 = first_seek.header
     if current_header.page_type != 1 or current_header.level != 0: return err("YDBv1 SQL INSERT grouped plan reached a non-leaf page")
+    var sim_count: Number = current_header.count
+    var sim_data_start: Number = current_header.data_start
     var current_low_fence: Bytes = bytes_from_text("")
     var current_high_fence: Bytes = bytes_from_text("")
     if current_header.low_fence_len > 0: set current_low_fence = yaza_db_btree_fence_bytes_v1(current_page, current_header, true)?
@@ -241,12 +291,14 @@ fn yaza_db_sql_insert_leaf_group_plan_prepared_v1(storage: YazaDbStorageHandleV1
         if not within_current_leaf:
             if not list_try_push(groups, YazaDbWriteLeafInsertGroupV1(current_page_id, current_inserts)): return err("YDBv1 SQL INSERT could not retain a completed leaf group")
             if list_count(groups) >= 128: return yaza_db_sql_insert_leaf_group_ineligible_v1()
-            let next_seek: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(storage.file, storage.header, tree_root_page_id, key)?
-            if next_seek.leaf_page_id == current_page_id: return err("YDBv1 SQL INSERT B+Tree seek returned the old leaf for a key outside its fences")
-            set current_page_id = next_seek.leaf_page_id
-            set current_page = yaza_db_storage_read_page_v1(storage.file, storage.header, current_page_id)?
-            set current_header = yaza_db_page_header_decode_v1(current_page, current_page_id)?
+            let next_seek: YazaDbSqlInsertPreflightLeafV1 = yaza_db_sql_insert_preflight_leaf_with_overlay_v1(storage, tree_root_page_id, key, -1, bytes_from_text(""), overlay)?
+            if next_seek.page_id == current_page_id: return err("YDBv1 SQL INSERT B+Tree seek returned the old leaf for a key outside its fences")
+            set current_page_id = next_seek.page_id
+            set current_page = next_seek.page
+            set current_header = next_seek.header
             if current_header.page_type != 1 or current_header.level != 0: return err("YDBv1 SQL INSERT grouped plan reached a non-leaf page")
+            set sim_count = current_header.count
+            set sim_data_start = current_header.data_start
             set current_low_fence = bytes_from_text("")
             set current_high_fence = bytes_from_text("")
             if current_header.low_fence_len > 0: set current_low_fence = yaza_db_btree_fence_bytes_v1(current_page, current_header, true)?
@@ -256,18 +308,18 @@ fn yaza_db_sql_insert_leaf_group_plan_prepared_v1(storage: YazaDbStorageHandleV1
             let next_group_result: Result[List[YazaDbWriteLeafInsertV1], Text] = list_try_new()
             if not result_is_ok(next_group_result): return err("YDBv1 SQL INSERT could not allocate a later leaf group")
             set current_inserts = result_unwrap(next_group_result)
-        let inserted_result: Result[Bytes, Text] = yaza_db_page_insert_sorted_slot_v1(current_page, key, payload)
-        if not result_is_ok(inserted_result):
-            let message: Text = result_unwrap_error(inserted_result)
-            if text_starts_with(message, "YDBv1 page has insufficient free space") or text_starts_with(message, "YDBv1 inserted page cannot retain its fences within the free-space bound") or text_starts_with(message, "YDBv1 slot array is full"):
-                return yaza_db_sql_insert_leaf_group_ineligible_v1()
-            return err("YDBv1 SQL INSERT grouped leaf preflight failed: " + message)
-        set current_page = result_unwrap(inserted_result)
+        let next_data_start: Number = yaza_db_sql_insert_slot_fits_v1(current_page, current_header, sim_count, sim_data_start, key, payload)?
+        if next_data_start < 0: return yaza_db_sql_insert_leaf_group_ineligible_v1()
+        set sim_count = sim_count + 1
+        set sim_data_start = next_data_start
         if not list_try_push(current_inserts, YazaDbWriteLeafInsertV1(key, payload)): return err("YDBv1 SQL INSERT could not stage a grouped leaf record")
         set previous_key = key
         set row_index = row_index + 1
     if not list_try_push(groups, YazaDbWriteLeafInsertGroupV1(current_page_id, current_inserts)): return err("YDBv1 SQL INSERT could not retain its final leaf group")
     return ok(YazaDbSqlInsertLeafGroupPlanV1(true, groups))
+
+fn yaza_db_sql_insert_leaf_group_plan_prepared_v1(storage: YazaDbStorageHandleV1, tree_root_page_id: Number, key_ordinals: List[Number], schema_version: Number, batch: YazaSqlInsertMaterializedV1, prepared_rows: List[YazaDbWriteLeafInsertV1]) -> Result[YazaDbSqlInsertLeafGroupPlanV1, Text]:
+    return yaza_db_sql_insert_leaf_group_plan_prepared_with_overlay_v1(storage, tree_root_page_id, key_ordinals, schema_version, batch, prepared_rows, none)
 
 fn yaza_db_sql_insert_leaf_group_plan_v1(storage: YazaDbStorageHandleV1, tree_root_page_id: Number, key_ordinals: List[Number], schema_version: Number, batch: YazaSqlInsertMaterializedV1) -> Result[YazaDbSqlInsertLeafGroupPlanV1, Text]:
     return yaza_db_sql_insert_leaf_group_plan_prepared_v1(storage, tree_root_page_id, key_ordinals, schema_version, batch, List[YazaDbWriteLeafInsertV1]())
@@ -304,36 +356,100 @@ fn yaza_db_sql_insert_split_aware_fail_v1(transaction: YazaDbWriteTransactionV1,
 # Monotone base-table batches can be divided at the first leaf split instead of
 # losing the entire grouped path. Each fitting prefix is WAL-grouped across its
 # leaves; only the row that forces a structural split uses the split-safe writer.
-fn yaza_db_sql_insert_write_split_aware_base_v1(transaction: YazaDbWriteTransactionV1, tree_root_page_id: Number, key_ordinals: List[Number], schema_version: Number, batch: YazaSqlInsertMaterializedV1) -> Result[YazaDbWriteTransactionV1, Text]:
+fn yaza_db_sql_insert_write_split_aware_base_prepared_v1(transaction: YazaDbWriteTransactionV1, tree_root_page_id: Number, key_ordinals: List[Number], schema_version: Number, batch: YazaSqlInsertMaterializedV1, prepared_rows: List[YazaDbWriteLeafInsertV1]) -> Result[YazaDbWriteTransactionV1, Text]:
     var current: YazaDbWriteTransactionV1 = transaction
     var row_index: Number = 0
     let row_count: Number = list_count(batch.rows)
+    let have_prepared: Boolean = list_count(prepared_rows) == row_count
     while row_index < row_count:
-        var best_count: Number = 0
-        let empty_plan_result: Result[YazaDbSqlInsertLeafGroupPlanV1, Text] = yaza_db_sql_insert_leaf_group_ineligible_v1()
-        if not result_is_ok(empty_plan_result): return yaza_db_sql_insert_split_aware_fail_v1(current, result_unwrap_error(empty_plan_result))
-        var best_plan: YazaDbSqlInsertLeafGroupPlanV1 = result_unwrap(empty_plan_result)
-        var low: Number = 2
-        var high: Number = row_count - row_index
-        while low <= high:
-            let candidate_count: Number = (low + high) / 2
-            let candidate_batch_result: Result[YazaSqlInsertMaterializedV1, Text] = yaza_db_sql_insert_batch_slice_v1(batch, row_index, candidate_count)
-            if not result_is_ok(candidate_batch_result): return yaza_db_sql_insert_split_aware_fail_v1(current, result_unwrap_error(candidate_batch_result))
-            let candidate_batch: YazaSqlInsertMaterializedV1 = result_unwrap(candidate_batch_result)
-            let candidate_result: Result[YazaDbSqlInsertLeafGroupPlanV1, Text] = yaza_db_sql_insert_leaf_group_plan_v1(current.storage, tree_root_page_id, key_ordinals, schema_version, candidate_batch)
-            if not result_is_ok(candidate_result): return yaza_db_sql_insert_split_aware_fail_v1(current, result_unwrap_error(candidate_result))
-            let candidate: YazaDbSqlInsertLeafGroupPlanV1 = result_unwrap(candidate_result)
-            if candidate.eligible:
-                set best_count = candidate_count
-                set best_plan = candidate
-                set low = candidate_count + 1
-            else:
-                set high = candidate_count - 1
-        if best_count >= 2:
-            let grouped: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_insert_leaf_groups_v1(current, best_plan.groups)
+        var probe: Number = row_index
+        let groups_result: Result[List[YazaDbWriteLeafInsertGroupV1], Text] = list_try_new()
+        if not result_is_ok(groups_result): return yaza_db_sql_insert_split_aware_fail_v1(current, "YDBv1 SQL INSERT could not allocate split-aware leaf groups")
+        let groups: List[YazaDbWriteLeafInsertGroupV1] = result_unwrap(groups_result)
+        if have_prepared and row_index + 1 < row_count:
+            let first_item: YazaDbWriteLeafInsertV1 = list_get(prepared_rows, row_index)
+            let first_seek_res: Result[YazaDbBtreeSeekV1, Text] = yaza_db_btree_seek_leaf_v1(current.storage.file, current.storage.header, tree_root_page_id, first_item.key)
+            if not result_is_ok(first_seek_res): return yaza_db_sql_insert_split_aware_fail_v1(current, result_unwrap_error(first_seek_res))
+            let first_seek: YazaDbBtreeSeekV1 = result_unwrap(first_seek_res)
+            var current_page_id: Number = first_seek.leaf_page_id
+            var current_page: Bytes = first_seek.leaf_page
+            var current_header: YazaDbPageHeaderV1 = first_seek.leaf_header
+            if current_header.page_type != 1 or current_header.level != 0:
+                return yaza_db_sql_insert_split_aware_fail_v1(current, "YDBv1 SQL INSERT split-aware seek reached a non-leaf page")
+            var sim_count: Number = current_header.count
+            var sim_data_start: Number = current_header.data_start
+            var current_low_fence: Bytes = bytes_from_text("")
+            var current_high_fence: Bytes = bytes_from_text("")
+            if current_header.low_fence_len > 0:
+                let lf_res: Result[Bytes, Text] = yaza_db_btree_fence_bytes_v1(current_page, current_header, true)
+                if not result_is_ok(lf_res): return yaza_db_sql_insert_split_aware_fail_v1(current, result_unwrap_error(lf_res))
+                set current_low_fence = result_unwrap(lf_res)
+            if current_header.high_fence_len > 0:
+                let hf_res: Result[Bytes, Text] = yaza_db_btree_fence_bytes_v1(current_page, current_header, false)
+                if not result_is_ok(hf_res): return yaza_db_sql_insert_split_aware_fail_v1(current, result_unwrap_error(hf_res))
+                set current_high_fence = result_unwrap(hf_res)
+            let first_inserts_res: Result[List[YazaDbWriteLeafInsertV1], Text] = list_try_new()
+            if not result_is_ok(first_inserts_res): return yaza_db_sql_insert_split_aware_fail_v1(current, "YDBv1 SQL INSERT could not allocate split-aware group")
+            var current_inserts: List[YazaDbWriteLeafInsertV1] = result_unwrap(first_inserts_res)
+            var can_grow: Boolean = true
+            while probe < row_count and can_grow and probe - row_index < 900:
+                let item: YazaDbWriteLeafInsertV1 = list_get(prepared_rows, probe)
+                var within_current_leaf: Boolean = true
+                if current_header.low_fence_len > 0 and yaza_db_compare_bytes_v1(item.key, current_low_fence) < 0: set within_current_leaf = false
+                if current_header.high_fence_len > 0 and yaza_db_compare_bytes_v1(item.key, current_high_fence) >= 0: set within_current_leaf = false
+                if not within_current_leaf:
+                    if list_count(groups) >= 127:
+                        set can_grow = false
+                    else:
+                        if list_count(current_inserts) > 0:
+                            if not list_try_push(groups, YazaDbWriteLeafInsertGroupV1(current_page_id, current_inserts)):
+                                return yaza_db_sql_insert_split_aware_fail_v1(current, "YDBv1 SQL INSERT could not retain split-aware leaf group")
+                        let next_seek_res: Result[YazaDbBtreeSeekV1, Text] = yaza_db_btree_seek_leaf_v1(current.storage.file, current.storage.header, tree_root_page_id, item.key)
+                        if not result_is_ok(next_seek_res): return yaza_db_sql_insert_split_aware_fail_v1(current, result_unwrap_error(next_seek_res))
+                        let next_seek: YazaDbBtreeSeekV1 = result_unwrap(next_seek_res)
+                        if next_seek.leaf_page_id == current_page_id:
+                            return yaza_db_sql_insert_split_aware_fail_v1(current, "YDBv1 SQL INSERT B+Tree seek returned the old leaf for a key outside its fences")
+                        set current_page_id = next_seek.leaf_page_id
+                        set current_page = next_seek.leaf_page
+                        set current_header = next_seek.leaf_header
+                        if current_header.page_type != 1 or current_header.level != 0:
+                            return yaza_db_sql_insert_split_aware_fail_v1(current, "YDBv1 SQL INSERT split-aware seek reached a non-leaf page")
+                        set sim_count = current_header.count
+                        set sim_data_start = current_header.data_start
+                        set current_low_fence = bytes_from_text("")
+                        set current_high_fence = bytes_from_text("")
+                        if current_header.low_fence_len > 0:
+                            let lf_res: Result[Bytes, Text] = yaza_db_btree_fence_bytes_v1(current_page, current_header, true)
+                            if not result_is_ok(lf_res): return yaza_db_sql_insert_split_aware_fail_v1(current, result_unwrap_error(lf_res))
+                            set current_low_fence = result_unwrap(lf_res)
+                        if current_header.high_fence_len > 0:
+                            let hf_res: Result[Bytes, Text] = yaza_db_btree_fence_bytes_v1(current_page, current_header, false)
+                            if not result_is_ok(hf_res): return yaza_db_sql_insert_split_aware_fail_v1(current, result_unwrap_error(hf_res))
+                            set current_high_fence = result_unwrap(hf_res)
+                        let next_inserts_res: Result[List[YazaDbWriteLeafInsertV1], Text] = list_try_new()
+                        if not result_is_ok(next_inserts_res): return yaza_db_sql_insert_split_aware_fail_v1(current, "YDBv1 SQL INSERT could not allocate next split-aware group")
+                        set current_inserts = result_unwrap(next_inserts_res)
+                if can_grow:
+                    let fit_res: Result[Number, Text] = yaza_db_sql_insert_slot_fits_v1(current_page, current_header, sim_count, sim_data_start, item.key, item.row_payload)
+                    if not result_is_ok(fit_res): return yaza_db_sql_insert_split_aware_fail_v1(current, result_unwrap_error(fit_res))
+                    let next_data_start: Number = result_unwrap(fit_res)
+                    if next_data_start < 0:
+                        set can_grow = false
+                    else:
+                        set sim_count = sim_count + 1
+                        set sim_data_start = next_data_start
+                        if not list_try_push(current_inserts, item):
+                            return yaza_db_sql_insert_split_aware_fail_v1(current, "YDBv1 SQL INSERT could not retain split-aware item")
+                        set probe = probe + 1
+            if list_count(current_inserts) > 0:
+                if not list_try_push(groups, YazaDbWriteLeafInsertGroupV1(current_page_id, current_inserts)):
+                    return yaza_db_sql_insert_split_aware_fail_v1(current, "YDBv1 SQL INSERT could not retain final split-aware leaf group")
+        let fit_count: Number = probe - row_index
+        if fit_count >= 2:
+            let grouped: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_insert_leaf_groups_v1(current, groups)
             if not result_is_ok(grouped): return yaza_db_sql_insert_split_aware_fail_v1(current, result_unwrap_error(grouped))
             set current = result_unwrap(grouped)
-            set row_index = row_index + best_count
+            set row_index = row_index + fit_count
         else:
             let row: YazaSqlInsertMaterializedRowV1 = list_get(batch.rows, row_index)
             let inserted: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_insert_committed_row_with_overflow_for_schema_v1(current, tree_root_page_id, row.values, row.nulls, List[YazaDbOverflowRefV1](), batch.columns, schema_version, key_ordinals)
@@ -342,8 +458,12 @@ fn yaza_db_sql_insert_write_split_aware_base_v1(transaction: YazaDbWriteTransact
             set row_index = row_index + 1
     return ok(current)
 
+fn yaza_db_sql_insert_write_split_aware_base_v1(transaction: YazaDbWriteTransactionV1, tree_root_page_id: Number, key_ordinals: List[Number], schema_version: Number, batch: YazaSqlInsertMaterializedV1) -> Result[YazaDbWriteTransactionV1, Text]:
+    let prepared: List[YazaDbWriteLeafInsertV1] = yaza_db_sql_insert_prepare_for_schema_v1(transaction.storage, tree_root_page_id, key_ordinals, schema_version, batch)?
+    return yaza_db_sql_insert_write_split_aware_base_prepared_v1(transaction, tree_root_page_id, key_ordinals, schema_version, batch, prepared)
+
 fn yaza_db_sql_insert_writer_handles_closed_v1(message: Text) -> Boolean:
-    return text_starts_with(message, "YDBv1 leaf mutation failed; writer handles were closed") or text_starts_with(message, "YDBv1 split write failed; writer handles were closed") or text_starts_with(message, "YDBv1 grouped LEAF_INSERT failed; writer handles were closed") or text_starts_with(message, "YDBv1 row insert is durable but pending-row tracking failed; writer handles were closed") or text_starts_with(message, "YDBv1 transaction cannot reserve WAL space to finalize pending rows; writer handles were closed") or text_starts_with(message, "YDBv1 pending-row metadata is inconsistent; recovery is required") or text_starts_with(message, "YDBv1 pending row could not be committed; writer handles were closed") or text_starts_with(message, "YDBv1 active-index writer handles were closed") or text_starts_with(message, "YDBv1 COMMIT append failed or has an uncertain durable outcome") or text_starts_with(message, "YDBv1 COMMIT is durable, but checkpoint publication failed") or text_starts_with(message, "YDBv1 overflow staging failed; writer handles were closed") or text_starts_with(message, "YDBv1 PAGE_ALLOC is durable")
+    return text_starts_with(message, "YDBv1 leaf mutation failed; writer handles were closed") or text_starts_with(message, "YDBv1 split write failed; writer handles were closed") or text_starts_with(message, "YDBv1 grouped LEAF_INSERT failed; writer handles were closed") or text_starts_with(message, "YDBv1 row insert is durable but pending-row tracking failed; writer handles were closed") or text_starts_with(message, "YDBv1 transaction cannot reserve WAL space to finalize pending rows; writer handles were closed") or text_starts_with(message, "YDBv1 pending-row metadata is inconsistent; recovery is required") or text_starts_with(message, "YDBv1 pending row could not be committed; writer handles were closed") or text_starts_with(message, "YDBv1 active-index writer handles were closed") or text_starts_with(message, "YDBv1 COMMIT append failed or has an uncertain durable outcome") or text_starts_with(message, "YDBv1 COMMIT is durable") or text_starts_with(message, "YDBv1 overflow staging failed; writer handles were closed") or text_starts_with(message, "YDBv1 PAGE_ALLOC is durable") or text_starts_with(message, "YDBv1 staged commit")
 
 fn yaza_db_sql_insert_close_writer_after_error_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, message: Text) -> Unit:
     if not yaza_db_sql_insert_writer_handles_closed_v1(message):
@@ -353,7 +473,7 @@ fn yaza_db_sql_insert_close_writer_after_error_v1(storage: YazaDbStorageHandleV1
 
 # Preserve the validated physical key and row bytes for the grouped writer; it
 # can reuse these instead of encoding the same row again after preflight.
-fn yaza_db_sql_insert_prepare_for_schema_v1(storage: YazaDbStorageHandleV1, tree_root_page_id: Number, key_ordinals: List[Number], schema_version: Number, batch: YazaSqlInsertMaterializedV1) -> Result[List[YazaDbWriteLeafInsertV1], Text]:
+fn yaza_db_sql_insert_prepare_with_overlay_for_schema_v1(storage: YazaDbStorageHandleV1, tree_root_page_id: Number, key_ordinals: List[Number], schema_version: Number, batch: YazaSqlInsertMaterializedV1, overlay: Option[YazaDbDirtyPageOverlayV1]) -> Result[List[YazaDbWriteLeafInsertV1], Text]:
     let column_count: Number = list_count(batch.columns)
     let row_count: Number = list_count(batch.rows)
     if batch.table_id < 1 or batch.catalog_version < 1 or column_count < 1 or column_count > 1024 or schema_version < 1 or schema_version > column_count or row_count < 1 or row_count > 900: return err("YDBv1 SQL INSERT batch exceeds its table, row, or schema bounds")
@@ -376,6 +496,13 @@ fn yaza_db_sql_insert_prepare_for_schema_v1(storage: YazaDbStorageHandleV1, tree
     var row_index: Number = 0
     var cached_leaf_page_id: Number = -1
     var cached_leaf_page: Bytes = bytes_from_text("")
+    var cached_leaf_header_opt: Option[YazaDbPageHeaderV1] = none
+    var cached_low_fence: Bytes = bytes_from_text("")
+    var cached_high_fence: Bytes = bytes_from_text("")
+    var cached_empty_data_start: Number = 0
+    var cached_past_existing_end: Boolean = false
+    var cached_has_last_key: Boolean = false
+    var cached_last_key: Bytes = bytes_from_text("")
     while row_index < row_count:
         let row: YazaSqlInsertMaterializedRowV1 = list_get(batch.rows, row_index)
         if list_count(row.values) != column_count or list_count(row.nulls) != column_count: return err("YDBv1 SQL INSERT row does not match its table schema")
@@ -393,32 +520,79 @@ fn yaza_db_sql_insert_prepare_for_schema_v1(storage: YazaDbStorageHandleV1, tree
             set bucket = (bucket + 1) % bucket_count
             set probes = probes + 1
             if probes >= bucket_count: return err("YDBv1 SQL INSERT duplicate-key hash table is full")
-        let leaf: YazaDbSqlInsertPreflightLeafV1 = yaza_db_sql_insert_preflight_leaf_v1(storage, tree_root_page_id, key, cached_leaf_page_id, cached_leaf_page)?
-        let existing_page: Bytes = leaf.page
-        let header: YazaDbPageHeaderV1 = leaf.header
-        let slot_index: Number = yaza_db_page_lower_bound_v1(existing_page, key, leaf.page_id)?
-        if slot_index < header.count:
-            let existing_key: Bytes = yaza_db_page_slot_key_v1(existing_page, slot_index, leaf.page_id)?
-            if bytes_equal(existing_key, key): return err("YDBv1 SQL INSERT target already contains the clustered key")
-        let empty_leaf: Bytes = yaza_db_page_new_v1(leaf.page_id, header.page_lsn, 1, 0)?
-        var candidate_leaf: Bytes = empty_leaf
-        if header.prefix_len > 0:
-            let prefix: Bytes = bytes_try_slice(existing_page, yaza_db_page_size_v1() - header.prefix_len, header.prefix_len)?
-            let ignored_prefix: Number = yaza_db_page_set_prefix_v1(candidate_leaf, prefix)?
-        if header.low_fence_len > 0 or header.high_fence_len > 0:
-            var low_fence: Bytes = bytes_from_text("")
-            var high_fence: Bytes = bytes_from_text("")
-            if header.low_fence_len > 0: set low_fence = bytes_try_slice(existing_page, header.low_fence_offset, header.low_fence_len)?
-            if header.high_fence_len > 0: set high_fence = bytes_try_slice(existing_page, header.high_fence_offset, header.high_fence_len)?
-            set candidate_leaf = yaza_db_page_set_fences_v1(candidate_leaf, header.low_fence_len > 0, low_fence, header.high_fence_len > 0, high_fence)?
-        let fits_empty_page: Result[Bytes, Text] = yaza_db_page_insert_sorted_slot_v1(candidate_leaf, key, payload)
-        if not result_is_ok(fits_empty_page): return err("YDBv1 SQL INSERT row cannot fit in an empty leaf: " + result_unwrap_error(fits_empty_page))
+        var have_leaf: Boolean = false
+        var leaf_page_id: Number = -1
+        var existing_page: Bytes = bytes_from_text("")
+        if cached_leaf_page_id >= 2 and option_is_some(cached_leaf_header_opt):
+            let cached_header: YazaDbPageHeaderV1 = option_unwrap(cached_leaf_header_opt)
+            var within_fences: Boolean = true
+            if cached_header.low_fence_len > 0:
+                if yaza_db_compare_bytes_v1(key, cached_low_fence) < 0: set within_fences = false
+            if cached_header.high_fence_len > 0:
+                if yaza_db_compare_bytes_v1(key, cached_high_fence) >= 0: set within_fences = false
+            if within_fences:
+                set have_leaf = true
+                set leaf_page_id = cached_leaf_page_id
+                set existing_page = cached_leaf_page
+        var header_opt: Option[YazaDbPageHeaderV1] = none
+        var empty_data_start: Number = 0
+        if have_leaf:
+            set header_opt = cached_leaf_header_opt
+            set empty_data_start = cached_empty_data_start
+        else:
+            let leaf: YazaDbSqlInsertPreflightLeafV1 = yaza_db_sql_insert_preflight_leaf_with_overlay_v1(storage, tree_root_page_id, key, -1, bytes_from_text(""), overlay)?
+            set leaf_page_id = leaf.page_id
+            set existing_page = leaf.page
+            let hdr: YazaDbPageHeaderV1 = leaf.header
+            set header_opt = some(hdr)
+            set empty_data_start = yaza_db_page_size_v1() - hdr.prefix_len - hdr.low_fence_len - hdr.high_fence_len
+            set cached_leaf_page_id = leaf_page_id
+            set cached_leaf_page = existing_page
+            set cached_leaf_header_opt = header_opt
+            if hdr.low_fence_len > 0:
+                set cached_low_fence = yaza_db_btree_fence_bytes_v1(existing_page, hdr, true)?
+            else:
+                set cached_low_fence = bytes_from_text("")
+            if hdr.high_fence_len > 0:
+                set cached_high_fence = yaza_db_btree_fence_bytes_v1(existing_page, hdr, false)?
+            else:
+                set cached_high_fence = bytes_from_text("")
+            set cached_empty_data_start = empty_data_start
+            set cached_past_existing_end = (hdr.count == 0)
+            set cached_has_last_key = false
+        let header: YazaDbPageHeaderV1 = option_unwrap(header_opt)
+        var need_lower_bound: Boolean = true
+        if cached_past_existing_end:
+            if header.count == 0:
+                set need_lower_bound = false
+            elif cached_has_last_key:
+                if yaza_db_compare_bytes_v1(key, cached_last_key) > 0:
+                    set need_lower_bound = false
+        if need_lower_bound:
+            let slot_index: Number = yaza_db_page_lower_bound_validated_header_v1(existing_page, header, key)?
+            if slot_index < header.count:
+                let existing_slot: YazaDbPageSlotV1 = yaza_db_page_slot_from_validated_header_v1(existing_page, header, slot_index)?
+                let existing_key: Bytes = yaza_db_page_slot_key_from_validated_header_v1(existing_page, header, existing_slot)?
+                if bytes_equal(existing_key, key): return err("YDBv1 SQL INSERT target already contains the clustered key")
+            else:
+                set cached_past_existing_end = true
+                if not cached_has_last_key or yaza_db_compare_bytes_v1(key, cached_last_key) > 0:
+                    set cached_last_key = key
+                    set cached_has_last_key = true
+        else:
+            if not cached_has_last_key or yaza_db_compare_bytes_v1(key, cached_last_key) > 0:
+                set cached_last_key = key
+                set cached_has_last_key = true
+        let fits_empty_result: Result[Number, Text] = yaza_db_sql_insert_slot_fits_v1(existing_page, header, 0, empty_data_start, key, payload)
+        if not result_is_ok(fits_empty_result): return err("YDBv1 SQL INSERT row cannot fit in an empty leaf: " + result_unwrap_error(fits_empty_result))
+        if result_unwrap(fits_empty_result) < 0: return err("YDBv1 SQL INSERT row cannot fit in an empty leaf: YDBv1 page has insufficient free space")
         if not list_try_push(prepared_rows, YazaDbWriteLeafInsertV1(key, payload)): return err("YDBv1 SQL INSERT preflight could not retain its prepared row")
         if not list_try_set(bucket_heads, bucket, row_index + 1): return err("YDBv1 SQL INSERT preflight could not record its duplicate-key hash bucket")
-        set cached_leaf_page_id = leaf.page_id
-        set cached_leaf_page = existing_page
         set row_index = row_index + 1
     return ok(prepared_rows)
+
+fn yaza_db_sql_insert_prepare_for_schema_v1(storage: YazaDbStorageHandleV1, tree_root_page_id: Number, key_ordinals: List[Number], schema_version: Number, batch: YazaSqlInsertMaterializedV1) -> Result[List[YazaDbWriteLeafInsertV1], Text]:
+    return yaza_db_sql_insert_prepare_with_overlay_for_schema_v1(storage, tree_root_page_id, key_ordinals, schema_version, batch, none)
 
 fn yaza_db_sql_insert_preflight_for_schema_v1(storage: YazaDbStorageHandleV1, tree_root_page_id: Number, key_ordinals: List[Number], schema_version: Number, batch: YazaSqlInsertMaterializedV1) -> Result[Boolean, Text]:
     let prepared: List[YazaDbWriteLeafInsertV1] = yaza_db_sql_insert_prepare_for_schema_v1(storage, tree_root_page_id, key_ordinals, schema_version, batch)?
@@ -430,8 +604,7 @@ fn yaza_db_sql_insert_preflight_v1(storage: YazaDbStorageHandleV1, tree_root_pag
 fn yaza_db_sql_insert_write_for_schema_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, tree_root_page_id: Number, key_ordinals: List[Number], schema_version: Number, batch: YazaSqlInsertMaterializedV1) -> Result[YazaDbWriteCommitV1, Text]:
     return yaza_db_sql_insert_write_with_indexes_for_schema_v1(storage, wal, tree_root_page_id, key_ordinals, schema_version, batch, List[YazaDbSecondaryIndexV1]())
 
-fn yaza_db_sql_insert_write_with_indexes_for_schema_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, tree_root_page_id: Number, key_ordinals: List[Number], schema_version: Number, batch: YazaSqlInsertMaterializedV1, indexes: List[YazaDbSecondaryIndexV1]) -> Result[YazaDbWriteCommitV1, Text]:
-    if storage.root != wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid): return err("YDBv1 SQL INSERT writer handles belong to different databases")
+fn yaza_db_sql_insert_prepare_plan_with_overlay_and_read_header_v1(storage: YazaDbStorageHandleV1, read_header: YazaDbFileHeaderV1, tree_root_page_id: Number, key_ordinals: List[Number], schema_version: Number, batch: YazaSqlInsertMaterializedV1, indexes: List[YazaDbSecondaryIndexV1], overlay: Option[YazaDbDirtyPageOverlayV1]) -> Result[YazaDbSqlInsertPreparedPlanV1, Text]:
     let transaction_row_count: Number = list_count(batch.rows) * (list_count(indexes) + 1)
     if transaction_row_count > 900: return err("YDBv1 SQL INSERT rows and active index entries exceed the 900-row atomic transaction bound")
     let overflow_budget: YazaDbSqlInsertOverflowBudgetV1 = yaza_db_sql_insert_overflow_budget_v1(batch)?
@@ -439,7 +612,7 @@ fn yaza_db_sql_insert_write_with_indexes_for_schema_v1(storage: YazaDbStorageHan
     var reserve_pages: Number = minimum_reserve
     if overflow_budget.page_count + 64 > reserve_pages: set reserve_pages = overflow_budget.page_count + 64
     if reserve_pages > yaza_db_storage_preallocated_page_count_v1(): return err("YDBv1 SQL INSERT overflow chain exceeds the bounded transaction page-reserve profile")
-    let prepared_rows: List[YazaDbWriteLeafInsertV1] = yaza_db_sql_insert_prepare_for_schema_v1(storage, tree_root_page_id, key_ordinals, schema_version, batch)?
+    let prepared_rows: List[YazaDbWriteLeafInsertV1] = yaza_db_sql_insert_prepare_with_overlay_for_schema_v1(storage, tree_root_page_id, key_ordinals, schema_version, batch, overlay)?
     if list_count(prepared_rows) != list_count(batch.rows): return err("YDBv1 SQL INSERT preflight did not prepare every row")
     var row_index: Number = 0
     while row_index < list_count(batch.rows):
@@ -458,7 +631,7 @@ fn yaza_db_sql_insert_write_with_indexes_for_schema_v1(storage: YazaDbStorageHan
                             return err("YDBv1 UNIQUE INDEX rejects duplicate non-NULL values in one INSERT statement")
                         set prior_row_index = prior_row_index + 1
             let entry: YazaDbSqlCreateIndexEntryV1 = yaza_db_index_maintenance_entry_v1(row.values, row.nulls, index)?
-            let absent: Boolean = yaza_db_index_maintenance_verify_insert_absent_v1(storage.file, storage.header, index, entry)?
+            let absent: Boolean = yaza_db_index_maintenance_verify_insert_absent_v1(storage.file, read_header, index, entry)?
             if not absent: return err("YDBv1 SQL INSERT preflight found a duplicate secondary-index row key")
             set index_number = index_number + 1
         set row_index = row_index + 1
@@ -469,7 +642,7 @@ fn yaza_db_sql_insert_write_with_indexes_for_schema_v1(storage: YazaDbStorageHan
     if overflow_budget.page_count == 0:
         if list_count(indexes) == 0:
             set split_aware_base_eligible = yaza_db_sql_insert_prepared_keys_increasing_v1(prepared_rows)
-        let plan_result: Result[YazaDbSqlInsertLeafGroupPlanV1, Text] = yaza_db_sql_insert_leaf_group_plan_prepared_v1(storage, tree_root_page_id, key_ordinals, schema_version, batch, prepared_rows)
+        let plan_result: Result[YazaDbSqlInsertLeafGroupPlanV1, Text] = yaza_db_sql_insert_leaf_group_plan_prepared_with_overlay_v1(storage, tree_root_page_id, key_ordinals, schema_version, batch, prepared_rows, overlay)
         if not result_is_ok(plan_result): return err(result_unwrap_error(plan_result))
         set fast_insert_plan = result_unwrap(plan_result)
         set fast_insert_eligible = fast_insert_plan.eligible
@@ -489,69 +662,192 @@ fn yaza_db_sql_insert_write_with_indexes_for_schema_v1(storage: YazaDbStorageHan
                 else:
                     if not list_try_push(fast_index_plans, index_plan): return err("YDBv1 SQL INSERT could not retain an active-index group plan")
                 set index_number = index_number + 1
-    let begun: YazaDbWriteTransactionV1 = yaza_db_write_transaction_begin_with_reserve_v1(storage, wal, reserve_pages)?
+    return ok(YazaDbSqlInsertPreparedPlanV1(transaction_row_count, overflow_budget, reserve_pages, prepared_rows, fast_insert_plan, fast_index_plans, fast_insert_eligible, split_aware_base_eligible))
+
+fn yaza_db_sql_insert_prepare_plan_with_read_header_v1(storage: YazaDbStorageHandleV1, read_header: YazaDbFileHeaderV1, tree_root_page_id: Number, key_ordinals: List[Number], schema_version: Number, batch: YazaSqlInsertMaterializedV1, indexes: List[YazaDbSecondaryIndexV1]) -> Result[YazaDbSqlInsertPreparedPlanV1, Text]:
+    return yaza_db_sql_insert_prepare_plan_with_overlay_and_read_header_v1(storage, read_header, tree_root_page_id, key_ordinals, schema_version, batch, indexes, none)
+
+fn yaza_db_sql_insert_required_wal_bytes_v1(plan: YazaDbSqlInsertPreparedPlanV1) -> Number:
     let leaf_record_bytes: Number = yaza_db_wal_header_size_v1() + yaza_db_wal_leaf_mutation_payload_size_v1()
     let allocation_record_bytes: Number = yaza_db_wal_header_size_v1() + yaza_db_page_space_payload_size_v1()
     let page_image_record_bytes: Number = yaza_db_wal_header_size_v1() + yaza_db_wal_page_image_payload_size_v1()
-    # SQL rows and index entries are written with commit_ts up front, so they
-    # need one leaf record each; the second record was only needed when COMMIT
-    # had to stamp a transaction-version row.
-    let required_wal_bytes: Number = transaction_row_count * leaf_record_bytes + overflow_budget.page_count * (allocation_record_bytes + page_image_record_bytes)
+    return plan.transaction_row_count * leaf_record_bytes + plan.overflow_budget.page_count * (allocation_record_bytes + page_image_record_bytes)
+
+fn yaza_db_sql_insert_execute_rows_in_tx_v1(initial_tx: YazaDbWriteTransactionV1, tree_root_page_id: Number, key_ordinals: List[Number], schema_version: Number, batch: YazaSqlInsertMaterializedV1, indexes: List[YazaDbSecondaryIndexV1], plan: YazaDbSqlInsertPreparedPlanV1) -> Result[YazaDbWriteTransactionV1, Text]:
+    var current: YazaDbWriteTransactionV1 = initial_tx
+    if plan.fast_insert_eligible:
+        let grouped_base: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_insert_leaf_groups_v1(current, plan.fast_insert_plan.groups)
+        if not result_is_ok(grouped_base):
+            let message: Text = result_unwrap_error(grouped_base)
+            yaza_db_sql_insert_close_writer_after_error_v1(current.storage, current.wal, message)
+            return err("YDBv1 SQL INSERT grouped leaf mutation failed; reopen through recovery before reuse: " + message)
+        set current = result_unwrap(grouped_base)
+        var index_plan_number: Number = 0
+        while index_plan_number < list_count(plan.fast_index_plans):
+            let index_plan: YazaDbSqlInsertIndexLeafGroupPlanV1 = list_get(plan.fast_index_plans, index_plan_number)
+            let grouped_idx: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_insert_leaf_groups_v1(current, index_plan.groups)
+            if not result_is_ok(grouped_idx):
+                let message: Text = result_unwrap_error(grouped_idx)
+                yaza_db_sql_insert_close_writer_after_error_v1(current.storage, current.wal, message)
+                return err("YDBv1 SQL INSERT grouped secondary-index mutation failed; reopen through recovery before reuse: " + message)
+            set current = result_unwrap(grouped_idx)
+            set index_plan_number = index_plan_number + 1
+        return ok(current)
+    if plan.split_aware_base_eligible:
+        let split_aware: Result[YazaDbWriteTransactionV1, Text] = yaza_db_sql_insert_write_split_aware_base_prepared_v1(current, tree_root_page_id, key_ordinals, schema_version, batch, plan.prepared_rows)
+        if not result_is_ok(split_aware): return err(result_unwrap_error(split_aware))
+        return ok(result_unwrap(split_aware))
+    var row_index: Number = 0
+    while row_index < list_count(batch.rows):
+        let row: YazaSqlInsertMaterializedRowV1 = list_get(batch.rows, row_index)
+        let staged: Result[YazaDbWriteOverflowRowV1, Text] = yaza_db_write_transaction_stage_overflow_text_v1(current, row.values, row.nulls, batch.columns)
+        if not result_is_ok(staged):
+            let message: Text = result_unwrap_error(staged)
+            yaza_db_sql_insert_close_writer_after_error_v1(current.storage, current.wal, message)
+            return err("YDBv1 SQL INSERT overflow staging failed; reopen through recovery before reuse: " + message)
+        let overflow_row: YazaDbWriteOverflowRowV1 = result_unwrap(staged)
+        set current = overflow_row.transaction
+        let inserted: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_insert_committed_row_with_overflow_for_schema_v1(current, tree_root_page_id, row.values, row.nulls, overflow_row.references, batch.columns, schema_version, key_ordinals)
+        if not result_is_ok(inserted):
+            let message: Text = result_unwrap_error(inserted)
+            yaza_db_sql_insert_close_writer_after_error_v1(current.storage, current.wal, message)
+            return err("YDBv1 SQL INSERT batch was not committed; reopen through recovery before reuse: " + message)
+        set current = result_unwrap(inserted)
+        let indexed: Result[YazaDbWriteTransactionV1, Text] = yaza_db_index_maintenance_insert_row_v1(current, indexes, row.values, row.nulls)
+        if not result_is_ok(indexed):
+            let message: Text = result_unwrap_error(indexed)
+            yaza_db_sql_insert_close_writer_after_error_v1(current.storage, current.wal, message)
+            return err("YDBv1 SQL INSERT secondary-index mutation failed; reopen through recovery before reuse: " + message)
+        set current = result_unwrap(indexed)
+        set row_index = row_index + 1
+    return ok(current)
+
+fn yaza_db_sql_insert_write_in_tx_for_schema_v1(transaction: YazaDbWriteTransactionV1, tree_root_page_id: Number, key_ordinals: List[Number], schema_version: Number, batch: YazaSqlInsertMaterializedV1, indexes: List[YazaDbSecondaryIndexV1]) -> Result[YazaDbTxDmlResultV1, Text]:
+    if not transaction.active or transaction.txn_id != transaction.storage.header.next_txn_id or transaction.commit_ts != transaction.storage.header.next_commit_ts:
+        return err("YDBv1 SQL INSERT explicit transaction state is stale")
+    let read_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(transaction.storage.header.db_uuid, transaction.storage.header.checkpoint_lsn, transaction.storage.header.next_txn_id, transaction.commit_ts + 1, transaction.storage.header.catalog_root, transaction.storage.header.page_count, transaction.storage.header.flags)
+    let plan: YazaDbSqlInsertPreparedPlanV1 = yaza_db_sql_insert_prepare_plan_with_read_header_v1(transaction.storage, read_header, tree_root_page_id, key_ordinals, schema_version, batch, indexes)?
+    let required_wal_bytes: Number = yaza_db_sql_insert_required_wal_bytes_v1(plan)
+    if not yaza_db_write_transaction_tail_fits_bytes_v1(transaction, required_wal_bytes):
+        return err("YDBv1 SQL INSERT batch exceeds the bounded WAL recovery-tail budget for the active transaction")
+    let free_pages: Number = yaza_db_allocator_count_free_pages_v1(transaction.storage, plan.reserve_pages)?
+    if free_pages < plan.reserve_pages:
+        return err("YDBv1 SQL INSERT active transaction does not have enough preallocated free pages remaining")
+    let next_tx: YazaDbWriteTransactionV1 = yaza_db_sql_insert_execute_rows_in_tx_v1(transaction, tree_root_page_id, key_ordinals, schema_version, batch, indexes, plan)?
+    return ok(YazaDbTxDmlResultV1(next_tx, list_count(batch.rows)))
+
+fn yaza_db_sql_insert_write_with_indexes_sync_policy_for_schema_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, tree_root_page_id: Number, key_ordinals: List[Number], schema_version: Number, batch: YazaSqlInsertMaterializedV1, indexes: List[YazaDbSecondaryIndexV1], defer_checkpoint: Boolean, sync_commit_wal: Boolean) -> Result[YazaDbWriteCommitV1, Text]:
+    if storage.root != wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid): return err("YDBv1 SQL INSERT writer handles belong to different databases")
+    let plan: YazaDbSqlInsertPreparedPlanV1 = yaza_db_sql_insert_prepare_plan_with_read_header_v1(storage, storage.header, tree_root_page_id, key_ordinals, schema_version, batch, indexes)?
+    var begun_result: Result[YazaDbWriteTransactionV1, Text] = err("YDBv1 SQL INSERT transaction begin path was not selected")
+    if defer_checkpoint:
+        set begun_result = yaza_db_write_transaction_begin_with_reserve_deferred_checkpoint_v1(storage, wal, plan.reserve_pages)
+    else:
+        set begun_result = yaza_db_write_transaction_begin_with_reserve_v1(storage, wal, plan.reserve_pages)
+    let begun: YazaDbWriteTransactionV1 = begun_result?
+    if begun.commit_ts != storage.header.next_commit_ts:
+        yaza_db_sql_insert_close_writer_after_error_v1(begun.storage, begun.wal, "commit timestamp changed")
+        return err("YDBv1 INSERT commit timestamp changed after row preflight; reopen through recovery before reuse")
+    let required_wal_bytes: Number = yaza_db_sql_insert_required_wal_bytes_v1(plan)
     if not yaza_db_write_transaction_tail_fits_bytes_v1(begun, required_wal_bytes):
         yaza_db_sql_insert_close_writer_after_error_v1(begun.storage, begun.wal, "WAL reserve limit")
         return err("YDBv1 SQL INSERT batch exceeds the bounded WAL recovery-tail budget; writer handles were closed and recovery is required")
     var current: YazaDbWriteTransactionV1 = begun
-    if fast_insert_eligible:
-        let grouped: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_insert_leaf_groups_v1(current, fast_insert_plan.groups)
-        if not result_is_ok(grouped):
-            let message: Text = result_unwrap_error(grouped)
+    if plan.fast_insert_eligible:
+        let staged_ids_result: Result[List[Number], Text] = list_try_new()
+        let staged_imgs_result: Result[List[Bytes], Text] = list_try_new()
+        if not result_is_ok(staged_ids_result) or not result_is_ok(staged_imgs_result):
+            yaza_db_sql_insert_close_writer_after_error_v1(current.storage, current.wal, "staged insert allocation")
+            return err("YDBv1 SQL INSERT could not allocate staged leaf outputs")
+        let staged_page_ids: List[Number] = result_unwrap(staged_ids_result)
+        let staged_pages: List[Bytes] = result_unwrap(staged_imgs_result)
+        let staged_base_result: Result[YazaDbStagedLeafBatchV1, Text] = yaza_db_write_transaction_stage_leaf_insert_groups_v1(current, plan.fast_insert_plan.groups)
+        if not result_is_ok(staged_base_result):
+            let message: Text = result_unwrap_error(staged_base_result)
             yaza_db_sql_insert_close_writer_after_error_v1(current.storage, current.wal, message)
             return err("YDBv1 SQL INSERT grouped leaf mutation failed; reopen through recovery before reuse: " + message)
-        set current = result_unwrap(grouped)
+        let staged_base: YazaDbStagedLeafBatchV1 = result_unwrap(staged_base_result)
+        set current = staged_base.transaction
+        var bi: Number = 0
+        while bi < list_count(staged_base.page_ids):
+            if not list_try_push(staged_page_ids, list_get(staged_base.page_ids, bi)) or not list_try_push(staged_pages, list_get(staged_base.pages, bi)):
+                yaza_db_sql_insert_close_writer_after_error_v1(current.storage, current.wal, "staged base page push")
+                return err("YDBv1 SQL INSERT could not record staged base leaf image")
+            set bi = bi + 1
         var index_plan_number: Number = 0
-        while index_plan_number < list_count(fast_index_plans):
-            let index_plan: YazaDbSqlInsertIndexLeafGroupPlanV1 = list_get(fast_index_plans, index_plan_number)
-            let grouped_index: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_insert_leaf_groups_v1(current, index_plan.groups)
-            if not result_is_ok(grouped_index):
-                let message: Text = result_unwrap_error(grouped_index)
+        while index_plan_number < list_count(plan.fast_index_plans):
+            let index_plan: YazaDbSqlInsertIndexLeafGroupPlanV1 = list_get(plan.fast_index_plans, index_plan_number)
+            let staged_idx_result: Result[YazaDbStagedLeafBatchV1, Text] = yaza_db_write_transaction_stage_leaf_insert_groups_v1(current, index_plan.groups)
+            if not result_is_ok(staged_idx_result):
+                let message: Text = result_unwrap_error(staged_idx_result)
                 yaza_db_sql_insert_close_writer_after_error_v1(current.storage, current.wal, message)
                 return err("YDBv1 SQL INSERT grouped secondary-index mutation failed; reopen through recovery before reuse: " + message)
-            set current = result_unwrap(grouped_index)
+            let staged_idx: YazaDbStagedLeafBatchV1 = result_unwrap(staged_idx_result)
+            set current = staged_idx.transaction
+            var ii: Number = 0
+            while ii < list_count(staged_idx.page_ids):
+                if not list_try_push(staged_page_ids, list_get(staged_idx.page_ids, ii)) or not list_try_push(staged_pages, list_get(staged_idx.pages, ii)):
+                    yaza_db_sql_insert_close_writer_after_error_v1(current.storage, current.wal, "staged index page push")
+                    return err("YDBv1 SQL INSERT could not record staged index leaf image")
+                set ii = ii + 1
             set index_plan_number = index_plan_number + 1
-    elif split_aware_base_eligible:
-        let split_aware: Result[YazaDbWriteTransactionV1, Text] = yaza_db_sql_insert_write_split_aware_base_v1(current, tree_root_page_id, key_ordinals, schema_version, batch)
-        if not result_is_ok(split_aware): return err(result_unwrap_error(split_aware))
-        set current = result_unwrap(split_aware)
-    else:
-        set row_index = 0
-        while row_index < list_count(batch.rows):
-            let row: YazaSqlInsertMaterializedRowV1 = list_get(batch.rows, row_index)
-            let staged: Result[YazaDbWriteOverflowRowV1, Text] = yaza_db_write_transaction_stage_overflow_text_v1(current, row.values, row.nulls, batch.columns)
-            if not result_is_ok(staged):
-                let message: Text = result_unwrap_error(staged)
-                yaza_db_sql_insert_close_writer_after_error_v1(current.storage, current.wal, message)
-                return err("YDBv1 SQL INSERT overflow staging failed; reopen through recovery before reuse: " + message)
-            let overflow_row: YazaDbWriteOverflowRowV1 = result_unwrap(staged)
-            set current = overflow_row.transaction
-            let inserted: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_insert_committed_row_with_overflow_for_schema_v1(current, tree_root_page_id, row.values, row.nulls, overflow_row.references, batch.columns, schema_version, key_ordinals)
-            if not result_is_ok(inserted):
-                let message: Text = result_unwrap_error(inserted)
-                yaza_db_sql_insert_close_writer_after_error_v1(current.storage, current.wal, message)
-                return err("YDBv1 SQL INSERT batch was not committed; reopen through recovery before reuse: " + message)
-            set current = result_unwrap(inserted)
-            let indexed: Result[YazaDbWriteTransactionV1, Text] = yaza_db_index_maintenance_insert_row_v1(current, indexes, row.values, row.nulls)
-            if not result_is_ok(indexed):
-                let message: Text = result_unwrap_error(indexed)
-                yaza_db_sql_insert_close_writer_after_error_v1(current.storage, current.wal, message)
-                return err("YDBv1 SQL INSERT secondary-index mutation failed; reopen through recovery before reuse: " + message)
-            set current = result_unwrap(indexed)
-            set row_index = row_index + 1
-    let committed: Result[YazaDbWriteCommitV1, Text] = yaza_db_write_transaction_commit_v1(current)
+        let committed_staged: Result[YazaDbWriteCommitV1, Text] = yaza_db_write_transaction_commit_staged_pages_sync_policy_v1(current, staged_page_ids, staged_pages, not defer_checkpoint, sync_commit_wal)
+        if not result_is_ok(committed_staged):
+            let message: Text = result_unwrap_error(committed_staged)
+            yaza_db_sql_insert_close_writer_after_error_v1(current.storage, current.wal, message)
+            return err("YDBv1 SQL INSERT commit did not return usable writer handles; reopen through recovery before reuse: " + message)
+        return ok(result_unwrap(committed_staged))
+    set current = yaza_db_sql_insert_execute_rows_in_tx_v1(current, tree_root_page_id, key_ordinals, schema_version, batch, indexes, plan)?
+    let committed: Result[YazaDbWriteCommitV1, Text] = yaza_db_write_transaction_commit_with_sync_policy_v1(current, not defer_checkpoint, 0, sync_commit_wal)
     if not result_is_ok(committed):
         let message: Text = result_unwrap_error(committed)
         yaza_db_sql_insert_close_writer_after_error_v1(current.storage, current.wal, message)
         return err("YDBv1 SQL INSERT commit did not return usable writer handles; reopen through recovery before reuse: " + message)
     return ok(result_unwrap(committed))
 
+fn yaza_db_sql_insert_write_with_indexes_and_policy_for_schema_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, tree_root_page_id: Number, key_ordinals: List[Number], schema_version: Number, batch: YazaSqlInsertMaterializedV1, indexes: List[YazaDbSecondaryIndexV1], defer_checkpoint: Boolean) -> Result[YazaDbWriteCommitV1, Text]:
+    return yaza_db_sql_insert_write_with_indexes_sync_policy_for_schema_v1(storage, wal, tree_root_page_id, key_ordinals, schema_version, batch, indexes, defer_checkpoint, true)
+
+fn yaza_db_sql_insert_write_with_indexes_for_schema_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, tree_root_page_id: Number, key_ordinals: List[Number], schema_version: Number, batch: YazaSqlInsertMaterializedV1, indexes: List[YazaDbSecondaryIndexV1]) -> Result[YazaDbWriteCommitV1, Text]:
+    return yaza_db_sql_insert_write_with_indexes_and_policy_for_schema_v1(storage, wal, tree_root_page_id, key_ordinals, schema_version, batch, indexes, false)
+
 fn yaza_db_sql_insert_write_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, tree_root_page_id: Number, key_ordinals: List[Number], batch: YazaSqlInsertMaterializedV1) -> Result[YazaDbWriteCommitV1, Text]:
     return yaza_db_sql_insert_write_for_schema_v1(storage, wal, tree_root_page_id, key_ordinals, 1, batch)
+
+fn yaza_db_sql_insert_try_execute_overlay_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, tree_root_page_id: Number, key_ordinals: List[Number], schema_version: Number, batch: YazaSqlInsertMaterializedV1, indexes: List[YazaDbSecondaryIndexV1], overlay: YazaDbDirtyPageOverlayV1) -> Result[YazaDbSqlInsertOverlayAttemptV1, Text]:
+    if storage.root != wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid):
+        return err("YDBv1 SQL INSERT writer handles belong to different databases")
+    if list_count(indexes) > 0:
+        return ok(YazaDbSqlInsertOverlayAttemptV1(false, none, overlay))
+    if (wal.next_lsn - storage.header.checkpoint_lsn) >= 33554432:
+        return ok(YazaDbSqlInsertOverlayAttemptV1(false, none, overlay))
+    let plan: YazaDbSqlInsertPreparedPlanV1 = yaza_db_sql_insert_prepare_plan_with_overlay_and_read_header_v1(storage, storage.header, tree_root_page_id, key_ordinals, schema_version, batch, indexes, some(overlay))?
+    if not plan.fast_insert_eligible or plan.overflow_budget.page_count > 0:
+        return ok(YazaDbSqlInsertOverlayAttemptV1(false, none, overlay))
+    if list_count(overlay.page_ids) + list_count(plan.fast_insert_plan.groups) > 64:
+        return ok(YazaDbSqlInsertOverlayAttemptV1(false, none, overlay))
+    let required_wal_bytes: Number = yaza_db_sql_insert_required_wal_bytes_v1(plan)
+    let recovery_tail_limit: Number = 67108864
+    if (wal.next_lsn - storage.header.checkpoint_lsn) + required_wal_bytes + yaza_db_wal_header_size_v1() * 2 > recovery_tail_limit:
+        return ok(YazaDbSqlInsertOverlayAttemptV1(false, none, overlay))
+    let begun: YazaDbWriteTransactionV1 = yaza_db_write_transaction_begin_prepared_with_sync_policy_v1(storage, wal, false)?
+    if begun.commit_ts != storage.header.next_commit_ts:
+        yaza_db_sql_insert_close_writer_after_error_v1(begun.storage, begun.wal, "commit timestamp changed")
+        return err("YDBv1 INSERT commit timestamp changed after row preflight; reopen through recovery before reuse")
+    if not yaza_db_write_transaction_tail_fits_bytes_v1(begun, required_wal_bytes):
+        yaza_db_sql_insert_close_writer_after_error_v1(begun.storage, begun.wal, "WAL reserve limit")
+        return err("YDBv1 SQL INSERT batch exceeds the bounded WAL recovery-tail budget; writer handles were closed and recovery is required")
+    let staged_base_result: Result[YazaDbStagedLeafBatchV1, Text] = yaza_db_write_transaction_stage_leaf_insert_groups_with_overlay_v1(begun, plan.fast_insert_plan.groups, some(overlay))
+    if not result_is_ok(staged_base_result):
+        let message: Text = result_unwrap_error(staged_base_result)
+        yaza_db_sql_insert_close_writer_after_error_v1(begun.storage, begun.wal, message)
+        return err("YDBv1 SQL INSERT grouped leaf mutation failed; reopen through recovery before reuse: " + message)
+    let staged_base: YazaDbStagedLeafBatchV1 = result_unwrap(staged_base_result)
+    let committed_overlay: Result[YazaDbOverlayCommitResultV1, Text] = yaza_db_write_transaction_commit_staged_overlay_v1(staged_base.transaction, staged_base.page_ids, staged_base.pages, overlay)
+    if not result_is_ok(committed_overlay):
+        let message: Text = result_unwrap_error(committed_overlay)
+        yaza_db_sql_insert_close_writer_after_error_v1(staged_base.transaction.storage, staged_base.transaction.wal, message)
+        return err("YDBv1 SQL INSERT commit did not return usable writer handles; reopen through recovery before reuse: " + message)
+    let co: YazaDbOverlayCommitResultV1 = result_unwrap(committed_overlay)
+    let c: YazaDbWriteCommitV1 = co.commit
+    return ok(YazaDbSqlInsertOverlayAttemptV1(true, some(YazaDbWriteCommitV1(c.storage, c.wal, c.txn_id, c.commit_ts, list_count(batch.rows))), co.overlay))

@@ -1,0 +1,923 @@
+# PostgreSQL v3 server wire protocol daemon and loopback transport helpers.
+# Supports SSLRequest ('N'), StartupMessage v3.0, trust & CleartextPassword auth,
+# Simple Query ('Q'), Extended Query ('P','B','D','E','C','H','S'), ReadyForQuery
+# ('I','T','E'), and Terminate ('X') backed directly by YazaDbSessionV1.
+use "std/net"
+use "./catalog_snapshot_v1"
+use "./session_v1"
+use "./sql_binder_v1"
+use "./sql_dispatch_v1"
+use "./sql_executor_v1"
+use "./sql_insert_v1"
+use "./sql_insert_bind_v1"
+use "./sql_lexer_v1"
+use "./sql_parser_v2"
+use "./sql_parser_v3"
+use "./transaction_v1"
+
+shape YazaDbPgServerConfigV1:
+    bind_host: Text
+    bind_port: Number
+    auth_mode: Text
+    expected_user: Text
+    expected_password: Text
+    read_only: Boolean
+    database_name: Text
+
+shape YazaDbPgPreparedStmtV1:
+    name: Text
+    sql: Text
+    param_oids: List[Number]
+
+shape YazaDbPgPortalV1:
+    name: Text
+    sql: Text
+    params: List[YazaSqlValueV1]
+
+shape YazaDbPgConnectionStateV1:
+    session: YazaDbSessionV1
+    config: YazaDbPgServerConfigV1
+    stmts: List[YazaDbPgPreparedStmtV1]
+    portals: List[YazaDbPgPortalV1]
+    closed: Boolean
+    authenticated: Boolean
+    user: Text
+    database: Text
+
+shape YazaDbPgStepOutcomeV1:
+    state: YazaDbPgConnectionStateV1
+    handled: Boolean
+    closed: Boolean
+
+shape YazaDbPgTcpFrameV1:
+    tag: Number
+    payload: Bytes
+
+fn yaza_db_pg_default_config_v1(bind_host: Text, bind_port: Number, database_name: Text) -> YazaDbPgServerConfigV1:
+    return YazaDbPgServerConfigV1(bind_host, bind_port, "trust", "yaza", "", false, database_name)
+
+fn yaza_db_pg_hex_digit_v1(nibble: Number) -> Number:
+    if nibble < 10: return 48 + nibble
+    return 87 + nibble
+
+fn yaza_db_pg_encode_bytea_hex_v1(input: Bytes) -> Result[Text, Text]:
+    let n: Number = bytes_length(input)
+    let out: Bytes = bytes_try_new_zeroed(2 + n * 2)?
+    if not bytes_try_set(out, 0, 92) or not bytes_try_set(out, 1, 120):
+        return err("PG bytea hex prefix write failed")
+    var i: Number = 0
+    while i < n:
+        let b: Number = bytes_get(input, i)
+        let hi: Number = yaza_db_pg_hex_digit_v1(b / 16)
+        let lo: Number = yaza_db_pg_hex_digit_v1(b % 16)
+        if not bytes_try_set(out, 2 + i * 2, hi) or not bytes_try_set(out, 2 + i * 2 + 1, lo):
+            return err("PG bytea hex byte write failed")
+        set i = i + 1
+    return bytes_try_to_text(out)
+
+fn yaza_db_pg_u32_be_v1(value: Number) -> Result[Bytes, Text]:
+    if value < 0 or value > 4294967295:
+        return err("PG u32 value out of range")
+    let b: Bytes = bytes_try_new_zeroed(4)?
+    if not bytes_try_set(b, 0, (value / 16777216) % 256) or not bytes_try_set(b, 1, (value / 65536) % 256) or not bytes_try_set(b, 2, (value / 256) % 256) or not bytes_try_set(b, 3, value % 256):
+        return err("PG u32 encode failed")
+    return ok(b)
+
+fn yaza_db_pg_u16_be_v1(value: Number) -> Result[Bytes, Text]:
+    if value < 0 or value > 65535:
+        return err("PG u16 value out of range")
+    let b: Bytes = bytes_try_new_zeroed(2)?
+    if not bytes_try_set(b, 0, (value / 256) % 256) or not bytes_try_set(b, 1, value % 256):
+        return err("PG u16 encode failed")
+    return ok(b)
+
+fn yaza_db_pg_read_u32_be_v1(input: Bytes, offset: Number) -> Result[Number, Text]:
+    if offset < 0 or offset + 4 > bytes_length(input):
+        return err("PG u32 decode out of bounds")
+    let b0: Number = bytes_get(input, offset)
+    let b1: Number = bytes_get(input, offset + 1)
+    let b2: Number = bytes_get(input, offset + 2)
+    let b3: Number = bytes_get(input, offset + 3)
+    return ok(b0 * 16777216 + b1 * 65536 + b2 * 256 + b3)
+
+fn yaza_db_pg_read_u16_be_v1(input: Bytes, offset: Number) -> Result[Number, Text]:
+    if offset < 0 or offset + 2 > bytes_length(input):
+        return err("PG u16 decode out of bounds")
+    let b0: Number = bytes_get(input, offset)
+    let b1: Number = bytes_get(input, offset + 1)
+    return ok(b0 * 256 + b1)
+
+fn yaza_db_pg_read_i32_be_v1(input: Bytes, offset: Number) -> Result[Number, Text]:
+    let u: Number = yaza_db_pg_read_u32_be_v1(input, offset)?
+    if u >= 2147483648:
+        return ok(u - 4294967296)
+    return ok(u)
+
+fn yaza_db_pg_cstring_v1(value: Text) -> Bytes:
+    let z: Bytes = bytes_from_number(0)
+    let one_z: Bytes = bytes_slice(z, 0, 1)
+    return bytes_concat(bytes_from_text(value), one_z)
+
+fn yaza_db_pg_hex_val_v1(ch: Number) -> Number:
+    if ch >= 48 and ch <= 57: return ch - 48
+    if ch >= 97 and ch <= 102: return ch - 87
+    if ch >= 65 and ch <= 70: return ch - 55
+    return -1
+
+fn yaza_db_pg_decode_bytea_hex_v1(value: Text) -> Result[Bytes, Text]:
+    if not text_starts_with(value, "\\x"):
+        return err("PG bytea hex value must start with \\x")
+    let n: Number = text_length(value) - 2
+    if n < 0 or n % 2 != 0:
+        return err("PG bytea hex value has invalid length")
+    let out: Bytes = bytes_try_new_zeroed(n / 2)?
+    var i: Number = 0
+    while i < n:
+        let hi: Number = yaza_db_pg_hex_val_v1(text_byte(value, 2 + i))
+        let lo: Number = yaza_db_pg_hex_val_v1(text_byte(value, 2 + i + 1))
+        if hi < 0 or lo < 0:
+            return err("PG bytea hex contains invalid hex digit")
+        if not bytes_try_set(out, i / 2, hi * 16 + lo):
+            return err("PG bytea hex decode write failed")
+        set i = i + 2
+    return ok(out)
+
+fn yaza_db_pg_backend_frame_v1(tag_byte: Number, payload: Bytes) -> Result[Bytes, Text]:
+    let body_len: Number = bytes_length(payload)
+    let len_bytes: Bytes = yaza_db_pg_u32_be_v1(body_len + 4)?
+    let tag_b: Bytes = bytes_try_new_zeroed(1)?
+    if not bytes_try_set(tag_b, 0, tag_byte):
+        return err("PG backend frame tag write failed")
+    return ok(bytes_concat(bytes_concat(tag_b, len_bytes), payload))
+
+fn yaza_db_pg_send_exact_v1(conn: Number, data: Bytes) -> Result[Boolean, Text]:
+    let written: Number = tcp_write(conn, data, 5000)?
+    if written != bytes_length(data):
+        return err("PG socket short write")
+    return ok(true)
+
+fn yaza_db_pg_read_exact_v1(conn: Number, expected_bytes: Number, timeout_ms: Number) -> Result[Bytes, Text]:
+    if expected_bytes == 0:
+        return bytes_try_new_zeroed(0)
+    if expected_bytes < 0 or expected_bytes > 16777216:
+        return err("PG socket read length exceeds 16 MiB bound")
+    let chunks_res: Result[List[Bytes], Text] = list_try_new()
+    if not result_is_ok(chunks_res):
+        return err("PG socket buffer allocation failed")
+    let chunks: List[Bytes] = result_unwrap(chunks_res)
+    var collected: Number = 0
+    let deadline: Number = monotonic_ms() + timeout_ms
+    while collected < expected_bytes:
+        let remaining_ms: Number = deadline - monotonic_ms()
+        if remaining_ms < 1:
+            return err("PG socket read timed out")
+        let chunk: Bytes = tcp_read(conn, expected_bytes - collected, remaining_ms)?
+        if bytes_length(chunk) == 0:
+            return err("PG socket closed by peer")
+        if not list_try_push(chunks, chunk):
+            return err("PG socket chunk append failed")
+        set collected = collected + bytes_length(chunk)
+    return bytes_join(chunks)
+
+fn yaza_db_pg_type_oid_v1(sql_type_id: Number) -> Number:
+    if sql_type_id == 1: return 16
+    if sql_type_id == 2: return 21
+    if sql_type_id == 3: return 23
+    if sql_type_id == 4: return 20
+    if sql_type_id == 6: return 701
+    if sql_type_id == 10: return 1700
+    if sql_type_id == 16: return 17
+    return 25
+
+fn yaza_db_pg_type_size_u16_v1(sql_type_id: Number) -> Number:
+    if sql_type_id == 1: return 1
+    if sql_type_id == 2: return 2
+    if sql_type_id == 3: return 4
+    if sql_type_id == 4: return 8
+    if sql_type_id == 6: return 8
+    return 65535
+
+fn yaza_db_pg_sql_type_from_oid_v1(oid: Number) -> Number:
+    if oid == 16: return 1
+    if oid == 21: return 2
+    if oid == 23: return 3
+    if oid == 20 or oid == 26: return 4
+    if oid == 700 or oid == 701: return 6
+    if oid == 1700: return 10
+    if oid == 17: return 16
+    if oid == 25 or oid == 1043 or oid == 1042: return 9
+    return 0
+
+fn yaza_db_pg_sqlstate_for_error_v1(message: Text) -> Text:
+    if text_find(message, "current transaction is aborted") >= 0 or text_find(message, "aborted due to a prior error") >= 0:
+        return "25P02"
+    if text_find(message, "UNIQUE") >= 0 or text_find(message, "duplicate") >= 0 or text_find(message, "already contains") >= 0:
+        return "23505"
+    if text_find(message, "foreign-key") >= 0 or text_find(message, "FOREIGN KEY") >= 0:
+        return "23503"
+    if text_find(message, "CHECK") >= 0:
+        return "23514"
+    if text_find(message, "NOT NULL") >= 0:
+        return "23502"
+    if text_find(message, "read-only replica") >= 0:
+        return "25006"
+    if text_find(message, "password authentication") >= 0:
+        return "28P01"
+    return "42000"
+
+fn yaza_db_pg_encode_error_frame_v1(sqlstate: Text, message: Text) -> Result[Bytes, Text]:
+    let nul: Bytes = bytes_try_new_zeroed(1)?
+    var payload: Bytes = bytes_concat(bytes_from_text("SERROR"), nul)
+    set payload = bytes_concat(payload, bytes_concat(bytes_from_text("VERROR"), nul))
+    set payload = bytes_concat(payload, bytes_concat(bytes_from_text("C" + sqlstate), nul))
+    set payload = bytes_concat(payload, bytes_concat(bytes_from_text("M" + message), nul))
+    set payload = bytes_concat(payload, nul)
+    return yaza_db_pg_backend_frame_v1(69, payload)
+
+fn yaza_db_pg_encode_ready_frame_v1(session: YazaDbSessionV1) -> Result[Bytes, Text]:
+    var status_byte: Number = 73
+    if option_is_some(session.explicit_tx):
+        if option_unwrap(session.explicit_tx).failed:
+            set status_byte = 69
+        else:
+            set status_byte = 84
+    let b: Bytes = bytes_try_new_zeroed(1)?
+    if not bytes_try_set(b, 0, status_byte):
+        return err("PG ReadyForQuery status byte failed")
+    return yaza_db_pg_backend_frame_v1(90, b)
+
+fn yaza_db_pg_encode_param_status_v1(name: Text, val: Text) -> Result[Bytes, Text]:
+    return yaza_db_pg_backend_frame_v1(83, bytes_concat(yaza_db_pg_cstring_v1(name), yaza_db_pg_cstring_v1(val)))
+
+fn yaza_db_pg_encode_auth_ok_v1() -> Result[Bytes, Text]:
+    let zero: Bytes = yaza_db_pg_u32_be_v1(0)?
+    return yaza_db_pg_backend_frame_v1(82, zero)
+
+fn yaza_db_pg_encode_auth_cleartext_v1() -> Result[Bytes, Text]:
+    let three: Bytes = yaza_db_pg_u32_be_v1(3)?
+    return yaza_db_pg_backend_frame_v1(82, three)
+
+fn yaza_db_pg_encode_backend_key_v1(pid: Number, secret_key: Number) -> Result[Bytes, Text]:
+    let p: Bytes = yaza_db_pg_u32_be_v1(pid)?
+    let s: Bytes = yaza_db_pg_u32_be_v1(secret_key)?
+    return yaza_db_pg_backend_frame_v1(75, bytes_concat(p, s))
+
+fn yaza_db_pg_encode_row_desc_v1(columns: List[YazaSqlBoundProjectionV1]) -> Result[Bytes, Text]:
+    let col_count: Number = list_count(columns)
+    var payload: Bytes = yaza_db_pg_u16_be_v1(col_count)?
+    let neg_one: Bytes = yaza_db_pg_u32_be_v1(4294967295)?
+    let zero_u32: Bytes = yaza_db_pg_u32_be_v1(0)?
+    let zero_u16: Bytes = yaza_db_pg_u16_be_v1(0)?
+    var c: Number = 0
+    while c < col_count:
+        let col: YazaSqlBoundProjectionV1 = list_get(columns, c)
+        let att_b: Bytes = yaza_db_pg_u16_be_v1(c + 1)?
+        let oid_b: Bytes = yaza_db_pg_u32_be_v1(yaza_db_pg_type_oid_v1(col.type_id))?
+        let tsize_b: Bytes = yaza_db_pg_u16_be_v1(yaza_db_pg_type_size_u16_v1(col.type_id))?
+        set payload = bytes_concat(payload, yaza_db_pg_cstring_v1(col.output_name))
+        set payload = bytes_concat(payload, zero_u32)
+        set payload = bytes_concat(payload, att_b)
+        set payload = bytes_concat(payload, oid_b)
+        set payload = bytes_concat(payload, tsize_b)
+        set payload = bytes_concat(payload, neg_one)
+        set payload = bytes_concat(payload, zero_u16)
+        set c = c + 1
+    return yaza_db_pg_backend_frame_v1(84, payload)
+
+fn yaza_db_pg_value_text_format_v1(val: YazaSqlValueV1) -> Result[Text, Text]:
+    if val.type_id == 1:
+        if val.boolean_value: return ok("t")
+        return ok("f")
+    if val.type_id == 2 or val.type_id == 3 or val.type_id == 4:
+        return ok(number_text(val.integer_value))
+    if val.type_id == 6:
+        return ok(float64_text(val.float_value))
+    if val.type_id == 16:
+        return yaza_db_pg_encode_bytea_hex_v1(val.bytes_value)
+    return ok(val.text_value)
+
+fn yaza_db_pg_encode_data_row_v1(row: List[YazaSqlValueV1]) -> Result[Bytes, Text]:
+    let col_count: Number = list_count(row)
+    var payload: Bytes = yaza_db_pg_u16_be_v1(col_count)?
+    let null_marker: Bytes = yaza_db_pg_u32_be_v1(4294967295)?
+    var c: Number = 0
+    while c < col_count:
+        let val: YazaSqlValueV1 = list_get(row, c)
+        if val.is_null:
+            set payload = bytes_concat(payload, null_marker)
+        else:
+            let txt: Text = yaza_db_pg_value_text_format_v1(val)?
+            let txt_bytes: Bytes = bytes_from_text(txt)
+            let len_b: Bytes = yaza_db_pg_u32_be_v1(bytes_length(txt_bytes))?
+            set payload = bytes_concat(payload, bytes_concat(len_b, txt_bytes))
+        set c = c + 1
+    return yaza_db_pg_backend_frame_v1(68, payload)
+
+fn yaza_db_pg_command_tag_v1(stmt: YazaDbSqlStatementResultV1) -> Text:
+    let k: Number = stmt.statement_kind
+    if k == yaza_db_sql_statement_kind_select_v1():
+        if option_is_some(stmt.query_result):
+            return "SELECT " + number_text(list_count(option_unwrap(stmt.query_result).rows))
+        return "SELECT 0"
+    if k == yaza_db_sql_statement_kind_insert_v1():
+        var aff: Number = 0
+        if option_is_some(stmt.write_commit): set aff = option_unwrap(stmt.write_commit).affected_rows
+        return "INSERT 0 " + number_text(aff)
+    if k == yaza_db_sql_statement_kind_update_v1():
+        var aff: Number = 0
+        if option_is_some(stmt.write_commit): set aff = option_unwrap(stmt.write_commit).affected_rows
+        return "UPDATE " + number_text(aff)
+    if k == yaza_db_sql_statement_kind_delete_v1():
+        var aff: Number = 0
+        if option_is_some(stmt.write_commit): set aff = option_unwrap(stmt.write_commit).affected_rows
+        return "DELETE " + number_text(aff)
+    if k == yaza_db_sql_statement_kind_begin_v1(): return "BEGIN"
+    if k == yaza_db_sql_statement_kind_commit_v1(): return "COMMIT"
+    if k == yaza_db_sql_statement_kind_rollback_v1() or k == yaza_db_sql_statement_kind_rollback_to_v1(): return "ROLLBACK"
+    if k == yaza_db_sql_statement_kind_savepoint_v1(): return "SAVEPOINT"
+    if k == yaza_db_sql_statement_kind_release_v1(): return "RELEASE"
+    if k == yaza_db_sql_statement_kind_explain_v1(): return "EXPLAIN"
+    if k == yaza_db_sql_statement_kind_create_table_v1(): return "CREATE TABLE"
+    if k == yaza_db_sql_statement_kind_create_index_v1(): return "CREATE INDEX"
+    if k == yaza_db_sql_statement_kind_create_view_v1(): return "CREATE VIEW"
+    if k == yaza_db_sql_statement_kind_drop_table_v1(): return "DROP TABLE"
+    if k == yaza_db_sql_statement_kind_drop_index_v1(): return "DROP INDEX"
+    if k == yaza_db_sql_statement_kind_drop_view_v1(): return "DROP VIEW"
+    if k == yaza_db_sql_statement_kind_alter_table_v1(): return "ALTER TABLE"
+    return "OK"
+
+fn yaza_db_pg_encode_command_complete_v1(tag: Text) -> Result[Bytes, Text]:
+    return yaza_db_pg_backend_frame_v1(67, yaza_db_pg_cstring_v1(tag))
+
+fn yaza_db_pg_sql_is_write_v1(source: Text) -> Boolean:
+    let lex_res: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(source)
+    if not result_is_ok(lex_res): return false
+    let tokens: List[YazaSqlTokenV1] = result_unwrap(lex_res)
+    if list_count(tokens) < 2: return false
+    return yaza_sql_v2_is_keyword(source, tokens, 0, "INSERT") or yaza_sql_v2_is_keyword(source, tokens, 0, "UPDATE") or yaza_sql_v2_is_keyword(source, tokens, 0, "DELETE") or yaza_sql_v2_is_keyword(source, tokens, 0, "CREATE") or yaza_sql_v2_is_keyword(source, tokens, 0, "DROP") or yaza_sql_v2_is_keyword(source, tokens, 0, "ALTER") or yaza_sql_v2_is_keyword(source, tokens, 0, "BEGIN") or yaza_sql_v2_is_keyword(source, tokens, 0, "START")
+
+fn yaza_db_pg_read_cstring_at_v1(buf: Bytes, offset: Number) -> Result[TextList, Text]:
+    let out_res: Result[TextList, Text] = text_list_try_new()
+    if not result_is_ok(out_res): return err("PG cstring alloc failed")
+    let out: TextList = result_unwrap(out_res)
+    let len: Number = bytes_length(buf)
+    var end: Number = offset
+    while end < len and bytes_get(buf, end) != 0:
+        set end = end + 1
+    if end >= len: return err("PG unterminated cstring")
+    let slice_b: Bytes = bytes_slice(buf, offset, end - offset)
+    let txt: Text = bytes_try_to_text(slice_b)?
+    let _p1: Boolean = list_try_push(out, txt)
+    let _p2: Boolean = list_try_push(out, number_text(end + 1))
+    return ok(out)
+
+fn yaza_db_pg_find_stmt_v1(stmts: List[YazaDbPgPreparedStmtV1], name: Text) -> Number:
+    var i: Number = 0
+    while i < list_count(stmts):
+        if list_get(stmts, i).name == name: return i
+        set i = i + 1
+    return -1
+
+fn yaza_db_pg_put_stmt_v1(stmts: List[YazaDbPgPreparedStmtV1], item: YazaDbPgPreparedStmtV1) -> Result[List[YazaDbPgPreparedStmtV1], Text]:
+    let out_res: Result[List[YazaDbPgPreparedStmtV1], Text] = list_try_new()
+    let out: List[YazaDbPgPreparedStmtV1] = out_res?
+    var replaced: Boolean = false
+    var i: Number = 0
+    while i < list_count(stmts):
+        let existing: YazaDbPgPreparedStmtV1 = list_get(stmts, i)
+        if existing.name == item.name:
+            let _p: Boolean = list_try_push(out, item)
+            set replaced = true
+        else:
+            let _p: Boolean = list_try_push(out, existing)
+        set i = i + 1
+    if not replaced:
+        let _p: Boolean = list_try_push(out, item)
+    return ok(out)
+
+fn yaza_db_pg_remove_stmt_v1(stmts: List[YazaDbPgPreparedStmtV1], name: Text) -> Result[List[YazaDbPgPreparedStmtV1], Text]:
+    let out_res: Result[List[YazaDbPgPreparedStmtV1], Text] = list_try_new()
+    let out: List[YazaDbPgPreparedStmtV1] = out_res?
+    var i: Number = 0
+    while i < list_count(stmts):
+        let existing: YazaDbPgPreparedStmtV1 = list_get(stmts, i)
+        if existing.name != name:
+            let _p: Boolean = list_try_push(out, existing)
+        set i = i + 1
+    return ok(out)
+
+fn yaza_db_pg_find_portal_v1(portals: List[YazaDbPgPortalV1], name: Text) -> Number:
+    var i: Number = 0
+    while i < list_count(portals):
+        if list_get(portals, i).name == name: return i
+        set i = i + 1
+    return -1
+
+fn yaza_db_pg_put_portal_v1(portals: List[YazaDbPgPortalV1], item: YazaDbPgPortalV1) -> Result[List[YazaDbPgPortalV1], Text]:
+    let out_res: Result[List[YazaDbPgPortalV1], Text] = list_try_new()
+    let out: List[YazaDbPgPortalV1] = out_res?
+    var replaced: Boolean = false
+    var i: Number = 0
+    while i < list_count(portals):
+        let existing: YazaDbPgPortalV1 = list_get(portals, i)
+        if existing.name == item.name:
+            let _p: Boolean = list_try_push(out, item)
+            set replaced = true
+        else:
+            let _p: Boolean = list_try_push(out, existing)
+        set i = i + 1
+    if not replaced:
+        let _p: Boolean = list_try_push(out, item)
+    return ok(out)
+
+fn yaza_db_pg_remove_portal_v1(portals: List[YazaDbPgPortalV1], name: Text) -> Result[List[YazaDbPgPortalV1], Text]:
+    let out_res: Result[List[YazaDbPgPortalV1], Text] = list_try_new()
+    let out: List[YazaDbPgPortalV1] = out_res?
+    var i: Number = 0
+    while i < list_count(portals):
+        let existing: YazaDbPgPortalV1 = list_get(portals, i)
+        if existing.name != name:
+            let _p: Boolean = list_try_push(out, existing)
+        set i = i + 1
+    return ok(out)
+
+fn yaza_db_pg_is_digits_only_v1(s: Text) -> Boolean:
+    let n: Number = text_length(s)
+    if n < 1: return false
+    var i: Number = 0
+    if text_byte(s, 0) == 45:
+        if n < 2: return false
+        set i = 1
+    while i < n:
+        let b: Number = text_byte(s, i)
+        if b < 48 or b > 57: return false
+        set i = i + 1
+    return true
+
+fn yaza_db_pg_infer_param_type_ids_v1(session: YazaDbSessionV1, sql: Text, raw_oids: List[Number], count: Number) -> List[Number]:
+    let type_ids: List[Number] = List[Number]()
+    var i: Number = 0
+    while i < count:
+        var tid: Number = 0
+        if i < list_count(raw_oids) and list_get(raw_oids, i) != 0:
+            set tid = yaza_db_pg_sql_type_from_oid_v1(list_get(raw_oids, i))
+        let _p: Boolean = list_try_push(type_ids, tid)
+        set i = i + 1
+    var any_missing: Boolean = false
+    set i = 0
+    while i < count:
+        if list_get(type_ids, i) == 0: set any_missing = true
+        set i = i + 1
+    if not any_missing or not session.is_open or session.storage.header.catalog_root == 0:
+        return type_ids
+    var snap_res: Result[YazaDbCatalogSnapshotWithRootsV1, Text] = err("no catalog")
+    if option_is_some(session.catalog_cache):
+        set snap_res = ok(option_unwrap(session.catalog_cache))
+    else:
+        set snap_res = yaza_db_catalog_snapshot_load_with_roots_v1(session.storage.file, session.storage.header)
+    if not result_is_ok(snap_res): return type_ids
+    let snap: YazaDbCatalogSnapshotWithRootsV1 = result_unwrap(snap_res)
+    let sel_ast: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_v3(sql)
+    if result_is_ok(sel_ast):
+        let bound_res: Result[YazaSqlBoundPlanV1, Text] = yaza_sql_bind_select_v1(sql, result_unwrap(sel_ast), snap.sql_snapshot)
+        if result_is_ok(bound_res):
+            let bp: YazaSqlBoundPlanV1 = result_unwrap(bound_res)
+            var p: Number = 0
+            while p < list_count(bp.parameters) and p < count:
+                if list_get(type_ids, p) == 0:
+                    let _s: Boolean = list_try_set(type_ids, p, list_get(bp.parameters, p).type_id)
+                set p = p + 1
+            return type_ids
+    let ins_ast: Result[YazaSqlInsertAstV1, Text] = yaza_sql_parse_insert_v1(sql)
+    if result_is_ok(ins_ast):
+        let bound_res: Result[YazaSqlBoundInsertPlanV1, Text] = yaza_sql_bind_insert_v1(sql, result_unwrap(ins_ast), snap.sql_snapshot)
+        if result_is_ok(bound_res):
+            let bip: YazaSqlBoundInsertPlanV1 = result_unwrap(bound_res)
+            var p: Number = 0
+            while p < list_count(bip.parameters) and p < count:
+                if list_get(type_ids, p) == 0:
+                    let _s: Boolean = list_try_set(type_ids, p, list_get(bip.parameters, p).type_id)
+                set p = p + 1
+            return type_ids
+    return type_ids
+
+fn yaza_db_pg_decode_param_value_v1(is_null: Boolean, text_val: Text, target_type_id: Number) -> Result[YazaSqlValueV1, Text]:
+    if is_null:
+        var tid: Number = target_type_id
+        if tid == 0: set tid = 9
+        return yaza_sql_value_null_v1(tid)
+    var eff_tid: Number = target_type_id
+    if eff_tid == 0:
+        if text_val == "true" or text_val == "false" or text_val == "t" or text_val == "f":
+            set eff_tid = 1
+        elif text_starts_with(text_val, "\\x"):
+            set eff_tid = 16
+        elif yaza_db_pg_is_digits_only_v1(text_val):
+            let num_res: Result[Number, Text] = number_try_parse(text_val)
+            if result_is_ok(num_res):
+                let nv: Number = result_unwrap(num_res)
+                if nv >= -2147483648 and nv <= 2147483647: set eff_tid = 3
+                else: set eff_tid = 4
+            else:
+                set eff_tid = 9
+        else:
+            set eff_tid = 9
+    if eff_tid == 1:
+        if text_val == "t" or text_val == "true" or text_val == "1": return ok(yaza_sql_value_boolean_v1(true))
+        if text_val == "f" or text_val == "false" or text_val == "0": return ok(yaza_sql_value_boolean_v1(false))
+        return err("PG bind parameter is not a valid BOOLEAN: " + text_val)
+    if eff_tid == 2 or eff_tid == 3 or eff_tid == 4:
+        let nv: Number = number_try_parse(text_val)?
+        return yaza_sql_value_integer_v1(eff_tid, nv)
+    if eff_tid == 6:
+        let fv: Float64 = float64_try_parse(text_val)?
+        return ok(yaza_sql_value_double_v1(fv))
+    if eff_tid == 16:
+        let raw_b: Bytes = yaza_db_pg_decode_bytea_hex_v1(text_val)?
+        return yaza_sql_value_blob_v1(raw_b)
+    return ok(yaza_sql_value_text_v1(text_val))
+
+fn yaza_db_pg_describe_select_columns_v1(session: YazaDbSessionV1, sql: Text) -> Result[Option[List[YazaSqlBoundProjectionV1]], Text]:
+    let tokens_res: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(sql)
+    if not result_is_ok(tokens_res): return ok(none)
+    let tokens: List[YazaSqlTokenV1] = result_unwrap(tokens_res)
+    if list_count(tokens) < 2 or not yaza_sql_v2_is_keyword(sql, tokens, 0, "SELECT"):
+        return ok(none)
+    var snap_res: Result[YazaDbCatalogSnapshotWithRootsV1, Text] = err("no catalog")
+    if option_is_some(session.catalog_cache):
+        set snap_res = ok(option_unwrap(session.catalog_cache))
+    else:
+        set snap_res = yaza_db_catalog_snapshot_load_with_roots_v1(session.storage.file, session.storage.header)
+    if not result_is_ok(snap_res): return ok(none)
+    let snap: YazaDbCatalogSnapshotWithRootsV1 = result_unwrap(snap_res)
+    let parsed: Result[YazaSqlSelectAstV3, Text] = yaza_sql_parse_select_tokens_v3(sql, tokens)
+    if not result_is_ok(parsed): return ok(none)
+    let bound: Result[YazaSqlBoundPlanV1, Text] = yaza_sql_bind_select_v1(sql, result_unwrap(parsed), snap.sql_snapshot)
+    if not result_is_ok(bound): return ok(none)
+    return ok(some(result_unwrap(bound).projections))
+
+fn yaza_db_pg_server_handle_ssl_once_v1(conn: Number) -> Result[Boolean, Text]:
+    let len_bytes: Bytes = yaza_db_pg_read_exact_v1(conn, 4, 5000)?
+    let pkt_len: Number = yaza_db_pg_read_u32_be_v1(len_bytes, 0)?
+    if pkt_len != 8:
+        return err("PG SSLRequest packet length must be 8")
+    let code_bytes: Bytes = yaza_db_pg_read_exact_v1(conn, 4, 5000)?
+    let code: Number = yaza_db_pg_read_u32_be_v1(code_bytes, 0)?
+    if code != 80877103 and code != 80877104:
+        return err("PG expected SSLRequest or GSSENCRequest code")
+    let n_byte: Bytes = bytes_from_text("N")
+    return yaza_db_pg_send_exact_v1(conn, n_byte)
+
+fn yaza_db_pg_server_handle_startup_v1(conn: Number, session: YazaDbSessionV1, config: YazaDbPgServerConfigV1, allow_ssl_prefix: Boolean) -> Result[YazaDbPgConnectionStateV1, Text]:
+    var packet_code: Number = 0
+    var body: Bytes = bytes_try_new_zeroed(0)?
+    var done_startup_pkt: Boolean = false
+    var ssl_hops: Number = 0
+    while not done_startup_pkt:
+        if ssl_hops > 2: return err("PG excessive SSL negotiation requests")
+        let len_bytes: Bytes = yaza_db_pg_read_exact_v1(conn, 4, 5000)?
+        let pkt_len: Number = yaza_db_pg_read_u32_be_v1(len_bytes, 0)?
+        if pkt_len < 8 or pkt_len > 10000:
+            return err("PG startup packet length out of range")
+        set body = yaza_db_pg_read_exact_v1(conn, pkt_len - 4, 5000)?
+        set packet_code = yaza_db_pg_read_u32_be_v1(body, 0)?
+        if packet_code == 80877103 or packet_code == 80877104:
+            if not allow_ssl_prefix:
+                return err("PG unexpected SSLRequest")
+            let _w: Boolean = yaza_db_pg_send_exact_v1(conn, bytes_from_text("N"))?
+            set ssl_hops = ssl_hops + 1
+        else:
+            set done_startup_pkt = true
+
+    if packet_code == 80877102:
+        let stmts0_res: Result[List[YazaDbPgPreparedStmtV1], Text] = list_try_new()
+        let portals0_res: Result[List[YazaDbPgPortalV1], Text] = list_try_new()
+        let stmts0: List[YazaDbPgPreparedStmtV1] = stmts0_res?
+        let portals0: List[YazaDbPgPortalV1] = portals0_res?
+        return ok(YazaDbPgConnectionStateV1(session, config, stmts0, portals0, true, false, "", ""))
+    if packet_code != 196608:
+        let err_f: Bytes = yaza_db_pg_encode_error_frame_v1("08P01", "YDBv1 PG protocol supports v3.0 startup only")?
+        let _ignored_w: Result[Boolean, Text] = yaza_db_pg_send_exact_v1(conn, err_f)
+        return err("PG unsupported protocol version")
+
+    var user: Text = ""
+    var database: Text = config.database_name
+    var off: Number = 4
+    let blen: Number = bytes_length(body)
+    while off < blen and bytes_get(body, off) != 0:
+        let k_res: TextList = yaza_db_pg_read_cstring_at_v1(body, off)?
+        let key: Text = list_get(k_res, 0)
+        set off = number_parse(list_get(k_res, 1))
+        let v_res: TextList = yaza_db_pg_read_cstring_at_v1(body, off)?
+        let val: Text = list_get(v_res, 0)
+        set off = number_parse(list_get(v_res, 1))
+        if key == "user": set user = val
+        elif key == "database": set database = val
+
+    if config.auth_mode == "password":
+        let auth_req: Bytes = yaza_db_pg_encode_auth_cleartext_v1()?
+        let _w_req: Boolean = yaza_db_pg_send_exact_v1(conn, auth_req)?
+        let p_hdr: Bytes = yaza_db_pg_read_exact_v1(conn, 5, 5000)?
+        if bytes_get(p_hdr, 0) != 112:
+            return err("PG expected CleartextPassword message 'p'")
+        let p_len: Number = yaza_db_pg_read_u32_be_v1(p_hdr, 1)?
+        if p_len < 5 or p_len > 4096:
+            return err("PG invalid password packet length")
+        let p_body: Bytes = yaza_db_pg_read_exact_v1(conn, p_len - 4, 5000)?
+        let pw_parts: TextList = yaza_db_pg_read_cstring_at_v1(p_body, 0)?
+        let given_pw: Text = list_get(pw_parts, 0)
+        let user_ok: Boolean = config.expected_user == "" or user == config.expected_user
+        let pw_ok: Boolean = bytes_equal_constant_time(bytes_from_text(given_pw), bytes_from_text(config.expected_password))
+        if not user_ok or not pw_ok:
+            let auth_err: Bytes = yaza_db_pg_encode_error_frame_v1("28P01", "password authentication failed for user \"" + user + "\"")?
+            let _w_err: Result[Boolean, Text] = yaza_db_pg_send_exact_v1(conn, auth_err)
+            return err("PG password authentication failed")
+
+    var resp: Bytes = yaza_db_pg_encode_auth_ok_v1()?
+    let ps1: Bytes = yaza_db_pg_encode_param_status_v1("server_version", "16.0 (YazaBase 1.0.2)")?
+    let ps2: Bytes = yaza_db_pg_encode_param_status_v1("client_encoding", "UTF8")?
+    let ps3: Bytes = yaza_db_pg_encode_param_status_v1("server_encoding", "UTF8")?
+    let ps4: Bytes = yaza_db_pg_encode_param_status_v1("standard_conforming_strings", "on")?
+    let bkd: Bytes = yaza_db_pg_encode_backend_key_v1(1001, 424242)?
+    let rfq: Bytes = yaza_db_pg_encode_ready_frame_v1(session)?
+    set resp = bytes_concat(resp, ps1)
+    set resp = bytes_concat(resp, ps2)
+    set resp = bytes_concat(resp, ps3)
+    set resp = bytes_concat(resp, ps4)
+    set resp = bytes_concat(resp, bkd)
+    set resp = bytes_concat(resp, rfq)
+    let _w_ok: Boolean = yaza_db_pg_send_exact_v1(conn, resp)?
+
+    let stmts_res: Result[List[YazaDbPgPreparedStmtV1], Text] = list_try_new()
+    let portals_res: Result[List[YazaDbPgPortalV1], Text] = list_try_new()
+    let stmts: List[YazaDbPgPreparedStmtV1] = stmts_res?
+    let portals: List[YazaDbPgPortalV1] = portals_res?
+    return ok(YazaDbPgConnectionStateV1(session, config, stmts, portals, false, true, user, database))
+
+shape YazaDbPgExecBytesOutcomeV1:
+    session: YazaDbSessionV1
+    frames_bytes: Bytes
+
+fn yaza_db_pg_run_statement_bytes_v1(session: YazaDbSessionV1, config: YazaDbPgServerConfigV1, sql: Text, params: List[YazaSqlValueV1], include_row_desc: Boolean) -> Result[YazaDbPgExecBytesOutcomeV1, Text]:
+    let trimmed: Text = text_trim(sql)
+    let zero_b: Bytes = bytes_try_new_zeroed(0)?
+    if trimmed == "":
+        let empty_f: Bytes = yaza_db_pg_backend_frame_v1(73, zero_b)?
+        return ok(YazaDbPgExecBytesOutcomeV1(session, empty_f))
+    if config.read_only and yaza_db_pg_sql_is_write_v1(sql):
+        let ro_err: Bytes = yaza_db_pg_encode_error_frame_v1("25006", "cannot execute write SQL in a read-only replica transaction")?
+        return ok(YazaDbPgExecBytesOutcomeV1(session, ro_err))
+
+    let res: YazaDbSessionExecutionV1 = yaza_db_session_execute_with_state_v1(session, sql, params)
+    if not res.ok:
+        let sqlstate: Text = yaza_db_pg_sqlstate_for_error_v1(res.error_message)
+        let err_f: Bytes = yaza_db_pg_encode_error_frame_v1(sqlstate, res.error_message)?
+        return ok(YazaDbPgExecBytesOutcomeV1(res.session, err_f))
+
+    let stmt: YazaDbSqlStatementResultV1 = option_unwrap(res.statement)
+    var out: Bytes = zero_b
+    if option_is_some(stmt.query_result):
+        let qres: YazaSqlQueryResultV1 = option_unwrap(stmt.query_result)
+        if include_row_desc:
+            let rd_b: Bytes = yaza_db_pg_encode_row_desc_v1(qres.columns)?
+            set out = bytes_concat(out, rd_b)
+        var r: Number = 0
+        while r < list_count(qres.rows):
+            let dr_b: Bytes = yaza_db_pg_encode_data_row_v1(list_get(qres.rows, r))?
+            set out = bytes_concat(out, dr_b)
+            set r = r + 1
+    elif option_is_some(stmt.explain_text):
+        let exp_cols_res: Result[List[YazaSqlBoundProjectionV1], Text] = list_try_new()
+        let exp_cols: List[YazaSqlBoundProjectionV1] = exp_cols_res?
+        let _pcol: Boolean = list_try_push(exp_cols, YazaSqlBoundProjectionV1(0, 9, false, "QUERY PLAN", 0, 0, 0, 0, 0))
+        if include_row_desc:
+            let rd_b: Bytes = yaza_db_pg_encode_row_desc_v1(exp_cols)?
+            set out = bytes_concat(out, rd_b)
+        let row_vals_res: Result[List[YazaSqlValueV1], Text] = list_try_new()
+        let row_vals: List[YazaSqlValueV1] = row_vals_res?
+        let _pval: Boolean = list_try_push(row_vals, yaza_sql_value_text_v1(option_unwrap(stmt.explain_text)))
+        let dr_b: Bytes = yaza_db_pg_encode_data_row_v1(row_vals)?
+        set out = bytes_concat(out, dr_b)
+    let tag: Text = yaza_db_pg_command_tag_v1(stmt)
+    let cc_b: Bytes = yaza_db_pg_encode_command_complete_v1(tag)?
+    set out = bytes_concat(out, cc_b)
+    return ok(YazaDbPgExecBytesOutcomeV1(res.session, out))
+
+fn yaza_db_pg_server_process_next_message_v1(conn: Number, state: YazaDbPgConnectionStateV1) -> Result[YazaDbPgStepOutcomeV1, Text]:
+    if state.closed:
+        return ok(YazaDbPgStepOutcomeV1(state, false, true))
+    let hdr: Bytes = yaza_db_pg_read_exact_v1(conn, 5, 5000)?
+    let tag: Number = bytes_get(hdr, 0)
+    let msg_len: Number = yaza_db_pg_read_u32_be_v1(hdr, 1)?
+    if msg_len < 4 or msg_len > 16777216:
+        return err("PG frontend message length out of bounds")
+    let payload: Bytes = yaza_db_pg_read_exact_v1(conn, msg_len - 4, 5000)?
+    let empty_z: Bytes = bytes_try_new_zeroed(0)?
+
+    var cur_state: YazaDbPgConnectionStateV1 = state
+    if tag == 88:
+        let next_s: YazaDbPgConnectionStateV1 = YazaDbPgConnectionStateV1(cur_state.session, cur_state.config, cur_state.stmts, cur_state.portals, true, cur_state.authenticated, cur_state.user, cur_state.database)
+        return ok(YazaDbPgStepOutcomeV1(next_s, true, true))
+
+    if tag == 81:
+        let sql_parts: TextList = yaza_db_pg_read_cstring_at_v1(payload, 0)?
+        let sql: Text = list_get(sql_parts, 0)
+        let outcome: YazaDbPgExecBytesOutcomeV1 = yaza_db_pg_run_statement_bytes_v1(cur_state.session, cur_state.config, sql, List[YazaSqlValueV1](), true)?
+        let ready: Bytes = yaza_db_pg_encode_ready_frame_v1(outcome.session)?
+        let _w: Boolean = yaza_db_pg_send_exact_v1(conn, bytes_concat(outcome.frames_bytes, ready))?
+        let next_s: YazaDbPgConnectionStateV1 = YazaDbPgConnectionStateV1(outcome.session, cur_state.config, cur_state.stmts, cur_state.portals, not outcome.session.is_open, cur_state.authenticated, cur_state.user, cur_state.database)
+        return ok(YazaDbPgStepOutcomeV1(next_s, true, next_s.closed))
+
+    if tag == 80:
+        let name_parts: TextList = yaza_db_pg_read_cstring_at_v1(payload, 0)?
+        let stmt_name: Text = list_get(name_parts, 0)
+        var off: Number = number_parse(list_get(name_parts, 1))
+        let sql_parts: TextList = yaza_db_pg_read_cstring_at_v1(payload, off)?
+        let sql: Text = list_get(sql_parts, 0)
+        set off = number_parse(list_get(sql_parts, 1))
+        let oid_count: Number = yaza_db_pg_read_u16_be_v1(payload, off)?
+        set off = off + 2
+        let oids_res: Result[List[Number], Text] = list_try_new()
+        let oids: List[Number] = oids_res?
+        var k: Number = 0
+        while k < oid_count:
+            let oid_val: Number = yaza_db_pg_read_u32_be_v1(payload, off)?
+            let _p: Boolean = list_try_push(oids, oid_val)
+            set off = off + 4
+            set k = k + 1
+        let next_stmts: List[YazaDbPgPreparedStmtV1] = yaza_db_pg_put_stmt_v1(cur_state.stmts, YazaDbPgPreparedStmtV1(stmt_name, sql, oids))?
+        let ok_f: Bytes = yaza_db_pg_backend_frame_v1(49, empty_z)?
+        let _w: Boolean = yaza_db_pg_send_exact_v1(conn, ok_f)?
+        let next_s: YazaDbPgConnectionStateV1 = YazaDbPgConnectionStateV1(cur_state.session, cur_state.config, next_stmts, cur_state.portals, false, cur_state.authenticated, cur_state.user, cur_state.database)
+        return ok(YazaDbPgStepOutcomeV1(next_s, true, false))
+
+    if tag == 66:
+        let portal_parts: TextList = yaza_db_pg_read_cstring_at_v1(payload, 0)?
+        let portal_name: Text = list_get(portal_parts, 0)
+        var off: Number = number_parse(list_get(portal_parts, 1))
+        let stmt_parts: TextList = yaza_db_pg_read_cstring_at_v1(payload, off)?
+        let stmt_name: Text = list_get(stmt_parts, 0)
+        set off = number_parse(list_get(stmt_parts, 1))
+        let fmt_count: Number = yaza_db_pg_read_u16_be_v1(payload, off)?
+        set off = off + 2 + fmt_count * 2
+        let param_count: Number = yaza_db_pg_read_u16_be_v1(payload, off)?
+        set off = off + 2
+
+        let stmt_idx: Number = yaza_db_pg_find_stmt_v1(cur_state.stmts, stmt_name)
+        if stmt_idx < 0:
+            let err_f: Bytes = yaza_db_pg_encode_error_frame_v1("26000", "prepared statement '" + stmt_name + "' does not exist")?
+            let _w: Boolean = yaza_db_pg_send_exact_v1(conn, err_f)?
+            return ok(YazaDbPgStepOutcomeV1(cur_state, true, false))
+
+        let prep: YazaDbPgPreparedStmtV1 = list_get(cur_state.stmts, stmt_idx)
+        let type_ids: List[Number] = yaza_db_pg_infer_param_type_ids_v1(cur_state.session, prep.sql, prep.param_oids, param_count)
+        let values_res: Result[List[YazaSqlValueV1], Text] = list_try_new()
+        let values: List[YazaSqlValueV1] = values_res?
+        var bind_err: Text = ""
+        var p: Number = 0
+        while p < param_count:
+            let flen: Number = yaza_db_pg_read_i32_be_v1(payload, off)?
+            set off = off + 4
+            var is_null: Boolean = flen == -1
+            var ptext: Text = ""
+            if flen >= 0:
+                let pb: Bytes = bytes_slice(payload, off, flen)
+                let pt_res: Result[Text, Text] = bytes_try_to_text(pb)
+                if not result_is_ok(pt_res):
+                    set bind_err = "PG Bind parameter UTF-8 decode failed"
+                else:
+                    set ptext = result_unwrap(pt_res)
+                set off = off + flen
+            if bind_err == "":
+                var tid: Number = 0
+                if p < list_count(type_ids): set tid = list_get(type_ids, p)
+                let dv_res: Result[YazaSqlValueV1, Text] = yaza_db_pg_decode_param_value_v1(is_null, ptext, tid)
+                if not result_is_ok(dv_res):
+                    set bind_err = result_unwrap_error(dv_res)
+                else:
+                    let _pv: Boolean = list_try_push(values, result_unwrap(dv_res))
+            set p = p + 1
+
+        if bind_err != "":
+            let err_f: Bytes = yaza_db_pg_encode_error_frame_v1("22P02", bind_err)?
+            let _w: Boolean = yaza_db_pg_send_exact_v1(conn, err_f)?
+            return ok(YazaDbPgStepOutcomeV1(cur_state, true, false))
+
+        let next_portals: List[YazaDbPgPortalV1] = yaza_db_pg_put_portal_v1(cur_state.portals, YazaDbPgPortalV1(portal_name, prep.sql, values))?
+        let ok_f: Bytes = yaza_db_pg_backend_frame_v1(50, empty_z)?
+        let _w: Boolean = yaza_db_pg_send_exact_v1(conn, ok_f)?
+        let next_s: YazaDbPgConnectionStateV1 = YazaDbPgConnectionStateV1(cur_state.session, cur_state.config, cur_state.stmts, next_portals, false, cur_state.authenticated, cur_state.user, cur_state.database)
+        return ok(YazaDbPgStepOutcomeV1(next_s, true, false))
+
+    if tag == 68:
+        let target_b: Number = bytes_get(payload, 0)
+        let name_parts: TextList = yaza_db_pg_read_cstring_at_v1(payload, 1)?
+        let target_name: Text = list_get(name_parts, 0)
+        var target_sql: Text = ""
+        if target_b == 83:
+            let s_idx: Number = yaza_db_pg_find_stmt_v1(cur_state.stmts, target_name)
+            if s_idx < 0:
+                let err_f: Bytes = yaza_db_pg_encode_error_frame_v1("26000", "prepared statement '" + target_name + "' does not exist")?
+                let _w: Boolean = yaza_db_pg_send_exact_v1(conn, err_f)?
+                return ok(YazaDbPgStepOutcomeV1(cur_state, true, false))
+            let ps: YazaDbPgPreparedStmtV1 = list_get(cur_state.stmts, s_idx)
+            set target_sql = ps.sql
+            var pd: Bytes = yaza_db_pg_u16_be_v1(list_count(ps.param_oids))?
+            var pi: Number = 0
+            while pi < list_count(ps.param_oids):
+                let oid_be: Bytes = yaza_db_pg_u32_be_v1(list_get(ps.param_oids, pi))?
+                set pd = bytes_concat(pd, oid_be)
+                set pi = pi + 1
+            let pd_f: Bytes = yaza_db_pg_backend_frame_v1(116, pd)?
+            let _wpd: Boolean = yaza_db_pg_send_exact_v1(conn, pd_f)?
+        else:
+            let p_idx: Number = yaza_db_pg_find_portal_v1(cur_state.portals, target_name)
+            if p_idx < 0:
+                let err_f: Bytes = yaza_db_pg_encode_error_frame_v1("34000", "portal '" + target_name + "' does not exist")?
+                let _w: Boolean = yaza_db_pg_send_exact_v1(conn, err_f)?
+                return ok(YazaDbPgStepOutcomeV1(cur_state, true, false))
+            set target_sql = list_get(cur_state.portals, p_idx).sql
+        let cols_opt: Option[List[YazaSqlBoundProjectionV1]] = yaza_db_pg_describe_select_columns_v1(cur_state.session, target_sql)?
+        if option_is_some(cols_opt):
+            let rd_f: Bytes = yaza_db_pg_encode_row_desc_v1(option_unwrap(cols_opt))?
+            let _w: Boolean = yaza_db_pg_send_exact_v1(conn, rd_f)?
+        else:
+            let nd_f: Bytes = yaza_db_pg_backend_frame_v1(110, empty_z)?
+            let _w: Boolean = yaza_db_pg_send_exact_v1(conn, nd_f)?
+        return ok(YazaDbPgStepOutcomeV1(cur_state, true, false))
+
+    if tag == 69:
+        let portal_parts: TextList = yaza_db_pg_read_cstring_at_v1(payload, 0)?
+        let portal_name: Text = list_get(portal_parts, 0)
+        let p_idx: Number = yaza_db_pg_find_portal_v1(cur_state.portals, portal_name)
+        if p_idx < 0:
+            let err_f: Bytes = yaza_db_pg_encode_error_frame_v1("34000", "portal '" + portal_name + "' does not exist")?
+            let _w: Boolean = yaza_db_pg_send_exact_v1(conn, err_f)?
+            return ok(YazaDbPgStepOutcomeV1(cur_state, true, false))
+        let portal: YazaDbPgPortalV1 = list_get(cur_state.portals, p_idx)
+        let outcome: YazaDbPgExecBytesOutcomeV1 = yaza_db_pg_run_statement_bytes_v1(cur_state.session, cur_state.config, portal.sql, portal.params, false)?
+        let _w: Boolean = yaza_db_pg_send_exact_v1(conn, outcome.frames_bytes)?
+        let next_s: YazaDbPgConnectionStateV1 = YazaDbPgConnectionStateV1(outcome.session, cur_state.config, cur_state.stmts, cur_state.portals, not outcome.session.is_open, cur_state.authenticated, cur_state.user, cur_state.database)
+        return ok(YazaDbPgStepOutcomeV1(next_s, true, next_s.closed))
+
+    if tag == 67:
+        let target_b: Number = bytes_get(payload, 0)
+        let name_parts: TextList = yaza_db_pg_read_cstring_at_v1(payload, 1)?
+        let target_name: Text = list_get(name_parts, 0)
+        var next_stmts: List[YazaDbPgPreparedStmtV1] = cur_state.stmts
+        var next_portals: List[YazaDbPgPortalV1] = cur_state.portals
+        if target_b == 83:
+            set next_stmts = yaza_db_pg_remove_stmt_v1(cur_state.stmts, target_name)?
+        else:
+            set next_portals = yaza_db_pg_remove_portal_v1(cur_state.portals, target_name)?
+        let ok_f: Bytes = yaza_db_pg_backend_frame_v1(51, empty_z)?
+        let _w: Boolean = yaza_db_pg_send_exact_v1(conn, ok_f)?
+        let next_s: YazaDbPgConnectionStateV1 = YazaDbPgConnectionStateV1(cur_state.session, cur_state.config, next_stmts, next_portals, false, cur_state.authenticated, cur_state.user, cur_state.database)
+        return ok(YazaDbPgStepOutcomeV1(next_s, true, false))
+
+    if tag == 72:
+        return ok(YazaDbPgStepOutcomeV1(cur_state, true, false))
+
+    if tag == 83:
+        let ready: Bytes = yaza_db_pg_encode_ready_frame_v1(cur_state.session)?
+        let _w: Boolean = yaza_db_pg_send_exact_v1(conn, ready)?
+        return ok(YazaDbPgStepOutcomeV1(cur_state, true, false))
+
+    let err_f: Bytes = yaza_db_pg_encode_error_frame_v1("0A000", "unsupported PostgreSQL frontend message tag " + number_text(tag))?
+    let _w: Boolean = yaza_db_pg_send_exact_v1(conn, err_f)?
+    return ok(YazaDbPgStepOutcomeV1(cur_state, true, false))
+
+fn yaza_db_pg_server_handle_connection_v1(conn: Number, session: YazaDbSessionV1, config: YazaDbPgServerConfigV1) -> Result[YazaDbSessionV1, Text]:
+    var st: YazaDbPgConnectionStateV1 = yaza_db_pg_server_handle_startup_v1(conn, session, config, true)?
+    while not st.closed:
+        let step_res: Result[YazaDbPgStepOutcomeV1, Text] = yaza_db_pg_server_process_next_message_v1(conn, st)
+        if not result_is_ok(step_res):
+            return ok(st.session)
+        let outcome: YazaDbPgStepOutcomeV1 = result_unwrap(step_res)
+        set st = outcome.state
+    return ok(st.session)
+
+fn yaza_db_pg_server_serve_v1(session: YazaDbSessionV1, config: YazaDbPgServerConfigV1, max_connections: Number) -> Result[YazaDbSessionV1, Text]:
+    let listener: Number = tcp_listen(config.bind_host, config.bind_port, 32)?
+    var cur_session: YazaDbSessionV1 = session
+    var served: Number = 0
+    while max_connections <= 0 or served < max_connections:
+        let accept_res: Result[Number, Text] = tcp_accept(listener, 2000)
+        if result_is_ok(accept_res):
+            let conn: Number = result_unwrap(accept_res)
+            let handled_res: Result[YazaDbSessionV1, Text] = yaza_db_pg_server_handle_connection_v1(conn, cur_session, config)
+            if result_is_ok(handled_res):
+                set cur_session = result_unwrap(handled_res)
+            let ignored_c: Result[Boolean, Text] = tcp_close(conn)
+            set served = served + 1
+    let ignored_l: Result[Boolean, Text] = tcp_close(listener)
+    return ok(cur_session)
+
+# Lightweight client-side TCP helpers for PG v3 protocol tests and tooling.
+fn yaza_db_pg_client_read_frame_v1(conn: Number, timeout_ms: Number) -> Result[YazaDbPgTcpFrameV1, Text]:
+    let hdr: Bytes = yaza_db_pg_read_exact_v1(conn, 5, timeout_ms)?
+    let total_len: Number = yaza_db_pg_read_u32_be_v1(hdr, 1)?
+    if total_len < 4 or total_len > 16777216:
+        return err("PG backend frame length out of bounds")
+    let payload: Bytes = yaza_db_pg_read_exact_v1(conn, total_len - 4, timeout_ms)?
+    return ok(YazaDbPgTcpFrameV1(bytes_get(hdr, 0), payload))

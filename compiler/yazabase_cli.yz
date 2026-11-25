@@ -2,6 +2,7 @@
 use "std/fs"
 use "std/csv"
 use "std/convert"
+use "std/json"
 use "../yazabase/backup_v1"
 use "../yazabase/catalog_init_v1"
 use "../yazabase/checkpoint_v1"
@@ -15,6 +16,11 @@ use "../yazabase/sql_temporal_v1"
 use "../yazabase/sql_executor_v1"
 use "../yazabase/transaction_v1"
 use "../yazabase/api_v1"
+use "../yazabase/autoscale_v1"
+use "../yazabase/cluster_ha_v1"
+use "../yazabase/pg_wire_v1"
+use "../yazabase/router_v1"
+use "../yazabase/server_v1"
 use "std/config/api_config"
 use "std/db/yazabase"
 
@@ -700,6 +706,14 @@ fn yaza_cli_print_db_help_v1() -> Number:
     say "  sql-batch [--count] <directory> <database-name> --statement <DML> ..."
     say "  session <directory> <database-name>"
     say "  api <directory> <database-name> [--host <h>] [--port <p>] [--secret <s>] [--max-requests <n>]"
+    say "  serve <directory> <database-name> [--host <h>] [--http-port <p>] [--pg-port <p>] [--role primary|replica] [--secret <s>]"
+    say "  pg-serve <directory> <database-name> [--host <h>] [--port <p>] [--auth trust|password] [--user <u>] [--password <pw>] [--read-only]"
+    say ""
+    say "CLUSTER, HA, ROUTING & AUTOSCALE"
+    say "  cluster status <directory> <database-name>"
+    say "  cluster promote <directory> <database-name> [--term <t>]"
+    say "  cluster route <sql> --primary <ep> --replicas <ep1,ep2> [--min-lsn <n>]"
+    say "  cluster autoscale --cpu <pct> --queue <q> --qps <n> --replicas <r>"
     say ""
     say "DATA IMPORT & EXPORT"
     say "  export <directory> <database-name> <table-name> [output-path.csv]"
@@ -1064,6 +1078,410 @@ fn yaza_cli_db_api_v1(root_path: Text, database_name: Text) -> Number:
     say "YazaBase API server stopped. Served " + number_text(result_unwrap(served)) + " requests."
     return 0
 
+fn yaza_cli_split_comma_v1(raw: Text) -> List[Text]:
+    let out: List[Text] = List[Text]()
+    if raw == "":
+        return out
+    var rest: Text = raw
+    while true:
+        let comma: Number = text_find(rest, ",")
+        if comma < 0:
+            let trimmed: Text = text_trim(rest)
+            if trimmed != "":
+                let _p: Boolean = list_try_push(out, trimmed)
+            break
+        let part: Text = text_trim(text_slice(rest, 0, comma))
+        if part != "":
+            let _p: Boolean = list_try_push(out, part)
+        set rest = text_slice(rest, comma + 1, text_length(rest) - (comma + 1))
+    return out
+
+fn yaza_cli_db_pg_serve_v1(root_path: Text, database_name: Text) -> Number:
+    var host: Text = "127.0.0.1"
+    var port: Number = 5432
+    var auth_mode: Text = "trust"
+    var user: Text = "yazabase"
+    var password: Text = ""
+    var read_only: Boolean = false
+    var max_conns: Number = 0
+    var i: Number = 4
+    while i <= arg_count():
+        if arg(i) == "--host" and i + 1 <= arg_count():
+            set host = arg(i + 1)
+            set i = i + 2
+        elif arg(i) == "--port" and i + 1 <= arg_count():
+            let p_res: Result[Number, Text] = number_try_parse(arg(i + 1))
+            if result_is_ok(p_res): set port = result_unwrap(p_res)
+            set i = i + 2
+        elif arg(i) == "--auth" and i + 1 <= arg_count():
+            set auth_mode = arg(i + 1)
+            set i = i + 2
+        elif arg(i) == "--user" and i + 1 <= arg_count():
+            set user = arg(i + 1)
+            set i = i + 2
+        elif arg(i) == "--password" and i + 1 <= arg_count():
+            set password = arg(i + 1)
+            set i = i + 2
+        elif arg(i) == "--read-only":
+            set read_only = true
+            set i = i + 1
+        elif arg(i) == "--max-conns" and i + 1 <= arg_count():
+            let mc_res: Result[Number, Text] = number_try_parse(arg(i + 1))
+            if result_is_ok(mc_res): set max_conns = result_unwrap(mc_res)
+            set i = i + 2
+        else:
+            set i = i + 1
+
+    if auth_mode == "password" and password == "":
+        set password = env_get("YAZABASE_PG_PASSWORD")
+    if auth_mode == "password" and password == "":
+        say "YazaBase: pg-serve --auth password requires --password or YAZABASE_PG_PASSWORD"
+        return 1
+    if host != "127.0.0.1" and host != "localhost" and env_get("YAZA_TRUST_TLS_PROXY") != "1":
+        say "YazaBase: refusing unencrypted PG wire bind on non-loopback address '" + host + "'; place behind a TLS-terminating proxy and set YAZA_TRUST_TLS_PROXY=1"
+        return 1
+
+    let root_result: Result[Number, Text] = root_open(root_path)
+    if not result_is_ok(root_result):
+        say "YazaBase: could not open database directory: " + result_unwrap_error(root_result)
+        return 1
+    let root: Number = result_unwrap(root_result)
+    let session_result: Result[YazaDbSessionV1, Text] = yaza_db_session_open_v1(root, database_name)
+    if not result_is_ok(session_result):
+        let _cr: Result[Boolean, Text] = close(root)
+        say "YazaBase: could not open database session: " + result_unwrap_error(session_result)
+        return 1
+    let session: YazaDbSessionV1 = result_unwrap(session_result)
+
+    var pg_cfg: YazaDbPgServerConfigV1 = yaza_db_pg_default_config_v1(host, port, database_name)
+    set pg_cfg = YazaDbPgServerConfigV1(host, port, auth_mode, user, password, read_only, database_name)
+    say "YazaBase PostgreSQL v3 Wire Server listening on " + host + ":" + number_text(port) + " (database: " + database_name + ", auth: " + auth_mode + ")"
+    let served: Result[YazaDbSessionV1, Text] = yaza_db_pg_server_serve_v1(session, pg_cfg, max_conns)
+    var end_sess: YazaDbSessionV1 = session
+    if result_is_ok(served):
+        set end_sess = result_unwrap(served)
+    let _cs: Result[Boolean, Text] = yaza_db_session_close_v1(end_sess)
+    let _cr: Result[Boolean, Text] = close(root)
+    if not result_is_ok(served):
+        say "YazaBase: PG server error: " + result_unwrap_error(served)
+        return 1
+    say "YazaBase PostgreSQL v3 Wire Server stopped."
+    return 0
+
+fn yaza_cli_db_serve_v1(root_path: Text, database_name: Text) -> Number:
+    var host: Text = "127.0.0.1"
+    var http_port: Number = 8080
+    var pg_port: Number = 0
+    var role: Text = "primary"
+    var secret: Text = ""
+    var max_requests: Number = 0
+    var max_conns: Number = 0
+    var explicit_http: Boolean = false
+    var explicit_pg: Boolean = false
+    var i: Number = 4
+    while i <= arg_count():
+        if arg(i) == "--host" and i + 1 <= arg_count():
+            set host = arg(i + 1)
+            set i = i + 2
+        elif (arg(i) == "--http-port" or arg(i) == "--port") and i + 1 <= arg_count():
+            let p_res: Result[Number, Text] = number_try_parse(arg(i + 1))
+            if result_is_ok(p_res):
+                set http_port = result_unwrap(p_res)
+                set explicit_http = true
+            set i = i + 2
+        elif arg(i) == "--pg-port" and i + 1 <= arg_count():
+            let pp_res: Result[Number, Text] = number_try_parse(arg(i + 1))
+            if result_is_ok(pp_res):
+                set pg_port = result_unwrap(pp_res)
+                set explicit_pg = true
+            set i = i + 2
+        elif arg(i) == "--role" and i + 1 <= arg_count():
+            set role = arg(i + 1)
+            set i = i + 2
+        elif arg(i) == "--secret" and i + 1 <= arg_count():
+            set secret = arg(i + 1)
+            set i = i + 2
+        elif arg(i) == "--max-requests" and i + 1 <= arg_count():
+            let m_res: Result[Number, Text] = number_try_parse(arg(i + 1))
+            if result_is_ok(m_res): set max_requests = result_unwrap(m_res)
+            set i = i + 2
+        elif arg(i) == "--max-conns" and i + 1 <= arg_count():
+            let mc_res: Result[Number, Text] = number_try_parse(arg(i + 1))
+            if result_is_ok(mc_res): set max_conns = result_unwrap(mc_res)
+            set i = i + 2
+        else:
+            set i = i + 1
+
+    if role != "primary" and role != "replica":
+        say "YazaBase: serve --role must be 'primary' or 'replica'"
+        return 1
+    if host != "127.0.0.1" and host != "localhost" and env_get("YAZA_TRUST_TLS_PROXY") != "1":
+        say "YazaBase: refusing unencrypted bind on non-loopback address '" + host + "'; place behind a TLS-terminating reverse proxy and set YAZA_TRUST_TLS_PROXY=1"
+        return 1
+
+    let root_result: Result[Number, Text] = root_open(root_path)
+    if not result_is_ok(root_result):
+        say "YazaBase: could not open database directory: " + result_unwrap_error(root_result)
+        return 1
+    let root: Number = result_unwrap(root_result)
+    let session_result: Result[YazaDbSessionV1, Text] = yaza_db_session_open_v1(root, database_name)
+    if not result_is_ok(session_result):
+        let _cr: Result[Boolean, Text] = close(root)
+        say "YazaBase: could not open database session: " + result_unwrap_error(session_result)
+        return 1
+    let session: YazaDbSessionV1 = result_unwrap(session_result)
+
+    if explicit_pg and pg_port > 0 and not explicit_http:
+        var ro: Boolean = false
+        if role == "replica": set ro = true
+        let pg_cfg: YazaDbPgServerConfigV1 = YazaDbPgServerConfigV1(host, pg_port, "trust", "yazabase", "", ro, database_name)
+        say "YazaBase serve (PG v3) listening on " + host + ":" + number_text(pg_port) + " (role: " + role + ", db: " + database_name + ")"
+        let served_pg: Result[YazaDbSessionV1, Text] = yaza_db_pg_server_serve_v1(session, pg_cfg, max_conns)
+        var end_pg: YazaDbSessionV1 = session
+        if result_is_ok(served_pg): set end_pg = result_unwrap(served_pg)
+        let _cs: Result[Boolean, Text] = yaza_db_session_close_v1(end_pg)
+        let _cr: Result[Boolean, Text] = close(root)
+        if not result_is_ok(served_pg):
+            say "YazaBase: server error: " + result_unwrap_error(served_pg)
+            return 1
+        return 0
+
+    if secret == "":
+        set secret = env_get("YAZABASE_API_SECRET")
+    if text_length(secret) < 32:
+        let _cs: Result[Boolean, Text] = yaza_db_session_close_v1(session)
+        let _cr: Result[Boolean, Text] = close(root)
+        say "YazaBase: serve HTTP requires --secret or YAZABASE_API_SECRET (minimum 32 characters)"
+        return 1
+
+    var cfg: ApiServiceConfig = yaza_api_default_service_config(database_name)
+    set cfg.bind_host = host
+    set cfg.bind_port = http_port
+    say "YazaBase serve (HTTP API, role: " + role + ") listening on http://" + host + ":" + number_text(http_port) + " (database: " + database_name + ")"
+    let served_http: Result[Number, Text] = yaza_api_serve_loop_config(session, root_path, database_name, cfg, max_requests, secret)
+    let _cs: Result[Boolean, Text] = yaza_db_session_close_v1(session)
+    let _cr: Result[Boolean, Text] = close(root)
+    if not result_is_ok(served_http):
+        say "YazaBase: HTTP serve error: " + result_unwrap_error(served_http)
+        return 1
+    say "YazaBase serve stopped. Served " + number_text(result_unwrap(served_http)) + " requests."
+    return 0
+
+fn yaza_cli_db_cluster_v1() -> Number:
+    if arg_count() < 2:
+        say "YazaBase: cluster requires subcommand (status | promote | route | autoscale)"
+        return 2
+    let sub: Text = arg(2)
+    if sub == "status":
+        if arg_count() < 4:
+            say "Usage: yazabase cluster status <directory> <database-name> [--node-id <id>] [--role <primary|replica>]"
+            return 2
+        let root_path: Text = arg(3)
+        let db_name: Text = arg(4)
+        var node_id: Text = "node-1"
+        var def_role: Text = "replica"
+        var i: Number = 5
+        while i <= arg_count():
+            if arg(i) == "--node-id" and i + 1 <= arg_count():
+                set node_id = arg(i + 1)
+                set i = i + 2
+            elif arg(i) == "--role" and i + 1 <= arg_count():
+                set def_role = arg(i + 1)
+                set i = i + 2
+            else:
+                set i = i + 1
+        let root_res: Result[Number, Text] = root_open(root_path)
+        if not result_is_ok(root_res):
+            say "YazaBase: could not open directory: " + result_unwrap_error(root_res)
+            return 1
+        let root: Number = result_unwrap(root_res)
+        let sess_res: Result[YazaDbSessionV1, Text] = yaza_db_session_open_v1(root, db_name)
+        if not result_is_ok(sess_res):
+            let _cr: Result[Boolean, Text] = close(root)
+            say "YazaBase: could not open database session: " + result_unwrap_error(sess_res)
+            return 1
+        let sess: YazaDbSessionV1 = result_unwrap(sess_res)
+        let def_ha: YazaDbHaStateV1 = yaza_db_ha_default_state_v1(node_id, def_role, 1, sess.wal.next_lsn, 3000)
+        let loaded_res: Result[YazaDbHaStateV1, Text] = yaza_db_ha_load_meta_v1(root, def_ha)
+        var out_state: YazaDbHaStateV1 = def_ha
+        if result_is_ok(loaded_res):
+            set out_state = yaza_db_ha_with_lsn_v1(result_unwrap(loaded_res), sess.wal.next_lsn)
+        let _cs: Result[Boolean, Text] = yaza_db_session_close_v1(sess)
+        let _cr: Result[Boolean, Text] = close(root)
+        say yaza_db_ha_state_json_v1(out_state)
+        return 0
+
+    if sub == "promote":
+        if arg_count() < 4:
+            say "Usage: yazabase cluster promote <directory> <database-name> [--term <t>] [--node-id <id>]"
+            return 2
+        let root_path: Text = arg(3)
+        let db_name: Text = arg(4)
+        var explicit_term: Number = 0
+        var node_id: Text = "node-1"
+        var i: Number = 5
+        while i <= arg_count():
+            if arg(i) == "--term" and i + 1 <= arg_count():
+                let t_res: Result[Number, Text] = number_try_parse(arg(i + 1))
+                if result_is_ok(t_res): set explicit_term = result_unwrap(t_res)
+                set i = i + 2
+            elif arg(i) == "--node-id" and i + 1 <= arg_count():
+                set node_id = arg(i + 1)
+                set i = i + 2
+            else:
+                set i = i + 1
+        let root_res: Result[Number, Text] = root_open(root_path)
+        if not result_is_ok(root_res):
+            say "YazaBase: could not open directory: " + result_unwrap_error(root_res)
+            return 1
+        let root: Number = result_unwrap(root_res)
+        let sess_res: Result[YazaDbSessionV1, Text] = yaza_db_session_open_v1(root, db_name)
+        if not result_is_ok(sess_res):
+            let _cr: Result[Boolean, Text] = close(root)
+            say "YazaBase: could not open database session: " + result_unwrap_error(sess_res)
+            return 1
+        let sess: YazaDbSessionV1 = result_unwrap(sess_res)
+        let def_ha: YazaDbHaStateV1 = yaza_db_ha_default_state_v1(node_id, "replica", 1, sess.wal.next_lsn, 3000)
+        let loaded_res: Result[YazaDbHaStateV1, Text] = yaza_db_ha_load_meta_v1(root, def_ha)
+        if not result_is_ok(loaded_res):
+            let _cs: Result[Boolean, Text] = yaza_db_session_close_v1(sess)
+            let _cr: Result[Boolean, Text] = close(root)
+            say "YazaBase: could not load cluster_raft.meta: " + result_unwrap_error(loaded_res)
+            return 1
+        let cur_ha: YazaDbHaStateV1 = result_unwrap(loaded_res)
+        var target_term: Number = cur_ha.term + 1
+        if explicit_term > target_term: set target_term = explicit_term
+        let prom_res: Result[YazaDbHaPromoteOutcomeV1, Text] = yaza_db_ha_promote_replica_v1(sess, cur_ha, target_term)
+        if not result_is_ok(prom_res):
+            let _cs: Result[Boolean, Text] = yaza_db_session_close_v1(sess)
+            let _cr: Result[Boolean, Text] = close(root)
+            say "YazaBase: cluster promote failed: " + result_unwrap_error(prom_res)
+            return 1
+        let promoted: YazaDbHaPromoteOutcomeV1 = result_unwrap(prom_res)
+        let _cs: Result[Boolean, Text] = yaza_db_session_close_v1(promoted.session)
+        let _cr: Result[Boolean, Text] = close(root)
+        say yaza_db_ha_state_json_v1(promoted.state)
+        return 0
+
+    if sub == "route":
+        if arg_count() < 3:
+            say "Usage: yazabase cluster route <sql> --primary <ep> --replicas <ep1,ep2> [--min-lsn <n>]"
+            return 2
+        let sql: Text = arg(3)
+        var primary_ep: Text = "127.0.0.1:8080"
+        var replicas_raw: Text = ""
+        var primary_lsn: Number = 1000
+        var min_lsn: Number = 0
+        var max_lag: Number = 65536
+        var i: Number = 4
+        while i <= arg_count():
+            if arg(i) == "--primary" and i + 1 <= arg_count():
+                set primary_ep = arg(i + 1)
+                set i = i + 2
+            elif arg(i) == "--replicas" and i + 1 <= arg_count():
+                set replicas_raw = arg(i + 1)
+                set i = i + 2
+            elif arg(i) == "--primary-lsn" and i + 1 <= arg_count():
+                let v: Result[Number, Text] = number_try_parse(arg(i + 1))
+                if result_is_ok(v): set primary_lsn = result_unwrap(v)
+                set i = i + 2
+            elif arg(i) == "--min-lsn" and i + 1 <= arg_count():
+                let v: Result[Number, Text] = number_try_parse(arg(i + 1))
+                if result_is_ok(v): set min_lsn = result_unwrap(v)
+                set i = i + 2
+            elif arg(i) == "--max-lag" and i + 1 <= arg_count():
+                let v: Result[Number, Text] = number_try_parse(arg(i + 1))
+                if result_is_ok(v): set max_lag = result_unwrap(v)
+                set i = i + 2
+            else:
+                set i = i + 1
+        let rep_eps: List[Text] = yaza_cli_split_comma_v1(replicas_raw)
+        let rep_nodes: List[YazaDbRouterNodeV1] = List[YazaDbRouterNodeV1]()
+        var ri: Number = 0
+        while ri < list_count(rep_eps):
+            let rn: YazaDbRouterNodeV1 = YazaDbRouterNodeV1("replica-" + number_text(ri + 1), list_get(rep_eps, ri), "replica", primary_lsn, true)
+            let _p: Boolean = list_try_push(rep_nodes, rn)
+            set ri = ri + 1
+        let p_node: YazaDbRouterNodeV1 = YazaDbRouterNodeV1("primary", primary_ep, "primary", primary_lsn, true)
+        let router: YazaDbRwRouterV1 = yaza_db_router_new_v1(p_node, rep_nodes, primary_lsn, max_lag)
+        let dec_res: Result[YazaDbRouteDecisionV1, Text] = yaza_db_router_select_target_v1(router, sql, min_lsn)
+        if not result_is_ok(dec_res):
+            say "YazaBase: route error: " + result_unwrap_error(dec_res)
+            return 1
+        let dec: YazaDbRouteDecisionV1 = result_unwrap(dec_res)
+        say "{\"target_id\":\"" + json_escape_text(dec.target.node_id) + "\",\"endpoint\":\"" + json_escape_text(dec.target.endpoint) + "\",\"role\":\"" + json_escape_text(dec.target.role) + "\",\"reason\":\"" + json_escape_text(dec.reason) + "\"}"
+        return 0
+
+    if sub == "autoscale":
+        var cpu: Number = 0
+        var queue_d: Number = 0
+        var qps: Number = 0
+        var replicas: Number = 1
+        var min_r: Number = 1
+        var max_r: Number = 8
+        var up_win: Number = 3
+        var down_win: Number = 5
+        var cons_high: Number = 0
+        var cons_low: Number = 0
+        var lag_b: Number = 0
+        var i: Number = 3
+        while i <= arg_count():
+            if arg(i) == "--cpu" and i + 1 <= arg_count():
+                let v: Result[Number, Text] = number_try_parse(arg(i + 1))
+                if result_is_ok(v): set cpu = result_unwrap(v)
+                set i = i + 2
+            elif arg(i) == "--queue" and i + 1 <= arg_count():
+                let v: Result[Number, Text] = number_try_parse(arg(i + 1))
+                if result_is_ok(v): set queue_d = result_unwrap(v)
+                set i = i + 2
+            elif arg(i) == "--qps" and i + 1 <= arg_count():
+                let v: Result[Number, Text] = number_try_parse(arg(i + 1))
+                if result_is_ok(v): set qps = result_unwrap(v)
+                set i = i + 2
+            elif arg(i) == "--replicas" and i + 1 <= arg_count():
+                let v: Result[Number, Text] = number_try_parse(arg(i + 1))
+                if result_is_ok(v): set replicas = result_unwrap(v)
+                set i = i + 2
+            elif arg(i) == "--min" and i + 1 <= arg_count():
+                let v: Result[Number, Text] = number_try_parse(arg(i + 1))
+                if result_is_ok(v): set min_r = result_unwrap(v)
+                set i = i + 2
+            elif arg(i) == "--max" and i + 1 <= arg_count():
+                let v: Result[Number, Text] = number_try_parse(arg(i + 1))
+                if result_is_ok(v): set max_r = result_unwrap(v)
+                set i = i + 2
+            elif arg(i) == "--up-win" and i + 1 <= arg_count():
+                let v: Result[Number, Text] = number_try_parse(arg(i + 1))
+                if result_is_ok(v): set up_win = result_unwrap(v)
+                set i = i + 2
+            elif arg(i) == "--down-win" and i + 1 <= arg_count():
+                let v: Result[Number, Text] = number_try_parse(arg(i + 1))
+                if result_is_ok(v): set down_win = result_unwrap(v)
+                set i = i + 2
+            elif arg(i) == "--high" and i + 1 <= arg_count():
+                let v: Result[Number, Text] = number_try_parse(arg(i + 1))
+                if result_is_ok(v): set cons_high = result_unwrap(v)
+                set i = i + 2
+            elif arg(i) == "--low" and i + 1 <= arg_count():
+                let v: Result[Number, Text] = number_try_parse(arg(i + 1))
+                if result_is_ok(v): set cons_low = result_unwrap(v)
+                set i = i + 2
+            elif arg(i) == "--lag" and i + 1 <= arg_count():
+                let v: Result[Number, Text] = number_try_parse(arg(i + 1))
+                if result_is_ok(v): set lag_b = result_unwrap(v)
+                set i = i + 2
+            else:
+                set i = i + 1
+        let pol: YazaDbAutoscalePolicyV1 = YazaDbAutoscalePolicyV1(min_r, max_r, 75, 25, 16, 1000, 1048576, up_win, down_win, 30000)
+        let st: YazaDbAutoscaleStateV1 = YazaDbAutoscaleStateV1(cons_high, cons_low, 0)
+        let met: YazaDbAutoscaleMetricsV1 = YazaDbAutoscaleMetricsV1(cpu, queue_d, qps, lag_b, replicas, 60000)
+        let dec: YazaDbAutoscaleDecisionV1 = yaza_db_autoscale_evaluate_v1(pol, st, met)
+        say "{\"action\":\"" + json_escape_text(dec.action) + "\",\"target_replicas\":" + number_text(dec.target_replicas) + ",\"reason\":\"" + json_escape_text(dec.reason) + "\",\"consecutive_high\":" + number_text(dec.state.consecutive_high) + ",\"consecutive_low\":" + number_text(dec.state.consecutive_low) + "}"
+        return 0
+
+    say "YazaBase: unknown cluster subcommand '" + sub + "' (expected status | promote | route | autoscale)"
+    return 2
+
 fn yaza_cli_format_ms_v1(elapsed_ns: Number) -> Text:
     if elapsed_ns <= 0: return "0.0 ms"
     let ms_whole: Number = elapsed_ns / 1000000
@@ -1372,6 +1790,9 @@ start:
     if arg_count() == 3 and (arg(1) == "shell" or arg(1) == "console"): exit(yaza_cli_db_repl_v1(arg(2), arg(3)))
     if arg_count() == 2 and (arg(1) == "shell" or arg(1) == "console"): exit(yaza_cli_db_repl_v1(arg(2), "app"))
     if arg_count() >= 3 and arg(1) == "api": exit(yaza_cli_db_api_v1(arg(2), arg(3)))
+    if arg_count() >= 3 and arg(1) == "serve": exit(yaza_cli_db_serve_v1(arg(2), arg(3)))
+    if arg_count() >= 3 and arg(1) == "pg-serve": exit(yaza_cli_db_pg_serve_v1(arg(2), arg(3)))
+    if arg_count() >= 2 and arg(1) == "cluster": exit(yaza_cli_db_cluster_v1())
     if arg_count() == 3 and arg(1) == "session": exit(yaza_cli_db_session_v1(arg(2), arg(3)))
     if arg_count() == 3 and arg(1) == "init": exit(yaza_cli_db_init_v1(arg(2), arg(3)))
     if arg_count() == 4 and arg(1) == "backup": exit(yaza_cli_db_backup_restore_v1("backup", arg(2), arg(3), arg(4)))
@@ -1427,9 +1848,9 @@ start:
             exit(0)
         say "YazaBase authentication FAILED for user '" + arg(3) + "'"
         exit(1)
-    if arg_count() == 2 and arg(1) != "sql" and arg(1) != "sql-batch" and arg(1) != "session" and arg(1) != "init" and arg(1) != "backup" and arg(1) != "restore" and arg(1) != "api" and arg(1) != "export" and arg(1) != "import" and arg(1) != "set-user" and arg(1) != "auth-check":
+    if arg_count() == 2 and arg(1) != "sql" and arg(1) != "sql-batch" and arg(1) != "session" and arg(1) != "init" and arg(1) != "backup" and arg(1) != "restore" and arg(1) != "api" and arg(1) != "serve" and arg(1) != "pg-serve" and arg(1) != "cluster" and arg(1) != "export" and arg(1) != "import" and arg(1) != "set-user" and arg(1) != "auth-check":
         exit(yaza_cli_db_repl_v1(arg(1), arg(2)))
-    if arg_count() == 1 and arg(1) != "sql" and arg(1) != "sql-batch" and arg(1) != "session" and arg(1) != "init" and arg(1) != "backup" and arg(1) != "restore" and arg(1) != "api" and arg(1) != "export" and arg(1) != "import" and arg(1) != "set-user" and arg(1) != "auth-check" and arg(1) != "--help" and arg(1) != "-h":
+    if arg_count() == 1 and arg(1) != "sql" and arg(1) != "sql-batch" and arg(1) != "session" and arg(1) != "init" and arg(1) != "backup" and arg(1) != "restore" and arg(1) != "api" and arg(1) != "serve" and arg(1) != "pg-serve" and arg(1) != "cluster" and arg(1) != "export" and arg(1) != "import" and arg(1) != "set-user" and arg(1) != "auth-check" and arg(1) != "--help" and arg(1) != "-h":
         exit(yaza_cli_db_repl_v1(arg(1), "app"))
     yaza_cli_print_db_help_v1()
     exit(2)

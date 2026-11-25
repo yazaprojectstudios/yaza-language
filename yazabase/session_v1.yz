@@ -1,9 +1,13 @@
 # Reusable single-process SQL session over one exclusively locked YDBv1 database.
 # Sessions own the root capability, storage handle, and WAL handle until close.
 use "std/fs"
+use "./buffer_pool_v1"
 use "./checkpoint_v1"
 use "./catalog_snapshot_v1"
+use "./explicit_tx_v1"
+use "./index_catalog_v1"
 use "./btree_scan_v1"
+use "./plan_cache_v1"
 use "./query_v1"
 use "./row_v1"
 use "./sql_dispatch_v1"
@@ -11,6 +15,7 @@ use "./sql_executor_v1"
 use "./sql_lexer_v1"
 use "./sql_parser_v2"
 use "./storage_v1"
+use "./transaction_v1"
 use "./wal_v1"
 
 shape YazaDbSessionV1:
@@ -19,13 +24,22 @@ shape YazaDbSessionV1:
     wal: YazaDbWalLogV1
     catalog_cache: Option[YazaDbCatalogSnapshotWithRootsV1]
     index_rows_cache: Option[List[YazaDbRowV1]]
+    buffer_pool: Option[YazaDbBufferPoolV1]
+    explicit_tx: Option[YazaDbExplicitTxV1]
     is_open: Boolean
+    plan_cache: Option[YazaDbSelectPlanCacheV1]
 
 shape YazaDbSessionStatementV1:
     session: YazaDbSessionV1
     statement: YazaDbSqlStatementResultV1
 
-fn yaza_db_session_open_v1(root: Number, database_name: Text) -> Result[YazaDbSessionV1, Text]:
+shape YazaDbSessionExecutionV1:
+    session: YazaDbSessionV1
+    ok: Boolean
+    statement: Option[YazaDbSqlStatementResultV1]
+    error_message: Text
+
+fn yaza_db_session_open_with_pool_v1(root: Number, database_name: Text, pool_capacity: Number) -> Result[YazaDbSessionV1, Text]:
     if root < 0 or text_length(database_name) < 1 or text_length(database_name) > 255:
         return err("YDBv1 session root or database name is outside its bound")
     let recovery_result: Result[YazaDbCheckpointRecoveryV1, Text] = yaza_db_open_recovered_v1(root, database_name)
@@ -38,7 +52,43 @@ fn yaza_db_session_open_v1(root: Number, database_name: Text) -> Result[YazaDbSe
         let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(recovered.storage)
         let ignored_root_close: Result[Boolean, Text] = close(root)
         return err("YDBv1 session recovery returned mismatched database capabilities")
-    return ok(YazaDbSessionV1(root, recovered.storage, recovered.wal, none, none, true))
+    var pool_opt: Option[YazaDbBufferPoolV1] = none
+    if pool_capacity > 0 and arena_live_scopes() == 0:
+        let pool_res: Result[YazaDbBufferPoolV1, Text] = yaza_db_buffer_pool_new_v1(recovered.storage.file, recovered.storage.header.db_uuid, pool_capacity)
+        if not result_is_ok(pool_res):
+            let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(recovered.wal)
+            let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(recovered.storage)
+            let ignored_root_close: Result[Boolean, Text] = close(root)
+            return err(result_unwrap_error(pool_res))
+        set pool_opt = some(result_unwrap(pool_res))
+    var plan_cache_opt: Option[YazaDbSelectPlanCacheV1] = none
+    if arena_live_scopes() == 0:
+        let pc_res: Result[YazaDbSelectPlanCacheV1, Text] = yaza_db_select_plan_cache_new_v1(yaza_db_select_plan_cache_default_capacity_v1())
+        if not result_is_ok(pc_res):
+            let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(recovered.wal)
+            let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(recovered.storage)
+            let ignored_root_close: Result[Boolean, Text] = close(root)
+            return err(result_unwrap_error(pc_res))
+        set plan_cache_opt = some(result_unwrap(pc_res))
+    return ok(YazaDbSessionV1(root, recovered.storage, recovered.wal, none, none, pool_opt, none, true, plan_cache_opt))
+
+fn yaza_db_session_open_v1(root: Number, database_name: Text) -> Result[YazaDbSessionV1, Text]:
+    return yaza_db_session_open_with_pool_v1(root, database_name, yaza_db_buffer_pool_default_capacity_v1())
+
+fn yaza_db_session_buffer_pool_stats_v1(session: YazaDbSessionV1) -> YazaDbBufferPoolStatsV1:
+    if option_is_some(session.buffer_pool):
+        return yaza_db_buffer_pool_stats_v1(option_unwrap(session.buffer_pool))
+    return YazaDbBufferPoolStatsV1(0, 0, 0, 0, 0, 0)
+
+fn yaza_db_session_plan_cache_stats_v1(session: YazaDbSessionV1) -> YazaDbSelectPlanCacheV1:
+    if option_is_some(session.plan_cache):
+        return option_unwrap(session.plan_cache)
+    return YazaDbSelectPlanCacheV1(0, List[YazaDbSelectPlanCacheEntryV1](), 0, 0, 0)
+
+fn yaza_db_session_invalidate_plan_cache_v1(plan_cache: Option[YazaDbSelectPlanCacheV1]) -> Option[YazaDbSelectPlanCacheV1]:
+    if option_is_some(plan_cache):
+        return some(yaza_db_select_plan_cache_invalidate_v1(option_unwrap(plan_cache)))
+    return none
 
 fn yaza_db_session_cacheable_select_v1(source: Text, tokens: List[YazaSqlTokenV1]) -> Boolean:
     if list_count(tokens) < 3 or not yaza_sql_v2_is_keyword(source, tokens, 0, "SELECT"): return false
@@ -57,7 +107,7 @@ fn yaza_db_session_catalog_at_current_version_v1(cached: YazaDbCatalogSnapshotWi
     return YazaDbCatalogSnapshotWithRootsV1(cached.catalog, snapshot, cached.root_page_ids, cached.table_schema_versions, cached.views)
 
 fn yaza_db_session_invalidates_catalog_v1(statement_kind: Number) -> Boolean:
-    return statement_kind == yaza_db_sql_statement_kind_insert_v1() or statement_kind == yaza_db_sql_statement_kind_create_table_v1() or statement_kind == yaza_db_sql_statement_kind_delete_v1() or statement_kind == yaza_db_sql_statement_kind_update_v1() or statement_kind == yaza_db_sql_statement_kind_drop_table_v1() or statement_kind == yaza_db_sql_statement_kind_alter_table_v1() or statement_kind == yaza_db_sql_statement_kind_create_index_v1() or statement_kind == yaza_db_sql_statement_kind_drop_index_v1()
+    return statement_kind == yaza_db_sql_statement_kind_create_table_v1() or statement_kind == yaza_db_sql_statement_kind_drop_table_v1() or statement_kind == yaza_db_sql_statement_kind_alter_table_v1() or statement_kind == yaza_db_sql_statement_kind_create_index_v1() or statement_kind == yaza_db_sql_statement_kind_drop_index_v1() or statement_kind == yaza_db_sql_statement_kind_create_view_v1() or statement_kind == yaza_db_sql_statement_kind_drop_view_v1()
 
 fn yaza_db_session_close_after_statement_error_v1(session: YazaDbSessionV1) -> Text:
     var cleanup_error: Text = ""
@@ -80,31 +130,265 @@ fn yaza_db_session_close_after_statement_error_v1(session: YazaDbSessionV1) -> T
         set cleanup_error = cleanup_error + "root close returned false"
     return cleanup_error
 
-fn yaza_db_session_execute_profiled_v1(session: YazaDbSessionV1, source: Text, parameters: List[YazaSqlValueV1], profile_ns: List[Number]) -> Result[YazaDbSessionStatementV1, Text]:
-    if not session.is_open: return err("YDBv1 SQL session is closed")
+fn yaza_db_session_mark_tx_failed_or_closed_v1(session: YazaDbSessionV1, error_message: Text) -> YazaDbSessionExecutionV1:
+    if yaza_db_error_closed_handles_v1(error_message):
+        let ignored_root_close: Result[Boolean, Text] = close(session.root)
+        let closed_session: YazaDbSessionV1 = YazaDbSessionV1(session.root, session.storage, session.wal, none, none, none, none, false, none)
+        return YazaDbSessionExecutionV1(closed_session, false, none, error_message)
+    if option_is_some(session.explicit_tx):
+        let failed_tx: YazaDbExplicitTxV1 = yaza_db_explicit_tx_mark_failed_v1(option_unwrap(session.explicit_tx))
+        let failed_session: YazaDbSessionV1 = YazaDbSessionV1(session.root, session.storage, session.wal, session.catalog_cache, session.index_rows_cache, session.buffer_pool, some(failed_tx), true, session.plan_cache)
+        return YazaDbSessionExecutionV1(failed_session, false, none, error_message)
+    return YazaDbSessionExecutionV1(session, false, none, error_message)
+
+fn yaza_db_session_catalog_at_header_v1(cached: YazaDbCatalogSnapshotWithRootsV1, header: YazaDbFileHeaderV1) -> YazaDbCatalogSnapshotWithRootsV1:
+    let snapshot: YazaSqlCatalogSnapshotV1 = YazaSqlCatalogSnapshotV1(header.next_commit_ts - 1, cached.sql_snapshot.tables, cached.sql_snapshot.column_defaults)
+    return YazaDbCatalogSnapshotWithRootsV1(cached.catalog, snapshot, cached.root_page_ids, cached.table_schema_versions, cached.views)
+
+fn yaza_db_session_finish_statement_with_plan_cache_v1(session: YazaDbSessionV1, statement: YazaDbSqlStatementResultV1, next_catalog_cache: Option[YazaDbCatalogSnapshotWithRootsV1], next_index_rows_cache: Option[List[YazaDbRowV1]], next_buffer_pool: Option[YazaDbBufferPoolV1], next_plan_cache: Option[YazaDbSelectPlanCacheV1], next_explicit_tx: Option[YazaDbExplicitTxV1]) -> YazaDbSessionExecutionV1:
+    if statement.storage.root != session.root or statement.wal.root != session.root or not bytes_equal(statement.storage.header.db_uuid, statement.wal.db_uuid):
+        let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(statement.wal)
+        let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(statement.storage)
+        let ignored_root_close: Result[Boolean, Text] = close(session.root)
+        let closed_session: YazaDbSessionV1 = YazaDbSessionV1(session.root, session.storage, session.wal, none, none, none, none, false, none)
+        return YazaDbSessionExecutionV1(closed_session, false, none, "YDBv1 SQL statement returned handles for a different session database")
+    var out_catalog_cache: Option[YazaDbCatalogSnapshotWithRootsV1] = next_catalog_cache
+    var out_index_rows_cache: Option[List[YazaDbRowV1]] = next_index_rows_cache
+    var out_plan_cache: Option[YazaDbSelectPlanCacheV1] = next_plan_cache
+    if statement.statement_kind != yaza_db_sql_statement_kind_select_v1() and statement.statement_kind != yaza_db_sql_statement_kind_explain_v1():
+        if statement.wal.next_lsn != session.wal.next_lsn or statement.storage.file != session.storage.file or statement.storage.header.page_count != session.storage.header.page_count or yaza_db_session_invalidates_catalog_v1(statement.statement_kind):
+            if option_is_some(next_buffer_pool):
+                let _cleared: Boolean = yaza_db_buffer_pool_clear_v1(option_unwrap(next_buffer_pool))
+    if yaza_db_session_invalidates_catalog_v1(statement.statement_kind) or statement.storage.header.catalog_root != session.storage.header.catalog_root:
+        set out_catalog_cache = none
+        set out_index_rows_cache = none
+        set out_plan_cache = yaza_db_session_invalidate_plan_cache_v1(out_plan_cache)
+    elif arena_live_scopes() == 0 and option_is_some(out_catalog_cache):
+        set out_catalog_cache = some(yaza_db_session_catalog_at_current_version_v1(option_unwrap(out_catalog_cache), statement.storage))
+    let preserved_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(session.storage.header.db_uuid, statement.storage.header.checkpoint_lsn, statement.storage.header.next_txn_id, statement.storage.header.next_commit_ts, statement.storage.header.catalog_root, statement.storage.header.page_count, statement.storage.header.flags)
+    let preserved_storage: YazaDbStorageHandleV1 = YazaDbStorageHandleV1(statement.storage.root, statement.storage.file, statement.storage.lock, statement.storage.identity_lock, preserved_header)
+    let preserved_wal: YazaDbWalLogV1 = YazaDbWalLogV1(statement.wal.root, session.wal.db_uuid, statement.wal.file, statement.wal.segment_index, statement.wal.segment_base_lsn, statement.wal.next_lsn)
+    let next_session: YazaDbSessionV1 = YazaDbSessionV1(session.root, preserved_storage, preserved_wal, out_catalog_cache, out_index_rows_cache, next_buffer_pool, next_explicit_tx, true, out_plan_cache)
+    return YazaDbSessionExecutionV1(next_session, true, some(statement), "")
+
+fn yaza_db_session_finish_statement_v1(session: YazaDbSessionV1, statement: YazaDbSqlStatementResultV1, next_catalog_cache: Option[YazaDbCatalogSnapshotWithRootsV1], next_index_rows_cache: Option[List[YazaDbRowV1]], next_buffer_pool: Option[YazaDbBufferPoolV1], next_explicit_tx: Option[YazaDbExplicitTxV1]) -> YazaDbSessionExecutionV1:
+    return yaza_db_session_finish_statement_with_plan_cache_v1(session, statement, next_catalog_cache, next_index_rows_cache, next_buffer_pool, session.plan_cache, next_explicit_tx)
+
+fn yaza_db_session_execute_tx_control_v1(session: YazaDbSessionV1, cmd: YazaDbTxControlCommandV1) -> YazaDbSessionExecutionV1:
+    if cmd.kind == yaza_db_sql_statement_kind_begin_v1():
+        if option_is_some(session.explicit_tx):
+            return yaza_db_session_mark_tx_failed_or_closed_v1(session, "YDBv1 explicit transaction is already active; nested BEGIN is not supported (use SAVEPOINT)")
+        let begun_res: Result[YazaDbExplicitTxV1, Text] = yaza_db_explicit_tx_begin_v1(session.storage, session.wal)
+        if not result_is_ok(begun_res):
+            return yaza_db_session_mark_tx_failed_or_closed_v1(session, result_unwrap_error(begun_res))
+        let begun_tx: YazaDbExplicitTxV1 = result_unwrap(begun_res)
+        let stmt: YazaDbSqlStatementResultV1 = YazaDbSqlStatementResultV1(cmd.kind, none, none, none, begun_tx.wal_tx.storage, begun_tx.wal_tx.wal)
+        return yaza_db_session_finish_statement_v1(session, stmt, session.catalog_cache, session.index_rows_cache, session.buffer_pool, some(begun_tx))
+    if not option_is_some(session.explicit_tx):
+        return YazaDbSessionExecutionV1(session, false, none, "YDBv1 no explicit transaction is currently active")
+    let cur_tx: YazaDbExplicitTxV1 = option_unwrap(session.explicit_tx)
+    if cmd.kind == yaza_db_sql_statement_kind_commit_v1():
+        if cur_tx.failed:
+            let aborted_res: Result[YazaDbWriteCommitV1, Text] = yaza_db_explicit_tx_rollback_v1(cur_tx)
+            if not result_is_ok(aborted_res):
+                return yaza_db_session_mark_tx_failed_or_closed_v1(session, result_unwrap_error(aborted_res))
+            let aborted: YazaDbWriteCommitV1 = result_unwrap(aborted_res)
+            if option_is_some(session.buffer_pool):
+                let _cleared: Boolean = yaza_db_buffer_pool_clear_v1(option_unwrap(session.buffer_pool))
+            let rolled_stmt: YazaDbSqlStatementResultV1 = YazaDbSqlStatementResultV1(yaza_db_sql_statement_kind_rollback_v1(), none, some(aborted), none, aborted.storage, aborted.wal)
+            let rolled_res: YazaDbSessionExecutionV1 = yaza_db_session_finish_statement_v1(session, rolled_stmt, session.catalog_cache, session.index_rows_cache, session.buffer_pool, none)
+            return YazaDbSessionExecutionV1(rolled_res.session, false, none, "YDBv1 transaction was aborted due to a prior error; changes were rolled back")
+        let committed_res: Result[YazaDbWriteCommitV1, Text] = yaza_db_explicit_tx_commit_v1(cur_tx)
+        if not result_is_ok(committed_res):
+            return yaza_db_session_mark_tx_failed_or_closed_v1(session, result_unwrap_error(committed_res))
+        let committed: YazaDbWriteCommitV1 = result_unwrap(committed_res)
+        let stmt: YazaDbSqlStatementResultV1 = YazaDbSqlStatementResultV1(cmd.kind, none, some(committed), none, committed.storage, committed.wal)
+        return yaza_db_session_finish_statement_v1(session, stmt, session.catalog_cache, session.index_rows_cache, session.buffer_pool, none)
+    if cmd.kind == yaza_db_sql_statement_kind_rollback_v1():
+        let aborted_res: Result[YazaDbWriteCommitV1, Text] = yaza_db_explicit_tx_rollback_v1(cur_tx)
+        if not result_is_ok(aborted_res):
+            return yaza_db_session_mark_tx_failed_or_closed_v1(session, result_unwrap_error(aborted_res))
+        let aborted: YazaDbWriteCommitV1 = result_unwrap(aborted_res)
+        let stmt: YazaDbSqlStatementResultV1 = YazaDbSqlStatementResultV1(cmd.kind, none, some(aborted), none, aborted.storage, aborted.wal)
+        return yaza_db_session_finish_statement_v1(session, stmt, session.catalog_cache, session.index_rows_cache, session.buffer_pool, none)
+    if cmd.kind == yaza_db_sql_statement_kind_savepoint_v1():
+        let sp_res: Result[YazaDbExplicitTxV1, Text] = yaza_db_explicit_tx_savepoint_v1(cur_tx, cmd.savepoint_name)
+        if not result_is_ok(sp_res):
+            return yaza_db_session_mark_tx_failed_or_closed_v1(session, result_unwrap_error(sp_res))
+        let next_tx: YazaDbExplicitTxV1 = result_unwrap(sp_res)
+        let stmt: YazaDbSqlStatementResultV1 = YazaDbSqlStatementResultV1(cmd.kind, none, none, none, next_tx.wal_tx.storage, next_tx.wal_tx.wal)
+        return yaza_db_session_finish_statement_v1(session, stmt, session.catalog_cache, session.index_rows_cache, session.buffer_pool, some(next_tx))
+    if cmd.kind == yaza_db_sql_statement_kind_rollback_to_v1():
+        let rb_res: Result[YazaDbExplicitTxV1, Text] = yaza_db_explicit_tx_rollback_to_v1(cur_tx, cmd.savepoint_name)
+        if not result_is_ok(rb_res):
+            return yaza_db_session_mark_tx_failed_or_closed_v1(session, result_unwrap_error(rb_res))
+        let next_tx: YazaDbExplicitTxV1 = result_unwrap(rb_res)
+        let stmt: YazaDbSqlStatementResultV1 = YazaDbSqlStatementResultV1(cmd.kind, none, none, none, next_tx.wal_tx.storage, next_tx.wal_tx.wal)
+        return yaza_db_session_finish_statement_v1(session, stmt, session.catalog_cache, session.index_rows_cache, session.buffer_pool, some(next_tx))
+    if cmd.kind == yaza_db_sql_statement_kind_release_v1():
+        let rel_res: Result[YazaDbExplicitTxV1, Text] = yaza_db_explicit_tx_release_v1(cur_tx, cmd.savepoint_name)
+        if not result_is_ok(rel_res):
+            return yaza_db_session_mark_tx_failed_or_closed_v1(session, result_unwrap_error(rel_res))
+        let next_tx: YazaDbExplicitTxV1 = result_unwrap(rel_res)
+        let stmt: YazaDbSqlStatementResultV1 = YazaDbSqlStatementResultV1(cmd.kind, none, none, none, next_tx.wal_tx.storage, next_tx.wal_tx.wal)
+        return yaza_db_session_finish_statement_v1(session, stmt, session.catalog_cache, session.index_rows_cache, session.buffer_pool, some(next_tx))
+    return yaza_db_session_mark_tx_failed_or_closed_v1(session, "YDBv1 unsupported transaction control statement")
+
+fn yaza_db_session_execute_inside_tx_v1(session: YazaDbSessionV1, cur_tx: YazaDbExplicitTxV1, source: Text, tokens: List[YazaSqlTokenV1], parameters: List[YazaSqlValueV1], profile_ns: List[Number]) -> YazaDbSessionExecutionV1:
+    if cur_tx.failed:
+        return YazaDbSessionExecutionV1(session, false, none, "YDBv1 current transaction is aborted, commands ignored until end of transaction block")
+    if yaza_db_statement_is_ddl_keyword_v1(source, tokens):
+        return yaza_db_session_mark_tx_failed_or_closed_v1(session, "YDBv1 DDL statements are not supported inside an explicit transaction")
+    let visible_header: YazaDbFileHeaderV1 = yaza_db_explicit_tx_visible_header_v1(cur_tx)
+    let visible_storage: YazaDbStorageHandleV1 = YazaDbStorageHandleV1(cur_tx.wal_tx.storage.root, cur_tx.wal_tx.storage.file, cur_tx.wal_tx.storage.lock, cur_tx.wal_tx.storage.identity_lock, visible_header)
+    if yaza_sql_v2_is_keyword(source, tokens, 0, "SELECT") or yaza_sql_v2_is_keyword(source, tokens, 0, "WITH") or yaza_sql_v2_is_keyword(source, tokens, 0, "EXPLAIN"):
+        let exec_res: Result[YazaDbSqlStatementResultV1, Text] = yaza_db_execute_session_statement_with_cache_profiled_v1(visible_storage, cur_tx.wal_tx.wal, source, parameters, none, session.index_rows_cache, profile_ns)
+        if not result_is_ok(exec_res):
+            return yaza_db_session_mark_tx_failed_or_closed_v1(session, result_unwrap_error(exec_res))
+        let vis_stmt: YazaDbSqlStatementResultV1 = result_unwrap(exec_res)
+        let real_stmt: YazaDbSqlStatementResultV1 = YazaDbSqlStatementResultV1(vis_stmt.statement_kind, vis_stmt.query_result, vis_stmt.write_commit, vis_stmt.explain_text, cur_tx.wal_tx.storage, cur_tx.wal_tx.wal)
+        return yaza_db_session_finish_statement_v1(session, real_stmt, session.catalog_cache, session.index_rows_cache, session.buffer_pool, some(cur_tx))
+    var active_cat: Option[YazaDbCatalogSnapshotWithRootsV1] = none
+    var active_idx: Option[List[YazaDbRowV1]] = none
+    var next_cat_cache: Option[YazaDbCatalogSnapshotWithRootsV1] = session.catalog_cache
+    var next_idx_cache: Option[List[YazaDbRowV1]] = session.index_rows_cache
+    if cur_tx.wal_tx.storage.header.catalog_root != 0 and visible_header.next_commit_ts >= 2:
+        var snap_res: Result[YazaDbCatalogSnapshotWithRootsV1, Text] = err("YDBv1 tx catalog cache was not loaded")
+        if option_is_some(session.catalog_cache):
+            set snap_res = ok(yaza_db_session_catalog_at_header_v1(option_unwrap(session.catalog_cache), visible_header))
+        else:
+            set snap_res = yaza_db_catalog_snapshot_load_with_roots_v1(cur_tx.wal_tx.storage.file, visible_header)
+        if not result_is_ok(snap_res):
+            return yaza_db_session_mark_tx_failed_or_closed_v1(session, result_unwrap_error(snap_res))
+        let snap: YazaDbCatalogSnapshotWithRootsV1 = result_unwrap(snap_res)
+        var idx_res: Result[List[YazaDbRowV1], Text] = err("YDBv1 tx index cache was not loaded")
+        if option_is_some(session.index_rows_cache):
+            set idx_res = ok(option_unwrap(session.index_rows_cache))
+        else:
+            set idx_res = yaza_db_index_catalog_rows_v1(cur_tx.wal_tx.storage.file, visible_header, snap.sql_snapshot.version)
+        if not result_is_ok(idx_res):
+            return yaza_db_session_mark_tx_failed_or_closed_v1(session, result_unwrap_error(idx_res))
+        let idx_rows: List[YazaDbRowV1] = result_unwrap(idx_res)
+        set active_cat = some(snap)
+        set active_idx = some(idx_rows)
+        if arena_live_scopes() == 0:
+            set next_cat_cache = some(snap)
+            set next_idx_cache = some(idx_rows)
+    var stmt_kind: Number = yaza_db_sql_statement_kind_insert_v1()
+    if yaza_sql_v2_is_keyword(source, tokens, 0, "UPDATE"): set stmt_kind = yaza_db_sql_statement_kind_update_v1()
+    elif yaza_sql_v2_is_keyword(source, tokens, 0, "DELETE"): set stmt_kind = yaza_db_sql_statement_kind_delete_v1()
+    let dml_res: Result[YazaDbTxDmlResultV1, Text] = yaza_db_execute_dml_in_tx_v1(cur_tx.wal_tx, source, parameters, active_cat, active_idx)
+    if not result_is_ok(dml_res):
+        return yaza_db_session_mark_tx_failed_or_closed_v1(session, result_unwrap_error(dml_res))
+    let dml: YazaDbTxDmlResultV1 = result_unwrap(dml_res)
+    let next_tx: YazaDbExplicitTxV1 = yaza_db_explicit_tx_advance_dml_v1(cur_tx, dml.transaction)
+    let write_commit: YazaDbWriteCommitV1 = YazaDbWriteCommitV1(next_tx.wal_tx.storage, next_tx.wal_tx.wal, next_tx.wal_tx.txn_id, next_tx.wal_tx.commit_ts, dml.affected_rows)
+    let stmt: YazaDbSqlStatementResultV1 = YazaDbSqlStatementResultV1(stmt_kind, none, some(write_commit), none, next_tx.wal_tx.storage, next_tx.wal_tx.wal)
+    return yaza_db_session_finish_statement_v1(session, stmt, next_cat_cache, next_idx_cache, session.buffer_pool, some(next_tx))
+
+fn yaza_db_session_execute_with_state_profiled_v1(session: YazaDbSessionV1, source: Text, parameters: List[YazaSqlValueV1], profile_ns: List[Number]) -> YazaDbSessionExecutionV1:
+    if not session.is_open: return YazaDbSessionExecutionV1(session, false, none, "YDBv1 SQL session is closed")
     if session.root < 0 or session.storage.root != session.root or session.wal.root != session.root or not bytes_equal(session.storage.header.db_uuid, session.wal.db_uuid):
-        return err("YDBv1 SQL session handles do not identify one open database")
+        return YazaDbSessionExecutionV1(session, false, none, "YDBv1 SQL session handles do not identify one open database")
     var next_catalog_cache: Option[YazaDbCatalogSnapshotWithRootsV1] = session.catalog_cache
     var next_index_rows_cache: Option[List[YazaDbRowV1]] = session.index_rows_cache
-    var executed: Result[YazaDbSqlStatementResultV1, Text] = err("YDBv1 session statement did not execute")
+    var next_buffer_pool: Option[YazaDbBufferPoolV1] = session.buffer_pool
+    var next_plan_cache: Option[YazaDbSelectPlanCacheV1] = session.plan_cache
+    if not option_is_some(session.explicit_tx) and option_is_some(next_plan_cache) and option_is_some(session.catalog_cache) and option_is_some(session.index_rows_cache):
+        let pc_lookup: YazaDbSelectPlanLookupV1 = yaza_db_select_plan_cache_lookup_v1(option_unwrap(next_plan_cache), source, session.storage.header.catalog_root)
+        if pc_lookup.hit:
+            let cached_entry: YazaDbSelectPlanCacheEntryV1 = option_unwrap(pc_lookup.entry)
+            let snapshot: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_session_catalog_at_current_version_v1(option_unwrap(session.catalog_cache), session.storage)
+            let idx_rows: List[YazaDbRowV1] = option_unwrap(session.index_rows_cache)
+            if cached_entry.table_index >= 0 and cached_entry.table_index < list_count(snapshot.sql_snapshot.tables) and cached_entry.table_index < list_count(snapshot.root_page_ids) and cached_entry.table_index < list_count(snapshot.table_schema_versions) and list_get(snapshot.sql_snapshot.tables, cached_entry.table_index).table_id == cached_entry.table_id and list_get(snapshot.root_page_ids, cached_entry.table_index) == cached_entry.table_root_page_id and list_get(snapshot.table_schema_versions, cached_entry.table_index) == cached_entry.table_schema_version:
+                let hit_res: Result[YazaDbQueryPooledSelectResultV1, Text] = yaza_db_execute_cached_select_plan_pooled_profiled_v1(session.storage.file, session.storage.header, parameters, snapshot, some(idx_rows), cached_entry, session.buffer_pool, profile_ns)
+                if not result_is_ok(hit_res):
+                    return yaza_db_session_mark_tx_failed_or_closed_v1(session, result_unwrap_error(hit_res))
+                let pooled_hit: YazaDbQueryPooledSelectResultV1 = result_unwrap(hit_res)
+                if arena_live_scopes() == 0:
+                    set next_plan_cache = some(pc_lookup.cache)
+                    set next_catalog_cache = some(snapshot)
+                    if option_is_some(next_buffer_pool) and list_count(pooled_hit.missed_pages) > 0:
+                        set next_buffer_pool = some(yaza_db_buffer_pool_fork_with_misses_v1(option_unwrap(next_buffer_pool), session.storage.file, session.storage.header.db_uuid, pooled_hit.missed_pages))
+                let hit_stmt: YazaDbSqlStatementResultV1 = YazaDbSqlStatementResultV1(yaza_db_sql_statement_kind_select_v1(), some(pooled_hit.query_result), none, none, session.storage, session.wal)
+                return yaza_db_session_finish_statement_with_plan_cache_v1(session, hit_stmt, next_catalog_cache, next_index_rows_cache, next_buffer_pool, next_plan_cache, none)
+            elif arena_live_scopes() == 0:
+                set next_plan_cache = some(yaza_db_select_plan_cache_invalidate_v1(option_unwrap(next_plan_cache)))
     var lex_started_ns: Number = 0
     if list_count(profile_ns) >= 4: set lex_started_ns = monotonic_ns()
     let tokens_result: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(source)
     if list_count(profile_ns) >= 4 and lex_started_ns > 0:
         let ignored_lex_profile: Number = yaza_db_query_profile_record_ns_v1(profile_ns, 0, lex_started_ns, monotonic_ns())
-    if result_is_ok(tokens_result):
-        let tokens: List[YazaSqlTokenV1] = result_unwrap(tokens_result)
-        if yaza_db_session_cacheable_select_v1(source, tokens):
-            var catalog_started_ns: Number = 0
-            if list_count(profile_ns) >= 4: set catalog_started_ns = monotonic_ns()
+    if not result_is_ok(tokens_result):
+        return yaza_db_session_mark_tx_failed_or_closed_v1(session, result_unwrap_error(tokens_result))
+    let tokens: List[YazaSqlTokenV1] = result_unwrap(tokens_result)
+    let tx_ctrl_res: Result[Option[YazaDbTxControlCommandV1], Text] = yaza_db_parse_tx_control_v1(source, tokens)
+    if not result_is_ok(tx_ctrl_res):
+        return yaza_db_session_mark_tx_failed_or_closed_v1(session, result_unwrap_error(tx_ctrl_res))
+    let tx_ctrl: Option[YazaDbTxControlCommandV1] = result_unwrap(tx_ctrl_res)
+    if option_is_some(tx_ctrl):
+        if list_count(parameters) != 0:
+            return yaza_db_session_mark_tx_failed_or_closed_v1(session, "YDBv1 transaction control statements do not accept bind parameters")
+        return yaza_db_session_execute_tx_control_v1(session, option_unwrap(tx_ctrl))
+    if option_is_some(session.explicit_tx):
+        return yaza_db_session_execute_inside_tx_v1(session, option_unwrap(session.explicit_tx), source, tokens, parameters, profile_ns)
+    var executed: Result[YazaDbSqlStatementResultV1, Text] = err("YDBv1 session statement did not execute")
+    if yaza_db_session_cacheable_select_v1(source, tokens):
+        var catalog_started_ns: Number = 0
+        if list_count(profile_ns) >= 4: set catalog_started_ns = monotonic_ns()
+        var snapshot_result: Result[YazaDbCatalogSnapshotWithRootsV1, Text] = err("YDBv1 session catalog cache was not loaded")
+        if option_is_some(session.catalog_cache):
+            set snapshot_result = ok(yaza_db_session_catalog_at_current_version_v1(option_unwrap(session.catalog_cache), session.storage))
+        else:
+            set snapshot_result = yaza_db_catalog_snapshot_load_with_roots_v1(session.storage.file, session.storage.header)
+        if list_count(profile_ns) >= 4 and catalog_started_ns > 0:
+            let ignored_catalog_profile: Number = yaza_db_query_profile_record_ns_v1(profile_ns, 0, catalog_started_ns, monotonic_ns())
+        if not result_is_ok(snapshot_result):
+            set executed = err(result_unwrap_error(snapshot_result))
+        else:
+            let snapshot: YazaDbCatalogSnapshotWithRootsV1 = result_unwrap(snapshot_result)
+            var index_rows_result: Result[List[YazaDbRowV1], Text] = err("YDBv1 session index cache was not loaded")
+            if option_is_some(session.index_rows_cache):
+                set index_rows_result = ok(option_unwrap(session.index_rows_cache))
+            else:
+                set index_rows_result = yaza_db_index_catalog_rows_v1(session.storage.file, session.storage.header, snapshot.sql_snapshot.version)
+            if not result_is_ok(index_rows_result):
+                set executed = err(result_unwrap_error(index_rows_result))
+            else:
+                let index_rows: List[YazaDbRowV1] = result_unwrap(index_rows_result)
+                let query_result: Result[YazaDbQueryPlannedSelectResultV1, Text] = yaza_db_execute_single_select_with_cache_entry_profiled_v1(session.storage.file, session.storage.header, source, tokens, parameters, snapshot, index_rows, session.buffer_pool, profile_ns)
+                if not result_is_ok(query_result):
+                    set executed = err(result_unwrap_error(query_result))
+                else:
+                    let planned_select: YazaDbQueryPlannedSelectResultV1 = result_unwrap(query_result)
+                    if arena_live_scopes() == 0:
+                        set next_catalog_cache = some(snapshot)
+                        set next_index_rows_cache = some(index_rows)
+                        if option_is_some(next_buffer_pool) and list_count(planned_select.missed_pages) > 0:
+                            set next_buffer_pool = some(yaza_db_buffer_pool_fork_with_misses_v1(option_unwrap(next_buffer_pool), session.storage.file, session.storage.header.db_uuid, planned_select.missed_pages))
+                        if option_is_some(next_plan_cache):
+                            let miss_lookup: YazaDbSelectPlanLookupV1 = yaza_db_select_plan_cache_lookup_v1(option_unwrap(next_plan_cache), source, session.storage.header.catalog_root)
+                            var updated_pc: YazaDbSelectPlanCacheV1 = miss_lookup.cache
+                            if option_is_some(planned_select.cache_entry):
+                                set updated_pc = yaza_db_select_plan_cache_put_v1(updated_pc, option_unwrap(planned_select.cache_entry))
+                            set next_plan_cache = some(updated_pc)
+                    set executed = ok(YazaDbSqlStatementResultV1(yaza_db_sql_statement_kind_select_v1(), some(planned_select.query_result), none, none, session.storage, session.wal))
+    else:
+        var active_catalog_cache: Option[YazaDbCatalogSnapshotWithRootsV1] = none
+        var active_index_rows_cache: Option[List[YazaDbRowV1]] = none
+        var cache_load_failed: Boolean = false
+        var is_dml: Boolean = false
+        if list_count(tokens) >= 2:
+            if yaza_sql_v2_is_keyword(source, tokens, 0, "INSERT") or yaza_sql_v2_is_keyword(source, tokens, 0, "UPDATE") or yaza_sql_v2_is_keyword(source, tokens, 0, "DELETE"):
+                set is_dml = true
+        if is_dml and session.storage.header.catalog_root != 0 and session.storage.header.next_commit_ts >= 2:
             var snapshot_result: Result[YazaDbCatalogSnapshotWithRootsV1, Text] = err("YDBv1 session catalog cache was not loaded")
             if option_is_some(session.catalog_cache):
                 set snapshot_result = ok(yaza_db_session_catalog_at_current_version_v1(option_unwrap(session.catalog_cache), session.storage))
             else:
                 set snapshot_result = yaza_db_catalog_snapshot_load_with_roots_v1(session.storage.file, session.storage.header)
-            if list_count(profile_ns) >= 4 and catalog_started_ns > 0:
-                let ignored_catalog_profile: Number = yaza_db_query_profile_record_ns_v1(profile_ns, 0, catalog_started_ns, monotonic_ns())
             if not result_is_ok(snapshot_result):
+                set cache_load_failed = true
                 set executed = err(result_unwrap_error(snapshot_result))
             else:
                 let snapshot: YazaDbCatalogSnapshotWithRootsV1 = result_unwrap(snapshot_result)
@@ -112,54 +396,55 @@ fn yaza_db_session_execute_profiled_v1(session: YazaDbSessionV1, source: Text, p
                 if option_is_some(session.index_rows_cache):
                     set index_rows_result = ok(option_unwrap(session.index_rows_cache))
                 else:
-                    set index_rows_result = yaza_db_query_clustered_index_rows_v1(session.storage.file, session.storage.header, snapshot.catalog, snapshot.sql_snapshot.version)
+                    set index_rows_result = yaza_db_index_catalog_rows_v1(session.storage.file, session.storage.header, snapshot.sql_snapshot.version)
                 if not result_is_ok(index_rows_result):
+                    set cache_load_failed = true
                     set executed = err(result_unwrap_error(index_rows_result))
                 else:
                     let index_rows: List[YazaDbRowV1] = result_unwrap(index_rows_result)
-                    let query_result: Result[YazaSqlQueryResultV1, Text] = yaza_db_execute_single_select_with_cached_catalog_and_index_rows_profiled_v1(session.storage.file, session.storage.header, source, tokens, parameters, snapshot, index_rows, profile_ns)
-                    if not result_is_ok(query_result):
-                        set executed = err(result_unwrap_error(query_result))
-                    else:
-                        if arena_live_scopes() == 0:
-                            set next_catalog_cache = some(snapshot)
-                            set next_index_rows_cache = some(index_rows)
-                        set executed = ok(YazaDbSqlStatementResultV1(yaza_db_sql_statement_kind_select_v1(), some(result_unwrap(query_result)), none, none, session.storage, session.wal))
-        else:
-            if list_count(profile_ns) >= 34:
-                set executed = yaza_db_execute_session_statement_profiled_v1(session.storage, session.wal, source, parameters, profile_ns)
-            else:
-                set executed = yaza_db_execute_session_statement_v1(session.storage, session.wal, source, parameters)
-    else:
-        set executed = yaza_db_execute_statement_v1(session.storage, session.wal, source, parameters)
+                    set active_catalog_cache = some(snapshot)
+                    set active_index_rows_cache = some(index_rows)
+                    if arena_live_scopes() == 0:
+                        set next_catalog_cache = some(snapshot)
+                        set next_index_rows_cache = some(index_rows)
+        if not cache_load_failed:
+            set executed = yaza_db_execute_session_statement_with_cache_profiled_v1(session.storage, session.wal, source, parameters, active_catalog_cache, active_index_rows_cache, profile_ns)
     if not result_is_ok(executed):
-        let error: Text = result_unwrap_error(executed)
-        let cleanup_error: Text = yaza_db_session_close_after_statement_error_v1(session)
-        if text_length(cleanup_error) > 0: return err(error + "; YDBv1 session cleanup failed: " + cleanup_error)
-        return err(error)
-    let statement: YazaDbSqlStatementResultV1 = result_unwrap(executed)
-    if statement.storage.root != session.root or statement.wal.root != session.root or not bytes_equal(statement.storage.header.db_uuid, statement.wal.db_uuid):
-        let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(statement.wal)
-        let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(statement.storage)
-        let ignored_root_close: Result[Boolean, Text] = close(session.root)
-        return err("YDBv1 SQL statement returned handles for a different session database")
-    if yaza_db_session_invalidates_catalog_v1(statement.statement_kind):
-        set next_catalog_cache = none
-        set next_index_rows_cache = none
-    elif arena_live_scopes() == 0 and option_is_some(next_catalog_cache):
-        set next_catalog_cache = some(yaza_db_session_catalog_at_current_version_v1(option_unwrap(next_catalog_cache), statement.storage))
-    let preserved_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(session.storage.header.db_uuid, statement.storage.header.checkpoint_lsn, statement.storage.header.next_txn_id, statement.storage.header.next_commit_ts, statement.storage.header.catalog_root, statement.storage.header.page_count, statement.storage.header.flags)
-    let preserved_storage: YazaDbStorageHandleV1 = YazaDbStorageHandleV1(statement.storage.root, statement.storage.file, statement.storage.lock, statement.storage.identity_lock, preserved_header)
-    let preserved_wal: YazaDbWalLogV1 = YazaDbWalLogV1(statement.wal.root, session.wal.db_uuid, statement.wal.file, statement.wal.segment_index, statement.wal.segment_base_lsn, statement.wal.next_lsn)
-    let next_session: YazaDbSessionV1 = YazaDbSessionV1(session.root, preserved_storage, preserved_wal, next_catalog_cache, next_index_rows_cache, true)
-    return ok(YazaDbSessionStatementV1(next_session, statement))
+        return yaza_db_session_mark_tx_failed_or_closed_v1(session, result_unwrap_error(executed))
+    return yaza_db_session_finish_statement_with_plan_cache_v1(session, result_unwrap(executed), next_catalog_cache, next_index_rows_cache, next_buffer_pool, next_plan_cache, none)
+
+fn yaza_db_session_execute_with_state_v1(session: YazaDbSessionV1, source: Text, parameters: List[YazaSqlValueV1]) -> YazaDbSessionExecutionV1:
+    return yaza_db_session_execute_with_state_profiled_v1(session, source, parameters, List[Number]())
+
+fn yaza_db_session_execute_profiled_v1(session: YazaDbSessionV1, source: Text, parameters: List[YazaSqlValueV1], profile_ns: List[Number]) -> Result[YazaDbSessionStatementV1, Text]:
+    let res: YazaDbSessionExecutionV1 = yaza_db_session_execute_with_state_profiled_v1(session, source, parameters, profile_ns)
+    if res.ok:
+        return ok(YazaDbSessionStatementV1(res.session, option_unwrap(res.statement)))
+    if res.session.is_open:
+        let cleanup_error: Text = yaza_db_session_close_after_statement_error_v1(res.session)
+        if text_length(cleanup_error) > 0: return err(res.error_message + "; YDBv1 session cleanup failed: " + cleanup_error)
+    return err(res.error_message)
 
 fn yaza_db_session_execute_v1(session: YazaDbSessionV1, source: Text, parameters: List[YazaSqlValueV1]) -> Result[YazaDbSessionStatementV1, Text]:
     return yaza_db_session_execute_profiled_v1(session, source, parameters, List[Number]())
 
 fn yaza_db_session_close_v1(session: YazaDbSessionV1) -> Result[Boolean, Text]:
     if not session.is_open: return err("YDBv1 SQL session is already closed")
-    let checkpointed: Result[YazaDbCheckpointResultV1, Text] = yaza_db_checkpoint_clean_v1(session.storage, session.wal, 0)
+    var cur_storage: YazaDbStorageHandleV1 = session.storage
+    var cur_wal: YazaDbWalLogV1 = session.wal
+    if option_is_some(session.explicit_tx):
+        let rb_res: Result[YazaDbWriteCommitV1, Text] = yaza_db_explicit_tx_rollback_v1(option_unwrap(session.explicit_tx))
+        if not result_is_ok(rb_res):
+            let msg: Text = result_unwrap_error(rb_res)
+            if not yaza_db_error_closed_handles_v1(msg):
+                let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(cur_wal)
+                let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(cur_storage)
+            let ignored_root_close: Result[Boolean, Text] = close(session.root)
+            return err("YDBv1 SQL session close rollback failed: " + msg)
+        let rb: YazaDbWriteCommitV1 = result_unwrap(rb_res)
+        set cur_storage = rb.storage
+        set cur_wal = rb.wal
+    let checkpointed: Result[YazaDbCheckpointResultV1, Text] = yaza_db_checkpoint_clean_v1(cur_storage, cur_wal, 0)
     if not result_is_ok(checkpointed):
         let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(session.wal)
         let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(session.storage)

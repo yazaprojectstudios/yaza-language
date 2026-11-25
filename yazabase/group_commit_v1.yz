@@ -1,0 +1,266 @@
+# Group Commit batcher: executes N auto-commit DML statements across the same
+# database with deferred fsyncs, committing the WAL segment with a single fsync(wal.file).
+use "std/fs"
+use "./buffer_pool_v1"
+use "./checkpoint_v1"
+use "./catalog_snapshot_v1"
+use "./index_catalog_v1"
+use "./row_v1"
+use "./session_v1"
+use "./sql_delete_query_v1"
+use "./sql_dispatch_v1"
+use "./sql_executor_v1"
+use "./sql_insert_query_v1"
+use "./sql_insert_write_v1"
+use "./sql_lexer_v1"
+use "./sql_parser_v2"
+use "./sql_update_query_v1"
+use "./storage_v1"
+use "./transaction_v1"
+use "./wal_v1"
+
+shape YazaDbGroupCommitItemV1:
+    sql: Text
+    parameters: List[YazaSqlValueV1]
+
+shape YazaDbGroupCommitItemResultV1:
+    index: Number
+    ok: Boolean
+    txn_id: Number
+    commit_ts: Number
+    affected_rows: Number
+    error_message: Text
+
+shape YazaDbGroupCommitBatchResultV1:
+    session: YazaDbSessionV1
+    results: List[YazaDbGroupCommitItemResultV1]
+    committed_count: Number
+    failed_count: Number
+    fsync_count: Number
+    elapsed_ns: Number
+
+fn yaza_db_group_commit_execute_v1(session: YazaDbSessionV1, statements: List[YazaDbGroupCommitItemV1]) -> Result[YazaDbGroupCommitBatchResultV1, Text]:
+    if not session.is_open:
+        return err("YDBv1 group commit requires an open SQL session")
+    if session.root < 0 or session.storage.root != session.root or session.wal.root != session.root or not bytes_equal(session.storage.header.db_uuid, session.wal.db_uuid):
+        return err("YDBv1 group commit session handles are mismatched")
+    if option_is_some(session.explicit_tx):
+        return err("YDBv1 group commit cannot run inside an active explicit transaction")
+    let total: Number = list_count(statements)
+    if total < 0 or total > 4096:
+        return err("YDBv1 group commit batch size exceeds the 4096-statement bound")
+
+    let results_res: Result[List[YazaDbGroupCommitItemResultV1], Text] = list_try_new()
+    if not result_is_ok(results_res):
+        return err("YDBv1 group commit could not allocate item results")
+    let results: List[YazaDbGroupCommitItemResultV1] = result_unwrap(results_res)
+    let ignored_resv: Boolean = list_try_reserve(results, total)
+
+    let started_ns: Number = monotonic_ns()
+    var cur_storage: YazaDbStorageHandleV1 = session.storage
+    var cur_wal: YazaDbWalLogV1 = session.wal
+    var cur_catalog_cache: Option[YazaDbCatalogSnapshotWithRootsV1] = session.catalog_cache
+    var cur_index_rows_cache: Option[List[YazaDbRowV1]] = session.index_rows_cache
+    var committed_count: Number = 0
+    var failed_count: Number = 0
+    var wal_bytes_dirty: Boolean = false
+    var fsync_count: Number = 0
+    let initial_wal_next_lsn: Number = session.wal.next_lsn
+    let initial_wal_segment: Number = session.wal.segment_index
+    let overlay_res: Result[YazaDbDirtyPageOverlayV1, Text] = yaza_db_dirty_overlay_new_v1()
+    if not result_is_ok(overlay_res):
+        return err(result_unwrap_error(overlay_res))
+    var overlay: YazaDbDirtyPageOverlayV1 = result_unwrap(overlay_res)
+    if total > 0:
+        let cap_res: Result[YazaDbWriteCapacityV1, Text] = yaza_db_write_transaction_prepare_capacity_v1(cur_storage, cur_wal, yaza_db_write_transaction_default_free_page_reserve_v1())
+        if not result_is_ok(cap_res):
+            return err(result_unwrap_error(cap_res))
+        let cap: YazaDbWriteCapacityV1 = result_unwrap(cap_res)
+        set cur_storage = cap.storage
+        set cur_wal = cap.wal
+        if cap.extensions > 0:
+            set fsync_count = fsync_count + cap.extensions
+
+    var i: Number = 0
+    while i < total:
+        let item: YazaDbGroupCommitItemV1 = list_get(statements, i)
+        let tokens_res: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(item.sql)
+        if not result_is_ok(tokens_res):
+            set failed_count = failed_count + 1
+            let _p: Boolean = list_try_push(results, YazaDbGroupCommitItemResultV1(i, false, 0, 0, 0, result_unwrap_error(tokens_res)))
+            set i = i + 1
+            continue
+        let tokens: List[YazaSqlTokenV1] = result_unwrap(tokens_res)
+        if list_count(tokens) < 2:
+            set failed_count = failed_count + 1
+            let _p: Boolean = list_try_push(results, YazaDbGroupCommitItemResultV1(i, false, 0, 0, 0, "YDBv1 group commit SQL statement is empty"))
+            set i = i + 1
+            continue
+        let is_insert: Boolean = yaza_sql_v2_is_keyword(item.sql, tokens, 0, "INSERT")
+        let is_update: Boolean = yaza_sql_v2_is_keyword(item.sql, tokens, 0, "UPDATE")
+        let is_delete: Boolean = yaza_sql_v2_is_keyword(item.sql, tokens, 0, "DELETE")
+        if not is_insert and not is_update and not is_delete:
+            set failed_count = failed_count + 1
+            let _p: Boolean = list_try_push(results, YazaDbGroupCommitItemResultV1(i, false, 0, 0, 0, "YDBv1 group commit supports INSERT, UPDATE, and DELETE DML only"))
+            set i = i + 1
+            continue
+
+        var active_catalog: Option[YazaDbCatalogSnapshotWithRootsV1] = none
+        var active_index_rows: Option[List[YazaDbRowV1]] = none
+        var cache_err: Text = ""
+        if cur_storage.header.catalog_root != 0 and cur_storage.header.next_commit_ts >= 2:
+            var snap_res: Result[YazaDbCatalogSnapshotWithRootsV1, Text] = err("YDBv1 catalog cache miss")
+            if option_is_some(cur_catalog_cache):
+                set snap_res = ok(yaza_db_session_catalog_at_current_version_v1(option_unwrap(cur_catalog_cache), cur_storage))
+            else:
+                set snap_res = yaza_db_catalog_snapshot_load_with_roots_v1(cur_storage.file, cur_storage.header)
+            if not result_is_ok(snap_res):
+                set cache_err = result_unwrap_error(snap_res)
+            else:
+                let snap: YazaDbCatalogSnapshotWithRootsV1 = result_unwrap(snap_res)
+                var idx_res: Result[List[YazaDbRowV1], Text] = err("YDBv1 index cache miss")
+                if option_is_some(cur_index_rows_cache):
+                    set idx_res = ok(option_unwrap(cur_index_rows_cache))
+                else:
+                    set idx_res = yaza_db_index_catalog_rows_v1(cur_storage.file, cur_storage.header, snap.sql_snapshot.version)
+                if not result_is_ok(idx_res):
+                    set cache_err = result_unwrap_error(idx_res)
+                else:
+                    let idx_rows: List[YazaDbRowV1] = result_unwrap(idx_res)
+                    set active_catalog = some(snap)
+                    set active_index_rows = some(idx_rows)
+                    if arena_live_scopes() == 0:
+                        set cur_catalog_cache = some(snap)
+                        set cur_index_rows_cache = some(idx_rows)
+        if cache_err != "":
+            set failed_count = failed_count + 1
+            let _p: Boolean = list_try_push(results, YazaDbGroupCommitItemResultV1(i, false, 0, 0, 0, cache_err))
+            set i = i + 1
+            continue
+
+        let write_allowed_res: Result[Boolean, Text] = yaza_db_sql_write_allowed_during_index_build_with_cache_v1(cur_storage, active_index_rows)
+        if not result_is_ok(write_allowed_res):
+            set failed_count = failed_count + 1
+            let _p: Boolean = list_try_push(results, YazaDbGroupCommitItemResultV1(i, false, 0, 0, 0, result_unwrap_error(write_allowed_res)))
+            set i = i + 1
+            continue
+        if not result_unwrap(write_allowed_res):
+            set failed_count = failed_count + 1
+            let _p: Boolean = list_try_push(results, YazaDbGroupCommitItemResultV1(i, false, 0, 0, 0, "YDBv1 writes are fenced while a secondary index build is incomplete"))
+            set i = i + 1
+            continue
+
+        var overlay_handled: Boolean = false
+        var dml_res: Result[YazaDbWriteCommitV1, Text] = err("YDBv1 group commit DML dispatch did not run")
+        if is_insert:
+            let ov_res: Result[YazaDbSqlInsertOverlayAttemptV1, Text] = yaza_db_execute_insert_try_overlay_v1(cur_storage, cur_wal, item.sql, item.parameters, active_catalog, active_index_rows, overlay)
+            if result_is_ok(ov_res):
+                let attempt: YazaDbSqlInsertOverlayAttemptV1 = result_unwrap(ov_res)
+                if attempt.handled:
+                    set overlay_handled = true
+                    set overlay = attempt.overlay
+                    set dml_res = ok(option_unwrap(attempt.commit))
+            else:
+                set overlay_handled = true
+                set dml_res = err(result_unwrap_error(ov_res))
+        if not overlay_handled:
+            if list_count(overlay.page_ids) > 0:
+                let flushed_res: Result[YazaDbOverlayFlushResultV1, Text] = yaza_db_dirty_overlay_flush_after_wal_sync_v1(overlay, cur_storage, cur_wal)
+                if not result_is_ok(flushed_res):
+                    let ignored_root_close: Result[Boolean, Text] = close(session.root)
+                    return err("YDBv1 group commit item " + number_text(i) + " suffered a fatal storage error: " + result_unwrap_error(flushed_res))
+                let flushed: YazaDbOverlayFlushResultV1 = result_unwrap(flushed_res)
+                set overlay = flushed.overlay
+                set fsync_count = fsync_count + flushed.fsync_count
+                set wal_bytes_dirty = false
+            if is_insert:
+                set dml_res = yaza_db_execute_insert_with_sync_policy_v1(cur_storage, cur_wal, item.sql, item.parameters, true, false, active_catalog, active_index_rows)
+            elif is_update:
+                set dml_res = yaza_db_execute_update_with_sync_policy_v1(cur_storage, cur_wal, item.sql, item.parameters, true, false, active_catalog, active_index_rows)
+            else:
+                set dml_res = yaza_db_execute_delete_with_sync_policy_profiled_v1(cur_storage, cur_wal, item.sql, item.parameters, true, false, active_catalog, active_index_rows, List[Number]())
+
+        if result_is_ok(dml_res):
+            let w: YazaDbWriteCommitV1 = result_unwrap(dml_res)
+            if w.wal.next_lsn != cur_wal.next_lsn or w.wal.segment_index != cur_wal.segment_index:
+                set wal_bytes_dirty = true
+            set cur_storage = w.storage
+            set cur_wal = w.wal
+            if (cur_wal.next_lsn - cur_storage.header.checkpoint_lsn) >= 33554432:
+                if list_count(overlay.page_ids) > 0:
+                    let flushed_res: Result[YazaDbOverlayFlushResultV1, Text] = yaza_db_dirty_overlay_flush_after_wal_sync_v1(overlay, cur_storage, cur_wal)
+                    if not result_is_ok(flushed_res):
+                        let ignored_root_close: Result[Boolean, Text] = close(session.root)
+                        return err("YDBv1 group commit checkpoint flush failed: " + result_unwrap_error(flushed_res))
+                    let flushed: YazaDbOverlayFlushResultV1 = result_unwrap(flushed_res)
+                    set overlay = flushed.overlay
+                    set fsync_count = fsync_count + flushed.fsync_count
+                    set wal_bytes_dirty = false
+                elif wal_bytes_dirty:
+                    let synced: Result[Boolean, Text] = sync(cur_wal.file)
+                    if not result_is_ok(synced) or not result_unwrap(synced):
+                        let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(cur_wal)
+                        let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(cur_storage)
+                        let ignored_root_close: Result[Boolean, Text] = close(session.root)
+                        return err("YDBv1 group commit WAL fsync failed; reopen through recovery before reuse")
+                    set fsync_count = fsync_count + 1
+                    set wal_bytes_dirty = false
+                let ckpt_res: Result[YazaDbCheckpointResultV1, Text] = yaza_db_checkpoint_clean_v1(cur_storage, cur_wal, 0)
+                if not result_is_ok(ckpt_res):
+                    let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(cur_wal)
+                    let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(cur_storage)
+                    let ignored_root_close: Result[Boolean, Text] = close(session.root)
+                    return err("YDBv1 group commit periodic checkpoint failed: " + result_unwrap_error(ckpt_res))
+                let ckpt: YazaDbCheckpointResultV1 = result_unwrap(ckpt_res)
+                set cur_storage = ckpt.storage
+                set cur_wal = ckpt.wal
+                set fsync_count = fsync_count + 1
+            set committed_count = committed_count + 1
+            let _p: Boolean = list_try_push(results, YazaDbGroupCommitItemResultV1(i, true, w.txn_id, w.commit_ts, w.affected_rows, ""))
+        else:
+            let err_msg: Text = result_unwrap_error(dml_res)
+            if yaza_db_error_closed_handles_v1(err_msg):
+                let ignored_root_close: Result[Boolean, Text] = close(session.root)
+                return err("YDBv1 group commit item " + number_text(i) + " suffered a fatal storage error: " + err_msg)
+            set failed_count = failed_count + 1
+            let _p: Boolean = list_try_push(results, YazaDbGroupCommitItemResultV1(i, false, 0, 0, 0, err_msg))
+        set i = i + 1
+
+    if list_count(overlay.page_ids) > 0:
+        let flushed_res: Result[YazaDbOverlayFlushResultV1, Text] = yaza_db_dirty_overlay_flush_after_wal_sync_v1(overlay, cur_storage, cur_wal)
+        if not result_is_ok(flushed_res):
+            let ignored_root_close: Result[Boolean, Text] = close(session.root)
+            return err("YDBv1 group commit final overlay flush failed: " + result_unwrap_error(flushed_res))
+        let flushed: YazaDbOverlayFlushResultV1 = result_unwrap(flushed_res)
+        set overlay = flushed.overlay
+        set fsync_count = fsync_count + flushed.fsync_count
+        set wal_bytes_dirty = false
+    elif wal_bytes_dirty or (fsync_count == 0 and (cur_wal.next_lsn != initial_wal_next_lsn or cur_wal.segment_index != initial_wal_segment)):
+        let synced: Result[Boolean, Text] = sync(cur_wal.file)
+        if not result_is_ok(synced) or not result_unwrap(synced):
+            let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(cur_wal)
+            let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(cur_storage)
+            let ignored_root_close: Result[Boolean, Text] = close(session.root)
+            return err("YDBv1 group commit WAL fsync failed; reopen through recovery before reuse")
+        set fsync_count = fsync_count + 1
+        set wal_bytes_dirty = false
+    if fsync_count > 0 and (cur_wal.next_lsn - cur_storage.header.checkpoint_lsn) >= 33554432:
+        let ckpt_res: Result[YazaDbCheckpointResultV1, Text] = yaza_db_checkpoint_clean_v1(cur_storage, cur_wal, 0)
+        if not result_is_ok(ckpt_res):
+            let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(cur_wal)
+            let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(cur_storage)
+            let ignored_root_close: Result[Boolean, Text] = close(session.root)
+            return err("YDBv1 group commit periodic checkpoint failed: " + result_unwrap_error(ckpt_res))
+        let ckpt: YazaDbCheckpointResultV1 = result_unwrap(ckpt_res)
+        set cur_storage = ckpt.storage
+        set cur_wal = ckpt.wal
+        set fsync_count = fsync_count + 1
+
+    if committed_count > 0 and option_is_some(session.buffer_pool):
+        let _cleared: Boolean = yaza_db_buffer_pool_clear_v1(option_unwrap(session.buffer_pool))
+    if arena_live_scopes() == 0 and option_is_some(cur_catalog_cache):
+        set cur_catalog_cache = some(yaza_db_session_catalog_at_current_version_v1(option_unwrap(cur_catalog_cache), cur_storage))
+
+    let next_session: YazaDbSessionV1 = YazaDbSessionV1(session.root, cur_storage, cur_wal, cur_catalog_cache, cur_index_rows_cache, session.buffer_pool, none, true, session.plan_cache)
+    let elapsed_ns: Number = monotonic_ns() - started_ns
+    return ok(YazaDbGroupCommitBatchResultV1(next_session, results, committed_count, failed_count, fsync_count, elapsed_ns))

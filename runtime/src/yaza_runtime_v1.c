@@ -6478,13 +6478,20 @@ int32_t yaza_vfs_v1_read_exact(int64_t file, int64_t offset, int64_t length, Yaz
     uint32_t slot = 0;
     int descriptor = -1;
     if (!yaza_vfs_v1_acquire(file, YAZA_VFS_V1_KIND_FILE, YAZA_VFS_V1_ACCESS_READ, &slot, &descriptor, out_error)) return 0;
+    unsigned char stack_temporary[16384];
     unsigned char *temporary = NULL;
+    int temporary_heap = 0;
     if (length > 0 && !yaza_vfs_v1_reserve_temporary((uint64_t)length)) {
         yaza_vfs_v1_release(slot, (uint64_t)file >> 8);
         *out_error = (char *)"VFS read exceeds the 64 MiB aggregate in-flight temporary-buffer quota";
         return 0;
     }
-    if (length > 0) temporary = (unsigned char *)malloc((size_t)length);
+    if (length > 0 && length <= 16384) {
+        temporary = stack_temporary;
+    } else if (length > 0) {
+        temporary = (unsigned char *)malloc((size_t)length);
+        temporary_heap = 1;
+    }
     if (length > 0 && temporary == NULL) {
         yaza_vfs_v1_release_temporary((uint64_t)length);
         yaza_vfs_v1_release(slot, (uint64_t)file >> 8);
@@ -6498,7 +6505,7 @@ int32_t yaza_vfs_v1_read_exact(int64_t file, int64_t offset, int64_t length, Yaz
         const ssize_t amount = yaza_vfs_v1_pread(descriptor, temporary + received, chunk, (yaza_vfs_off_t)current_offset);
         if (amount < 0 && errno == EINTR) continue;
         if (amount <= 0) {
-            free(temporary);
+            if (temporary_heap) free(temporary);
             yaza_vfs_v1_release_temporary((uint64_t)length);
             yaza_vfs_v1_release(slot, (uint64_t)file >> 8);
             *out_error = (char *)(amount == 0 ? "VFS exact read reached end of file" : "VFS exact read failed");
@@ -6509,14 +6516,14 @@ int32_t yaza_vfs_v1_read_exact(int64_t file, int64_t offset, int64_t length, Yaz
     unsigned char *buffer = NULL;
     if (length > 0) buffer = (unsigned char *)yaza_rt_v1_try_alloc((uint64_t)length);
     if (length > 0 && buffer == NULL) {
-        free(temporary);
+        if (temporary_heap) free(temporary);
         yaza_vfs_v1_release_temporary((uint64_t)length);
         yaza_vfs_v1_release(slot, (uint64_t)file >> 8);
         *out_error = (char *)"VFS read buffer exceeds the active arena quota";
         return 0;
     }
     if (length > 0) memcpy(buffer, temporary, (size_t)length);
-    free(temporary);
+    if (temporary_heap) free(temporary);
     yaza_vfs_v1_release_temporary((uint64_t)length);
     yaza_vfs_v1_release(slot, (uint64_t)file >> 8);
     *out_bytes = (YazaBytesV1){buffer, (uint64_t)length};

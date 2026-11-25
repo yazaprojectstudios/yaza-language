@@ -1,0 +1,34 @@
+# Unified YazaBase Server helpers: periodic clean checkpointing and SQL write guard.
+use "./checkpoint_v1"
+use "./session_v1"
+use "./sql_lexer_v1"
+use "./sql_parser_v2"
+use "./storage_v1"
+use "./wal_v1"
+
+shape YazaDbServerConfigV1:
+    bind_host: Text
+    http_port: Number
+    pg_port: Number
+    role: Text
+    checkpoint_wal_bytes: Number
+    max_connections: Number
+
+fn yaza_db_server_default_config_v1() -> YazaDbServerConfigV1:
+    return YazaDbServerConfigV1("127.0.0.1", 8080, 5432, "primary", 33554432, 0)
+
+fn yaza_db_server_maybe_checkpoint_v1(session: YazaDbSessionV1, wal_threshold_bytes: Number) -> Result[YazaDbSessionV1, Text]:
+    if not session.is_open or option_is_some(session.explicit_tx) or wal_threshold_bytes < 1:
+        return ok(session)
+    let tail_bytes: Number = session.wal.next_lsn - session.storage.header.checkpoint_lsn
+    if tail_bytes < wal_threshold_bytes:
+        return ok(session)
+    let ckpt: YazaDbCheckpointResultV1 = yaza_db_checkpoint_clean_v1(session.storage, session.wal, 0)?
+    return ok(YazaDbSessionV1(session.root, ckpt.storage, ckpt.wal, session.catalog_cache, session.index_rows_cache, session.buffer_pool, none, true, session.plan_cache))
+
+fn yaza_db_server_sql_is_write_v1(sql: Text) -> Boolean:
+    let lex_res: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(sql)
+    if not result_is_ok(lex_res): return false
+    let tokens: List[YazaSqlTokenV1] = result_unwrap(lex_res)
+    if list_count(tokens) < 2: return false
+    return yaza_sql_v2_is_keyword(sql, tokens, 0, "INSERT") or yaza_sql_v2_is_keyword(sql, tokens, 0, "UPDATE") or yaza_sql_v2_is_keyword(sql, tokens, 0, "DELETE") or yaza_sql_v2_is_keyword(sql, tokens, 0, "CREATE") or yaza_sql_v2_is_keyword(sql, tokens, 0, "DROP") or yaza_sql_v2_is_keyword(sql, tokens, 0, "ALTER") or yaza_sql_v2_is_keyword(sql, tokens, 0, "BEGIN") or yaza_sql_v2_is_keyword(sql, tokens, 0, "START")

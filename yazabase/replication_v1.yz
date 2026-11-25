@@ -1,0 +1,570 @@
+# Physical WAL Streaming Replication (Phase C1)
+# Streams CRC32C-verified WAL chunks from primary to replicas, supports clean
+# snapshot bootstrap via backup_v1, applies ARIES redo + catalog/checkpoint updates
+# with single-fsync batches, tracks replica LSN acknowledgements & sync quorum,
+# and exposes JSON/HTTP handlers and loopback HTTP client helpers.
+
+use "std/fs"
+use "std/http"
+use "std/json"
+use "std/net"
+use "std/time"
+use "./allocator_v1"
+use "./backup_v1"
+use "./buffer_pool_v1"
+use "./checkpoint_v1"
+use "./page_image_v1"
+use "./page_v1"
+use "./page_wal_v1"
+use "./session_v1"
+use "./storage_v1"
+use "./wal_v1"
+
+shape YazaDbWalChunkV1:
+    db_uuid: Bytes
+    from_lsn: Number
+    to_lsn: Number
+    record_count: Number
+    raw_bytes: Bytes
+    chunk_crc32c: Number
+
+shape YazaDbReplicaAckV1:
+    replica_id: Text
+    applied_lsn: Number
+    updated_ms: Number
+
+shape YazaDbReplicationStateV1:
+    role: Text
+    node_id: Text
+    sync_quorum: Number
+    acks: List[YazaDbReplicaAckV1]
+
+shape YazaDbReplicationApplyOutcomeV1:
+    session: YazaDbSessionV1
+    applied_records: Number
+    applied_lsn: Number
+    caught_up: Boolean
+
+shape YazaDbReplicationSnapshotExportV1:
+    session: YazaDbSessionV1
+    report: YazaDbBackupReportV1
+    snapshot_lsn: Number
+
+shape YazaDbReplicationHttpOutcomeV1:
+    state: YazaDbReplicationStateV1
+    response: HttpResponse
+
+fn yaza_db_repl_hex_byte_v1(b: Number) -> Text:
+    let digits: Text = "0123456789abcdef"
+    let hi: Number = (b / 16) % 16
+    let lo: Number = b % 16
+    return text_slice(digits, hi, 1) + text_slice(digits, lo, 1)
+
+fn yaza_db_repl_bytes_to_hex_v1(b: Bytes) -> Text:
+    let parts: TextList = text_list()
+    var i: Number = 0
+    let len: Number = bytes_length(b)
+    while i < len:
+        list_push(parts, yaza_db_repl_hex_byte_v1(bytes_get(b, i)))
+        set i = i + 1
+    return text_join(parts, "")
+
+fn yaza_db_repl_hex_val_v1(ch: Number) -> Number:
+    if ch >= 48 and ch <= 57: return ch - 48
+    if ch >= 97 and ch <= 102: return ch - 87
+    if ch >= 65 and ch <= 70: return ch - 55
+    return -1
+
+fn yaza_db_repl_hex_to_bytes_v1(hex: Text) -> Result[Bytes, Text]:
+    let len: Number = text_length(hex)
+    if len == 0:
+        return bytes_try_new_zeroed(0)
+    if len % 2 != 0:
+        return err("YDBv1 replication hex string has odd length")
+    let out: Bytes = bytes_try_new_zeroed(len / 2)?
+    var i: Number = 0
+    while i < len:
+        let hi: Number = yaza_db_repl_hex_val_v1(text_byte(hex, i))
+        let lo: Number = yaza_db_repl_hex_val_v1(text_byte(hex, i + 1))
+        if hi < 0 or lo < 0:
+            return err("YDBv1 replication hex string contains invalid digit")
+        if not bytes_try_set(out, i / 2, hi * 16 + lo):
+            return err("YDBv1 replication hex decode failed writing byte")
+        set i = i + 2
+    return ok(out)
+
+fn yaza_db_replication_default_state_v1(role: Text, node_id: Text, sync_quorum: Number) -> YazaDbReplicationStateV1:
+    let acks_res: Result[List[YazaDbReplicaAckV1], Text] = list_try_new()
+    var acks: List[YazaDbReplicaAckV1] = List[YazaDbReplicaAckV1]()
+    if result_is_ok(acks_res):
+        set acks = result_unwrap(acks_res)
+    var q: Number = sync_quorum
+    if q < 0: set q = 0
+    return YazaDbReplicationStateV1(role, node_id, q, acks)
+
+fn yaza_db_replication_record_ack_v1(state: YazaDbReplicationStateV1, replica_id: Text, applied_lsn: Number, now_ms: Number) -> Result[YazaDbReplicationStateV1, Text]:
+    if replica_id == "":
+        return err("YDBv1 replication ack requires a non-empty replica_id")
+    if applied_lsn < 0:
+        return err("YDBv1 replication ack requires a non-negative applied_lsn")
+    let next_acks_res: Result[List[YazaDbReplicaAckV1], Text] = list_try_new()
+    if not result_is_ok(next_acks_res):
+        return err("YDBv1 replication ack list allocation failed")
+    let next_acks: List[YazaDbReplicaAckV1] = result_unwrap(next_acks_res)
+    var found: Boolean = false
+    var i: Number = 0
+    let count: Number = list_count(state.acks)
+    while i < count:
+        let item: YazaDbReplicaAckV1 = list_get(state.acks, i)
+        if item.replica_id == replica_id:
+            var best_lsn: Number = item.applied_lsn
+            if applied_lsn > best_lsn:
+                set best_lsn = applied_lsn
+            if not list_try_push(next_acks, YazaDbReplicaAckV1(replica_id, best_lsn, now_ms)):
+                return err("YDBv1 replication ack list append failed")
+            set found = true
+        else:
+            if not list_try_push(next_acks, item):
+                return err("YDBv1 replication ack list copy failed")
+        set i = i + 1
+    if not found:
+        if not list_try_push(next_acks, YazaDbReplicaAckV1(replica_id, applied_lsn, now_ms)):
+            return err("YDBv1 replication ack list insert failed")
+    return ok(YazaDbReplicationStateV1(state.role, state.node_id, state.sync_quorum, next_acks))
+
+fn yaza_db_replication_quorum_satisfied_v1(state: YazaDbReplicationStateV1, target_lsn: Number) -> Boolean:
+    if state.sync_quorum <= 0:
+        return true
+    var acked: Number = 0
+    var i: Number = 0
+    let count: Number = list_count(state.acks)
+    while i < count:
+        let item: YazaDbReplicaAckV1 = list_get(state.acks, i)
+        if item.applied_lsn >= target_lsn:
+            set acked = acked + 1
+        set i = i + 1
+    return acked >= state.sync_quorum
+
+fn yaza_db_replication_bytes_all_zero_v1(data: Bytes) -> Boolean:
+    var i: Number = 0
+    let n: Number = bytes_length(data)
+    while i < n:
+        if bytes_get(data, i) != 0:
+            return false
+        set i = i + 1
+    return true
+
+fn yaza_db_replication_read_wal_chunk_v1(root: Number, db_uuid: Bytes, from_lsn: Number, max_bytes: Number, wal_next_lsn: Number) -> Result[YazaDbWalChunkV1, Text]:
+    if from_lsn < 0:
+        return err("YDBv1 replication from_lsn must be non-negative")
+    if bytes_length(db_uuid) != 16:
+        return err("YDBv1 replication requires a 16-byte database UUID")
+    var budget: Number = max_bytes
+    if budget < 1:
+        set budget = 4194304
+    if from_lsn >= wal_next_lsn:
+        let empty: Bytes = bytes_try_new_zeroed(0)?
+        return ok(YazaDbWalChunkV1(db_uuid, from_lsn, from_lsn, 0, empty, bytes_ydbv1_checksum(empty)))
+
+    let segment_size: Number = yaza_db_wal_segment_size_v1()
+    let segment_count: Number = yaza_db_wal_segment_count_for_v1(root, db_uuid)?
+    let parts_res: Result[List[Bytes], Text] = list_try_new()
+    if not result_is_ok(parts_res):
+        return err("YDBv1 replication chunk buffer allocation failed")
+    let parts: List[Bytes] = result_unwrap(parts_res)
+
+    var cur_lsn: Number = from_lsn
+    var to_lsn: Number = from_lsn
+    var record_count: Number = 0
+    var total_bytes: Number = 0
+    var open_seg_idx: Number = -1
+    var open_seg_file: Number = -1
+    var open_seg_size: Number = 0
+    var stop_reading: Boolean = false
+
+    while cur_lsn < wal_next_lsn and not stop_reading:
+        let seg_idx: Number = cur_lsn / segment_size
+        let seg_off: Number = cur_lsn % segment_size
+        if seg_idx >= segment_count:
+            if open_seg_file >= 0:
+                let _c: Result[Boolean, Text] = close(open_seg_file)
+            return err("YDBv1 replication WAL segment index is missing for requested LSN")
+        if seg_idx != open_seg_idx:
+            if open_seg_file >= 0:
+                let closed_prev: Result[Boolean, Text] = close(open_seg_file)
+                if not result_is_ok(closed_prev) or not result_unwrap(closed_prev):
+                    return err("YDBv1 replication could not close previous WAL segment")
+                set open_seg_file = -1
+            let seg_name: Text = yaza_db_wal_segment_name_for_v1(seg_idx, db_uuid)?
+            let opened: Result[Number, Text] = open_read(root, seg_name)
+            if not result_is_ok(opened):
+                return err(result_unwrap_error(opened))
+            set open_seg_file = result_unwrap(opened)
+            set open_seg_idx = seg_idx
+            let sz_res: Result[Number, Text] = file_size(open_seg_file)
+            if not result_is_ok(sz_res):
+                let _c: Result[Boolean, Text] = close(open_seg_file)
+                return err(result_unwrap_error(sz_res))
+            set open_seg_size = result_unwrap(sz_res)
+
+        if seg_off >= open_seg_size or seg_off + 4 > open_seg_size:
+            if seg_idx + 1 < segment_count:
+                set cur_lsn = (seg_idx + 1) * segment_size
+                continue
+            set stop_reading = true
+            continue
+
+        let len_res: Result[Bytes, Text] = read_exact(open_seg_file, seg_off, 4)
+        if not result_is_ok(len_res):
+            let _c: Result[Boolean, Text] = close(open_seg_file)
+            return err(result_unwrap_error(len_res))
+        let rec_len: Number = yaza_db_read_uint_le_v1(result_unwrap(len_res), 0, 4)?
+        if rec_len == 0:
+            if seg_idx + 1 < segment_count:
+                set cur_lsn = (seg_idx + 1) * segment_size
+                continue
+            set stop_reading = true
+            continue
+
+        if record_count > 0 and total_bytes + rec_len > budget:
+            set stop_reading = true
+            continue
+
+        let rec_res: Result[YazaDbWalRecordV1, Text] = yaza_db_wal_read_segment_record_v1(open_seg_file, seg_off, cur_lsn)
+        if not result_is_ok(rec_res):
+            let _c: Result[Boolean, Text] = close(open_seg_file)
+            return err(result_unwrap_error(rec_res))
+        let rec: YazaDbWalRecordV1 = result_unwrap(rec_res)
+        let enc_res: Result[Bytes, Text] = yaza_db_wal_encode_v1(rec)
+        if not result_is_ok(enc_res):
+            let _c: Result[Boolean, Text] = close(open_seg_file)
+            return err(result_unwrap_error(enc_res))
+        let enc: Bytes = result_unwrap(enc_res)
+        let enc_len: Number = bytes_length(enc)
+        if not list_try_push(parts, enc):
+            let _c: Result[Boolean, Text] = close(open_seg_file)
+            return err("YDBv1 replication chunk push failed")
+        set record_count = record_count + 1
+        set total_bytes = total_bytes + enc_len
+        set cur_lsn = cur_lsn + enc_len
+        set to_lsn = cur_lsn
+        if total_bytes >= budget:
+            set stop_reading = true
+
+    if open_seg_file >= 0:
+        let closed_last: Boolean = close(open_seg_file)?
+        if not closed_last:
+            return err("YDBv1 replication failed closing WAL segment handle")
+
+    var raw_bytes: Bytes = bytes_try_new_zeroed(0)?
+    if record_count > 0:
+        set raw_bytes = bytes_join(parts)?
+    return ok(YazaDbWalChunkV1(db_uuid, from_lsn, to_lsn, record_count, raw_bytes, bytes_ydbv1_checksum(raw_bytes)))
+
+fn yaza_db_replication_export_snapshot_v1(session: YazaDbSessionV1, backup_root: Number, database_name: Text) -> Result[YazaDbReplicationSnapshotExportV1, Text]:
+    if not session.is_open:
+        return err("YDBv1 snapshot export requires an open primary session")
+    if option_is_some(session.explicit_tx):
+        return err("YDBv1 snapshot export cannot run inside an active explicit transaction")
+    let ckpt: YazaDbCheckpointResultV1 = yaza_db_checkpoint_clean_v1(session.storage, session.wal, 0)?
+    let report: YazaDbBackupReportV1 = yaza_db_backup_copy_locked_v1(session.root, ckpt.storage, backup_root, database_name)?
+    let cleared_bp: Option[YazaDbBufferPoolV1] = session.buffer_pool
+    let updated_session: YazaDbSessionV1 = YazaDbSessionV1(session.root, ckpt.storage, ckpt.wal, session.catalog_cache, session.index_rows_cache, cleared_bp, none, true, session.plan_cache)
+    return ok(YazaDbReplicationSnapshotExportV1(updated_session, report, ckpt.wal.next_lsn))
+
+fn yaza_db_replication_bootstrap_replica_v1(backup_root: Number, database_name: Text, replica_root: Number) -> Result[YazaDbSessionV1, Text]:
+    let _report: YazaDbBackupReportV1 = yaza_db_backup_v1(backup_root, database_name, replica_root)?
+    return yaza_db_session_open_v1(replica_root, database_name)
+
+fn yaza_db_replication_redo_record_in_scope_v1(storage: YazaDbStorageHandleV1, record: YazaDbWalRecordV1, wal_end_lsn: Number) -> Number:
+    # Returns 0 on success or small positive error code without allocating heap strings past arena_scope.
+    var code: Number = 0
+    arena_scope 4194304:
+        let rt: Number = record.rec_type
+        if rt == yaza_db_wal_type_page_alloc_v1() or rt == yaza_db_wal_type_page_free_v1():
+            let applied: Result[Boolean, Text] = yaza_db_allocator_redo_page_space_v1(storage, record, wal_end_lsn)
+            if not result_is_ok(applied): set code = 3
+        elif rt == yaza_db_wal_type_compensation_v1():
+            let ver_res: Result[Number, Text] = yaza_db_read_uint_le_v1(record.payload, 0, 2)
+            if not result_is_ok(ver_res):
+                set code = 4
+            else:
+                let ver: Number = result_unwrap(ver_res)
+                if ver == 1:
+                    let applied: Result[Boolean, Text] = yaza_db_allocator_redo_compensation_v1(storage, record, wal_end_lsn)
+                    if not result_is_ok(applied): set code = 4
+                elif ver == 2:
+                    let applied: Result[Boolean, Text] = yaza_db_storage_redo_leaf_compensation_v1(storage, record, wal_end_lsn)
+                    if not result_is_ok(applied): set code = 7
+                elif ver == 3:
+                    let applied: Result[Boolean, Text] = yaza_db_storage_redo_node_split_compensation_v1(storage, record, wal_end_lsn)
+                    if not result_is_ok(applied): set code = 7
+                else:
+                    set code = 4
+        elif rt == yaza_db_wal_type_leaf_insert_v1() or rt == yaza_db_wal_type_leaf_update_v1() or rt == yaza_db_wal_type_leaf_delete_v1():
+            let applied: Result[Boolean, Text] = yaza_db_storage_redo_leaf_mutation_v1(storage, record, wal_end_lsn)
+            if not result_is_ok(applied): set code = 7
+        elif rt == yaza_db_wal_type_node_split_v1():
+            let applied: Result[Boolean, Text] = yaza_db_storage_redo_node_split_v1(storage, record, wal_end_lsn)
+            if not result_is_ok(applied): set code = 8
+        elif rt == yaza_db_wal_type_full_page_image_v1():
+            let applied: Result[Boolean, Text] = yaza_db_storage_redo_page_image_v1(storage, record, wal_end_lsn)
+            if not result_is_ok(applied): set code = 6
+        elif rt != yaza_db_wal_type_checkpoint_begin_v1() and rt != yaza_db_wal_type_checkpoint_end_v1() and rt != yaza_db_wal_type_skip_v1() and rt != yaza_db_wal_type_mtr_end_v1() and rt != yaza_db_wal_type_commit_v1() and rt != yaza_db_wal_type_catalog_root_commit_v1() and rt != yaza_db_wal_type_abort_v1():
+            set code = 5
+    return code
+
+fn yaza_db_replication_extend_replica_pages_v1(storage: YazaDbStorageHandleV1, new_page_count: Number, page_lsn: Number) -> Result[YazaDbStorageHandleV1, Text]:
+    if new_page_count <= storage.header.page_count:
+        return ok(storage)
+    let target_bytes: Number = new_page_count * yaza_db_page_size_v1()
+    let current_bytes: Number = file_size(storage.file)?
+    if target_bytes > current_bytes:
+        let reserved: Boolean = preallocate(storage.file, target_bytes)?
+        if not reserved:
+            return err("YDBv1 replica preallocate failed during checkpoint extension")
+        let fs: Boolean = sync(storage.file)?
+        let ds: Boolean = sync_directory(storage.root)?
+        if not fs or not ds:
+            return err("YDBv1 replica storage sync failed after extension")
+    let _init: Number = yaza_db_storage_initialize_new_bitmap_ranges_v1(storage.file, storage.header.page_count, new_page_count, page_lsn)?
+    let next_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(storage.header.db_uuid, storage.header.checkpoint_lsn, storage.header.next_txn_id, storage.header.next_commit_ts, storage.header.catalog_root, new_page_count, storage.header.flags)
+    return ok(YazaDbStorageHandleV1(storage.root, storage.file, storage.lock, storage.identity_lock, next_header))
+
+fn yaza_db_replication_apply_wal_chunk_v1(session: YazaDbSessionV1, chunk: YazaDbWalChunkV1) -> Result[YazaDbReplicationApplyOutcomeV1, Text]:
+    if not session.is_open:
+        return err("YDBv1 replication apply requires an open replica session")
+    if option_is_some(session.explicit_tx):
+        return err("YDBv1 replication cannot apply WAL chunks inside an explicit transaction")
+    if not bytes_equal(chunk.db_uuid, session.storage.header.db_uuid):
+        return err("YDBv1 replication WAL chunk UUID mismatch")
+    if bytes_ydbv1_checksum(chunk.raw_bytes) != chunk.chunk_crc32c:
+        return err("YDBv1 replication WAL chunk CRC32C checksum mismatch")
+    if chunk.from_lsn > session.wal.next_lsn:
+        return err("YDBv1 replication WAL chunk has an LSN gap")
+    if chunk.to_lsn <= session.wal.next_lsn or chunk.record_count == 0 or bytes_length(chunk.raw_bytes) == 0:
+        return ok(YazaDbReplicationApplyOutcomeV1(session, 0, session.wal.next_lsn, true))
+
+    let raw: Bytes = chunk.raw_bytes
+    let raw_len: Number = bytes_length(raw)
+    let segment_size: Number = yaza_db_wal_segment_size_v1()
+    let header_size: Number = yaza_db_wal_header_size_v1()
+
+    var cur_storage: YazaDbStorageHandleV1 = session.storage
+    var cur_wal: YazaDbWalLogV1 = session.wal
+    var offset: Number = 0
+    var scan_lsn: Number = chunk.from_lsn
+    var applied_count: Number = 0
+
+    while offset < raw_len:
+        if offset + 4 > raw_len:
+            return err("YDBv1 replication WAL chunk record header is truncated")
+        let len_slice: Bytes = bytes_try_slice(raw, offset, 4)?
+        let total_len: Number = yaza_db_read_uint_le_v1(len_slice, 0, 4)?
+        if total_len < header_size or offset + total_len > raw_len:
+            return err("YDBv1 replication WAL chunk record length is invalid")
+        let seg_off: Number = scan_lsn % segment_size
+        if seg_off != 0 and total_len > segment_size - seg_off:
+            set scan_lsn = ((scan_lsn / segment_size) + 1) * segment_size
+        let encoded: Bytes = bytes_try_slice(raw, offset, total_len)?
+        let rec: YazaDbWalRecordV1 = yaza_db_wal_decode_v1(encoded, scan_lsn)?
+
+        if rec.lsn + total_len <= cur_wal.next_lsn:
+            set offset = offset + total_len
+            set scan_lsn = rec.lsn + total_len
+            continue
+
+        let appended: YazaDbWalAppendV1 = yaza_db_wal_log_append_unflushed_v1(cur_wal, rec)?
+        set cur_wal = appended.log
+        let applied_rec: YazaDbWalRecordV1 = appended.record
+        if applied_rec.lsn != rec.lsn:
+            return err("YDBv1 replication WAL append LSN diverged from primary")
+
+        let redo_code: Number = yaza_db_replication_redo_record_in_scope_v1(cur_storage, applied_rec, cur_wal.next_lsn)
+        if redo_code != 0:
+            return err("YDBv1 replication redo failed at LSN " + number_text(applied_rec.lsn) + " (code " + number_text(redo_code) + ")")
+
+        if applied_rec.rec_type == yaza_db_wal_type_commit_v1():
+            let commit_ts: Number = yaza_db_wal_commit_payload_decode_v1(applied_rec)?
+            var next_txn: Number = cur_storage.header.next_txn_id
+            if applied_rec.txn_id + 1 > next_txn:
+                set next_txn = applied_rec.txn_id + 1
+            var next_ts: Number = cur_storage.header.next_commit_ts
+            if commit_ts + 1 > next_ts:
+                set next_ts = commit_ts + 1
+            let nh: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(cur_storage.header.db_uuid, cur_storage.header.checkpoint_lsn, next_txn, next_ts, cur_storage.header.catalog_root, cur_storage.header.page_count, cur_storage.header.flags)
+            set cur_storage = YazaDbStorageHandleV1(cur_storage.root, cur_storage.file, cur_storage.lock, cur_storage.identity_lock, nh)
+        elif applied_rec.rec_type == yaza_db_wal_type_catalog_root_commit_v1():
+            let crc: YazaDbWalCatalogRootCommitV1 = yaza_db_wal_catalog_root_commit_payload_decode_v1(applied_rec)?
+            var next_txn: Number = cur_storage.header.next_txn_id
+            if applied_rec.txn_id + 1 > next_txn:
+                set next_txn = applied_rec.txn_id + 1
+            var next_ts: Number = cur_storage.header.next_commit_ts
+            if crc.commit_ts + 1 > next_ts:
+                set next_ts = crc.commit_ts + 1
+            let nh: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(cur_storage.header.db_uuid, cur_storage.header.checkpoint_lsn, next_txn, next_ts, crc.new_catalog_root, cur_storage.header.page_count, cur_storage.header.flags)
+            set cur_storage = YazaDbStorageHandleV1(cur_storage.root, cur_storage.file, cur_storage.lock, cur_storage.identity_lock, nh)
+        elif applied_rec.rec_type == yaza_db_wal_type_abort_v1():
+            var next_txn: Number = cur_storage.header.next_txn_id
+            if applied_rec.txn_id + 1 > next_txn:
+                set next_txn = applied_rec.txn_id + 1
+            let nh: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(cur_storage.header.db_uuid, cur_storage.header.checkpoint_lsn, next_txn, cur_storage.header.next_commit_ts, cur_storage.header.catalog_root, cur_storage.header.page_count, cur_storage.header.flags)
+            set cur_storage = YazaDbStorageHandleV1(cur_storage.root, cur_storage.file, cur_storage.lock, cur_storage.identity_lock, nh)
+        elif applied_rec.rec_type == yaza_db_wal_type_checkpoint_end_v1():
+            let snap: YazaDbCheckpointSnapshotV1 = yaza_db_checkpoint_end_payload_decode_v1(applied_rec)?
+            if snap.page_count > cur_storage.header.page_count:
+                set cur_storage = yaza_db_replication_extend_replica_pages_v1(cur_storage, snap.page_count, snap.begin_lsn)?
+            let nh: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(cur_storage.header.db_uuid, applied_rec.lsn, snap.next_txn_id, snap.next_commit_ts, snap.catalog_root, snap.page_count, cur_storage.header.flags)
+            let w_sync: Boolean = sync(cur_wal.file)?
+            let s_sync: Boolean = sync(cur_storage.file)?
+            if not w_sync or not s_sync:
+                return err("YDBv1 replica sync failed prior to publishing CHECKPOINT_END header")
+            let _hdr_written: Number = yaza_db_storage_write_header_v1(cur_storage.file, nh)?
+            let _hs: Boolean = sync(cur_storage.file)?
+            set cur_storage = YazaDbStorageHandleV1(cur_storage.root, cur_storage.file, cur_storage.lock, cur_storage.identity_lock, nh)
+
+        set applied_count = applied_count + 1
+        set offset = offset + total_len
+        set scan_lsn = rec.lsn + total_len
+
+    let wal_synced: Boolean = sync(cur_wal.file)?
+    let storage_synced: Boolean = sync(cur_storage.file)?
+    if not wal_synced or not storage_synced:
+        return err("YDBv1 replication WAL/storage batch fsync failed")
+
+    var next_bp: Option[YazaDbBufferPoolV1] = session.buffer_pool
+    if option_is_some(next_bp):
+        let bp: YazaDbBufferPoolV1 = option_unwrap(next_bp)
+        yaza_db_buffer_pool_clear_v1(bp)
+        set next_bp = some(bp)
+    let next_session: YazaDbSessionV1 = YazaDbSessionV1(session.root, cur_storage, cur_wal, none, none, next_bp, none, true, none)
+    return ok(YazaDbReplicationApplyOutcomeV1(next_session, applied_count, cur_wal.next_lsn, cur_wal.next_lsn >= chunk.to_lsn))
+
+fn yaza_db_replication_status_json_v1(session: YazaDbSessionV1, state: YazaDbReplicationStateV1) -> Result[Text, Text]:
+    let uuid_hex: Text = yaza_db_storage_uuid_hex_v1(session.storage.header.db_uuid)?
+    let ack_jsons_res: Result[List[Text], Text] = list_try_new()
+    if not result_is_ok(ack_jsons_res):
+        return err("YDBv1 replication status allocation failed")
+    let ack_jsons: List[Text] = result_unwrap(ack_jsons_res)
+    var i: Number = 0
+    while i < list_count(state.acks):
+        let a: YazaDbReplicaAckV1 = list_get(state.acks, i)
+        var lag: Number = session.wal.next_lsn - a.applied_lsn
+        if lag < 0: set lag = 0
+        let item_json: Text = "{\"replica_id\":\"" + json_escape_text(a.replica_id) + "\",\"applied_lsn\":" + number_text(a.applied_lsn) + ",\"lag_bytes\":" + number_text(lag) + ",\"updated_ms\":" + number_text(a.updated_ms) + "}"
+        let _p: Boolean = list_try_push(ack_jsons, item_json)
+        set i = i + 1
+    let body: Text = "{\"role\":\"" + json_escape_text(state.role) + "\",\"node_id\":\"" + json_escape_text(state.node_id) + "\",\"db_uuid\":\"" + json_escape_text(uuid_hex) + "\",\"wal_next_lsn\":" + number_text(session.wal.next_lsn) + ",\"checkpoint_lsn\":" + number_text(session.storage.header.checkpoint_lsn) + ",\"sync_quorum\":" + number_text(state.sync_quorum) + ",\"replicas\":" + json_array(ack_jsons) + "}"
+    return ok(body)
+
+fn yaza_db_replication_wal_chunk_to_json_v1(chunk: YazaDbWalChunkV1) -> Result[Text, Text]:
+    let uuid_hex: Text = yaza_db_storage_uuid_hex_v1(chunk.db_uuid)?
+    let raw_hex: Text = yaza_db_repl_bytes_to_hex_v1(chunk.raw_bytes)
+    let body: Text = "{\"db_uuid\":\"" + json_escape_text(uuid_hex) + "\",\"from_lsn\":" + number_text(chunk.from_lsn) + ",\"to_lsn\":" + number_text(chunk.to_lsn) + ",\"record_count\":" + number_text(chunk.record_count) + ",\"chunk_crc32c\":" + number_text(chunk.chunk_crc32c) + ",\"raw_hex\":\"" + raw_hex + "\"}"
+    return ok(body)
+
+fn yaza_db_replication_parse_wal_chunk_json_v1(json_body: Text) -> Result[YazaDbWalChunkV1, Text]:
+    let uuid_opt: Option[Text] = json_extract_string(json_body, "db_uuid")
+    let from_opt: Option[Number] = json_extract_number(json_body, "from_lsn")
+    let to_opt: Option[Number] = json_extract_number(json_body, "to_lsn")
+    let cnt_opt: Option[Number] = json_extract_number(json_body, "record_count")
+    let crc_opt: Option[Number] = json_extract_number(json_body, "chunk_crc32c")
+    let hex_opt: Option[Text] = json_extract_string(json_body, "raw_hex")
+    if not option_is_some(uuid_opt) or not option_is_some(from_opt) or not option_is_some(to_opt) or not option_is_some(cnt_opt) or not option_is_some(crc_opt) or not option_is_some(hex_opt):
+        return err("YDBv1 replication WAL chunk JSON is missing required fields")
+    let db_uuid: Bytes = yaza_db_repl_hex_to_bytes_v1(option_unwrap(uuid_opt))?
+    let raw_bytes: Bytes = yaza_db_repl_hex_to_bytes_v1(option_unwrap(hex_opt))?
+    return ok(YazaDbWalChunkV1(db_uuid, option_unwrap(from_opt), option_unwrap(to_opt), option_unwrap(cnt_opt), raw_bytes, option_unwrap(crc_opt)))
+
+fn yaza_db_replication_handle_http_v1(session: YazaDbSessionV1, state: YazaDbReplicationStateV1, request: HttpRequest) -> Result[YazaDbReplicationHttpOutcomeV1, Text]:
+    if request.path == "/api/v1/replication/status":
+        if request.method != "GET":
+            return ok(YazaDbReplicationHttpOutcomeV1(state, http_response_method_not_allowed("use GET for /api/v1/replication/status", true)))
+        let body: Text = yaza_db_replication_status_json_v1(session, state)?
+        return ok(YazaDbReplicationHttpOutcomeV1(state, http_response_ok_json(body)))
+
+    if request.path == "/api/v1/replication/wal":
+        if request.method != "GET":
+            return ok(YazaDbReplicationHttpOutcomeV1(state, http_response_method_not_allowed("use GET for /api/v1/replication/wal", true)))
+        let from_lsn: Number = http_query_param_number(request.query, "from_lsn", 0)
+        let max_bytes: Number = http_query_param_number(request.query, "max_bytes", 1048576)
+        let chunk_res: Result[YazaDbWalChunkV1, Text] = yaza_db_replication_read_wal_chunk_v1(session.root, session.storage.header.db_uuid, from_lsn, max_bytes, session.wal.next_lsn)
+        if not result_is_ok(chunk_res):
+            return ok(YazaDbReplicationHttpOutcomeV1(state, http_response_bad_request(result_unwrap_error(chunk_res), true)))
+        let json_body: Text = yaza_db_replication_wal_chunk_to_json_v1(result_unwrap(chunk_res))?
+        return ok(YazaDbReplicationHttpOutcomeV1(state, http_response_ok_json(json_body)))
+
+    if request.path == "/api/v1/replication/ack":
+        if request.method != "POST":
+            return ok(YazaDbReplicationHttpOutcomeV1(state, http_response_method_not_allowed("use POST for /api/v1/replication/ack", true)))
+        let rep_opt: Option[Text] = json_extract_string(request.body_text, "replica_id")
+        let lsn_opt: Option[Number] = json_extract_number(request.body_text, "applied_lsn")
+        if not option_is_some(rep_opt) or not option_is_some(lsn_opt):
+            return ok(YazaDbReplicationHttpOutcomeV1(state, http_response_bad_request("replication ack requires replica_id and applied_lsn", true)))
+        let rep_id: Text = option_unwrap(rep_opt)
+        let lsn: Number = option_unwrap(lsn_opt)
+        let updated: YazaDbReplicationStateV1 = yaza_db_replication_record_ack_v1(state, rep_id, lsn, monotonic_ms())?
+        let q_ok: Boolean = yaza_db_replication_quorum_satisfied_v1(updated, session.wal.next_lsn)
+        var q_txt: Text = "false"
+        if q_ok: set q_txt = "true"
+        let ack_json: Text = "{\"status\":\"ok\",\"replica_id\":\"" + json_escape_text(rep_id) + "\",\"applied_lsn\":" + number_text(lsn) + ",\"quorum_satisfied\":" + q_txt + "}"
+        return ok(YazaDbReplicationHttpOutcomeV1(updated, http_response_ok_json(ack_json)))
+
+    return ok(YazaDbReplicationHttpOutcomeV1(state, http_response_not_found("route not found: " + request.path, true)))
+
+fn yaza_db_replication_http_request_build_v1(method: Text, target: Text, body_json: Text) -> Bytes:
+    let body_bytes: Bytes = bytes_from_text(body_json)
+    var headers: Text = method + " " + target + " HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: " + number_text(bytes_length(body_bytes)) + "\r\n\r\n"
+    return bytes_concat(bytes_from_text(headers), body_bytes)
+
+fn yaza_db_replication_http_read_response_v1(conn: Number, timeout_ms: Number) -> Result[Text, Text]:
+    let chunks_res: Result[List[Bytes], Text] = list_try_new()
+    if not result_is_ok(chunks_res):
+        return err("YDBv1 replication HTTP client buffer allocation failed")
+    let chunks: List[Bytes] = result_unwrap(chunks_res)
+    var deadline_ms: Number = monotonic_ms() + timeout_ms
+    var header_end: Number = -1
+    var expected_total: Number = -1
+    var total_len: Number = 0
+    while true:
+        let rem: Number = deadline_ms - monotonic_ms()
+        if rem <= 0:
+            return err("YDBv1 replication HTTP client timed out")
+        let part_res: Result[Bytes, Text] = tcp_read(conn, 65536, rem)
+        if not result_is_ok(part_res):
+            return err(result_unwrap_error(part_res))
+        let part: Bytes = result_unwrap(part_res)
+        if bytes_length(part) == 0:
+            break
+        if not list_try_push(chunks, part):
+            return err("YDBv1 replication HTTP response append failed")
+        set total_len = total_len + bytes_length(part)
+        let joined: Bytes = bytes_join(chunks)?
+        if header_end < 0:
+            set header_end = http_find_header_end_bytes(joined)
+            if header_end >= 0:
+                let hdr_bytes: Bytes = bytes_try_slice(joined, 0, header_end)?
+                let hdr_text: Text = bytes_try_to_text(hdr_bytes)?
+                var cl_idx: Number = text_find(hdr_text, "Content-Length:")
+                if cl_idx < 0:
+                    set cl_idx = text_find(hdr_text, "content-length:")
+                if cl_idx >= 0:
+                    let after_cl: Text = text_slice(hdr_text, cl_idx + 15, text_length(hdr_text) - (cl_idx + 15))
+                    let eol_idx: Number = text_find(after_cl, "\r\n")
+                    var cl_str: Text = after_cl
+                    if eol_idx >= 0:
+                        set cl_str = text_slice(after_cl, 0, eol_idx)
+                    let cl_num: Result[Number, Text] = number_try_parse(text_trim(cl_str))
+                    if result_is_ok(cl_num):
+                        set expected_total = header_end + 4 + result_unwrap(cl_num)
+        if expected_total >= 0 and total_len >= expected_total:
+            break
+    if list_count(chunks) == 0:
+        return err("YDBv1 replication HTTP response was empty")
+    let full: Bytes = bytes_join(chunks)?
+    let end_pos: Number = http_find_header_end_bytes(full)
+    if end_pos < 0:
+        return err("YDBv1 replication HTTP response missing header terminator")
+    let body_start: Number = end_pos + 4
+    let body_slice: Bytes = bytes_try_slice(full, body_start, bytes_length(full) - body_start)?
+    return bytes_try_to_text(body_slice)

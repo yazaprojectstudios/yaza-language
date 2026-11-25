@@ -1,0 +1,368 @@
+# Phase A Micro-Polishes + Phase B1-B4 Validation Fixture
+use "std/fs"
+use "std/net"
+use "std/pg/protocol"
+use "../yazabase/buffer_pool_v1"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/explicit_tx_v1"
+use "../yazabase/group_commit_v1"
+use "../yazabase/pg_wire_v1"
+use "../yazabase/plan_cache_v1"
+use "../yazabase/session_v1"
+use "../yazabase/sql_executor_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/transaction_v1"
+use "../yazabase/wal_v1"
+
+fn pb_expect_ok(cond: Boolean, label: Text) -> Result[Boolean, Text]:
+    if not cond:
+        return err("phase-b assertion failed: " + label)
+    return ok(true)
+
+fn pb_init_db(dir_path: Text, db_name: Text) -> Result[YazaDbSessionV1, Text]:
+    let root: Number = root_open(dir_path)?
+    let boot: YazaDbCatalogBootstrapV1 = yaza_db_catalog_create_v1(root, db_name)?
+    let _wc: Boolean = yaza_db_wal_log_close_v1(boot.wal)?
+    let _sc: Boolean = yaza_db_storage_close_v1(boot.storage)?
+    return yaza_db_session_open_v1(root, db_name)
+
+fn pb_exec_ok(sess: YazaDbSessionV1, sql: Text, params: List[YazaSqlValueV1]) -> Result[YazaDbSessionStatementV1, Text]:
+    return yaza_db_session_execute_v1(sess, sql, params)
+
+fn pb_exec_sess(sess: YazaDbSessionV1, sql: Text) -> Result[YazaDbSessionV1, Text]:
+    let r: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(sess, sql, List[YazaSqlValueV1]())?
+    return ok(r.session)
+
+fn pb_query_int(sess: YazaDbSessionV1, sql: Text) -> Result[Number, Text]:
+    let res: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(sess, sql, List[YazaSqlValueV1]())?
+    let qr: YazaSqlQueryResultV1 = option_unwrap(res.statement.query_result)
+    if list_count(qr.rows) < 1:
+        return err("expected >= 1 row for query: " + sql)
+    let val: YazaSqlValueV1 = list_get(list_get(qr.rows, 0), 0)
+    return ok(val.integer_value)
+
+fn pb_query_text(sess: YazaDbSessionV1, sql: Text) -> Result[Text, Text]:
+    let res: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(sess, sql, List[YazaSqlValueV1]())?
+    let qr: YazaSqlQueryResultV1 = option_unwrap(res.statement.query_result)
+    if list_count(qr.rows) < 1:
+        return err("expected >= 1 row for query: " + sql)
+    let val: YazaSqlValueV1 = list_get(list_get(qr.rows, 0), 0)
+    return ok(val.text_value)
+
+fn pb_query_row_count(sess: YazaDbSessionV1, sql: Text) -> Result[Number, Text]:
+    let res: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(sess, sql, List[YazaSqlValueV1]())?
+    let qr: YazaSqlQueryResultV1 = option_unwrap(res.statement.query_result)
+    return ok(list_count(qr.rows))
+
+fn pb_make_blob(len: Number, seed: Number) -> Result[Bytes, Text]:
+    let b: Bytes = bytes_try_new_zeroed(len)?
+    var i: Number = 0
+    while i < len:
+        let _s: Boolean = bytes_try_set(b, i, ((i * 31 + seed) % 251) + 1)
+        set i = i + 257
+    if len > 0:
+        let _s0: Boolean = bytes_try_set(b, 0, (seed % 200) + 10)
+        let _sl: Boolean = bytes_try_set(b, len - 1, ((seed + 7) % 200) + 10)
+    return ok(b)
+
+fn pb_pg_read_single_byte(conn: Number, timeout_ms: Number) -> Result[Number, Text]:
+    let b: Bytes = tcp_read(conn, 1, timeout_ms)?
+    if bytes_length(b) != 1:
+        return err("expected 1 byte SSL response")
+    return ok(bytes_get(b, 0))
+
+fn pb_run(base_root: Text) -> Result[Boolean, Text]:
+    let db_name: Text = "phaseb.yzdb"
+    var sess: YazaDbSessionV1 = pb_init_db(base_root + "/main", db_name)?
+
+    # Create table docs
+    set sess = pb_exec_sess(sess, "CREATE TABLE docs (id INTEGER PRIMARY KEY, body BLOB, note TEXT)")?
+
+    let blob1: Bytes = pb_make_blob(50000, 17)?
+    let p_ins: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let v_id1: YazaSqlValueV1 = yaza_sql_value_integer_v1(3, 1)?
+    let v_b1: YazaSqlValueV1 = yaza_sql_value_blob_v1(blob1)?
+    let _pi1: Boolean = list_try_push(p_ins, v_id1)
+    let _pi2: Boolean = list_try_push(p_ins, v_b1)
+    let _pi3: Boolean = list_try_push(p_ins, yaza_sql_value_text_v1("initial"))
+    let r_ins1: YazaDbSessionStatementV1 = pb_exec_ok(sess, "INSERT INTO docs (id, body, note) VALUES ($1, $2, $3)", p_ins)?
+    set sess = r_ins1.session
+
+    # 1. Phase A Micro-Polish 2: Early-Return No-Op UPDATE (row_count == 0 skips WAL & commit_ts)
+    let lsn_before_noop: Number = sess.wal.next_lsn
+    let ts_before_noop: Number = sess.storage.header.next_commit_ts
+    let r_noop: YazaDbSessionStatementV1 = pb_exec_ok(sess, "UPDATE docs SET note = 'x' WHERE id = 9999", List[YazaSqlValueV1]())?
+    set sess = r_noop.session
+    let _a1: Boolean = pb_expect_ok(option_unwrap(r_noop.statement.write_commit).affected_rows == 0, "no-op UPDATE affected_rows == 0")?
+    let _a2: Boolean = pb_expect_ok(sess.wal.next_lsn == lsn_before_noop, "no-op UPDATE did not write WAL")?
+    let _a3: Boolean = pb_expect_ok(sess.storage.header.next_commit_ts == ts_before_noop, "no-op UPDATE did not bump next_commit_ts")?
+
+    # 2. Phase A Micro-Polish 1: Identical BLOB (type_id == 16) preserves overflow without new page allocation
+    let pages_before_dup: Number = sess.storage.header.page_count
+    var k: Number = 0
+    while k < 4:
+        let p_upd: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+        let vu_b: YazaSqlValueV1 = yaza_sql_value_blob_v1(blob1)?
+        let vu_id: YazaSqlValueV1 = yaza_sql_value_integer_v1(3, 1)?
+        let _pu1: Boolean = list_try_push(p_upd, vu_b)
+        let _pu2: Boolean = list_try_push(p_upd, vu_id)
+        let r_dup: YazaDbSessionStatementV1 = pb_exec_ok(sess, "UPDATE docs SET body = $1 WHERE id = $2", p_upd)?
+        set sess = r_dup.session
+        set k = k + 1
+    let _a4: Boolean = pb_expect_ok(sess.storage.header.page_count == pages_before_dup, "identical BLOB UPDATE preserved overflow pages without growth")?
+    let r_chk_blob: YazaDbSessionStatementV1 = pb_exec_ok(sess, "SELECT body FROM docs WHERE id = 1", List[YazaSqlValueV1]())?
+    set sess = r_chk_blob.session
+    let got_blob: Bytes = list_get(list_get(option_unwrap(r_chk_blob.statement.query_result).rows, 0), 0).bytes_value
+    let _a5: Boolean = pb_expect_ok(bytes_equal(got_blob, blob1), "preserved BLOB matches byte-for-byte")?
+
+    let blob2: Bytes = pb_make_blob(50000, 99)?
+    let p_upd2: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let vu2_b: YazaSqlValueV1 = yaza_sql_value_blob_v1(blob2)?
+    let vu2_id: YazaSqlValueV1 = yaza_sql_value_integer_v1(3, 1)?
+    let _pu3: Boolean = list_try_push(p_upd2, vu2_b)
+    let _pu4: Boolean = list_try_push(p_upd2, vu2_id)
+    let r_chg: YazaDbSessionStatementV1 = pb_exec_ok(sess, "UPDATE docs SET body = $1 WHERE id = $2", p_upd2)?
+    set sess = r_chg.session
+    let r_chk_blob2: YazaDbSessionStatementV1 = pb_exec_ok(sess, "SELECT body FROM docs WHERE id = 1", List[YazaSqlValueV1]())?
+    set sess = r_chk_blob2.session
+    let got_blob2: Bytes = list_get(list_get(option_unwrap(r_chk_blob2.statement.query_result).rows, 0), 0).bytes_value
+    let _a6: Boolean = pb_expect_ok(bytes_equal(got_blob2, blob2), "modified BLOB updated properly")?
+
+    # 3. Phase B1: CLOCK LRU Buffer Pool hits, misses, and write invalidation
+    var q: Number = 0
+    while q < 10:
+        let p_sel: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+        let vs_id: YazaSqlValueV1 = yaza_sql_value_integer_v1(3, 1)?
+        let _ps: Boolean = list_try_push(p_sel, vs_id)
+        let rs: YazaDbSessionStatementV1 = pb_exec_ok(sess, "SELECT note FROM docs WHERE id = $1", p_sel)?
+        set sess = rs.session
+        set q = q + 1
+    let stats1: YazaDbBufferPoolStatsV1 = yaza_db_session_buffer_pool_stats_v1(sess)
+    let _a7: Boolean = pb_expect_ok(stats1.hits > 0 and stats1.resident_count > 0, "buffer pool recorded warm cache hits")?
+    set sess = pb_exec_sess(sess, "UPDATE docs SET note = 'cache_updated' WHERE id = 1")?
+    let stats2: YazaDbBufferPoolStatsV1 = yaza_db_session_buffer_pool_stats_v1(sess)
+    let _a8: Boolean = pb_expect_ok(stats2.invalidations > stats1.invalidations, "buffer pool invalidated written page")?
+    let got_note1: Text = pb_query_text(sess, "SELECT note FROM docs WHERE id = 1")?
+    let _a9: Boolean = pb_expect_ok(got_note1 == "cache_updated", "select after write sees fresh value")?
+
+    # 4. Phase B2: Explicit Multi-Statement Transactions (BEGIN, SAVEPOINT, ROLLBACK TO, RELEASE, ROLLBACK, COMMIT, DDL rejection)
+    set sess = pb_exec_sess(sess, "BEGIN")?
+    set sess = pb_exec_sess(sess, "INSERT INTO docs (id, body, note) VALUES (10, NULL, 'ten')")?
+    set sess = pb_exec_sess(sess, "SAVEPOINT sp1")?
+    set sess = pb_exec_sess(sess, "INSERT INTO docs (id, body, note) VALUES (11, NULL, 'eleven')")?
+    set sess = pb_exec_sess(sess, "UPDATE docs SET note = 'ten_edited' WHERE id = 10")?
+    set sess = pb_exec_sess(sess, "SAVEPOINT sp2")?
+    set sess = pb_exec_sess(sess, "DELETE FROM docs WHERE id = 1")?
+    set sess = pb_exec_sess(sess, "ROLLBACK TO sp2")?
+    let rc_sp2: Number = pb_query_row_count(sess, "SELECT id FROM docs WHERE id = 1")?
+    let _a10: Boolean = pb_expect_ok(rc_sp2 == 1, "ROLLBACK TO sp2 restored deleted id=1")?
+    set sess = pb_exec_sess(sess, "ROLLBACK TO SAVEPOINT sp1")?
+    let rc_sp1_11: Number = pb_query_row_count(sess, "SELECT id FROM docs WHERE id = 11")?
+    let _a11: Boolean = pb_expect_ok(rc_sp1_11 == 0, "ROLLBACK TO sp1 undid id=11")?
+    let note_10: Text = pb_query_text(sess, "SELECT note FROM docs WHERE id = 10")?
+    let _a12: Boolean = pb_expect_ok(note_10 == "ten", "ROLLBACK TO sp1 restored id=10 note")?
+    set sess = pb_exec_sess(sess, "INSERT INTO docs (id, body, note) VALUES (12, NULL, 'twelve')")?
+    set sess = pb_exec_sess(sess, "RELEASE SAVEPOINT sp1")?
+    set sess = pb_exec_sess(sess, "COMMIT")?
+    let rc_10: Number = pb_query_row_count(sess, "SELECT id FROM docs WHERE id = 10")?
+    let rc_12: Number = pb_query_row_count(sess, "SELECT id FROM docs WHERE id = 12")?
+    let _a13: Boolean = pb_expect_ok(rc_10 == 1 and rc_12 == 1, "COMMIT persisted explicit tx")?
+
+    # Explicit ROLLBACK + DDL inside explicit tx
+    set sess = pb_exec_sess(sess, "BEGIN")?
+    set sess = pb_exec_sess(sess, "INSERT INTO docs (id, body, note) VALUES (13, NULL, 'thirteen')")?
+    let ddl_in_tx: YazaDbSessionExecutionV1 = yaza_db_session_execute_with_state_v1(sess, "CREATE TABLE bad_ddl (id INTEGER PRIMARY KEY)", List[YazaSqlValueV1]())
+    set sess = ddl_in_tx.session
+    let _a14: Boolean = pb_expect_ok(not ddl_in_tx.ok, "DDL rejected inside explicit tx")?
+    set sess = pb_exec_sess(sess, "ROLLBACK")?
+    let rc_13: Number = pb_query_row_count(sess, "SELECT id FROM docs WHERE id = 13")?
+    let _a15: Boolean = pb_expect_ok(rc_13 == 0, "ROLLBACK undid id=13 cleanly after failed statement")?
+
+    # 4b. ARIES Crash Recovery of uncommitted BEGIN
+    let crash_name: Text = "crash_tx.yzdb"
+    var cs: YazaDbSessionV1 = pb_init_db(base_root + "/crash", crash_name)?
+    set cs = pb_exec_sess(cs, "CREATE TABLE kv (id INTEGER PRIMARY KEY, v TEXT)")?
+    set cs = pb_exec_sess(cs, "INSERT INTO kv (id, v) VALUES (1, 'committed')")?
+    set cs = pb_exec_sess(cs, "BEGIN")?
+    set cs = pb_exec_sess(cs, "INSERT INTO kv (id, v) VALUES (2, 'loser1')")?
+    set cs = pb_exec_sess(cs, "SAVEPOINT s1")?
+    set cs = pb_exec_sess(cs, "INSERT INTO kv (id, v) VALUES (3, 'loser2')")?
+    let _c_wal: Boolean = yaza_db_wal_log_close_v1(cs.wal)?
+    let _c_sto: Boolean = yaza_db_storage_close_v1(cs.storage)?
+    let crash_root: Number = cs.root
+    let reopened_cs: YazaDbSessionV1 = yaza_db_session_open_v1(crash_root, crash_name)?
+    let kv_1: Number = pb_query_row_count(reopened_cs, "SELECT id FROM kv WHERE id = 1")?
+    let kv_2: Number = pb_query_row_count(reopened_cs, "SELECT id FROM kv WHERE id = 2")?
+    let kv_3: Number = pb_query_row_count(reopened_cs, "SELECT id FROM kv WHERE id = 3")?
+    let _a16: Boolean = pb_expect_ok(kv_1 == 1, "ARIES kept committed id=1")?
+    let _a17: Boolean = pb_expect_ok(kv_2 == 0 and kv_3 == 0, "ARIES rolled back uncommitted BEGIN loser rows")?
+    let _ccs: Boolean = yaza_db_session_close_v1(reopened_cs)?
+
+    # 5. Phase B3: Group Commit Batcher (single WAL fsync + mixed valid/invalid)
+    let gc_items: List[YazaDbGroupCommitItemV1] = List[YazaDbGroupCommitItemV1]()
+    var gi: Number = 100
+    while gi < 110:
+        let sql_i: Text = "INSERT INTO docs (id, body, note) VALUES (" + number_text(gi) + ", NULL, 'gc" + number_text(gi) + "')"
+        let _pg: Boolean = list_try_push(gc_items, YazaDbGroupCommitItemV1(sql_i, List[YazaSqlValueV1]()))
+        set gi = gi + 1
+    let _pg_bad: Boolean = list_try_push(gc_items, YazaDbGroupCommitItemV1("SELECT FROM BROKEN SYNTAX", List[YazaSqlValueV1]()))
+    let _pg_upd: Boolean = list_try_push(gc_items, YazaDbGroupCommitItemV1("UPDATE docs SET note = 'gc100_upd' WHERE id = 100", List[YazaSqlValueV1]()))
+    let gc_res: YazaDbGroupCommitBatchResultV1 = yaza_db_group_commit_execute_v1(sess, gc_items)?
+    set sess = gc_res.session
+    let _a18: Boolean = pb_expect_ok(gc_res.fsync_count >= 1 and gc_res.fsync_count <= 2 and gc_res.committed_count == 11 and gc_res.failed_count == 1, "group commit single fsync mixed batch")?
+
+    # Close & reopen main session to confirm group commit durability
+    let _mc1: Boolean = yaza_db_session_close_v1(sess)?
+    let main_root: Number = root_open(base_root + "/main")?
+    set sess = yaza_db_session_open_v1(main_root, db_name)?
+    let note_100: Text = pb_query_text(sess, "SELECT note FROM docs WHERE id = 100")?
+    let rc_109: Number = pb_query_row_count(sess, "SELECT id FROM docs WHERE id = 109")?
+    let _a19: Boolean = pb_expect_ok(note_100 == "gc100_upd", "group commit survived close/reopen")?
+    let _a20: Boolean = pb_expect_ok(rc_109 == 1, "group commit row 109 durable")?
+
+    # 6. Phase B4: PostgreSQL v3 Wire Protocol over tcp_pair_create
+    let s1: Number = tcp_pair_create()?
+    let s2: Number = tcp_pair_peer(s1)?
+    var pg_cfg: YazaDbPgServerConfigV1 = yaza_db_pg_default_config_v1("127.0.0.1", 5432, db_name)
+    set pg_cfg = YazaDbPgServerConfigV1("127.0.0.1", 5432, "password", "admin", "secret-pg-123", false, db_name)
+
+    let ssl_pkt: Bytes = pg_ssl_request()?
+    let start_pkt: Bytes = pg_startup_packet("admin", db_name)?
+    let pw_pkt: Bytes = pg_frontend_message("p", pg_cstring("secret-pg-123"))?
+    let _w_ssl: Number = tcp_write(s2, bytes_concat(bytes_concat(ssl_pkt, start_pkt), pw_pkt), 2000)?
+
+    var pg_state: YazaDbPgConnectionStateV1 = yaza_db_pg_server_handle_startup_v1(s1, sess, pg_cfg, true)?
+    let ssl_ans: Number = pb_pg_read_single_byte(s2, 2000)?
+    let _apg1: Boolean = pb_expect_ok(ssl_ans == 78, "PG SSLRequest replied with 'N'")?
+    let auth_req_f: YazaDbPgTcpFrameV1 = yaza_db_pg_client_read_frame_v1(s2, 2000)?
+    let auth_req_code: Number = yaza_db_pg_read_u32_be_v1(auth_req_f.payload, 0)?
+    let _apg2: Boolean = pb_expect_ok(auth_req_f.tag == 82 and auth_req_code == 3, "PG requested CleartextPassword")?
+    let auth_ok_f: YazaDbPgTcpFrameV1 = yaza_db_pg_client_read_frame_v1(s2, 2000)?
+    let auth_ok_code: Number = yaza_db_pg_read_u32_be_v1(auth_ok_f.payload, 0)?
+    let _apg3: Boolean = pb_expect_ok(auth_ok_f.tag == 82 and auth_ok_code == 0, "PG returned AuthenticationOk")?
+    var ready_seen: Boolean = false
+    while not ready_seen:
+        let bf: YazaDbPgTcpFrameV1 = yaza_db_pg_client_read_frame_v1(s2, 2000)?
+        if bf.tag == 90:
+            set ready_seen = true
+            let _apg4: Boolean = pb_expect_ok(bytes_get(bf.payload, 0) == 73, "PG ReadyForQuery idle 'I'")?
+
+    # Simple Query 'Q'
+    let sq_pkt: Bytes = pg_simple_query_message("SELECT id, note FROM docs WHERE id = 10")?
+    let _w_sq: Number = tcp_write(s2, sq_pkt, 2000)?
+    let st1: YazaDbPgStepOutcomeV1 = yaza_db_pg_server_process_next_message_v1(s1, pg_state)?
+    set pg_state = st1.state
+    let sq_rd: YazaDbPgTcpFrameV1 = yaza_db_pg_client_read_frame_v1(s2, 2000)?
+    let _apg5: Boolean = pb_expect_ok(sq_rd.tag == 84, "PG Simple Query returned RowDescription 'T'")?
+    let sq_dr: YazaDbPgTcpFrameV1 = yaza_db_pg_client_read_frame_v1(s2, 2000)?
+    let _apg6: Boolean = pb_expect_ok(sq_dr.tag == 68, "PG Simple Query returned DataRow 'D'")?
+    let sq_cc: YazaDbPgTcpFrameV1 = yaza_db_pg_client_read_frame_v1(s2, 2000)?
+    let _apg7: Boolean = pb_expect_ok(sq_cc.tag == 67, "PG Simple Query returned CommandComplete 'C'")?
+    let sq_rfq: YazaDbPgTcpFrameV1 = yaza_db_pg_client_read_frame_v1(s2, 2000)?
+    let _apg8: Boolean = pb_expect_ok(sq_rfq.tag == 90, "PG Simple Query ended with ReadyForQuery 'Z'")?
+
+    # Extended Query 'P' / 'B' / 'D' / 'E' / 'S' + Terminate 'X'
+    let ext_params: TextList = text_list()
+    list_push(ext_params, "100")
+    let ext_nulls: TextList = text_list()
+    list_push(ext_nulls, "0")
+    let p_msg: Bytes = pg_parse_message("st1", "SELECT note FROM docs WHERE id = $1")?
+    let b_msg: Bytes = pg_bind_values_message("p1", "st1", ext_params, ext_nulls)?
+    let d_msg: Bytes = pg_describe_message("P", "p1")?
+    let e_msg: Bytes = pg_execute_message("p1", 0)?
+    let s_msg: Bytes = pg_sync_message()?
+    let x_msg: Bytes = pg_frontend_message("X", bytes_empty())?
+    let batch_wire: Bytes = bytes_concat(bytes_concat(bytes_concat(p_msg, b_msg), d_msg), bytes_concat(bytes_concat(e_msg, s_msg), x_msg))
+    let _w_ext: Number = tcp_write(s2, batch_wire, 2000)?
+    while not pg_state.closed:
+        let step_ext: YazaDbPgStepOutcomeV1 = yaza_db_pg_server_process_next_message_v1(s1, pg_state)?
+        set pg_state = step_ext.state
+
+    let f_p: YazaDbPgTcpFrameV1 = yaza_db_pg_client_read_frame_v1(s2, 2000)?
+    let _apg9: Boolean = pb_expect_ok(f_p.tag == 49, "PG ParseComplete '1'")?
+    let f_b: YazaDbPgTcpFrameV1 = yaza_db_pg_client_read_frame_v1(s2, 2000)?
+    let _apg10: Boolean = pb_expect_ok(f_b.tag == 50, "PG BindComplete '2'")?
+    let f_d: YazaDbPgTcpFrameV1 = yaza_db_pg_client_read_frame_v1(s2, 2000)?
+    let _apg11: Boolean = pb_expect_ok(f_d.tag == 84, "PG Describe RowDescription 'T'")?
+    let f_e_row: YazaDbPgTcpFrameV1 = yaza_db_pg_client_read_frame_v1(s2, 2000)?
+    let _apg12: Boolean = pb_expect_ok(f_e_row.tag == 68, "PG Execute DataRow 'D'")?
+    let f_e_cc: YazaDbPgTcpFrameV1 = yaza_db_pg_client_read_frame_v1(s2, 2000)?
+    let _apg13: Boolean = pb_expect_ok(f_e_cc.tag == 67, "PG Execute CommandComplete 'C'")?
+    let f_sync: YazaDbPgTcpFrameV1 = yaza_db_pg_client_read_frame_v1(s2, 2000)?
+    let _apg14: Boolean = pb_expect_ok(f_sync.tag == 90, "PG Sync ReadyForQuery 'Z'")?
+
+    let _cp1: Boolean = tcp_close(s1)?
+    let _cp2: Boolean = tcp_close(s2)?
+    set sess = pg_state.session
+
+    # 7. Perf Enhancements: Bulk Split-Aware INSERT, Streaming Aggregates (COUNT/SUM/MIN/MAX), Overlay Group Commit, Plan Cache & DDL Invalidation
+    set sess = pb_exec_sess(sess, "CREATE TABLE bulk_t (id INTEGER PRIMARY KEY, val INTEGER, note TEXT)")?
+    let bulk_parts: TextList = text_list()
+    list_push(bulk_parts, "INSERT INTO bulk_t (id, val, note) VALUES ")
+    var bi: Number = 1
+    while bi <= 400:
+        if bi > 1: list_push(bulk_parts, ", ")
+        list_push(bulk_parts, "(" + number_text(bi) + ", " + number_text(bi * 10) + ", 'row_" + number_text(bi) + "_padding_for_leaf_split_test')")
+        set bi = bi + 1
+    let bulk_ins_res: YazaDbSessionStatementV1 = pb_exec_ok(sess, text_join(bulk_parts, ""), List[YazaSqlValueV1]())?
+    set sess = bulk_ins_res.session
+    let _ab1: Boolean = pb_expect_ok(option_unwrap(bulk_ins_res.statement.write_commit).affected_rows == 400, "bulk split-aware INSERT inserted 400 rows")?
+    let b_cnt: Number = pb_query_int(sess, "SELECT COUNT(*) FROM bulk_t")?
+    let b_sum: Number = pb_query_int(sess, "SELECT SUM(id) FROM bulk_t")?
+    let b_min_id: Number = pb_query_int(sess, "SELECT MIN(id) FROM bulk_t")?
+    let b_max_id: Number = pb_query_int(sess, "SELECT MAX(id) FROM bulk_t")?
+    let b_min_val: Number = pb_query_int(sess, "SELECT MIN(val) FROM bulk_t")?
+    let b_max_val: Number = pb_query_int(sess, "SELECT MAX(val) FROM bulk_t")?
+    let _ab2: Boolean = pb_expect_ok(b_cnt == 400 and b_sum == 80200 and b_min_id == 1 and b_max_id == 400 and b_min_val == 10 and b_max_val == 4000, "streaming COUNT/SUM/MIN/MAX match across split leaves")?
+
+    # Overlay Group Commit (30 pure INSERTs -> 1 fsync, no premature dirty page reads missing)
+    let ov_items: List[YazaDbGroupCommitItemV1] = List[YazaDbGroupCommitItemV1]()
+    var ovi: Number = 401
+    while ovi <= 430:
+        let sql_ov: Text = "INSERT INTO bulk_t (id, val, note) VALUES (" + number_text(ovi) + ", " + number_text(ovi * 10) + ", 'ov_" + number_text(ovi) + "')"
+        let _po: Boolean = list_try_push(ov_items, YazaDbGroupCommitItemV1(sql_ov, List[YazaSqlValueV1]()))
+        set ovi = ovi + 1
+    let ov_res: YazaDbGroupCommitBatchResultV1 = yaza_db_group_commit_execute_v1(sess, ov_items)?
+    set sess = ov_res.session
+    let _ab3: Boolean = pb_expect_ok(ov_res.fsync_count == 1 and ov_res.committed_count == 30 and ov_res.failed_count == 0, "overlay group commit executed 30 INSERTs with 1 fsync")?
+
+    let _mc2: Boolean = yaza_db_session_close_v1(sess)?
+    let main_root2: Number = root_open(base_root + "/main")?
+    set sess = yaza_db_session_open_v1(main_root2, db_name)?
+    let ov_cnt: Number = pb_query_int(sess, "SELECT COUNT(*) FROM bulk_t")?
+    let ov_last: Text = pb_query_text(sess, "SELECT note FROM bulk_t WHERE id = 430")?
+    let _ab4: Boolean = pb_expect_ok(ov_cnt == 430 and ov_last == "ov_430", "overlay group commit durable after reopen")?
+
+    # Plan Cache hits + DDL invalidation
+    let pc_before: YazaDbSelectPlanCacheV1 = yaza_db_session_plan_cache_stats_v1(sess)
+    let pc_sql: Text = "SELECT note FROM bulk_t WHERE id = $1"
+    var pci: Number = 1
+    while pci <= 5:
+        let ps: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+        let pv: YazaSqlValueV1 = yaza_sql_value_integer_v1(3, pci)?
+        let _pa: Boolean = list_try_push(ps, pv)
+        let pr: YazaDbSessionStatementV1 = pb_exec_ok(sess, pc_sql, ps)?
+        set sess = pr.session
+        let got_n: Text = list_get(list_get(option_unwrap(pr.statement.query_result).rows, 0), 0).text_value
+        let _ap: Boolean = pb_expect_ok(got_n == "row_" + number_text(pci) + "_padding_for_leaf_split_test", "cached plan returned exact row")?
+        set pci = pci + 1
+    let pc_after_hits: YazaDbSelectPlanCacheV1 = yaza_db_session_plan_cache_stats_v1(sess)
+    let _ab5: Boolean = pb_expect_ok(pc_after_hits.hits >= pc_before.hits + 4, "plan cache recorded hits on repeated parameterized SELECT")?
+
+    set sess = pb_exec_sess(sess, "CREATE TABLE pc_ddl_check (id INTEGER PRIMARY KEY)")?
+    let pc_after_ddl: YazaDbSelectPlanCacheV1 = yaza_db_session_plan_cache_stats_v1(sess)
+    let _ab6: Boolean = pb_expect_ok(pc_after_ddl.invalidations > pc_after_hits.invalidations, "DDL invalidated session plan cache")?
+
+    let _close_m: Boolean = yaza_db_session_close_v1(sess)?
+    return ok(true)
+
+start:
+    if arg_count() < 1:
+        say "usage: yazabase-phase-b-smoke <root-dir>"
+        exit(2)
+    let ok_res: Result[Boolean, Text] = pb_run(arg(1))
+    if not result_is_ok(ok_res):
+        say "yazabase-phase-b-smoke: FAIL: " + result_unwrap_error(ok_res)
+        exit(1)
+    say "yazabase-phase-b-smoke: PASS"
+    exit(0)

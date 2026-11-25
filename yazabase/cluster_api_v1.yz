@@ -1,0 +1,118 @@
+# Cluster HTTP API Router (/api/v1/replication/* and /api/v1/cluster/*) & Autoscale Reconciler
+use "std/http"
+use "./api_v1"
+use "./autoscale_v1"
+use "./cluster_ha_v1"
+use "./replication_v1"
+use "./router_v1"
+use "./session_v1"
+
+shape YazaApiReplicationResponseV1:
+    session: YazaDbSessionV1
+    repl_state: YazaDbReplicationStateV1
+    response: HttpResponse
+
+shape YazaApiClusterResponseV1:
+    session: YazaDbSessionV1
+    repl_state: YazaDbReplicationStateV1
+    ha_state: YazaDbHaStateV1
+    response: HttpResponse
+
+shape YazaDbAutoscaleReconcileResultV1:
+    router: YazaDbRwRouterV1
+    autoscale_state: YazaDbAutoscaleStateV1
+    primary_session: YazaDbSessionV1
+    replica_sessions: List[YazaDbSessionV1]
+    action: Text
+    target_replicas: Number
+    reason: Text
+
+fn yaza_api_route_replication_v1(session: YazaDbSessionV1, root_path: Text, db_name: Text, request: HttpRequest, auth_secret: Text, state: YazaApiServerStateV1, repl_state: YazaDbReplicationStateV1) -> Result[YazaApiReplicationResponseV1, Text]:
+    if text_starts_with(request.path, "/api/v1/replication/"):
+        if request.method == "OPTIONS":
+            return ok(YazaApiReplicationResponseV1(session, repl_state, http_response_no_content()))
+        let auth_err: Option[HttpResponse] = yaza_api_verify_auth(request, auth_secret)
+        if option_is_some(auth_err):
+            return ok(YazaApiReplicationResponseV1(session, repl_state, option_unwrap(auth_err)))
+        let repl_out: YazaDbReplicationHttpOutcomeV1 = yaza_db_replication_handle_http_v1(session, repl_state, request)?
+        return ok(YazaApiReplicationResponseV1(session, repl_out.state, repl_out.response))
+    let base: YazaApiSessionResponseV1 = yaza_api_route_request_state_with_role_v1(session, root_path, db_name, request, auth_secret, state, repl_state.role)?
+    return ok(YazaApiReplicationResponseV1(base.session, repl_state, base.response))
+
+fn yaza_api_route_request_cluster_v1(session: YazaDbSessionV1, root_path: Text, db_name: Text, request: HttpRequest, auth_secret: Text, state: YazaApiServerStateV1, repl_state: YazaDbReplicationStateV1, ha_state: YazaDbHaStateV1) -> Result[YazaApiClusterResponseV1, Text]:
+    if text_starts_with(request.path, "/api/v1/replication/"):
+        if request.method == "OPTIONS":
+            return ok(YazaApiClusterResponseV1(session, repl_state, ha_state, http_response_no_content()))
+        let auth_err: Option[HttpResponse] = yaza_api_verify_auth(request, auth_secret)
+        if option_is_some(auth_err):
+            return ok(YazaApiClusterResponseV1(session, repl_state, ha_state, option_unwrap(auth_err)))
+        let repl_out: YazaDbReplicationHttpOutcomeV1 = yaza_db_replication_handle_http_v1(session, repl_state, request)?
+        return ok(YazaApiClusterResponseV1(session, repl_out.state, ha_state, repl_out.response))
+    if text_starts_with(request.path, "/api/v1/cluster/"):
+        if request.method == "OPTIONS":
+            return ok(YazaApiClusterResponseV1(session, repl_state, ha_state, http_response_no_content()))
+        let auth_err: Option[HttpResponse] = yaza_api_verify_auth(request, auth_secret)
+        if option_is_some(auth_err):
+            return ok(YazaApiClusterResponseV1(session, repl_state, ha_state, option_unwrap(auth_err)))
+        let ha_out: YazaDbHaHttpOutcomeV1 = yaza_db_ha_handle_http_v1(session, ha_state, request)?
+        var next_repl: YazaDbReplicationStateV1 = repl_state
+        if ha_out.state.role != repl_state.role:
+            set next_repl = YazaDbReplicationStateV1(ha_out.state.role, repl_state.node_id, repl_state.sync_quorum, repl_state.acks)
+        return ok(YazaApiClusterResponseV1(ha_out.session, next_repl, ha_out.state, ha_out.response))
+    let base: YazaApiSessionResponseV1 = yaza_api_route_request_state_with_role_v1(session, root_path, db_name, request, auth_secret, state, ha_state.role)?
+    return ok(YazaApiClusterResponseV1(base.session, repl_state, ha_state, base.response))
+
+fn yaza_db_autoscale_reconcile_v1(policy: YazaDbAutoscalePolicyV1, state: YazaDbAutoscaleStateV1, metrics: YazaDbAutoscaleMetricsV1, router: YazaDbRwRouterV1, primary_session: YazaDbSessionV1, replica_sessions: List[YazaDbSessionV1], snapshot_root: Number, new_replica_root: Number, database_name: Text, new_replica_id: Text, new_replica_endpoint: Text) -> Result[YazaDbAutoscaleReconcileResultV1, Text]:
+    let dec: YazaDbAutoscaleDecisionV1 = yaza_db_autoscale_evaluate_v1(policy, state, metrics)
+    if dec.action == "scale_up" and new_replica_root >= 0 and snapshot_root >= 0:
+        let exported: YazaDbReplicationSnapshotExportV1 = yaza_db_replication_export_snapshot_v1(primary_session, snapshot_root, database_name)?
+        let new_rep_session: YazaDbSessionV1 = yaza_db_replication_bootstrap_replica_v1(snapshot_root, database_name, new_replica_root)?
+
+        let next_sessions_res: Result[List[YazaDbSessionV1], Text] = list_try_new()
+        let next_nodes_res: Result[List[YazaDbRouterNodeV1], Text] = list_try_new()
+        if not result_is_ok(next_sessions_res) or not result_is_ok(next_nodes_res):
+            return err("YDBv1 autoscale reconcile could not allocate replica lists")
+        let next_sessions: List[YazaDbSessionV1] = result_unwrap(next_sessions_res)
+        let next_nodes: List[YazaDbRouterNodeV1] = result_unwrap(next_nodes_res)
+        var i: Number = 0
+        while i < list_count(replica_sessions):
+            let _p1: Boolean = list_try_push(next_sessions, list_get(replica_sessions, i))
+            set i = i + 1
+        let _pa: Boolean = list_try_push(next_sessions, new_rep_session)
+        set i = 0
+        while i < list_count(router.replicas):
+            let _p2: Boolean = list_try_push(next_nodes, list_get(router.replicas, i))
+            set i = i + 1
+        let added_node: YazaDbRouterNodeV1 = YazaDbRouterNodeV1(new_replica_id, new_replica_endpoint, "replica", exported.snapshot_lsn, true)
+        let _pn: Boolean = list_try_push(next_nodes, added_node)
+        let next_router: YazaDbRwRouterV1 = yaza_db_router_update_topology_v1(router, router.primary, next_nodes, exported.session.wal.next_lsn)
+        return ok(YazaDbAutoscaleReconcileResultV1(next_router, dec.state, exported.session, next_sessions, dec.action, list_count(next_nodes), dec.reason))
+
+    if dec.action == "scale_down" and list_count(router.replicas) > 0:
+        let keep_nodes_count: Number = list_count(router.replicas) - 1
+        let next_nodes_res: Result[List[YazaDbRouterNodeV1], Text] = list_try_new()
+        let next_sessions_res: Result[List[YazaDbSessionV1], Text] = list_try_new()
+        if not result_is_ok(next_nodes_res) or not result_is_ok(next_sessions_res):
+            return err("YDBv1 autoscale scale_down list allocation failed")
+        let next_nodes: List[YazaDbRouterNodeV1] = result_unwrap(next_nodes_res)
+        let next_sessions: List[YazaDbSessionV1] = result_unwrap(next_sessions_res)
+        var i: Number = 0
+        while i < keep_nodes_count:
+            let _pn: Boolean = list_try_push(next_nodes, list_get(router.replicas, i))
+            set i = i + 1
+        let s_count: Number = list_count(replica_sessions)
+        var keep_sess_count: Number = s_count
+        if keep_sess_count > keep_nodes_count and s_count > 0:
+            set keep_sess_count = s_count - 1
+        set i = 0
+        while i < s_count:
+            if i < keep_sess_count:
+                let _ps: Boolean = list_try_push(next_sessions, list_get(replica_sessions, i))
+            else:
+                let drained: YazaDbSessionV1 = list_get(replica_sessions, i)
+                let _c: Result[Boolean, Text] = yaza_db_session_close_v1(drained)
+            set i = i + 1
+        let next_router: YazaDbRwRouterV1 = yaza_db_router_update_topology_v1(router, router.primary, next_nodes, primary_session.wal.next_lsn)
+        return ok(YazaDbAutoscaleReconcileResultV1(next_router, dec.state, primary_session, next_sessions, dec.action, list_count(next_nodes), dec.reason))
+
+    return ok(YazaDbAutoscaleReconcileResultV1(router, dec.state, primary_session, replica_sessions, dec.action, dec.target_replicas, dec.reason))

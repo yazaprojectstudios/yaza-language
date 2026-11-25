@@ -1,0 +1,83 @@
+# Read-Replica Autoscale Controller (Phase C3)
+# Evaluates sustained high/low utilization windows with hysteresis + cooldown.
+
+shape YazaDbAutoscalePolicyV1:
+    min_replicas: Number
+    max_replicas: Number
+    cpu_high_pct: Number
+    cpu_low_pct: Number
+    queue_high: Number
+    qps_per_replica: Number
+    lag_threshold_bytes: Number
+    scale_up_windows: Number
+    scale_down_windows: Number
+    cooldown_ms: Number
+
+shape YazaDbAutoscaleMetricsV1:
+    cpu_pct: Number
+    queue_depth: Number
+    read_qps: Number
+    max_replica_lag_bytes: Number
+    active_replicas: Number
+    now_ms: Number
+
+shape YazaDbAutoscaleStateV1:
+    consecutive_high: Number
+    consecutive_low: Number
+    last_scale_ms: Number
+
+shape YazaDbAutoscaleDecisionV1:
+    state: YazaDbAutoscaleStateV1
+    action: Text
+    target_replicas: Number
+    reason: Text
+
+fn yaza_db_autoscale_default_policy_v1() -> YazaDbAutoscalePolicyV1:
+    return YazaDbAutoscalePolicyV1(1, 8, 75, 25, 16, 1000, 1048576, 3, 5, 30000)
+
+fn yaza_db_autoscale_default_state_v1() -> YazaDbAutoscaleStateV1:
+    return YazaDbAutoscaleStateV1(0, 0, 0)
+
+fn yaza_db_autoscale_evaluate_v1(policy: YazaDbAutoscalePolicyV1, state: YazaDbAutoscaleStateV1, metrics: YazaDbAutoscaleMetricsV1) -> YazaDbAutoscaleDecisionV1:
+    if metrics.active_replicas < policy.min_replicas:
+        let seeded: YazaDbAutoscaleStateV1 = YazaDbAutoscaleStateV1(0, 0, metrics.now_ms)
+        return YazaDbAutoscaleDecisionV1(seeded, "scale_up", policy.min_replicas, "below_min_replicas")
+    if metrics.active_replicas > policy.max_replicas:
+        let clamped: YazaDbAutoscaleStateV1 = YazaDbAutoscaleStateV1(0, 0, metrics.now_ms)
+        return YazaDbAutoscaleDecisionV1(clamped, "scale_down", policy.max_replicas, "above_max_replicas")
+
+    if state.last_scale_ms > 0 and (metrics.now_ms - state.last_scale_ms) < policy.cooldown_ms:
+        return YazaDbAutoscaleDecisionV1(state, "hold", metrics.active_replicas, "cooldown_active")
+
+    let qps_cap: Number = metrics.active_replicas * policy.qps_per_replica
+    let qps_high: Boolean = metrics.active_replicas > 0 and metrics.read_qps > qps_cap
+    let overloaded: Boolean = metrics.cpu_pct >= policy.cpu_high_pct or metrics.queue_depth >= policy.queue_high or qps_high
+    if overloaded:
+        let next_high: Number = state.consecutive_high + 1
+        var req_up: Number = policy.scale_up_windows
+        if req_up < 1: set req_up = 1
+        if next_high >= req_up and metrics.active_replicas < policy.max_replicas:
+            let scaled: YazaDbAutoscaleStateV1 = YazaDbAutoscaleStateV1(0, 0, metrics.now_ms)
+            return YazaDbAutoscaleDecisionV1(scaled, "scale_up", metrics.active_replicas + 1, "sustained_high_load")
+        let wait_up: YazaDbAutoscaleStateV1 = YazaDbAutoscaleStateV1(next_high, 0, state.last_scale_ms)
+        if metrics.active_replicas >= policy.max_replicas:
+            return YazaDbAutoscaleDecisionV1(wait_up, "hold", metrics.active_replicas, "at_max_replicas")
+        return YazaDbAutoscaleDecisionV1(wait_up, "hold", metrics.active_replicas, "hysteresis_high_window")
+
+    let qps_low: Boolean = metrics.active_replicas <= 1 or metrics.read_qps < ((metrics.active_replicas - 1) * policy.qps_per_replica) / 2
+    let lag_ok: Boolean = metrics.max_replica_lag_bytes <= policy.lag_threshold_bytes
+    let underloaded: Boolean = metrics.cpu_pct <= policy.cpu_low_pct and metrics.queue_depth <= 1 and qps_low and lag_ok
+    if underloaded:
+        let next_low: Number = state.consecutive_low + 1
+        var req_down: Number = policy.scale_down_windows
+        if req_down < 1: set req_down = 1
+        if next_low >= req_down and metrics.active_replicas > policy.min_replicas:
+            let scaled: YazaDbAutoscaleStateV1 = YazaDbAutoscaleStateV1(0, 0, metrics.now_ms)
+            return YazaDbAutoscaleDecisionV1(scaled, "scale_down", metrics.active_replicas - 1, "sustained_low_load")
+        let wait_down: YazaDbAutoscaleStateV1 = YazaDbAutoscaleStateV1(0, next_low, state.last_scale_ms)
+        if metrics.active_replicas <= policy.min_replicas:
+            return YazaDbAutoscaleDecisionV1(wait_down, "hold", metrics.active_replicas, "at_min_replicas")
+        return YazaDbAutoscaleDecisionV1(wait_down, "hold", metrics.active_replicas, "hysteresis_low_window")
+
+    let steady: YazaDbAutoscaleStateV1 = YazaDbAutoscaleStateV1(0, 0, state.last_scale_ms)
+    return YazaDbAutoscaleDecisionV1(steady, "hold", metrics.active_replicas, "within_target_band")

@@ -101,16 +101,34 @@ fn yaza_db_wal_leaf_mutation_validate_delta_format_v1(format_version: Number, op
 fn yaza_db_wal_leaf_mutation_validate_delta_v1(operation: Number, page_id: Number, record_lsn: Number, before_image: Bytes, after_image: Bytes) -> Result[Boolean, Text]:
     return yaza_db_wal_leaf_mutation_validate_delta_format_v1(1, operation, page_id, record_lsn, before_image, after_image)
 
+fn yaza_db_wal_leaf_mutation_pack_bytes_v1(format_version: Number, operation: Number, page_id: Number, before_image: Bytes, after_image: Bytes) -> Result[Bytes, Text]:
+    let header_size: Number = yaza_db_wal_leaf_mutation_header_size_v1()
+    let header: Bytes = bytes_try_new_zeroed(header_size)?
+    if not yaza_db_write_uint_le_v1(header, 0, format_version, 2) or not yaza_db_write_uint_le_v1(header, 2, operation, 2): return err("YDBv1 leaf mutation version or operation could not be encoded")
+    if not yaza_db_write_uint_le_v1(header, 4, page_id, 8) or not yaza_db_write_uint_le_v1(header, 12, yaza_db_page_size_v1(), 4): return err("YDBv1 leaf mutation page metadata could not be encoded")
+    if not yaza_db_write_uint_le_v1(header, 16, 0, 4) or not yaza_db_write_uint_le_v1(header, 20, 0, 4): return err("YDBv1 leaf mutation reserved fields could not be cleared")
+    let parts_res: Result[List[Bytes], Text] = list_try_new()
+    if not result_is_ok(parts_res): return err("YDBv1 leaf mutation payload parts could not be allocated")
+    let parts: List[Bytes] = result_unwrap(parts_res)
+    if not list_try_reserve(parts, 3) or not list_try_push(parts, header) or not list_try_push(parts, before_image) or not list_try_push(parts, after_image):
+        return err("YDBv1 leaf mutation payload parts could not be staged")
+    return bytes_join(parts)
+
 fn yaza_db_wal_leaf_mutation_payload_encode_format_v1(format_version: Number, operation: Number, page_id: Number, record_lsn: Number, before_image: Bytes, after_image: Bytes) -> Result[Bytes, Text]:
     let ignored_delta: Boolean = yaza_db_wal_leaf_mutation_validate_delta_format_v1(format_version, operation, page_id, record_lsn, before_image, after_image)?
-    let payload: Bytes = bytes_try_new_zeroed(yaza_db_wal_leaf_mutation_payload_size_v1())?
-    if not yaza_db_write_uint_le_v1(payload, 0, format_version, 2) or not yaza_db_write_uint_le_v1(payload, 2, operation, 2): return err("YDBv1 leaf mutation version or operation could not be encoded")
-    if not yaza_db_write_uint_le_v1(payload, 4, page_id, 8) or not yaza_db_write_uint_le_v1(payload, 12, yaza_db_page_size_v1(), 4): return err("YDBv1 leaf mutation page metadata could not be encoded")
-    if not yaza_db_write_uint_le_v1(payload, 16, 0, 4) or not yaza_db_write_uint_le_v1(payload, 20, 0, 4): return err("YDBv1 leaf mutation reserved fields could not be cleared")
-    let header_size: Number = yaza_db_wal_leaf_mutation_header_size_v1()
-    if not yaza_db_write_bytes_v1(payload, header_size, before_image): return err("YDBv1 leaf mutation before image could not be copied")
-    if not yaza_db_write_bytes_v1(payload, header_size + yaza_db_page_size_v1(), after_image): return err("YDBv1 leaf mutation after image could not be copied")
-    return ok(payload)
+    return yaza_db_wal_leaf_mutation_pack_bytes_v1(format_version, operation, page_id, before_image, after_image)
+
+fn yaza_db_wal_leaf_mutation_payload_encode_trusted_v1(format_version: Number, operation: Number, page_id: Number, record_lsn: Number, before_image: Bytes, after_image: Bytes) -> Result[Bytes, Text]:
+    if format_version != 1 and format_version != 2 and format_version != 3: return err("YDBv1 leaf mutation payload version is unsupported")
+    if format_version == 2 and operation != yaza_db_wal_type_leaf_update_v1(): return err("YDBv1 batched leaf mutation version is reserved for LEAF_UPDATE")
+    if format_version == 3 and operation != yaza_db_wal_type_leaf_insert_v1(): return err("YDBv1 grouped leaf mutation version is reserved for LEAF_INSERT")
+    if operation != yaza_db_wal_type_leaf_insert_v1() and operation != yaza_db_wal_type_leaf_update_v1() and operation != yaza_db_wal_type_leaf_delete_v1(): return err("YDBv1 leaf mutation operation is not INSERT, UPDATE, or DELETE")
+    if page_id < 2 or record_lsn < 1: return err("YDBv1 leaf mutation page ID or WAL LSN is invalid")
+    if bytes_length(before_image) != yaza_db_page_size_v1() or bytes_length(after_image) != yaza_db_page_size_v1(): return err("YDBv1 leaf mutation images must be 16 KiB pages")
+    let before_lsn: Number = yaza_db_read_uint_le_v1(before_image, 0, 8)?
+    let after_lsn: Number = yaza_db_read_uint_le_v1(after_image, 0, 8)?
+    if before_lsn >= record_lsn or after_lsn != record_lsn: return err("YDBv1 leaf mutation page LSNs do not match the WAL record")
+    return yaza_db_wal_leaf_mutation_pack_bytes_v1(format_version, operation, page_id, before_image, after_image)
 
 fn yaza_db_wal_leaf_mutation_payload_encode_v1(operation: Number, page_id: Number, record_lsn: Number, before_image: Bytes, after_image: Bytes) -> Result[Bytes, Text]:
     return yaza_db_wal_leaf_mutation_payload_encode_format_v1(1, operation, page_id, record_lsn, before_image, after_image)

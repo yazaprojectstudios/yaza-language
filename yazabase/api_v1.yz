@@ -12,12 +12,63 @@ use "std/ywt"
 use "std/time"
 use "std/db/yazabase"
 use "std/config/api_config"
+use "./buffer_pool_v1"
 use "./checkpoint_v1"
+use "./group_commit_v1"
+use "./server_v1"
 use "./session_v1"
 use "./sql_binder_v1"
 use "./sql_dispatch_v1"
 use "./sql_executor_v1"
 use "./transaction_v1"
+
+fn yaza_api_response_conflict_json(code: Text, message: Text) -> HttpResponse:
+    let err_json: Text = "{\"error\":{\"code\":\"" + json_escape_text(code) + "\",\"message\":\"" + json_escape_text(message) + "\",\"status\":409}}"
+    return HttpResponse(409, "Conflict", "application/json", bytes_from_text(err_json))
+
+fn yaza_api_effective_node_role_v1() -> Text:
+    let r: Text = text_trim(env_get("YAZABASE_NODE_ROLE"))
+    if r == "replica": return "replica"
+    return "primary"
+
+fn yaza_api_parse_group_commit_items_v1(body_text: Text) -> Result[List[YazaDbGroupCommitItemV1], Text]:
+    let items_res: Result[List[YazaDbGroupCommitItemV1], Text] = list_try_new()
+    let items: List[YazaDbGroupCommitItemV1] = items_res?
+    let trimmed: Text = text_trim(body_text)
+    if trimmed == "": return err("YDBv1 group commit request body is empty")
+    if text_starts_with(trimmed, "{"):
+        let key_pos: Number = json_find_top_level_value_pos(trimmed, "statements")
+        if key_pos < 0 or key_pos >= text_length(trimmed) or text_byte(trimmed, key_pos) != 91:
+            return err("YDBv1 group commit JSON requires {\"statements\": [...]}")
+        let n: Number = text_length(trimmed)
+        var i: Number = key_pos + 1
+        var done: Boolean = false
+        while i < n and not done:
+            set i = json_skip_ws(trimmed, i)
+            if i >= n: return err("YDBv1 group commit JSON array is unterminated")
+            let b: Number = text_byte(trimmed, i)
+            if b == 93:
+                set done = true
+            elif b == 44:
+                set i = i + 1
+            elif b == 34:
+                let str_end: Number = json_scan_string_end(trimmed, i)
+                if str_end < 0: return err("YDBv1 group commit JSON string is unterminated")
+                let unesc: Option[Text] = json_unescape_slice(trimmed, i + 1, str_end)
+                if not option_is_some(unesc): return err("YDBv1 group commit JSON string escape is invalid")
+                let _p: Boolean = list_try_push(items, YazaDbGroupCommitItemV1(option_unwrap(unesc), List[YazaSqlValueV1]()))
+                set i = str_end + 1
+            else:
+                return err("YDBv1 group commit JSON statements array must contain SQL strings")
+        return ok(items)
+    let lines: TextList = text_lines(trimmed)
+    var li: Number = 0
+    while li < list_count(lines):
+        let line: Text = text_trim(list_get(lines, li))
+        if line != "":
+            let _p: Boolean = list_try_push(items, YazaDbGroupCommitItemV1(line, List[YazaSqlValueV1]()))
+        set li = li + 1
+    return ok(items)
 
 shape YazaApiServerStateV1:
     config: ApiServiceConfig
@@ -135,7 +186,7 @@ fn yaza_api_execute_sql(session: YazaDbSessionV1, root_path: Text, db_name: Text
         return YazaApiSqlOutcomeV1(session_stmt.session, some(session_stmt.statement), "")
 
     let err_msg: Text = result_unwrap_error(exec_result)
-    var recovered: YazaDbSessionV1 = YazaDbSessionV1(-1, session.storage, session.wal, none, none, false)
+    var recovered: YazaDbSessionV1 = YazaDbSessionV1(-1, session.storage, session.wal, none, none, none, none, false, none)
     if root_path != "":
         let rec_root_result: Result[Number, Text] = root_open(root_path)
         if result_is_ok(rec_root_result):
@@ -150,6 +201,9 @@ async fn yaza_api_execute_sql_async(session: YazaDbSessionV1, root_path: Text, d
     return yaza_api_execute_sql(session, root_path, db_name, sql)
 
 fn yaza_api_route_request_state(session: YazaDbSessionV1, root_path: Text, db_name: Text, request: HttpRequest, auth_secret: Text, state: YazaApiServerStateV1) -> Result[YazaApiSessionResponseV1, Text]:
+    return yaza_api_route_request_state_with_role_v1(session, root_path, db_name, request, auth_secret, state, yaza_api_effective_node_role_v1())
+
+fn yaza_api_route_request_state_with_role_v1(session: YazaDbSessionV1, root_path: Text, db_name: Text, request: HttpRequest, auth_secret: Text, state: YazaApiServerStateV1, node_role: Text) -> Result[YazaApiSessionResponseV1, Text]:
     # CORS preflight
     if request.method == "OPTIONS":
         return ok(YazaApiSessionResponseV1(session, http_response_no_content()))
@@ -181,6 +235,7 @@ fn yaza_api_route_request_state(session: YazaDbSessionV1, root_path: Text, db_na
         var is_open_val: Number = 0
         if session.is_open: set is_open_val = 1
         let r: ApiResourcesConfig = state.config.resources
+        let bp_stats: YazaDbBufferPoolStatsV1 = yaza_db_session_buffer_pool_stats_v1(session)
 
         if text_find(request.accept, "application/json") >= 0 or request.path == "/api/v1/metrics":
             var m_json: Text = "{"
@@ -190,6 +245,12 @@ fn yaza_api_route_request_state(session: YazaDbSessionV1, root_path: Text, db_na
             set m_json = m_json + "\"arena_used_bytes\":" + number_text(a_used) + ","
             set m_json = m_json + "\"arena_storage_used_bytes\":" + number_text(a_store) + ","
             set m_json = m_json + "\"session_is_open\":" + json_bool(session.is_open) + ","
+            set m_json = m_json + "\"node_role\":\"" + json_escape_text(node_role) + "\","
+            set m_json = m_json + "\"buffer_pool_capacity\":" + number_text(bp_stats.capacity) + ","
+            set m_json = m_json + "\"buffer_pool_entries\":" + number_text(bp_stats.resident_count) + ","
+            set m_json = m_json + "\"buffer_pool_hits\":" + number_text(bp_stats.hits) + ","
+            set m_json = m_json + "\"buffer_pool_misses\":" + number_text(bp_stats.misses) + ","
+            set m_json = m_json + "\"buffer_pool_evictions\":" + number_text(bp_stats.evictions) + ","
             set m_json = m_json + "\"profile\":\"" + json_escape_text(r.profile) + "\","
             set m_json = m_json + "\"arena_mode\":\"" + json_escape_text(r.arena_mode) + "\","
             set m_json = m_json + "\"max_in_flight\":" + number_text(r.max_in_flight) + ","
@@ -206,6 +267,9 @@ fn yaza_api_route_request_state(session: YazaDbSessionV1, root_path: Text, db_na
         set m_txt = m_txt + "# HELP yazabase_arena_used_bytes Primary arena memory used in bytes\n# TYPE yazabase_arena_used_bytes gauge\nyazabase_arena_used_bytes " + number_text(a_used) + "\n"
         set m_txt = m_txt + "# HELP yazabase_arena_storage_used_bytes Storage arena memory used in bytes\n# TYPE yazabase_arena_storage_used_bytes gauge\nyazabase_arena_storage_used_bytes " + number_text(a_store) + "\n"
         set m_txt = m_txt + "# HELP yazabase_session_is_open Database session open status\n# TYPE yazabase_session_is_open gauge\nyazabase_session_is_open " + number_text(is_open_val) + "\n"
+        set m_txt = m_txt + "# HELP yazabase_buffer_pool_hits_total Buffer pool cache hits\n# TYPE yazabase_buffer_pool_hits_total counter\nyazabase_buffer_pool_hits_total " + number_text(bp_stats.hits) + "\n"
+        set m_txt = m_txt + "# HELP yazabase_buffer_pool_misses_total Buffer pool cache misses\n# TYPE yazabase_buffer_pool_misses_total counter\nyazabase_buffer_pool_misses_total " + number_text(bp_stats.misses) + "\n"
+        set m_txt = m_txt + "# HELP yazabase_buffer_pool_evictions_total Buffer pool CLOCK evictions\n# TYPE yazabase_buffer_pool_evictions_total counter\nyazabase_buffer_pool_evictions_total " + number_text(bp_stats.evictions) + "\n"
         set m_txt = m_txt + "# HELP yazabase_profile_info Resource profile information\n# TYPE yazabase_profile_info gauge\nyazabase_profile_info{profile=\"" + r.profile + "\",arena_mode=\"" + r.arena_mode + "\"} 1\n"
         set m_txt = m_txt + "# HELP yazabase_max_in_flight Maximum concurrent requests admitted\n# TYPE yazabase_max_in_flight gauge\nyazabase_max_in_flight " + number_text(r.max_in_flight) + "\n"
         set m_txt = m_txt + "# HELP yazabase_in_flight_requests Current active requests\n# TYPE yazabase_in_flight_requests gauge\nyazabase_in_flight_requests " + number_text(state.in_flight_requests) + "\n"
@@ -314,6 +378,8 @@ fn yaza_api_route_request_state(session: YazaDbSessionV1, root_path: Text, db_na
 
         # 2. DELETE /api/v1/tables/<table_name>/<id> - Delete Record
         if record_id != "" and request.method == "DELETE":
+            if node_role == "replica":
+                return ok(YazaApiSessionResponseV1(session, yaza_api_response_conflict_json("READ_ONLY_REPLICA", "cannot DELETE on a read-only replica node")))
             let del_sql: Text = "DELETE FROM " + table_name + " WHERE id = " + record_id + ";"
             let outcome: YazaApiSqlOutcomeV1 = yaza_api_execute_sql(session, root_path, db_name, del_sql)
             if outcome.error_message != "":
@@ -326,6 +392,8 @@ fn yaza_api_route_request_state(session: YazaDbSessionV1, root_path: Text, db_na
 
         # 3. PUT /api/v1/tables/<table_name>/<id> - Update Record
         if record_id != "" and (request.method == "PUT" or request.method == "PATCH"):
+            if node_role == "replica":
+                return ok(YazaApiSessionResponseV1(session, yaza_api_response_conflict_json("READ_ONLY_REPLICA", "cannot UPDATE on a read-only replica node")))
             var set_clause: Text = ""
             if text_starts_with(request.body_text, "{"):
                 let set_opt: Option[Text] = json_extract_string(request.body_text, "set")
@@ -356,6 +424,8 @@ fn yaza_api_route_request_state(session: YazaDbSessionV1, root_path: Text, db_na
 
         # 5. POST /api/v1/tables/<table_name> - Insert Record
         if record_id == "" and request.method == "POST":
+            if node_role == "replica":
+                return ok(YazaApiSessionResponseV1(session, yaza_api_response_conflict_json("READ_ONLY_REPLICA", "cannot INSERT on a read-only replica node")))
             var insert_sql: Text = ""
             if text_starts_with(request.body_text, "{"):
                 let vals_opt: Option[Text] = json_extract_string(request.body_text, "values")
@@ -395,6 +465,36 @@ fn yaza_api_route_request_state(session: YazaDbSessionV1, root_path: Text, db_na
 
         return ok(YazaApiSessionResponseV1(session, http_response_method_not_allowed("method not supported for table endpoint", true)))
 
+    # Group Commit Batch SQL Endpoint: POST /api/v1/sql/group-commit
+    if request.path == "/api/v1/sql/group-commit":
+        let auth_err: Option[HttpResponse] = yaza_api_verify_auth(request, auth_secret)
+        if option_is_some(auth_err):
+            return ok(YazaApiSessionResponseV1(session, option_unwrap(auth_err)))
+        if request.method != "POST":
+            return ok(YazaApiSessionResponseV1(session, http_response_method_not_allowed("use POST for /api/v1/sql/group-commit", true)))
+        if node_role == "replica":
+            return ok(YazaApiSessionResponseV1(session, yaza_api_response_conflict_json("READ_ONLY_REPLICA", "cannot execute group-commit writes on a read-only replica")))
+        let parsed_items: Result[List[YazaDbGroupCommitItemV1], Text] = yaza_api_parse_group_commit_items_v1(request.body_text)
+        if not result_is_ok(parsed_items):
+            return ok(YazaApiSessionResponseV1(session, http_response_bad_request(result_unwrap_error(parsed_items), true)))
+        let gc_res: Result[YazaDbGroupCommitBatchResultV1, Text] = yaza_db_group_commit_execute_v1(session, result_unwrap(parsed_items))
+        if not result_is_ok(gc_res):
+            return ok(YazaApiSessionResponseV1(session, http_response_internal_error(result_unwrap_error(gc_res), true)))
+        let gc: YazaDbGroupCommitBatchResultV1 = result_unwrap(gc_res)
+        let item_jsons_res: Result[List[Text], Text] = list_try_new()
+        let item_jsons: List[Text] = item_jsons_res?
+        var gi: Number = 0
+        while gi < list_count(gc.results):
+            let gr: YazaDbGroupCommitItemResultV1 = list_get(gc.results, gi)
+            var ij: Text = "{\"index\":" + number_text(gr.index) + ",\"ok\":" + json_bool(gr.ok) + ",\"txn_id\":" + number_text(gr.txn_id) + ",\"commit_ts\":" + number_text(gr.commit_ts) + ",\"affected_rows\":" + number_text(gr.affected_rows)
+            if gr.error_message != "":
+                set ij = ij + ",\"error\":\"" + json_escape_text(gr.error_message) + "\""
+            set ij = ij + "}"
+            let _p: Boolean = list_try_push(item_jsons, ij)
+            set gi = gi + 1
+        let gc_json: Text = "{\"status\":\"ok\",\"committed_count\":" + number_text(gc.committed_count) + ",\"failed_count\":" + number_text(gc.failed_count) + ",\"fsync_count\":" + number_text(gc.fsync_count) + ",\"elapsed_ns\":" + number_text(gc.elapsed_ns) + ",\"results\":" + json_array(item_jsons) + "}"
+        return ok(YazaApiSessionResponseV1(gc.session, http_response_ok_json(gc_json)))
+
     # Raw SQL Execution Endpoint: POST /api/v1/sql
     if request.path == "/api/v1/sql":
         let auth_err: Option[HttpResponse] = yaza_api_verify_auth(request, auth_secret)
@@ -423,6 +523,8 @@ fn yaza_api_route_request_state(session: YazaDbSessionV1, root_path: Text, db_na
 
         if text_length(sql) == 0:
             return ok(YazaApiSessionResponseV1(session, http_response_bad_request("SQL statement must not be empty", as_json)))
+        if node_role == "replica" and yaza_db_server_sql_is_write_v1(sql):
+            return ok(YazaApiSessionResponseV1(session, yaza_api_response_conflict_json("READ_ONLY_REPLICA", "cannot execute write SQL against a read-only replica")))
 
         let outcome: YazaApiSqlOutcomeV1 = yaza_api_execute_sql(session, root_path, db_name, sql)
         if outcome.error_message != "":

@@ -4,6 +4,7 @@
 # to the rightmost child. Scans carry the root descent path, ascend to the next
 # subtree, then descend to its leftmost leaf. This avoids restarting every
 # leaf transition from the root when pages have no sibling links.
+use "./buffer_pool_v1"
 use "./key_codec_v1"
 use "./mvcc_history_v1"
 use "./overflow_storage_v1"
@@ -17,6 +18,7 @@ shape YazaDbBtreeSeekV1:
     page_reads: Number
     leaf_page: Bytes
     leaf_header: YazaDbPageHeaderV1
+    missed_pages: List[YazaDbValidatedPageV1]
 
 shape YazaDbBtreeSeekPathV1:
     leaf_page_id: Number
@@ -24,6 +26,7 @@ shape YazaDbBtreeSeekPathV1:
     leaf_page: Bytes
     leaf_header: YazaDbPageHeaderV1
     parent_path: List[YazaDbBtreePathFrameV1]
+    missed_pages: List[YazaDbValidatedPageV1]
 
 shape YazaDbBtreePathFrameV1:
     page_id: Number
@@ -42,6 +45,7 @@ shape YazaDbBtreeScanResultV1:
     page_reads: Number
     work_units: Number
     aggregate_row: Option[List[YazaSqlValueV1]]
+    missed_pages: List[YazaDbValidatedPageV1]
 
 # Query-local validation caches for a read-only scan under the exclusive lock.
 # Newly visited leaves and descendants are read and CRC-checked; validated
@@ -59,6 +63,7 @@ shape YazaDbBtreePageValidationCacheV1:
     bitmap_words: List[Number]
     bitmap_page_reads: List[Number]
     profile_ns: List[Number]
+    buffer_pool: Option[YazaDbBufferPoolV1]
 
 # Point lookup normally visits only a handful of pages from one allocation
 # range. Keep the already validated BITMAP image for the duration of one seek
@@ -71,6 +76,11 @@ shape YazaDbBtreePointBitmapCacheV1:
 shape YazaDbBtreeSeekPageReadV1:
     validated_page: YazaDbValidatedPageV1
     bitmap_cache: YazaDbBtreePointBitmapCacheV1
+    from_pool: Boolean
+
+shape YazaDbBtreeCacheValidatedReadV1:
+    validated_page: YazaDbValidatedPageV1
+    from_pool: Boolean
 
 fn yaza_db_btree_max_rows_v1() -> Number:
     return 65536
@@ -84,7 +94,7 @@ fn yaza_db_btree_max_seek_depth_v1() -> Number:
 fn yaza_db_btree_max_page_reads_v1() -> Number:
     return 1000000
 
-fn yaza_db_btree_page_validation_cache_new_v1(file: Number, file_header: YazaDbFileHeaderV1, profile_ns: List[Number]) -> Result[YazaDbBtreePageValidationCacheV1, Text]:
+fn yaza_db_btree_page_validation_cache_new_with_pool_v1(file: Number, file_header: YazaDbFileHeaderV1, buffer_pool: Option[YazaDbBufferPoolV1], profile_ns: List[Number]) -> Result[YazaDbBtreePageValidationCacheV1, Text]:
     if file < 0 or bytes_length(file_header.db_uuid) != 16 or file_header.checkpoint_lsn < 0 or file_header.page_count < 2:
         return err("YDBv1 B+Tree validation cache identity is invalid")
     let ignored_file_size: Number = yaza_db_storage_validate_header_capacity_v1(file, file_header)?
@@ -107,7 +117,10 @@ fn yaza_db_btree_page_validation_cache_new_v1(file: Number, file_header: YazaDbF
     while slot_index < bitmap_capacity:
         if not list_try_push(bitmap_page_ids, -1) or not list_try_push(bitmap_banks, -1) or not list_try_push(bitmap_word_starts, -1): return err("YDBv1 B+Tree bitmap cache could not initialize its entries")
         set slot_index = slot_index + 1
-    return ok(YazaDbBtreePageValidationCacheV1(file, file_header.db_uuid, file_header.checkpoint_lsn, file_header.page_count, bitmap_page_ids, bitmap_banks, bitmap_word_starts, bitmap_words, bitmap_page_reads, profile_ns))
+    return ok(YazaDbBtreePageValidationCacheV1(file, file_header.db_uuid, file_header.checkpoint_lsn, file_header.page_count, bitmap_page_ids, bitmap_banks, bitmap_word_starts, bitmap_words, bitmap_page_reads, profile_ns, buffer_pool))
+
+fn yaza_db_btree_page_validation_cache_new_v1(file: Number, file_header: YazaDbFileHeaderV1, profile_ns: List[Number]) -> Result[YazaDbBtreePageValidationCacheV1, Text]:
+    return yaza_db_btree_page_validation_cache_new_with_pool_v1(file, file_header, none, profile_ns)
 
 fn yaza_db_btree_bitmap_cache_capacity_v1() -> Number:
     return 4
@@ -203,7 +216,11 @@ fn yaza_db_btree_point_validate_page_role_v1(cache: YazaDbBtreePointBitmapCacheV
     if not page_allocated: return err("YDBv1 data page is not marked allocated in its BITMAP")
     return ok(next_cache)
 
-fn yaza_db_btree_seek_read_page_v1(file: Number, file_header: YazaDbFileHeaderV1, page_id: Number, bitmap_cache: YazaDbBtreePointBitmapCacheV1, profile_ns: List[Number]) -> Result[YazaDbBtreeSeekPageReadV1, Text]:
+fn yaza_db_btree_seek_read_page_with_pool_v1(file: Number, file_header: YazaDbFileHeaderV1, page_id: Number, bitmap_cache: YazaDbBtreePointBitmapCacheV1, buffer_pool: Option[YazaDbBufferPoolV1], profile_ns: List[Number]) -> Result[YazaDbBtreeSeekPageReadV1, Text]:
+    if page_id >= 2 and page_id < file_header.page_count and option_is_some(buffer_pool):
+        let cached: Option[YazaDbValidatedPageV1] = yaza_db_buffer_pool_get_v1(option_unwrap(buffer_pool), file, file_header.db_uuid, page_id)
+        if option_is_some(cached):
+            return ok(YazaDbBtreeSeekPageReadV1(option_unwrap(cached), bitmap_cache, true))
     var detail_started_ns: Number = 0
     if list_count(profile_ns) >= 22: set detail_started_ns = monotonic_ns()
     let page_offset: Number = yaza_db_storage_page_offset_v1(page_id)?
@@ -217,12 +234,19 @@ fn yaza_db_btree_seek_read_page_v1(file: Number, file_header: YazaDbFileHeaderV1
     if list_count(profile_ns) >= 22: set detail_started_ns = monotonic_ns()
     let next_bitmap_cache: YazaDbBtreePointBitmapCacheV1 = yaza_db_btree_point_validate_page_role_v1(bitmap_cache, file, file_header, page_bytes, page_header)?
     if list_count(profile_ns) >= 22: let ignored_page_role_profile: Number = yaza_db_btree_scan_profile_record_ns_v1(profile_ns, 20, detail_started_ns, monotonic_ns())
-    return ok(YazaDbBtreeSeekPageReadV1(YazaDbValidatedPageV1(page_bytes, page_header), next_bitmap_cache))
+    return ok(YazaDbBtreeSeekPageReadV1(YazaDbValidatedPageV1(page_bytes, page_header), next_bitmap_cache, false))
 
-fn yaza_db_btree_page_validation_cache_read_validated_v1(cache: YazaDbBtreePageValidationCacheV1, file: Number, file_header: YazaDbFileHeaderV1, page_id: Number) -> Result[YazaDbValidatedPageV1, Text]:
+fn yaza_db_btree_seek_read_page_v1(file: Number, file_header: YazaDbFileHeaderV1, page_id: Number, bitmap_cache: YazaDbBtreePointBitmapCacheV1, profile_ns: List[Number]) -> Result[YazaDbBtreeSeekPageReadV1, Text]:
+    return yaza_db_btree_seek_read_page_with_pool_v1(file, file_header, page_id, bitmap_cache, none, profile_ns)
+
+fn yaza_db_btree_page_validation_cache_read_validated_flagged_v1(cache: YazaDbBtreePageValidationCacheV1, file: Number, file_header: YazaDbFileHeaderV1, page_id: Number) -> Result[YazaDbBtreeCacheValidatedReadV1, Text]:
     if cache.file != file or not bytes_equal(cache.db_uuid, file_header.db_uuid) or cache.checkpoint_lsn != file_header.checkpoint_lsn or cache.page_count != file_header.page_count:
         return err("YDBv1 B+Tree validation cache cannot be reused with a different database snapshot")
     if page_id < 2 or page_id >= file_header.page_count: return err("YDBv1 B+Tree validation-cache page is outside the logical database")
+    if option_is_some(cache.buffer_pool):
+        let cached: Option[YazaDbValidatedPageV1] = yaza_db_buffer_pool_get_v1(option_unwrap(cache.buffer_pool), file, file_header.db_uuid, page_id)
+        if option_is_some(cached):
+            return ok(YazaDbBtreeCacheValidatedReadV1(option_unwrap(cached), true))
     let profile_enabled: Boolean = list_count(cache.profile_ns) >= 37
     var stage_started_ns: Number = 0
     if profile_enabled: set stage_started_ns = monotonic_ns()
@@ -233,16 +257,23 @@ fn yaza_db_btree_page_validation_cache_read_validated_v1(cache: YazaDbBtreePageV
     if profile_enabled: set stage_started_ns = yaza_db_btree_scan_profile_record_ns_v1(cache.profile_ns, 35, stage_started_ns, monotonic_ns())
     let ignored_role: Boolean = yaza_db_btree_page_validation_cache_validate_role_v1(cache, file, file_header, page, page_header)?
     if profile_enabled: let ignored_role_profile: Number = yaza_db_btree_scan_profile_record_ns_v1(cache.profile_ns, 36, stage_started_ns, monotonic_ns())
-    return ok(YazaDbValidatedPageV1(page, page_header))
+    return ok(YazaDbBtreeCacheValidatedReadV1(YazaDbValidatedPageV1(page, page_header), false))
+
+fn yaza_db_btree_page_validation_cache_read_validated_v1(cache: YazaDbBtreePageValidationCacheV1, file: Number, file_header: YazaDbFileHeaderV1, page_id: Number) -> Result[YazaDbValidatedPageV1, Text]:
+    let read_res: YazaDbBtreeCacheValidatedReadV1 = yaza_db_btree_page_validation_cache_read_validated_flagged_v1(cache, file, file_header, page_id)?
+    return ok(read_res.validated_page)
 
 fn yaza_db_btree_page_validation_cache_read_v1(cache: YazaDbBtreePageValidationCacheV1, file: Number, file_header: YazaDbFileHeaderV1, page_id: Number) -> Result[Bytes, Text]:
     let validated: YazaDbValidatedPageV1 = yaza_db_btree_page_validation_cache_read_validated_v1(cache, file, file_header, page_id)?
     return ok(validated.page)
 
 fn yaza_db_btree_scan_result_v1(rows: List[YazaDbRowV1], page_reads: Number, work_units: Number) -> YazaDbBtreeScanResultV1:
-    return YazaDbBtreeScanResultV1(rows, page_reads, work_units, none)
+    return YazaDbBtreeScanResultV1(rows, page_reads, work_units, none, List[YazaDbValidatedPageV1]())
 
-fn yaza_db_btree_scan_stream_aggregate_result_v1(rows: List[YazaDbRowV1], page_reads: Number, scan_work_units: Number, input_rows: Number, projection_count: Number, plan: Option[YazaSqlBoundPlanV1], stream_aggregate: Boolean, aggregate_count: Number, integer_sums: List[Number], double_sums: List[Float64], aggregate_values: List[YazaSqlValueV1], aggregate_has_values: List[Boolean], average_compensations: List[Float64], average_counts: List[Number], scalar_sum_active: Boolean, scalar_sum_integer: Number, scalar_sum_double: Float64, scalar_sum_has_value: Boolean) -> Result[YazaDbBtreeScanResultV1, Text]:
+fn yaza_db_btree_scan_result_with_misses_v1(scan: YazaDbBtreeScanResultV1, missed_pages: List[YazaDbValidatedPageV1]) -> YazaDbBtreeScanResultV1:
+    return YazaDbBtreeScanResultV1(scan.rows, scan.page_reads, scan.work_units, scan.aggregate_row, missed_pages)
+
+fn yaza_db_btree_scan_stream_aggregate_result_v1(rows: List[YazaDbRowV1], page_reads: Number, scan_work_units: Number, input_rows: Number, projection_count: Number, plan: Option[YazaSqlBoundPlanV1], stream_aggregate: Boolean, aggregate_count: Number, integer_sums: List[Number], double_sums: List[Float64], aggregate_values: List[YazaSqlValueV1], aggregate_has_values: List[Boolean], average_compensations: List[Float64], average_counts: List[Number], scalar_sum_active: Boolean, scalar_sum_integer: Number, scalar_sum_double: Float64, scalar_sum_has_value: Boolean, scalar_extreme_active: Boolean, scalar_extreme_integer: Number, scalar_extreme_double: Float64, scalar_extreme_has_value: Boolean) -> Result[YazaDbBtreeScanResultV1, Text]:
     if not stream_aggregate: return ok(yaza_db_btree_scan_result_v1(rows, page_reads, scan_work_units))
     if not option_is_some(plan) or input_rows < 0 or input_rows > yaza_db_btree_max_rows_v1() or projection_count < 1:
         return err("SQL executor streaming aggregate work metadata is invalid")
@@ -251,6 +282,16 @@ fn yaza_db_btree_scan_stream_aggregate_result_v1(rows: List[YazaDbRowV1], page_r
             return err("SQL executor scalar SUM state does not match its projection")
         if not list_try_set(integer_sums, 0, scalar_sum_integer) or not list_try_set(double_sums, 0, scalar_sum_double) or not list_try_set(aggregate_has_values, 0, scalar_sum_has_value):
             return err("SQL executor could not publish scalar SUM state")
+    if scalar_extreme_active:
+        if projection_count != 1 or list_count(aggregate_values) != 1 or list_count(aggregate_has_values) != 1:
+            return err("SQL executor scalar MIN/MAX state does not match its projection")
+        if scalar_extreme_has_value:
+            let proj: YazaSqlBoundProjectionV1 = list_get(option_unwrap(plan).projections, 0)
+            let extreme_val: YazaSqlValueV1 = yaza_sql_executor_value_v1(proj.type_id, scalar_extreme_integer, scalar_extreme_double, false, "")
+            if not list_try_set(aggregate_values, 0, extreme_val):
+                return err("SQL executor could not publish scalar MIN/MAX value")
+        if not list_try_set(aggregate_has_values, 0, scalar_extreme_has_value):
+            return err("SQL executor could not publish scalar MIN/MAX null state")
     let projection_work_units: Number = input_rows * projection_count
     if scan_work_units < 0 or scan_work_units > yaza_sql_executor_max_work_units_v1() or projection_work_units > yaza_sql_executor_max_work_units_v1() - scan_work_units:
         return err("SQL executor streaming aggregate exceeds the bounded per-query work budget")
@@ -259,7 +300,7 @@ fn yaza_db_btree_scan_stream_aggregate_result_v1(rows: List[YazaDbRowV1], page_r
         return err("SQL executor streaming aggregate exceeds the bounded per-query work budget")
     let empty_source_row: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
     let aggregate_row: List[YazaSqlValueV1] = yaza_sql_executor_build_aggregate_row_v1(option_unwrap(plan), false, empty_source_row, aggregate_count, integer_sums, double_sums, aggregate_values, aggregate_has_values, average_compensations, average_counts)?
-    return ok(YazaDbBtreeScanResultV1(rows, page_reads, with_projection_work + projection_count, some(aggregate_row)))
+    return ok(YazaDbBtreeScanResultV1(rows, page_reads, with_projection_work + projection_count, some(aggregate_row), List[YazaDbValidatedPageV1]()))
 
 fn yaza_db_btree_fence_bytes_v1(page: Bytes, header: YazaDbPageHeaderV1, is_low: Boolean) -> Result[Bytes, Text]:
     var offset: Number = header.high_fence_offset
@@ -299,7 +340,7 @@ fn yaza_db_btree_child_from_validated_header_v1(page: Bytes, header: YazaDbPageH
     let pointer: Number = yaza_db_read_uint_le_v1(slot.payload, 0, 8)?
     return yaza_db_btree_page_id_from_disk_pointer_v1(pointer, page_count)
 
-fn yaza_db_btree_seek_leaf_internal_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, search_key: Bytes, capture_path: Boolean, profile_ns: List[Number]) -> Result[YazaDbBtreeSeekPathV1, Text]:
+fn yaza_db_btree_seek_leaf_internal_with_pool_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, search_key: Bytes, capture_path: Boolean, buffer_pool: Option[YazaDbBufferPoolV1], profile_ns: List[Number]) -> Result[YazaDbBtreeSeekPathV1, Text]:
     if root_page_id < 2 or root_page_id >= file_header.page_count: return err("YDBv1 B+Tree root page is outside the logical database")
     if bytes_length(search_key) > 2048: return err("YDBv1 B+Tree seek key exceeds 2 KiB")
     var parent_path: List[YazaDbBtreePathFrameV1] = List[YazaDbBtreePathFrameV1]()
@@ -314,10 +355,13 @@ fn yaza_db_btree_seek_leaf_internal_v1(file: Number, file_header: YazaDbFileHead
     var page_reads: Number = 0
     var depth: Number = 0
     var point_bitmap_cache: YazaDbBtreePointBitmapCacheV1 = YazaDbBtreePointBitmapCacheV1(false, -1, bytes_from_text(""))
+    let missed_pages: List[YazaDbValidatedPageV1] = List[YazaDbValidatedPageV1]()
     while depth < yaza_db_btree_max_seek_depth_v1():
-        let page_read: YazaDbBtreeSeekPageReadV1 = yaza_db_btree_seek_read_page_v1(file, file_header, page_id, point_bitmap_cache, profile_ns)?
+        let page_read: YazaDbBtreeSeekPageReadV1 = yaza_db_btree_seek_read_page_with_pool_v1(file, file_header, page_id, point_bitmap_cache, buffer_pool, profile_ns)?
         set point_bitmap_cache = page_read.bitmap_cache
         let validated: YazaDbValidatedPageV1 = page_read.validated_page
+        if option_is_some(buffer_pool) and not page_read.from_pool and list_count(missed_pages) < 512:
+            let _m: Boolean = list_try_push(missed_pages, validated)
         let page: Bytes = validated.page
         set page_reads = page_reads + 1
         if page_reads > yaza_db_btree_max_page_reads_v1(): return err("YDBv1 B+Tree seek exceeded its page-read budget")
@@ -338,7 +382,7 @@ fn yaza_db_btree_seek_leaf_internal_v1(file: Number, file_header: YazaDbFileHead
         if header.page_type == 1:
             if header.level != 0: return err("YDBv1 B+Tree leaf has a non-zero level")
             if list_count(profile_ns) >= 22: let ignored_route_profile: Number = yaza_db_btree_scan_profile_record_ns_v1(profile_ns, 21, route_started_ns, monotonic_ns())
-            return ok(YazaDbBtreeSeekPathV1(page_id, page_reads, page, header, parent_path))
+            return ok(YazaDbBtreeSeekPathV1(page_id, page_reads, page, header, parent_path, missed_pages))
         if header.page_type != 2 or header.level == 0: return err("YDBv1 B+Tree traversal encountered a non-index page")
 
         var child_index: Number = yaza_db_page_lower_bound_validated_header_v1(page, header, search_key)?
@@ -384,6 +428,7 @@ fn yaza_db_btree_seek_leaf_internal_cached_with_root_v1(file: Number, file_heade
     var expected_high: Bytes = bytes_from_text("")
     var page_reads: Number = 0
     var depth: Number = 0
+    let missed_pages: List[YazaDbValidatedPageV1] = List[YazaDbValidatedPageV1]()
     while depth < yaza_db_btree_max_seek_depth_v1():
         var page: Bytes = bytes_from_text("")
         var header: YazaDbPageHeaderV1 = YazaDbPageHeaderV1(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
@@ -393,7 +438,10 @@ fn yaza_db_btree_seek_leaf_internal_cached_with_root_v1(file: Number, file_heade
             set page = root.page
             set header = root.header
         else:
-            let validated_page: YazaDbValidatedPageV1 = yaza_db_btree_page_validation_cache_read_validated_v1(cache, file, file_header, page_id)?
+            let read_flagged: YazaDbBtreeCacheValidatedReadV1 = yaza_db_btree_page_validation_cache_read_validated_flagged_v1(cache, file, file_header, page_id)?
+            let validated_page: YazaDbValidatedPageV1 = read_flagged.validated_page
+            if option_is_some(cache.buffer_pool) and not read_flagged.from_pool and list_count(missed_pages) < 64:
+                let _m: Boolean = list_try_push(missed_pages, validated_page)
             set page = validated_page.page
             set header = validated_page.header
         set page_reads = page_reads + 1
@@ -411,7 +459,7 @@ fn yaza_db_btree_seek_leaf_internal_cached_with_root_v1(file: Number, file_heade
             if yaza_db_compare_bytes_v1(search_key, high_fence) >= 0: return err("YDBv1 B+Tree seek key is at or above the selected page's high fence")
         if header.page_type == 1:
             if header.level != 0: return err("YDBv1 B+Tree leaf has a non-zero level")
-            return ok(YazaDbBtreeSeekPathV1(page_id, page_reads, page, header, parent_path))
+            return ok(YazaDbBtreeSeekPathV1(page_id, page_reads, page, header, parent_path, missed_pages))
         if header.page_type != 2 or header.level == 0: return err("YDBv1 B+Tree traversal encountered a non-index page")
 
         var child_index: Number = yaza_db_page_lower_bound_validated_header_v1(page, header, search_key)?
@@ -446,13 +494,22 @@ fn yaza_db_btree_seek_leaf_internal_cached_with_root_v1(file: Number, file_heade
 fn yaza_db_btree_seek_leaf_internal_cached_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, search_key: Bytes, capture_path: Boolean, cache: YazaDbBtreePageValidationCacheV1) -> Result[YazaDbBtreeSeekPathV1, Text]:
     return yaza_db_btree_seek_leaf_internal_cached_with_root_v1(file, file_header, root_page_id, search_key, capture_path, cache, none)
 
+fn yaza_db_btree_seek_leaf_internal_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, search_key: Bytes, capture_path: Boolean, profile_ns: List[Number]) -> Result[YazaDbBtreeSeekPathV1, Text]:
+    return yaza_db_btree_seek_leaf_internal_with_pool_v1(file, file_header, root_page_id, search_key, capture_path, none, profile_ns)
+
+fn yaza_db_btree_seek_leaf_with_pool_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, search_key: Bytes, buffer_pool: Option[YazaDbBufferPoolV1]) -> Result[YazaDbBtreeSeekV1, Text]:
+    let path: YazaDbBtreeSeekPathV1 = yaza_db_btree_seek_leaf_internal_with_pool_v1(file, file_header, root_page_id, search_key, false, buffer_pool, List[Number]())?
+    return ok(YazaDbBtreeSeekV1(path.leaf_page_id, path.page_reads, path.leaf_page, path.leaf_header, path.missed_pages))
+
+fn yaza_db_btree_seek_leaf_profiled_with_pool_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, search_key: Bytes, buffer_pool: Option[YazaDbBufferPoolV1], profile_ns: List[Number]) -> Result[YazaDbBtreeSeekV1, Text]:
+    let path: YazaDbBtreeSeekPathV1 = yaza_db_btree_seek_leaf_internal_with_pool_v1(file, file_header, root_page_id, search_key, false, buffer_pool, profile_ns)?
+    return ok(YazaDbBtreeSeekV1(path.leaf_page_id, path.page_reads, path.leaf_page, path.leaf_header, path.missed_pages))
+
 fn yaza_db_btree_seek_leaf_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, search_key: Bytes) -> Result[YazaDbBtreeSeekV1, Text]:
-    let path: YazaDbBtreeSeekPathV1 = yaza_db_btree_seek_leaf_internal_v1(file, file_header, root_page_id, search_key, false, List[Number]())?
-    return ok(YazaDbBtreeSeekV1(path.leaf_page_id, path.page_reads, path.leaf_page, path.leaf_header))
+    return yaza_db_btree_seek_leaf_with_pool_v1(file, file_header, root_page_id, search_key, none)
 
 fn yaza_db_btree_seek_leaf_profiled_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, search_key: Bytes, profile_ns: List[Number]) -> Result[YazaDbBtreeSeekV1, Text]:
-    let path: YazaDbBtreeSeekPathV1 = yaza_db_btree_seek_leaf_internal_v1(file, file_header, root_page_id, search_key, false, profile_ns)?
-    return ok(YazaDbBtreeSeekV1(path.leaf_page_id, path.page_reads, path.leaf_page, path.leaf_header))
+    return yaza_db_btree_seek_leaf_profiled_with_pool_v1(file, file_header, root_page_id, search_key, none, profile_ns)
 
 fn yaza_db_btree_seek_leaf_with_path_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, search_key: Bytes) -> Result[YazaDbBtreeSeekPathV1, Text]:
     return yaza_db_btree_seek_leaf_internal_v1(file, file_header, root_page_id, search_key, true, List[Number]())
@@ -463,8 +520,12 @@ fn yaza_db_btree_descend_leftmost_v1(file: Number, file_header: YazaDbFileHeader
     var expected_low: Bytes = first_low
     var expected_high: Bytes = first_high
     var page_reads: Number = prior_page_reads
+    let missed_pages: List[YazaDbValidatedPageV1] = List[YazaDbValidatedPageV1]()
     while expected_level >= 0:
-        let validated_page: YazaDbValidatedPageV1 = yaza_db_btree_page_validation_cache_read_validated_v1(cache, file, file_header, page_id)?
+        let read_flagged: YazaDbBtreeCacheValidatedReadV1 = yaza_db_btree_page_validation_cache_read_validated_flagged_v1(cache, file, file_header, page_id)?
+        let validated_page: YazaDbValidatedPageV1 = read_flagged.validated_page
+        if option_is_some(cache.buffer_pool) and not read_flagged.from_pool and list_count(missed_pages) < 64:
+            let _m: Boolean = list_try_push(missed_pages, validated_page)
         let page: Bytes = validated_page.page
         set page_reads = page_reads + 1
         if page_reads > yaza_db_btree_max_page_reads_v1(): return err("YDBv1 B+Tree cursor exceeded its page-read budget")
@@ -475,7 +536,7 @@ fn yaza_db_btree_descend_leftmost_v1(file: Number, file_header: YazaDbFileHeader
         if not low_matches or not high_matches: return err("YDBv1 B+Tree cursor child fences do not match their parent range")
         if header.page_type == 1:
             if expected_level != 0: return err("YDBv1 B+Tree cursor leaf has a non-zero level")
-            let path: YazaDbBtreeSeekPathV1 = YazaDbBtreeSeekPathV1(page_id, page_reads, page, header, parent_path)
+            let path: YazaDbBtreeSeekPathV1 = YazaDbBtreeSeekPathV1(page_id, page_reads, page, header, parent_path, missed_pages)
             return ok(YazaDbBtreeNextLeafV1(path, true, page_reads - prior_page_reads))
         if header.page_type != 2 or expected_level == 0: return err("YDBv1 B+Tree cursor encountered an invalid INNER page")
         var first_child_high: Bytes = bytes_from_text("")
@@ -591,7 +652,28 @@ fn yaza_db_btree_eval_pure_integer_key_predicate_v1(plan: YazaSqlBoundPlanV1, pr
         return yaza_sql_executor_apply_comparison_v1(cmp, node.operator)
     return false
 
-fn yaza_db_btree_read_rows_internal_filtered_profiled_v1(root: Number, db_uuid: Bytes, log_end_lsn: Number, file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, columns: List[YazaSqlColumnSchemaV1], schema_version: Number, key_ordinals: List[Number], visible_ts: Number, row_limit: Number, stop_at_row_limit: Boolean, own_txn_id: Number, transactions: List[YazaDbTxnStatusV1], use_history: Boolean, has_start_after: Boolean, start_after_key: Bytes, has_end_key: Boolean, end_key: Bytes, end_key_inclusive: Boolean, filter_plan: Option[YazaSqlBoundPlanV1], filter_prepared: List[YazaSqlValueV1], filter_subqueries: List[YazaSqlSubqueryValuesV1], profile_ns: List[Number], stream_aggregate: Boolean) -> Result[YazaDbBtreeScanResultV1, Text]:
+fn yaza_db_btree_read_signed_le_unchecked_v1(page: Bytes, offset: Number, width: Number) -> Number:
+    let b0: Number = bytes_get(page, offset)
+    let b1: Number = bytes_get(page, offset + 1)
+    if width == 2:
+        var v2: Number = b0 + b1 * 256
+        if b1 >= 128: set v2 = v2 - 65536
+        return v2
+    let b2: Number = bytes_get(page, offset + 2)
+    let b3: Number = bytes_get(page, offset + 3)
+    if width == 4:
+        var v4: Number = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+        if b3 >= 128: set v4 = v4 - 4294967296
+        return v4
+    let b4: Number = bytes_get(page, offset + 4)
+    let b5: Number = bytes_get(page, offset + 5)
+    let b6: Number = bytes_get(page, offset + 6)
+    let b7: Number = bytes_get(page, offset + 7)
+    if b7 < 128:
+        return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216 + b4 * 4294967296 + b5 * 1099511627776 + b6 * 281474976710656 + b7 * 72057594037927936
+    return -1 - ((255 - b0) + (255 - b1) * 256 + (255 - b2) * 65536 + (255 - b3) * 16777216 + (255 - b4) * 4294967296 + (255 - b5) * 1099511627776 + (255 - b6) * 281474976710656 + (255 - b7) * 72057594037927936)
+
+fn yaza_db_btree_read_rows_internal_filtered_with_pool_profiled_v1(root: Number, db_uuid: Bytes, log_end_lsn: Number, file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, columns: List[YazaSqlColumnSchemaV1], schema_version: Number, key_ordinals: List[Number], visible_ts: Number, row_limit: Number, stop_at_row_limit: Boolean, own_txn_id: Number, transactions: List[YazaDbTxnStatusV1], use_history: Boolean, has_start_after: Boolean, start_after_key: Bytes, has_end_key: Boolean, end_key: Bytes, end_key_inclusive: Boolean, filter_plan: Option[YazaSqlBoundPlanV1], filter_prepared: List[YazaSqlValueV1], filter_subqueries: List[YazaSqlSubqueryValuesV1], buffer_pool: Option[YazaDbBufferPoolV1], profile_ns: List[Number], stream_aggregate: Boolean) -> Result[YazaDbBtreeScanResultV1, Text]:
     let column_count: Number = list_count(columns)
     if visible_ts < 1 or row_limit < 0 or row_limit > yaza_db_btree_max_rows_v1(): return err("YDBv1 B+Tree scan bounds are invalid")
     if column_count < 1 or column_count > 1024: return err("YDBv1 B+Tree scan schema is outside its bound")
@@ -621,6 +703,13 @@ fn yaza_db_btree_read_rows_internal_filtered_profiled_v1(root: Number, db_uuid: 
     var stream_scalar_sum_integer: Number = 0
     var stream_scalar_sum_double: Float64 = 0.0
     var stream_scalar_sum_has_value: Boolean = false
+    var stream_scalar_extreme_active: Boolean = false
+    var stream_scalar_extreme_kind: Number = 0
+    var stream_scalar_extreme_column_ordinal: Number = -1
+    var stream_scalar_extreme_is_double: Boolean = false
+    var stream_scalar_extreme_integer: Number = 0
+    var stream_scalar_extreme_double: Float64 = 0.0
+    var stream_scalar_extreme_has_value: Boolean = false
     if stream_aggregate and not option_is_some(filter_plan): return err("SQL executor streaming aggregate requires a validated bound plan")
     if option_is_some(filter_plan):
         let verified_filter: YazaSqlBoundPlanV1 = option_unwrap(filter_plan)
@@ -647,6 +736,11 @@ fn yaza_db_btree_read_rows_internal_filtered_profiled_v1(root: Number, db_uuid: 
                     set stream_scalar_sum_active = true
                     set stream_scalar_sum_column_ordinal = only_projection.column_ordinal
                     set stream_scalar_sum_is_double = only_projection.type_id == 6
+                elif (only_projection.aggregate_kind == 3 or only_projection.aggregate_kind == 4) and (only_projection.type_id == 2 or only_projection.type_id == 3 or only_projection.type_id == 4 or only_projection.type_id == 6):
+                    set stream_scalar_extreme_active = true
+                    set stream_scalar_extreme_kind = only_projection.aggregate_kind
+                    set stream_scalar_extreme_column_ordinal = only_projection.column_ordinal
+                    set stream_scalar_extreme_is_double = only_projection.type_id == 6
             var stream_key_index: Number = 0
             while stream_key_index < list_count(key_ordinals):
                 let stream_key_ordinal: Number = list_get(key_ordinals, stream_key_index)
@@ -688,7 +782,8 @@ fn yaza_db_btree_read_rows_internal_filtered_profiled_v1(root: Number, db_uuid: 
     let rows_result: Result[List[YazaDbRowV1], Text] = list_try_new()
     if not result_is_ok(rows_result): return err(result_unwrap_error(rows_result))
     let rows: List[YazaDbRowV1] = result_unwrap(rows_result)
-    if row_limit == 0: return ok(YazaDbBtreeScanResultV1(rows, 0, 0, none))
+    let empty_misses: List[YazaDbValidatedPageV1] = List[YazaDbValidatedPageV1]()
+    if row_limit == 0: return ok(YazaDbBtreeScanResultV1(rows, 0, 0, none, empty_misses))
     if not yaza_db_row_schema_valid_v1(columns): return err("YDBv1 B+Tree scan received an invalid row schema")
     var single_integer_key_ordinal: Number = -1
     var integer_key_filter_node: Number = -1
@@ -718,7 +813,7 @@ fn yaza_db_btree_read_rows_internal_filtered_profiled_v1(root: Number, db_uuid: 
         var aggregate_matches_primary_key: Boolean = false
         if fast_projection.aggregate_kind == 1 and (fast_projection.column_ordinal == -1 or fast_projection.column_ordinal == single_integer_key_ordinal):
             set aggregate_matches_primary_key = true
-        elif fast_projection.aggregate_kind == 2 and fast_projection.column_ordinal == single_integer_key_ordinal and fast_projection.type_id == key_type:
+        elif (fast_projection.aggregate_kind == 2 or fast_projection.aggregate_kind == 3 or fast_projection.aggregate_kind == 4) and fast_projection.column_ordinal == single_integer_key_ordinal and fast_projection.type_id == key_type:
             set aggregate_matches_primary_key = true
         var predicate_matches_primary_key: Boolean = true
         if has_filter:
@@ -787,9 +882,13 @@ fn yaza_db_btree_read_rows_internal_filtered_profiled_v1(root: Number, db_uuid: 
     let scan_profile_enabled: Boolean = list_count(profile_ns) >= 14
     var scan_stage_started_ns: Number = 0
     if scan_profile_enabled: set scan_stage_started_ns = monotonic_ns()
-    let cache: YazaDbBtreePageValidationCacheV1 = yaza_db_btree_page_validation_cache_new_v1(file, file_header, profile_ns)?
+    let cache: YazaDbBtreePageValidationCacheV1 = yaza_db_btree_page_validation_cache_new_with_pool_v1(file, file_header, buffer_pool, profile_ns)?
 
-    let root_validated: YazaDbValidatedPageV1 = yaza_db_btree_page_validation_cache_read_validated_v1(cache, file, file_header, root_page_id)?
+    let scan_missed_pages: List[YazaDbValidatedPageV1] = List[YazaDbValidatedPageV1]()
+    let root_read: YazaDbBtreeCacheValidatedReadV1 = yaza_db_btree_page_validation_cache_read_validated_flagged_v1(cache, file, file_header, root_page_id)?
+    let root_validated: YazaDbValidatedPageV1 = root_read.validated_page
+    if option_is_some(buffer_pool) and not root_read.from_pool and list_count(scan_missed_pages) < 512:
+        let _mr: Boolean = list_try_push(scan_missed_pages, root_validated)
     let root_page: Bytes = root_validated.page
     let root_header: YazaDbPageHeaderV1 = root_validated.header
     var first_key: Bytes = bytes_from_text("")
@@ -798,6 +897,11 @@ fn yaza_db_btree_read_rows_internal_filtered_profiled_v1(root: Number, db_uuid: 
     elif root_header.low_fence_len > 0:
         set first_key = yaza_db_btree_fence_bytes_v1(root_page, root_header, true)?
     var cursor: YazaDbBtreeSeekPathV1 = yaza_db_btree_seek_leaf_internal_cached_with_root_v1(file, file_header, root_page_id, first_key, true, cache, some(root_validated))?
+    if option_is_some(buffer_pool):
+        var mci: Number = 0
+        while mci < list_count(cursor.missed_pages) and list_count(scan_missed_pages) < 512:
+            let _mc: Boolean = list_try_push(scan_missed_pages, list_get(cursor.missed_pages, mci))
+            set mci = mci + 1
     if scan_profile_enabled: set scan_stage_started_ns = yaza_db_btree_scan_profile_record_ns_v1(profile_ns, 7, scan_stage_started_ns, monotonic_ns())
     var total_page_reads: Number = cursor.page_reads
     var pages_scanned: Number = 0
@@ -813,6 +917,79 @@ fn yaza_db_btree_read_rows_internal_filtered_profiled_v1(root: Number, db_uuid: 
     var filter_work_units: Number = 0
     var scan_variable_bytes: Number = 0
     var passed_start_after: Boolean = not has_start_after
+    var direct_where_root: Number = -1
+    var direct_projection_count: Number = 0
+    var direct_count_star_ok: Boolean = false
+    if has_filter:
+        let df_plan: YazaSqlBoundPlanV1 = option_unwrap(filter_plan)
+        set direct_where_root = df_plan.where_root
+        set direct_projection_count = list_count(df_plan.projections)
+        if direct_projection_count == 1:
+            let dp0: YazaSqlBoundProjectionV1 = list_get(df_plan.projections, 0)
+            if dp0.aggregate_kind == 1 and dp0.column_ordinal == -1:
+                set direct_count_star_ok = true
+    var direct_where_supported: Boolean = (not has_filter) or (direct_where_root < 0) or (is_pure_integer_key_filter and single_integer_key_ordinal >= 0)
+    var direct_mode: Number = 0
+    var direct_target_ordinal: Number = -1
+    if stream_aggregate and not use_history and not stream_aggregate_needs_text and direct_where_supported and direct_projection_count == 1:
+        if stream_count_only and direct_count_star_ok:
+            set direct_mode = 1
+        elif stream_scalar_sum_active:
+            set direct_mode = 2
+            set direct_target_ordinal = stream_scalar_sum_column_ordinal
+        elif stream_scalar_extreme_active:
+            set direct_mode = 3
+            set direct_target_ordinal = stream_scalar_extreme_column_ordinal
+    let direct_null_bytes: Number = (column_count + 7) / 8
+    var direct_expected_fixed_len: Number = 0
+    var direct_variable_count: Number = 0
+    var direct_target_offset: Number = -1
+    var direct_target_width: Number = 0
+    var direct_target_null_byte_off: Number = 0
+    var direct_target_null_mask: Number = 1
+    var direct_pk_offset: Number = -1
+    var direct_pk_width: Number = 0
+    var direct_pk_null_byte_off: Number = 0
+    var direct_pk_null_mask: Number = 1
+    if direct_mode > 0:
+        var col_i: Number = 0
+        while col_i < column_count:
+            let col_s: YazaSqlColumnSchemaV1 = list_get(columns, col_i)
+            let col_w: Number = yaza_db_row_fixed_width_v1(col_s.type_id)
+            if col_w < 0: set direct_mode = 0
+            if col_i == direct_target_ordinal:
+                if col_s.type_id != 2 and col_s.type_id != 3 and col_s.type_id != 4 and col_s.type_id != 6:
+                    set direct_mode = 0
+                else:
+                    set direct_target_offset = 24 + direct_null_bytes + direct_expected_fixed_len
+                    set direct_target_width = col_w
+                    set direct_target_null_byte_off = 24 + col_i / 8
+                    set direct_target_null_mask = yaza_db_row_bit_mask_v1(col_i % 8)
+            if single_integer_key_ordinal >= 0 and col_i == single_integer_key_ordinal:
+                if col_s.type_id != 2 and col_s.type_id != 3 and col_s.type_id != 4:
+                    set direct_mode = 0
+                else:
+                    set direct_pk_offset = 24 + direct_null_bytes + direct_expected_fixed_len
+                    set direct_pk_width = col_w
+                    set direct_pk_null_byte_off = 24 + col_i / 8
+                    set direct_pk_null_mask = yaza_db_row_bit_mask_v1(col_i % 8)
+            if col_w > 0: set direct_expected_fixed_len = direct_expected_fixed_len + col_w
+            else: set direct_variable_count = direct_variable_count + 1
+            set col_i = col_i + 1
+        if (direct_mode == 2 or direct_mode == 3) and direct_target_offset < 0: set direct_mode = 0
+        if has_filter and direct_where_root >= 0 and direct_pk_offset < 0: set direct_mode = 0
+    let direct_var_table_start: Number = 24 + direct_null_bytes + direct_expected_fixed_len
+    let direct_var_data_start: Number = direct_var_table_start + direct_variable_count * 2
+    var direct_expected_schema_tag: Number = 0
+    if schema_version > 1: set direct_expected_schema_tag = 32768 + schema_version
+    let direct_has_unused_null_bits: Boolean = column_count % 8 != 0
+    let direct_last_null_byte_off: Number = 24 + direct_null_bytes - 1
+    let direct_allowed_null_mask: Number = yaza_db_row_bit_mask_v1(column_count % 8) - 1
+    let direct_max_input_rows: Number = yaza_db_btree_max_rows_v1()
+    let direct_max_input_cells: Number = yaza_sql_executor_max_input_cells_v1()
+    let direct_max_text_val_bytes: Number = yaza_sql_executor_max_text_value_bytes_v1()
+    let direct_max_input_text_bytes: Number = yaza_sql_executor_max_input_text_bytes_v1()
+    let direct_max_work_units: Number = yaza_sql_executor_max_work_units_v1()
 
     while true:
         if pages_scanned >= yaza_db_btree_max_pages_v1() or pages_scanned >= file_header.page_count - 2: return err("YDBv1 B+Tree scan exceeded its page-visit budget")
@@ -826,6 +1003,146 @@ fn yaza_db_btree_read_rows_internal_filtered_profiled_v1(root: Number, db_uuid: 
         let high_fence: Bytes = yaza_db_btree_fence_bytes_v1(page, header, false)?
         if scan_profile_enabled: set scan_stage_started_ns = yaza_db_btree_scan_profile_record_ns_v1(profile_ns, 7, scan_stage_started_ns, monotonic_ns())
         var slot_index: Number = 0
+        if direct_mode > 0 and header.count > 0 and passed_start_after:
+            var direct_leaf_ok: Boolean = true
+            if has_end_key:
+                if header.high_fence_len == 0:
+                    set direct_leaf_ok = false
+                else:
+                    let end_fence_cmp: Number = yaza_db_compare_bytes_v1(high_fence, end_key)
+                    if end_fence_cmp > 0 or (end_fence_cmp == 0 and not end_key_inclusive):
+                        set direct_leaf_ok = false
+            var leaf_last_key: Bytes = empty_scan_key
+            if direct_leaf_ok:
+                let first_span: YazaDbPageSlotSpanV1 = yaza_db_page_slot_span_from_validated_header_v1(page, header, 0)?
+                if header.low_fence_len > 0:
+                    let lo_cmp: Number = yaza_db_page_slot_span_compare_key_v1(page, header, first_span, low_fence)?
+                    if lo_cmp < 0: return err("YDBv1 B+Tree leaf key is below its low fence")
+                if has_last_key:
+                    let prev_cmp: Number = yaza_db_page_slot_span_compare_key_v1(page, header, first_span, last_key)?
+                    if prev_cmp <= 0: return err("YDBv1 B+Tree scan keys are not globally increasing")
+                if header.count == 1:
+                    set leaf_last_key = yaza_db_page_slot_key_from_validated_span_v1(page, header, first_span)?
+                else:
+                    let last_span: YazaDbPageSlotSpanV1 = yaza_db_page_slot_span_from_validated_header_v1(page, header, header.count - 1)?
+                    set leaf_last_key = yaza_db_page_slot_key_from_validated_span_v1(page, header, last_span)?
+                if header.high_fence_len > 0:
+                    if yaza_db_compare_bytes_v1(leaf_last_key, high_fence) >= 0: return err("YDBv1 B+Tree leaf key is at or above its high fence")
+            while direct_leaf_ok and slot_index < header.count:
+                let desc: Number = 48 + slot_index * 12
+                let s_off: Number = bytes_get(page, desc) + bytes_get(page, desc + 1) * 256
+                let k_len: Number = bytes_get(page, desc + 2) + bytes_get(page, desc + 3) * 256
+                let pay_len: Number = bytes_get(page, desc + 4) + bytes_get(page, desc + 5) * 256
+                let pay_off: Number = s_off + k_len
+                if pay_len < direct_var_data_start:
+                    set direct_leaf_ok = false
+                else:
+                    let infomask: Number = bytes_get(page, pay_off + 16) + bytes_get(page, pay_off + 17) * 256
+                    let stored_count: Number = bytes_get(page, pay_off + 18) + bytes_get(page, pay_off + 19) * 256
+                    let stored_fixed_len: Number = bytes_get(page, pay_off + 20) + bytes_get(page, pay_off + 21) * 256
+                    let schema_tag: Number = bytes_get(page, pay_off + 22) + bytes_get(page, pay_off + 23) * 256
+                    let ver_b7: Number = bytes_get(page, pay_off + 7)
+                    if (infomask != 0 and infomask != 4) or stored_count != column_count or stored_fixed_len != direct_expected_fixed_len or schema_tag != direct_expected_schema_tag or ver_b7 >= 128:
+                        set direct_leaf_ok = false
+                    else:
+                        let ver_ts: Number = bytes_get(page, pay_off) + bytes_get(page, pay_off + 1) * 256 + bytes_get(page, pay_off + 2) * 65536 + bytes_get(page, pay_off + 3) * 16777216 + bytes_get(page, pay_off + 4) * 4294967296 + bytes_get(page, pay_off + 5) * 1099511627776 + bytes_get(page, pay_off + 6) * 281474976710656 + ver_b7 * 72057594037927936
+                        if ver_ts > visible_ts:
+                            set direct_leaf_ok = false
+                        elif infomask == 4 and direct_has_unused_null_bits:
+                            if bytes_get(page, pay_off + direct_last_null_byte_off) > direct_allowed_null_mask:
+                                set direct_leaf_ok = false
+                if direct_leaf_ok and direct_variable_count > 0 and pay_len >= direct_var_data_start + 28:
+                    var vi: Number = 0
+                    while direct_leaf_ok and vi < direct_variable_count:
+                        let ve_off: Number = pay_off + direct_var_table_start + vi * 2
+                        let vs_off: Number = bytes_get(page, ve_off) + bytes_get(page, ve_off + 1) * 256
+                        if vs_off > 0:
+                            if vs_off > pay_len - 4:
+                                set direct_leaf_ok = false
+                            elif bytes_get(page, pay_off + vs_off) == 255 and bytes_get(page, pay_off + vs_off + 1) == 255 and bytes_get(page, pay_off + vs_off + 2) == 255 and bytes_get(page, pay_off + vs_off + 3) == 255:
+                                set direct_leaf_ok = false
+                        set vi = vi + 1
+                if direct_leaf_ok:
+                    var pred_match: Boolean = true
+                    var next_input_rows: Number = filter_input_rows
+                    var next_input_cells: Number = filter_input_cells
+                    var next_text_bytes: Number = filter_input_text_bytes
+                    var next_work_units: Number = filter_work_units
+                    if has_filter:
+                        if filter_input_rows >= direct_max_input_rows: return err("SQL executor in-memory profile is limited to 65536 input rows")
+                        set next_input_rows = filter_input_rows + 1
+                        set next_input_cells = filter_input_cells + column_count
+                        if next_input_cells > direct_max_input_cells: return err("SQL executor exceeds the bounded input-cell budget")
+                        if direct_variable_count > 0:
+                            let row_inline_text: Number = pay_len - direct_var_data_start
+                            if row_inline_text > direct_max_text_val_bytes or row_inline_text > direct_max_input_text_bytes - next_text_bytes:
+                                set direct_leaf_ok = false
+                            else:
+                                set next_text_bytes = next_text_bytes + row_inline_text
+                        set next_work_units = next_input_cells + next_input_rows * (where_expression_count + 1) + next_input_rows * subquery_values_per_row + next_input_rows * where_text_filter_count * (2 * filter_max_text_bytes + 1)
+                        if next_work_units > direct_max_work_units: return err("SQL executor exceeds the bounded per-query work budget")
+                        if direct_leaf_ok and direct_where_root >= 0:
+                            let pk_is_null: Boolean = (bytes_get(page, pay_off + 16) == 4) and ((bytes_get(page, pay_off + direct_pk_null_byte_off) / direct_pk_null_mask) % 2 != 0)
+                            if pk_is_null:
+                                set direct_leaf_ok = false
+                            else:
+                                let pk_val: Number = yaza_db_btree_read_signed_le_unchecked_v1(page, pay_off + direct_pk_offset, direct_pk_width)
+                                set pred_match = yaza_db_btree_eval_pure_integer_key_predicate_v1(option_unwrap(filter_plan), filter_prepared, pk_val, direct_where_root)
+                    if direct_leaf_ok:
+                        set filter_input_rows = next_input_rows
+                        set filter_input_cells = next_input_cells
+                        set filter_input_text_bytes = next_text_bytes
+                        set filter_work_units = next_work_units
+                        if pred_match:
+                            if filter_input_rows > row_limit: return err("SQL executor streaming aggregate exceeded its input row limit")
+                            if stream_aggregate_count >= direct_max_input_rows: return err("SQL executor streaming aggregate exceeds the 65536-row input bound")
+                            if direct_mode == 1:
+                                set stream_aggregate_count = stream_aggregate_count + 1
+                            elif direct_mode == 2:
+                                set stream_aggregate_count = stream_aggregate_count + 1
+                                var col_is_null: Boolean = false
+                                if bytes_get(page, pay_off + 16) == 4:
+                                    set col_is_null = (bytes_get(page, pay_off + direct_target_null_byte_off) / direct_target_null_mask) % 2 != 0
+                                if not col_is_null:
+                                    if stream_scalar_sum_is_double:
+                                        let fbits: Number = yaza_db_btree_read_signed_le_unchecked_v1(page, pay_off + direct_target_offset, 8)
+                                        set stream_scalar_sum_double = stream_scalar_sum_double + float64_from_bits(fbits)
+                                    else:
+                                        let iv: Number = yaza_db_btree_read_signed_le_unchecked_v1(page, pay_off + direct_target_offset, direct_target_width)
+                                        let sum_max: Number = 9223372036854775807
+                                        let sum_min: Number = -9223372036854775807 - 1
+                                        if iv > 0 and stream_scalar_sum_integer > sum_max - iv: return err("SQL executor SUM overflowed signed BIGINT result")
+                                        if iv < 0 and stream_scalar_sum_integer < sum_min - iv: return err("SQL executor SUM underflowed signed BIGINT result")
+                                        set stream_scalar_sum_integer = stream_scalar_sum_integer + iv
+                                    set stream_scalar_sum_has_value = true
+                            else:
+                                set stream_aggregate_count = stream_aggregate_count + 1
+                                var col_is_null: Boolean = false
+                                if bytes_get(page, pay_off + 16) == 4:
+                                    set col_is_null = (bytes_get(page, pay_off + direct_target_null_byte_off) / direct_target_null_mask) % 2 != 0
+                                if not col_is_null:
+                                    if stream_scalar_extreme_is_double:
+                                        let fv: Float64 = float64_from_bits(yaza_db_btree_read_signed_le_unchecked_v1(page, pay_off + direct_target_offset, 8))
+                                        if not stream_scalar_extreme_has_value:
+                                            set stream_scalar_extreme_double = fv
+                                            set stream_scalar_extreme_has_value = true
+                                        elif stream_scalar_extreme_kind == 3 and fv < stream_scalar_extreme_double:
+                                            set stream_scalar_extreme_double = fv
+                                        elif stream_scalar_extreme_kind == 4 and fv > stream_scalar_extreme_double:
+                                            set stream_scalar_extreme_double = fv
+                                    else:
+                                        let iv: Number = yaza_db_btree_read_signed_le_unchecked_v1(page, pay_off + direct_target_offset, direct_target_width)
+                                        if not stream_scalar_extreme_has_value:
+                                            set stream_scalar_extreme_integer = iv
+                                            set stream_scalar_extreme_has_value = true
+                                        elif stream_scalar_extreme_kind == 3 and iv < stream_scalar_extreme_integer:
+                                            set stream_scalar_extreme_integer = iv
+                                        elif stream_scalar_extreme_kind == 4 and iv > stream_scalar_extreme_integer:
+                                            set stream_scalar_extreme_integer = iv
+                        set slot_index = slot_index + 1
+            if direct_leaf_ok and slot_index == header.count:
+                set has_last_key = true
+                set last_key = leaf_last_key
         while slot_index < header.count:
             if scan_profile_enabled: set scan_stage_started_ns = monotonic_ns()
             let slot_span: YazaDbPageSlotSpanV1 = yaza_db_page_slot_span_from_validated_header_v1(page, header, slot_index)?
@@ -848,8 +1165,8 @@ fn yaza_db_btree_read_rows_internal_filtered_profiled_v1(root: Number, db_uuid: 
             if has_end_key:
                 let end_comparison: Number = yaza_db_page_slot_span_compare_key_v1(page, header, slot_span, end_key)?
                 if (end_key_inclusive and end_comparison > 0) or (not end_key_inclusive and end_comparison >= 0):
-                    let completed_range: YazaDbBtreeScanResultV1 = yaza_db_btree_scan_stream_aggregate_result_v1(rows, total_page_reads, filter_work_units, filter_input_rows, stream_projection_count, filter_plan, stream_aggregate, stream_aggregate_count, stream_integer_sums, stream_double_sums, stream_aggregate_values, stream_aggregate_has_values, stream_average_compensations, stream_average_counts, stream_scalar_sum_active, stream_scalar_sum_integer, stream_scalar_sum_double, stream_scalar_sum_has_value)?
-                    return ok(completed_range)
+                    let completed_range: YazaDbBtreeScanResultV1 = yaza_db_btree_scan_stream_aggregate_result_v1(rows, total_page_reads, filter_work_units, filter_input_rows, stream_projection_count, filter_plan, stream_aggregate, stream_aggregate_count, stream_integer_sums, stream_double_sums, stream_aggregate_values, stream_aggregate_has_values, stream_average_compensations, stream_average_counts, stream_scalar_sum_active, stream_scalar_sum_integer, stream_scalar_sum_double, stream_scalar_sum_has_value, stream_scalar_extreme_active, stream_scalar_extreme_integer, stream_scalar_extreme_double, stream_scalar_extreme_has_value)?
+                    return ok(yaza_db_btree_scan_result_with_misses_v1(completed_range, scan_missed_pages))
             if not passed_start_after:
                 let start_key_order: Number = yaza_db_page_slot_span_compare_key_v1(page, header, slot_span, start_after_key)?
                 if start_key_order <= 0:
@@ -1003,6 +1320,35 @@ fn yaza_db_btree_read_rows_internal_filtered_profiled_v1(root: Number, db_uuid: 
                                     if value.integer_value < 0 and stream_scalar_sum_integer < minimum - value.integer_value: return err("SQL executor SUM underflowed signed BIGINT result")
                                     set stream_scalar_sum_integer = stream_scalar_sum_integer + value.integer_value
                                 set stream_scalar_sum_has_value = true
+                    elif stream_scalar_extreme_active:
+                        set stream_aggregate_count = stream_aggregate_count + 1
+                        if stream_primary_integer_aggregate_fastpath:
+                            if not stream_scalar_extreme_has_value:
+                                set stream_scalar_extreme_integer = scan_primary_key_integer
+                                set stream_scalar_extreme_has_value = true
+                            elif stream_scalar_extreme_kind == 3 and scan_primary_key_integer < stream_scalar_extreme_integer:
+                                set stream_scalar_extreme_integer = scan_primary_key_integer
+                            elif stream_scalar_extreme_kind == 4 and scan_primary_key_integer > stream_scalar_extreme_integer:
+                                set stream_scalar_extreme_integer = scan_primary_key_integer
+                        else:
+                            let value: YazaSqlValueV1 = list_get(row.values, stream_scalar_extreme_column_ordinal)
+                            if not value.is_null:
+                                if stream_scalar_extreme_is_double:
+                                    if not stream_scalar_extreme_has_value:
+                                        set stream_scalar_extreme_double = value.float_value
+                                        set stream_scalar_extreme_has_value = true
+                                    elif stream_scalar_extreme_kind == 3 and value.float_value < stream_scalar_extreme_double:
+                                        set stream_scalar_extreme_double = value.float_value
+                                    elif stream_scalar_extreme_kind == 4 and value.float_value > stream_scalar_extreme_double:
+                                        set stream_scalar_extreme_double = value.float_value
+                                else:
+                                    if not stream_scalar_extreme_has_value:
+                                        set stream_scalar_extreme_integer = value.integer_value
+                                        set stream_scalar_extreme_has_value = true
+                                    elif stream_scalar_extreme_kind == 3 and value.integer_value < stream_scalar_extreme_integer:
+                                        set stream_scalar_extreme_integer = value.integer_value
+                                    elif stream_scalar_extreme_kind == 4 and value.integer_value > stream_scalar_extreme_integer:
+                                        set stream_scalar_extreme_integer = value.integer_value
                     else:
                         let next_aggregate_count: Number = yaza_sql_executor_accumulate_row_v1(active_plan, row.values, stream_integer_sums, stream_double_sums, stream_aggregate_values, stream_aggregate_has_values, stream_average_compensations, stream_average_counts, stream_aggregate_count)?
                         set stream_aggregate_count = next_aggregate_count
@@ -1010,25 +1356,25 @@ fn yaza_db_btree_read_rows_internal_filtered_profiled_v1(root: Number, db_uuid: 
                     if list_count(rows) >= row_limit:
                         if stop_at_row_limit:
                             if scan_profile_enabled: let ignored_retain_profile: Number = yaza_db_btree_scan_profile_record_ns_v1(profile_ns, 13, scan_stage_started_ns, monotonic_ns())
-                            return ok(yaza_db_btree_scan_result_v1(rows, total_page_reads, filter_work_units))
+                            return ok(yaza_db_btree_scan_result_with_misses_v1(yaza_db_btree_scan_result_v1(rows, total_page_reads, filter_work_units), scan_missed_pages))
                         return err("YDBv1 B+Tree scan exceeded its row limit")
                     if list_count(rows) >= materialized_row_limit: return err("YDBv1 persistent SELECT exceeds the bounded executor cell budget")
                     if not list_try_push(rows, row): return err("YDBv1 B+Tree scan row-list growth failed")
                 if scan_profile_enabled: set scan_stage_started_ns = yaza_db_btree_scan_profile_record_ns_v1(profile_ns, 13, scan_stage_started_ns, monotonic_ns())
-                if stop_at_row_limit and not stream_aggregate and list_count(rows) >= row_limit: return ok(yaza_db_btree_scan_result_v1(rows, total_page_reads, filter_work_units))
+                if stop_at_row_limit and not stream_aggregate and list_count(rows) >= row_limit: return ok(yaza_db_btree_scan_result_with_misses_v1(yaza_db_btree_scan_result_v1(rows, total_page_reads, filter_work_units), scan_missed_pages))
             if slot_index + 1 == header.count:
                 if not key_materialized: return err("YDBv1 scan cursor did not retain the final key for the next leaf")
                 set has_last_key = true
                 set last_key = key
             set slot_index = slot_index + 1
         if header.high_fence_len == 0:
-            let completed_scan: YazaDbBtreeScanResultV1 = yaza_db_btree_scan_stream_aggregate_result_v1(rows, total_page_reads, filter_work_units, filter_input_rows, stream_projection_count, filter_plan, stream_aggregate, stream_aggregate_count, stream_integer_sums, stream_double_sums, stream_aggregate_values, stream_aggregate_has_values, stream_average_compensations, stream_average_counts, stream_scalar_sum_active, stream_scalar_sum_integer, stream_scalar_sum_double, stream_scalar_sum_has_value)?
-            return ok(completed_scan)
+            let completed_scan: YazaDbBtreeScanResultV1 = yaza_db_btree_scan_stream_aggregate_result_v1(rows, total_page_reads, filter_work_units, filter_input_rows, stream_projection_count, filter_plan, stream_aggregate, stream_aggregate_count, stream_integer_sums, stream_double_sums, stream_aggregate_values, stream_aggregate_has_values, stream_average_compensations, stream_average_counts, stream_scalar_sum_active, stream_scalar_sum_integer, stream_scalar_sum_double, stream_scalar_sum_has_value, stream_scalar_extreme_active, stream_scalar_extreme_integer, stream_scalar_extreme_double, stream_scalar_extreme_has_value)?
+            return ok(yaza_db_btree_scan_result_with_misses_v1(completed_scan, scan_missed_pages))
         if has_end_key:
             let end_fence_comparison: Number = yaza_db_compare_bytes_v1(high_fence, end_key)
             if (end_key_inclusive and end_fence_comparison > 0) or (not end_key_inclusive and end_fence_comparison >= 0):
-                let completed_range: YazaDbBtreeScanResultV1 = yaza_db_btree_scan_stream_aggregate_result_v1(rows, total_page_reads, filter_work_units, filter_input_rows, stream_projection_count, filter_plan, stream_aggregate, stream_aggregate_count, stream_integer_sums, stream_double_sums, stream_aggregate_values, stream_aggregate_has_values, stream_average_compensations, stream_average_counts, stream_scalar_sum_active, stream_scalar_sum_integer, stream_scalar_sum_double, stream_scalar_sum_has_value)?
-                return ok(completed_range)
+                let completed_range: YazaDbBtreeScanResultV1 = yaza_db_btree_scan_stream_aggregate_result_v1(rows, total_page_reads, filter_work_units, filter_input_rows, stream_projection_count, filter_plan, stream_aggregate, stream_aggregate_count, stream_integer_sums, stream_double_sums, stream_aggregate_values, stream_aggregate_has_values, stream_average_compensations, stream_average_counts, stream_scalar_sum_active, stream_scalar_sum_integer, stream_scalar_sum_double, stream_scalar_sum_has_value, stream_scalar_extreme_active, stream_scalar_extreme_integer, stream_scalar_extreme_double, stream_scalar_extreme_has_value)?
+                return ok(yaza_db_btree_scan_result_with_misses_v1(completed_range, scan_missed_pages))
         if has_previous_high_fence and yaza_db_compare_bytes_v1(high_fence, previous_high_fence) <= 0: return err("YDBv1 B+Tree leaf high fences are not strictly increasing")
         if scan_profile_enabled: set scan_stage_started_ns = monotonic_ns()
         let next_leaf: YazaDbBtreeNextLeafV1 = yaza_db_btree_next_leaf_from_path_v1(file, file_header, cursor, cache)?
@@ -1037,33 +1383,50 @@ fn yaza_db_btree_read_rows_internal_filtered_profiled_v1(root: Number, db_uuid: 
         if total_page_reads > yaza_db_btree_max_page_reads_v1(): return err("YDBv1 B+Tree scan exceeded its page-read budget")
         if not next_leaf.has_next: return err("YDBv1 B+Tree leaf has a high fence but no next leaf in its path")
         if next_leaf.path.leaf_page_id == page_id: return err("YDBv1 B+Tree cursor returned the same leaf twice")
+        if option_is_some(buffer_pool):
+            var mni: Number = 0
+            while mni < list_count(next_leaf.path.missed_pages) and list_count(scan_missed_pages) < 512:
+                let _mn: Boolean = list_try_push(scan_missed_pages, list_get(next_leaf.path.missed_pages, mni))
+                set mni = mni + 1
         set previous_high_fence = high_fence
         set has_previous_high_fence = true
         set cursor = next_leaf.path
         set pages_scanned = pages_scanned + 1
-    let completed_scan: YazaDbBtreeScanResultV1 = yaza_db_btree_scan_stream_aggregate_result_v1(rows, total_page_reads, filter_work_units, filter_input_rows, stream_projection_count, filter_plan, stream_aggregate, stream_aggregate_count, stream_integer_sums, stream_double_sums, stream_aggregate_values, stream_aggregate_has_values, stream_average_compensations, stream_average_counts, stream_scalar_sum_active, stream_scalar_sum_integer, stream_scalar_sum_double, stream_scalar_sum_has_value)?
-    return ok(completed_scan)
+    let completed_scan: YazaDbBtreeScanResultV1 = yaza_db_btree_scan_stream_aggregate_result_v1(rows, total_page_reads, filter_work_units, filter_input_rows, stream_projection_count, filter_plan, stream_aggregate, stream_aggregate_count, stream_integer_sums, stream_double_sums, stream_aggregate_values, stream_aggregate_has_values, stream_average_compensations, stream_average_counts, stream_scalar_sum_active, stream_scalar_sum_integer, stream_scalar_sum_double, stream_scalar_sum_has_value, stream_scalar_extreme_active, stream_scalar_extreme_integer, stream_scalar_extreme_double, stream_scalar_extreme_has_value)?
+    return ok(yaza_db_btree_scan_result_with_misses_v1(completed_scan, scan_missed_pages))
+
+fn yaza_db_btree_read_rows_internal_filtered_profiled_v1(root: Number, db_uuid: Bytes, log_end_lsn: Number, file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, columns: List[YazaSqlColumnSchemaV1], schema_version: Number, key_ordinals: List[Number], visible_ts: Number, row_limit: Number, stop_at_row_limit: Boolean, own_txn_id: Number, transactions: List[YazaDbTxnStatusV1], use_history: Boolean, has_start_after: Boolean, start_after_key: Bytes, has_end_key: Boolean, end_key: Bytes, end_key_inclusive: Boolean, filter_plan: Option[YazaSqlBoundPlanV1], filter_prepared: List[YazaSqlValueV1], filter_subqueries: List[YazaSqlSubqueryValuesV1], profile_ns: List[Number], stream_aggregate: Boolean) -> Result[YazaDbBtreeScanResultV1, Text]:
+    return yaza_db_btree_read_rows_internal_filtered_with_pool_profiled_v1(root, db_uuid, log_end_lsn, file, file_header, root_page_id, columns, schema_version, key_ordinals, visible_ts, row_limit, stop_at_row_limit, own_txn_id, transactions, use_history, has_start_after, start_after_key, has_end_key, end_key, end_key_inclusive, filter_plan, filter_prepared, filter_subqueries, none, profile_ns, stream_aggregate)
 
 fn yaza_db_btree_read_rows_internal_filtered_v1(root: Number, db_uuid: Bytes, log_end_lsn: Number, file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, columns: List[YazaSqlColumnSchemaV1], schema_version: Number, key_ordinals: List[Number], visible_ts: Number, row_limit: Number, stop_at_row_limit: Boolean, own_txn_id: Number, transactions: List[YazaDbTxnStatusV1], use_history: Boolean, has_start_after: Boolean, start_after_key: Bytes, filter_plan: Option[YazaSqlBoundPlanV1], filter_prepared: List[YazaSqlValueV1], filter_subqueries: List[YazaSqlSubqueryValuesV1]) -> Result[YazaDbBtreeScanResultV1, Text]:
     return yaza_db_btree_read_rows_internal_filtered_profiled_v1(root, db_uuid, log_end_lsn, file, file_header, root_page_id, columns, schema_version, key_ordinals, visible_ts, row_limit, stop_at_row_limit, own_txn_id, transactions, use_history, has_start_after, start_after_key, false, bytes_from_text(""), false, filter_plan, filter_prepared, filter_subqueries, List[Number](), false)
 
-fn yaza_db_btree_read_rows_profiled_for_schema_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, columns: List[YazaSqlColumnSchemaV1], schema_version: Number, key_ordinals: List[Number], visible_ts: Number, row_limit: Number, profile_ns: List[Number]) -> Result[List[YazaDbRowV1], Text]:
-    let scan: YazaDbBtreeScanResultV1 = yaza_db_btree_read_rows_internal_filtered_profiled_v1(0, bytes_from_text(""), 0, file, file_header, root_page_id, columns, schema_version, key_ordinals, visible_ts, row_limit, false, 0, List[YazaDbTxnStatusV1](), false, false, bytes_from_text(""), false, bytes_from_text(""), false, none, List[YazaSqlValueV1](), List[YazaSqlSubqueryValuesV1](), profile_ns, false)?
+fn yaza_db_btree_read_rows_profiled_with_pool_for_schema_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, columns: List[YazaSqlColumnSchemaV1], schema_version: Number, key_ordinals: List[Number], visible_ts: Number, row_limit: Number, buffer_pool: Option[YazaDbBufferPoolV1], profile_ns: List[Number]) -> Result[List[YazaDbRowV1], Text]:
+    let scan: YazaDbBtreeScanResultV1 = yaza_db_btree_read_rows_internal_filtered_with_pool_profiled_v1(0, bytes_from_text(""), 0, file, file_header, root_page_id, columns, schema_version, key_ordinals, visible_ts, row_limit, false, 0, List[YazaDbTxnStatusV1](), false, false, bytes_from_text(""), false, bytes_from_text(""), false, none, List[YazaSqlValueV1](), List[YazaSqlSubqueryValuesV1](), buffer_pool, profile_ns, false)?
     return ok(scan.rows)
+
+fn yaza_db_btree_read_rows_profiled_for_schema_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, columns: List[YazaSqlColumnSchemaV1], schema_version: Number, key_ordinals: List[Number], visible_ts: Number, row_limit: Number, profile_ns: List[Number]) -> Result[List[YazaDbRowV1], Text]:
+    return yaza_db_btree_read_rows_profiled_with_pool_for_schema_v1(file, file_header, root_page_id, columns, schema_version, key_ordinals, visible_ts, row_limit, none, profile_ns)
 
 fn yaza_db_btree_read_rows_where_profiled_with_stats_for_schema_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, columns: List[YazaSqlColumnSchemaV1], schema_version: Number, key_ordinals: List[Number], visible_ts: Number, plan: YazaSqlBoundPlanV1, prepared: List[YazaSqlValueV1], subqueries: List[YazaSqlSubqueryValuesV1], profile_ns: List[Number]) -> Result[YazaDbBtreeScanResultV1, Text]:
     return yaza_db_btree_read_rows_internal_filtered_profiled_v1(0, bytes_from_text(""), 0, file, file_header, root_page_id, columns, schema_version, key_ordinals, visible_ts, yaza_db_btree_max_rows_v1(), false, 0, List[YazaDbTxnStatusV1](), false, false, bytes_from_text(""), false, bytes_from_text(""), false, some(plan), prepared, subqueries, profile_ns, false)
 
-fn yaza_db_btree_read_rows_where_range_profiled_with_stats_for_schema_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, columns: List[YazaSqlColumnSchemaV1], schema_version: Number, key_ordinals: List[Number], visible_ts: Number, start_after_key: Bytes, end_key: Bytes, end_key_inclusive: Boolean, plan: YazaSqlBoundPlanV1, prepared: List[YazaSqlValueV1], subqueries: List[YazaSqlSubqueryValuesV1], profile_ns: List[Number]) -> Result[YazaDbBtreeScanResultV1, Text]:
+fn yaza_db_btree_read_rows_where_range_profiled_with_stats_and_pool_for_schema_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, columns: List[YazaSqlColumnSchemaV1], schema_version: Number, key_ordinals: List[Number], visible_ts: Number, start_after_key: Bytes, end_key: Bytes, end_key_inclusive: Boolean, plan: YazaSqlBoundPlanV1, prepared: List[YazaSqlValueV1], subqueries: List[YazaSqlSubqueryValuesV1], buffer_pool: Option[YazaDbBufferPoolV1], profile_ns: List[Number]) -> Result[YazaDbBtreeScanResultV1, Text]:
     let has_start_after: Boolean = bytes_length(start_after_key) > 0
     let has_end_key: Boolean = bytes_length(end_key) > 0
-    return yaza_db_btree_read_rows_internal_filtered_profiled_v1(0, bytes_from_text(""), 0, file, file_header, root_page_id, columns, schema_version, key_ordinals, visible_ts, yaza_db_btree_max_rows_v1(), false, 0, List[YazaDbTxnStatusV1](), false, has_start_after, start_after_key, has_end_key, end_key, end_key_inclusive, some(plan), prepared, subqueries, profile_ns, false)
+    return yaza_db_btree_read_rows_internal_filtered_with_pool_profiled_v1(0, bytes_from_text(""), 0, file, file_header, root_page_id, columns, schema_version, key_ordinals, visible_ts, yaza_db_btree_max_rows_v1(), false, 0, List[YazaDbTxnStatusV1](), false, has_start_after, start_after_key, has_end_key, end_key, end_key_inclusive, some(plan), prepared, subqueries, buffer_pool, profile_ns, false)
 
-fn yaza_db_btree_read_stream_aggregate_for_schema_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, columns: List[YazaSqlColumnSchemaV1], schema_version: Number, key_ordinals: List[Number], visible_ts: Number, start_after_key: Bytes, end_key: Bytes, end_key_inclusive: Boolean, plan: YazaSqlBoundPlanV1, prepared: List[YazaSqlValueV1], subqueries: List[YazaSqlSubqueryValuesV1], profile_ns: List[Number]) -> Result[YazaDbBtreeScanResultV1, Text]:
+fn yaza_db_btree_read_rows_where_range_profiled_with_stats_for_schema_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, columns: List[YazaSqlColumnSchemaV1], schema_version: Number, key_ordinals: List[Number], visible_ts: Number, start_after_key: Bytes, end_key: Bytes, end_key_inclusive: Boolean, plan: YazaSqlBoundPlanV1, prepared: List[YazaSqlValueV1], subqueries: List[YazaSqlSubqueryValuesV1], profile_ns: List[Number]) -> Result[YazaDbBtreeScanResultV1, Text]:
+    return yaza_db_btree_read_rows_where_range_profiled_with_stats_and_pool_for_schema_v1(file, file_header, root_page_id, columns, schema_version, key_ordinals, visible_ts, start_after_key, end_key, end_key_inclusive, plan, prepared, subqueries, none, profile_ns)
+
+fn yaza_db_btree_read_stream_aggregate_with_pool_for_schema_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, columns: List[YazaSqlColumnSchemaV1], schema_version: Number, key_ordinals: List[Number], visible_ts: Number, start_after_key: Bytes, end_key: Bytes, end_key_inclusive: Boolean, plan: YazaSqlBoundPlanV1, prepared: List[YazaSqlValueV1], subqueries: List[YazaSqlSubqueryValuesV1], buffer_pool: Option[YazaDbBufferPoolV1], profile_ns: List[Number]) -> Result[YazaDbBtreeScanResultV1, Text]:
     if bytes_length(start_after_key) > 2048 or bytes_length(end_key) > 2048: return err("YDBv1 streaming aggregate range bound exceeds its limit")
     let has_start_after: Boolean = bytes_length(start_after_key) > 0
     let has_end_key: Boolean = bytes_length(end_key) > 0
-    return yaza_db_btree_read_rows_internal_filtered_profiled_v1(0, bytes_from_text(""), 0, file, file_header, root_page_id, columns, schema_version, key_ordinals, visible_ts, yaza_db_btree_max_rows_v1(), false, 0, List[YazaDbTxnStatusV1](), false, has_start_after, start_after_key, has_end_key, end_key, end_key_inclusive, some(plan), prepared, subqueries, profile_ns, true)
+    return yaza_db_btree_read_rows_internal_filtered_with_pool_profiled_v1(0, bytes_from_text(""), 0, file, file_header, root_page_id, columns, schema_version, key_ordinals, visible_ts, yaza_db_btree_max_rows_v1(), false, 0, List[YazaDbTxnStatusV1](), false, has_start_after, start_after_key, has_end_key, end_key, end_key_inclusive, some(plan), prepared, subqueries, buffer_pool, profile_ns, true)
+
+fn yaza_db_btree_read_stream_aggregate_for_schema_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, columns: List[YazaSqlColumnSchemaV1], schema_version: Number, key_ordinals: List[Number], visible_ts: Number, start_after_key: Bytes, end_key: Bytes, end_key_inclusive: Boolean, plan: YazaSqlBoundPlanV1, prepared: List[YazaSqlValueV1], subqueries: List[YazaSqlSubqueryValuesV1], profile_ns: List[Number]) -> Result[YazaDbBtreeScanResultV1, Text]:
+    return yaza_db_btree_read_stream_aggregate_with_pool_for_schema_v1(file, file_header, root_page_id, columns, schema_version, key_ordinals, visible_ts, start_after_key, end_key, end_key_inclusive, plan, prepared, subqueries, none, profile_ns)
 
 fn yaza_db_btree_read_rows_internal_v1(root: Number, db_uuid: Bytes, log_end_lsn: Number, file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, columns: List[YazaSqlColumnSchemaV1], schema_version: Number, key_ordinals: List[Number], visible_ts: Number, row_limit: Number, stop_at_row_limit: Boolean, own_txn_id: Number, transactions: List[YazaDbTxnStatusV1], use_history: Boolean, has_start_after: Boolean, start_after_key: Bytes) -> Result[YazaDbBtreeScanResultV1, Text]:
     return yaza_db_btree_read_rows_internal_filtered_v1(root, db_uuid, log_end_lsn, file, file_header, root_page_id, columns, schema_version, key_ordinals, visible_ts, row_limit, stop_at_row_limit, own_txn_id, transactions, use_history, has_start_after, start_after_key, none, List[YazaSqlValueV1](), List[YazaSqlSubqueryValuesV1]())
@@ -1076,12 +1439,15 @@ fn yaza_db_btree_read_rows_where_range_with_stats_for_schema_v1(file: Number, fi
     let has_end_key: Boolean = bytes_length(end_key) > 0
     return yaza_db_btree_read_rows_internal_filtered_profiled_v1(0, bytes_from_text(""), 0, file, file_header, root_page_id, columns, schema_version, key_ordinals, visible_ts, yaza_db_btree_max_rows_v1(), false, 0, List[YazaDbTxnStatusV1](), false, has_start_after, start_after_key, has_end_key, end_key, end_key_inclusive, some(plan), prepared, subqueries, List[Number](), false)
 
-fn yaza_db_btree_read_rows_unfiltered_range_for_schema_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, columns: List[YazaSqlColumnSchemaV1], schema_version: Number, key_ordinals: List[Number], visible_ts: Number, start_after_key: Bytes, end_key: Bytes, end_key_inclusive: Boolean) -> Result[List[YazaDbRowV1], Text]:
+fn yaza_db_btree_read_rows_unfiltered_range_with_pool_for_schema_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, columns: List[YazaSqlColumnSchemaV1], schema_version: Number, key_ordinals: List[Number], visible_ts: Number, start_after_key: Bytes, end_key: Bytes, end_key_inclusive: Boolean, buffer_pool: Option[YazaDbBufferPoolV1]) -> Result[List[YazaDbRowV1], Text]:
     if bytes_length(start_after_key) > 2048 or bytes_length(end_key) > 2048: return err("YDBv1 B+Tree unfiltered range bounds exceed the encoded-key limit")
     let has_start_after: Boolean = bytes_length(start_after_key) > 0
     let has_end_key: Boolean = bytes_length(end_key) > 0
-    let scan: YazaDbBtreeScanResultV1 = yaza_db_btree_read_rows_internal_filtered_profiled_v1(0, bytes_from_text(""), 0, file, file_header, root_page_id, columns, schema_version, key_ordinals, visible_ts, yaza_db_btree_max_rows_v1(), false, 0, List[YazaDbTxnStatusV1](), false, has_start_after, start_after_key, has_end_key, end_key, end_key_inclusive, none, List[YazaSqlValueV1](), List[YazaSqlSubqueryValuesV1](), List[Number](), false)?
+    let scan: YazaDbBtreeScanResultV1 = yaza_db_btree_read_rows_internal_filtered_with_pool_profiled_v1(0, bytes_from_text(""), 0, file, file_header, root_page_id, columns, schema_version, key_ordinals, visible_ts, yaza_db_btree_max_rows_v1(), false, 0, List[YazaDbTxnStatusV1](), false, has_start_after, start_after_key, has_end_key, end_key, end_key_inclusive, none, List[YazaSqlValueV1](), List[YazaSqlSubqueryValuesV1](), buffer_pool, List[Number](), false)?
     return ok(scan.rows)
+
+fn yaza_db_btree_read_rows_unfiltered_range_for_schema_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, columns: List[YazaSqlColumnSchemaV1], schema_version: Number, key_ordinals: List[Number], visible_ts: Number, start_after_key: Bytes, end_key: Bytes, end_key_inclusive: Boolean) -> Result[List[YazaDbRowV1], Text]:
+    return yaza_db_btree_read_rows_unfiltered_range_with_pool_for_schema_v1(file, file_header, root_page_id, columns, schema_version, key_ordinals, visible_ts, start_after_key, end_key, end_key_inclusive, none)
 
 fn yaza_db_btree_read_rows_where_at_snapshot_with_stats_for_schema_v1(root: Number, db_uuid: Bytes, log_end_lsn: Number, file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, columns: List[YazaSqlColumnSchemaV1], schema_version: Number, key_ordinals: List[Number], snapshot_ts: Number, own_txn_id: Number, transactions: List[YazaDbTxnStatusV1], plan: YazaSqlBoundPlanV1, prepared: List[YazaSqlValueV1], subqueries: List[YazaSqlSubqueryValuesV1]) -> Result[YazaDbBtreeScanResultV1, Text]:
     return yaza_db_btree_read_rows_internal_filtered_v1(root, db_uuid, log_end_lsn, file, file_header, root_page_id, columns, schema_version, key_ordinals, snapshot_ts, yaza_db_btree_max_rows_v1(), false, own_txn_id, transactions, true, false, bytes_from_text(""), some(plan), prepared, subqueries)
@@ -1120,6 +1486,13 @@ fn yaza_db_btree_read_rows_for_schema_v1(file: Number, file_header: YazaDbFileHe
 
 fn yaza_db_btree_read_rows_prefix_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, columns: List[YazaSqlColumnSchemaV1], key_ordinals: List[Number], visible_ts: Number, row_limit: Number) -> Result[List[YazaDbRowV1], Text]:
     let scan: YazaDbBtreeScanResultV1 = yaza_db_btree_read_rows_prefix_with_stats_v1(file, file_header, root_page_id, columns, key_ordinals, visible_ts, row_limit)?
+    return ok(scan.rows)
+
+fn yaza_db_btree_read_rows_prefix_with_stats_and_pool_for_schema_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, columns: List[YazaSqlColumnSchemaV1], schema_version: Number, key_ordinals: List[Number], visible_ts: Number, row_limit: Number, buffer_pool: Option[YazaDbBufferPoolV1]) -> Result[YazaDbBtreeScanResultV1, Text]:
+    return yaza_db_btree_read_rows_internal_filtered_with_pool_profiled_v1(0, bytes_from_text(""), 0, file, file_header, root_page_id, columns, schema_version, key_ordinals, visible_ts, row_limit, true, 0, List[YazaDbTxnStatusV1](), false, false, bytes_from_text(""), false, bytes_from_text(""), false, none, List[YazaSqlValueV1](), List[YazaSqlSubqueryValuesV1](), buffer_pool, List[Number](), false)
+
+fn yaza_db_btree_read_rows_prefix_with_pool_for_schema_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, columns: List[YazaSqlColumnSchemaV1], schema_version: Number, key_ordinals: List[Number], visible_ts: Number, row_limit: Number, buffer_pool: Option[YazaDbBufferPoolV1]) -> Result[List[YazaDbRowV1], Text]:
+    let scan: YazaDbBtreeScanResultV1 = yaza_db_btree_read_rows_prefix_with_stats_and_pool_for_schema_v1(file, file_header, root_page_id, columns, schema_version, key_ordinals, visible_ts, row_limit, buffer_pool)?
     return ok(scan.rows)
 
 fn yaza_db_btree_read_rows_prefix_for_schema_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, columns: List[YazaSqlColumnSchemaV1], schema_version: Number, key_ordinals: List[Number], visible_ts: Number, row_limit: Number) -> Result[List[YazaDbRowV1], Text]:
@@ -1162,14 +1535,14 @@ fn yaza_db_btree_key_has_prefix_v1(key: Bytes, prefix: Bytes) -> Boolean:
 # known. The prefix is encoded with the same key codec as the full index key;
 # ordered byte comparison lets the cursor seek once, then stop at the first
 # key outside that leading-component range.
-fn yaza_db_btree_read_rows_with_key_prefix_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, columns: List[YazaSqlColumnSchemaV1], schema_version: Number, key_ordinals: List[Number], visible_ts: Number, prefix: Bytes, row_limit: Number) -> Result[List[YazaDbRowV1], Text]:
+fn yaza_db_btree_read_rows_with_key_prefix_and_pool_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, columns: List[YazaSqlColumnSchemaV1], schema_version: Number, key_ordinals: List[Number], visible_ts: Number, prefix: Bytes, row_limit: Number, buffer_pool: Option[YazaDbBufferPoolV1]) -> Result[List[YazaDbRowV1], Text]:
     if visible_ts < 1 or bytes_length(prefix) < 1 or bytes_length(prefix) > 2048 or row_limit < 0 or row_limit > yaza_db_btree_max_rows_v1():
         return err("YDBv1 B+Tree prefix-scan bounds are invalid")
     let rows_result: Result[List[YazaDbRowV1], Text] = list_try_new()
     if not result_is_ok(rows_result): return err(result_unwrap_error(rows_result))
     let rows: List[YazaDbRowV1] = result_unwrap(rows_result)
     if row_limit == 0: return ok(rows)
-    let cache: YazaDbBtreePageValidationCacheV1 = yaza_db_btree_page_validation_cache_new_v1(file, file_header, List[Number]())?
+    let cache: YazaDbBtreePageValidationCacheV1 = yaza_db_btree_page_validation_cache_new_with_pool_v1(file, file_header, buffer_pool, List[Number]())?
     let cursor: YazaDbBtreeSeekPathV1 = yaza_db_btree_seek_leaf_internal_cached_v1(file, file_header, root_page_id, prefix, true, cache)?
     var current: YazaDbBtreeSeekPathV1 = cursor
     var total_page_reads: Number = cursor.page_reads
@@ -1218,6 +1591,9 @@ fn yaza_db_btree_read_rows_with_key_prefix_v1(file: Number, file_header: YazaDbF
         set pages_scanned = pages_scanned + 1
     return ok(rows)
 
+fn yaza_db_btree_read_rows_with_key_prefix_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, columns: List[YazaSqlColumnSchemaV1], schema_version: Number, key_ordinals: List[Number], visible_ts: Number, prefix: Bytes, row_limit: Number) -> Result[List[YazaDbRowV1], Text]:
+    return yaza_db_btree_read_rows_with_key_prefix_and_pool_v1(file, file_header, root_page_id, columns, schema_version, key_ordinals, visible_ts, prefix, row_limit, none)
+
 # Point lookup for a complete clustered key. It descends directly to one leaf
 # and validates the selected tuple before returning it; callers still run the
 # bound predicate and projection so this access path cannot change SQL results.
@@ -1249,9 +1625,12 @@ fn yaza_db_btree_read_rows_from_seek_for_schema_v1(file: Number, file_header: Ya
     if not row.deleted and not list_try_push(rows, row): return err("YDBv1 B+Tree point lookup could not return its row")
     return ok(rows)
 
-fn yaza_db_btree_read_rows_by_key_for_schema_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, columns: List[YazaSqlColumnSchemaV1], schema_version: Number, key_ordinals: List[Number], visible_ts: Number, search_key: Bytes) -> Result[List[YazaDbRowV1], Text]:
-    let seek: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(file, file_header, root_page_id, search_key)?
+fn yaza_db_btree_read_rows_by_key_with_pool_for_schema_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, columns: List[YazaSqlColumnSchemaV1], schema_version: Number, key_ordinals: List[Number], visible_ts: Number, search_key: Bytes, buffer_pool: Option[YazaDbBufferPoolV1]) -> Result[List[YazaDbRowV1], Text]:
+    let seek: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_with_pool_v1(file, file_header, root_page_id, search_key, buffer_pool)?
     return yaza_db_btree_read_rows_from_seek_for_schema_v1(file, file_header, columns, schema_version, key_ordinals, visible_ts, search_key, seek)
+
+fn yaza_db_btree_read_rows_by_key_for_schema_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, columns: List[YazaSqlColumnSchemaV1], schema_version: Number, key_ordinals: List[Number], visible_ts: Number, search_key: Bytes) -> Result[List[YazaDbRowV1], Text]:
+    return yaza_db_btree_read_rows_by_key_with_pool_for_schema_v1(file, file_header, root_page_id, columns, schema_version, key_ordinals, visible_ts, search_key, none)
 
 
 fn yaza_db_btree_read_rows_by_key_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, columns: List[YazaSqlColumnSchemaV1], key_ordinals: List[Number], visible_ts: Number, search_key: Bytes) -> Result[List[YazaDbRowV1], Text]:

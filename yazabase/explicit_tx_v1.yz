@@ -1,0 +1,106 @@
+# Explicit multi-statement transactions (BEGIN / COMMIT / ROLLBACK / SAVEPOINT).
+# Uses ARIES CLRs on ROLLBACK and ROLLBACK TO SAVEPOINT so crash recovery and
+# explicit rollback share a single reversible WAL protocol.
+use "./storage_v1"
+use "./transaction_v1"
+use "./wal_v1"
+
+shape YazaDbTxSavepointsCopyV1:
+    names: TextList
+    lsns: List[Number]
+
+shape YazaDbExplicitTxV1:
+    wal_tx: YazaDbWriteTransactionV1
+    savepoint_names: TextList
+    savepoint_lsns: List[Number]
+    failed: Boolean
+    statement_count: Number
+
+fn yaza_db_explicit_tx_default_reserve_pages_v1() -> Number:
+    return 256
+
+fn yaza_db_explicit_tx_savepoints_copy_prefix_v1(names: TextList, lsns: List[Number], count: Number) -> Result[YazaDbTxSavepointsCopyV1, Text]:
+    if count < 0 or count > list_count(names) or list_count(names) != list_count(lsns):
+        return err("YDBv1 savepoint table bounds are inconsistent")
+    let out_names_res: Result[TextList, Text] = text_list_try_new()
+    let out_lsns_res: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(out_names_res) or not result_is_ok(out_lsns_res):
+        return err("YDBv1 explicit transaction could not allocate savepoint table")
+    let out_names: TextList = result_unwrap(out_names_res)
+    let out_lsns: List[Number] = result_unwrap(out_lsns_res)
+    var index: Number = 0
+    while index < count:
+        if not list_try_push(out_names, list_get(names, index)) or not list_try_push(out_lsns, list_get(lsns, index)):
+            return err("YDBv1 explicit transaction could not copy savepoint entry")
+        set index = index + 1
+    return ok(YazaDbTxSavepointsCopyV1(out_names, out_lsns))
+
+fn yaza_db_explicit_tx_find_savepoint_v1(names: TextList, target_name: Text) -> Number:
+    var index: Number = list_count(names) - 1
+    while index >= 0:
+        if list_get(names, index) == target_name:
+            return index
+        set index = index - 1
+    return -1
+
+fn yaza_db_explicit_tx_begin_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1) -> Result[YazaDbExplicitTxV1, Text]:
+    let wal_tx: YazaDbWriteTransactionV1 = yaza_db_write_transaction_begin_with_reserve_deferred_checkpoint_v1(storage, wal, yaza_db_explicit_tx_default_reserve_pages_v1())?
+    let names_res: Result[TextList, Text] = text_list_try_new()
+    let lsns_res: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(names_res) or not result_is_ok(lsns_res):
+        let ignored_abort: Result[YazaDbWriteCommitV1, Text] = yaza_db_write_transaction_abort_v1(wal_tx)
+        return err("YDBv1 BEGIN could not allocate savepoint metadata")
+    return ok(YazaDbExplicitTxV1(wal_tx, result_unwrap(names_res), result_unwrap(lsns_res), false, 0))
+
+fn yaza_db_explicit_tx_savepoint_v1(tx: YazaDbExplicitTxV1, name: Text) -> Result[YazaDbExplicitTxV1, Text]:
+    if tx.failed:
+        return err("YDBv1 current transaction is aborted, commands ignored until end of transaction block")
+    if name == "":
+        return err("YDBv1 SAVEPOINT requires a valid savepoint name")
+    let count: Number = list_count(tx.savepoint_names)
+    if count >= 64:
+        return err("YDBv1 explicit transaction exceeded the 64-savepoint bound")
+    let copy: YazaDbTxSavepointsCopyV1 = yaza_db_explicit_tx_savepoints_copy_prefix_v1(tx.savepoint_names, tx.savepoint_lsns, count)?
+    if not list_try_push(copy.names, name) or not list_try_push(copy.lsns, tx.wal_tx.last_lsn):
+        return err("YDBv1 explicit transaction could not record savepoint '" + name + "'")
+    return ok(YazaDbExplicitTxV1(tx.wal_tx, copy.names, copy.lsns, false, tx.statement_count + 1))
+
+fn yaza_db_explicit_tx_rollback_to_v1(tx: YazaDbExplicitTxV1, name: Text) -> Result[YazaDbExplicitTxV1, Text]:
+    if name == "":
+        return err("YDBv1 ROLLBACK TO SAVEPOINT requires a savepoint name")
+    let sp_idx: Number = yaza_db_explicit_tx_find_savepoint_v1(tx.savepoint_names, name)
+    if sp_idx < 0:
+        return err("YDBv1 savepoint '" + name + "' does not exist")
+    let target_lsn: Number = list_get(tx.savepoint_lsns, sp_idx)
+    let undone: YazaDbWriteTransactionV1 = yaza_db_write_transaction_undo_to_lsn_v1(tx.wal_tx, target_lsn)?
+    let copy: YazaDbTxSavepointsCopyV1 = yaza_db_explicit_tx_savepoints_copy_prefix_v1(tx.savepoint_names, tx.savepoint_lsns, sp_idx + 1)?
+    return ok(YazaDbExplicitTxV1(undone, copy.names, copy.lsns, false, tx.statement_count + 1))
+
+fn yaza_db_explicit_tx_release_v1(tx: YazaDbExplicitTxV1, name: Text) -> Result[YazaDbExplicitTxV1, Text]:
+    if tx.failed:
+        return err("YDBv1 current transaction is aborted, commands ignored until end of transaction block")
+    if name == "":
+        return err("YDBv1 RELEASE SAVEPOINT requires a savepoint name")
+    let sp_idx: Number = yaza_db_explicit_tx_find_savepoint_v1(tx.savepoint_names, name)
+    if sp_idx < 0:
+        return err("YDBv1 savepoint '" + name + "' does not exist")
+    let copy: YazaDbTxSavepointsCopyV1 = yaza_db_explicit_tx_savepoints_copy_prefix_v1(tx.savepoint_names, tx.savepoint_lsns, sp_idx)?
+    return ok(YazaDbExplicitTxV1(tx.wal_tx, copy.names, copy.lsns, false, tx.statement_count + 1))
+
+fn yaza_db_explicit_tx_commit_v1(tx: YazaDbExplicitTxV1) -> Result[YazaDbWriteCommitV1, Text]:
+    if tx.failed:
+        return yaza_db_write_transaction_abort_v1(tx.wal_tx)
+    return yaza_db_write_transaction_commit_deferred_checkpoint_v1(tx.wal_tx)
+
+fn yaza_db_explicit_tx_rollback_v1(tx: YazaDbExplicitTxV1) -> Result[YazaDbWriteCommitV1, Text]:
+    return yaza_db_write_transaction_abort_v1(tx.wal_tx)
+
+fn yaza_db_explicit_tx_mark_failed_v1(tx: YazaDbExplicitTxV1) -> YazaDbExplicitTxV1:
+    return YazaDbExplicitTxV1(tx.wal_tx, tx.savepoint_names, tx.savepoint_lsns, true, tx.statement_count)
+
+fn yaza_db_explicit_tx_advance_dml_v1(tx: YazaDbExplicitTxV1, next_wal_tx: YazaDbWriteTransactionV1) -> YazaDbExplicitTxV1:
+    return YazaDbExplicitTxV1(next_wal_tx, tx.savepoint_names, tx.savepoint_lsns, false, tx.statement_count + 1)
+
+fn yaza_db_explicit_tx_visible_header_v1(tx: YazaDbExplicitTxV1) -> YazaDbFileHeaderV1:
+    let base: YazaDbFileHeaderV1 = tx.wal_tx.storage.header
+    return YazaDbFileHeaderV1(base.db_uuid, base.checkpoint_lsn, base.next_txn_id, tx.wal_tx.commit_ts + 1, base.catalog_root, base.page_count, base.flags)

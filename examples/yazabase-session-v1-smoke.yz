@@ -175,6 +175,82 @@ fn yazabase_session_v1_smoke(root_path: Text) -> Result[Number, Text]:
     set reopened_session = recovered_delete.session
     if not option_is_some(recovered_delete.statement.query_result) or list_count(option_unwrap(recovered_delete.statement.query_result).rows) != 0:
         return err("YDBv1 startup recovery did not replay the durable session DELETE")
+
+    let dml_create: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(reopened_session, "CREATE TABLE session_dml_probe (id BIGINT PRIMARY KEY, score BIGINT)", no_parameters)?
+    set reopened_session = dml_create.session
+    let dml_index: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(reopened_session, "CREATE INDEX session_dml_probe_score_idx ON session_dml_probe(score)", no_parameters)?
+    set reopened_session = dml_index.session
+    set reopened_session = yazabase_session_expect_count_v1(reopened_session, "SELECT COUNT(*) FROM session_dml_probe", no_parameters, 0)?
+    if not option_is_some(reopened_session.catalog_cache): return err("YDBv1 session did not warm catalog cache before DML")
+    let dml_checkpoint_lsn: Number = reopened_session.storage.header.checkpoint_lsn
+    let dml_next_ts: Number = reopened_session.storage.header.next_commit_ts
+
+    let dml_insert_one: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(reopened_session, "INSERT INTO session_dml_probe (id, score) VALUES (1, 10)", no_parameters)?
+    set reopened_session = dml_insert_one.session
+    if not option_is_some(dml_insert_one.statement.write_commit) or option_unwrap(dml_insert_one.statement.write_commit).affected_rows != 1:
+        return err("YDBv1 session single-row INSERT did not commit one row")
+    let dml_insert_one_commit: YazaDbWriteCommitV1 = option_unwrap(dml_insert_one.statement.write_commit)
+    if dml_insert_one_commit.storage.header.checkpoint_lsn != dml_checkpoint_lsn or dml_insert_one_commit.storage.header.next_commit_ts != dml_next_ts + 1:
+        return err("YDBv1 session single-row INSERT did not preserve deferred-checkpoint state")
+    if not option_is_some(reopened_session.catalog_cache):
+        return err("YDBv1 session invalidated catalog cache across single-row INSERT")
+
+    let dml_insert_many: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(reopened_session, "INSERT INTO session_dml_probe (id, score) VALUES (2, 10), (3, 20), (4, 10)", no_parameters)?
+    set reopened_session = dml_insert_many.session
+    if not option_is_some(dml_insert_many.statement.write_commit) or option_unwrap(dml_insert_many.statement.write_commit).affected_rows != 3:
+        return err("YDBv1 session multi-row INSERT did not commit three rows")
+    let dml_insert_many_commit: YazaDbWriteCommitV1 = option_unwrap(dml_insert_many.statement.write_commit)
+    if dml_insert_many_commit.storage.header.checkpoint_lsn != dml_checkpoint_lsn or dml_insert_many_commit.storage.header.next_commit_ts != dml_next_ts + 2:
+        return err("YDBv1 session multi-row INSERT did not preserve deferred-checkpoint state")
+    if not option_is_some(reopened_session.catalog_cache):
+        return err("YDBv1 session invalidated catalog cache across multi-row INSERT")
+
+    let dml_update_one: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(reopened_session, "UPDATE session_dml_probe SET score = 30 WHERE id = 3", no_parameters)?
+    set reopened_session = dml_update_one.session
+    if not option_is_some(dml_update_one.statement.write_commit) or option_unwrap(dml_update_one.statement.write_commit).affected_rows != 1:
+        return err("YDBv1 session single-row UPDATE did not commit one row")
+    let dml_update_one_commit: YazaDbWriteCommitV1 = option_unwrap(dml_update_one.statement.write_commit)
+    if dml_update_one_commit.storage.header.checkpoint_lsn != dml_checkpoint_lsn or dml_update_one_commit.storage.header.next_commit_ts != dml_next_ts + 3:
+        return err("YDBv1 session single-row UPDATE did not preserve deferred-checkpoint state")
+    if not option_is_some(reopened_session.catalog_cache):
+        return err("YDBv1 session invalidated catalog cache across single-row UPDATE")
+
+    let dml_update_many: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(reopened_session, "UPDATE session_dml_probe SET score = 50 WHERE score = 10", no_parameters)?
+    set reopened_session = dml_update_many.session
+    if not option_is_some(dml_update_many.statement.write_commit) or option_unwrap(dml_update_many.statement.write_commit).affected_rows != 3:
+        return err("YDBv1 session multi-row UPDATE did not commit three rows")
+    let dml_update_many_commit: YazaDbWriteCommitV1 = option_unwrap(dml_update_many.statement.write_commit)
+    if dml_update_many_commit.storage.header.checkpoint_lsn != dml_checkpoint_lsn or dml_update_many_commit.storage.header.next_commit_ts != dml_next_ts + 4:
+        return err("YDBv1 session multi-row UPDATE did not preserve deferred-checkpoint state")
+    if not option_is_some(reopened_session.catalog_cache):
+        return err("YDBv1 session invalidated catalog cache across multi-row UPDATE")
+
+    set reopened_session = yazabase_session_expect_count_v1(reopened_session, "SELECT COUNT(*) FROM session_dml_probe WHERE score = 10", no_parameters, 0)?
+    set reopened_session = yazabase_session_expect_count_v1(reopened_session, "SELECT COUNT(*) FROM session_dml_probe WHERE score = 30", no_parameters, 1)?
+    set reopened_session = yazabase_session_expect_count_v1(reopened_session, "SELECT COUNT(*) FROM session_dml_probe WHERE score = 50", no_parameters, 3)?
+
+    let dml_uncheckpointed_wal_closed: Boolean = yaza_db_wal_log_close_v1(reopened_session.wal)?
+    let dml_uncheckpointed_storage_closed: Boolean = yaza_db_storage_close_v1(reopened_session.storage)?
+    let dml_uncheckpointed_root_closed: Boolean = close(reopened_session.root)?
+    if not dml_uncheckpointed_wal_closed or not dml_uncheckpointed_storage_closed or not dml_uncheckpointed_root_closed:
+        return err("YDBv1 session could not close after uncheckpointed indexed INSERT/UPDATE")
+
+    let dml_reopen_root_result: Result[Number, Text] = root_open(root_path)
+    if not result_is_ok(dml_reopen_root_result): return err("root open after uncheckpointed indexed DML close failed: " + result_unwrap_error(dml_reopen_root_result))
+    let dml_reopen_root: Number = result_unwrap(dml_reopen_root_result)
+    set reopened_session = yaza_db_session_open_v1(dml_reopen_root, database_name)?
+    set reopened_session = yazabase_session_expect_count_v1(reopened_session, "SELECT COUNT(*) FROM session_dml_probe WHERE score = 10", no_parameters, 0)?
+    set reopened_session = yazabase_session_expect_count_v1(reopened_session, "SELECT COUNT(*) FROM session_dml_probe WHERE score = 30", no_parameters, 1)?
+    set reopened_session = yazabase_session_expect_count_v1(reopened_session, "SELECT COUNT(*) FROM session_dml_probe WHERE score = 50", no_parameters, 3)?
+    let dml_recovered_idx_rows: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(reopened_session, "SELECT id FROM session_dml_probe WHERE score = 50", no_parameters)?
+    set reopened_session = dml_recovered_idx_rows.session
+    if not option_is_some(dml_recovered_idx_rows.statement.query_result) or list_count(option_unwrap(dml_recovered_idx_rows.statement.query_result).rows) != 3:
+        return err("YDBv1 startup recovery did not preserve secondary-index lookup rows after UPDATE")
+    let dml_recovered_row: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(reopened_session, "SELECT score FROM session_dml_probe WHERE id = 2", no_parameters)?
+    set reopened_session = dml_recovered_row.session
+    if not option_is_some(dml_recovered_row.statement.query_result) or list_count(option_unwrap(dml_recovered_row.statement.query_result).rows) != 1 or list_get(list_get(option_unwrap(dml_recovered_row.statement.query_result).rows, 0), 0).integer_value != 50:
+        return err("YDBv1 startup recovery did not preserve secondary-index UPDATE row value")
+
     let invalid_query: Result[YazaDbSessionStatementV1, Text] = yaza_db_session_execute_v1(reopened_session, "SELECT absent FROM session_probe", no_parameters)
     if result_is_ok(invalid_query): return err("YDBv1 session accepted a SELECT of an unknown column")
 

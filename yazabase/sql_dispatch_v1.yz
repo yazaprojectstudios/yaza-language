@@ -3,6 +3,7 @@
 # their existing parser/binder/storage contracts and transaction boundaries.
 use "./catalog_snapshot_v1"
 use "./query_v1"
+use "./row_v1"
 use "./sql_create_table_v1"
 use "./sql_create_table_write_v1"
 use "./sql_create_index_v1"
@@ -32,6 +33,10 @@ shape YazaDbSqlStatementResultV1:
     explain_text: Option[Text]
     storage: YazaDbStorageHandleV1
     wal: YazaDbWalLogV1
+
+shape YazaDbTxControlCommandV1:
+    kind: Number
+    savepoint_name: Text
 
 fn yaza_db_sql_statement_kind_select_v1() -> Number:
     return 1
@@ -69,6 +74,127 @@ fn yaza_db_sql_statement_kind_create_view_v1() -> Number:
 fn yaza_db_sql_statement_kind_drop_view_v1() -> Number:
     return 12
 
+fn yaza_db_sql_statement_kind_begin_v1() -> Number:
+    return 13
+
+fn yaza_db_sql_statement_kind_commit_v1() -> Number:
+    return 14
+
+fn yaza_db_sql_statement_kind_rollback_v1() -> Number:
+    return 15
+
+fn yaza_db_sql_statement_kind_savepoint_v1() -> Number:
+    return 16
+
+fn yaza_db_sql_statement_kind_rollback_to_v1() -> Number:
+    return 17
+
+fn yaza_db_sql_statement_kind_release_v1() -> Number:
+    return 18
+
+fn yaza_db_tx_normalize_savepoint_name_v1(source: Text, token: YazaSqlTokenV1) -> Result[Text, Text]:
+    if token.kind == 1:
+        var out: Text = ""
+        var offset: Number = token.start_byte
+        while offset < token.end_byte:
+            let b: Number = text_byte(source, offset)
+            var lower_b: Number = b
+            if b >= 65 and b <= 90: set lower_b = b + 32
+            let ch_bytes: Bytes = bytes_try_new_zeroed(1)?
+            if not bytes_try_set(ch_bytes, 0, lower_b): return err("YDBv1 savepoint identifier byte failed")
+            let ch_text: Text = bytes_try_to_text(ch_bytes)?
+            set out = text_try_concat(out, ch_text)?
+            set offset = offset + 1
+        if text_length(out) < 1: return err("YDBv1 savepoint name cannot be empty")
+        return ok(out)
+    if token.kind == 2 and token.end_byte - token.start_byte >= 2:
+        var out: Text = ""
+        var offset: Number = token.start_byte + 1
+        let stop: Number = token.end_byte - 1
+        while offset < stop:
+            let b: Number = text_byte(source, offset)
+            if b == 34 and offset + 1 < stop and text_byte(source, offset + 1) == 34:
+                set offset = offset + 1
+            let ch_bytes: Bytes = bytes_try_new_zeroed(1)?
+            if not bytes_try_set(ch_bytes, 0, b): return err("YDBv1 quoted savepoint identifier byte failed")
+            let ch_text: Text = bytes_try_to_text(ch_bytes)?
+            set out = text_try_concat(out, ch_text)?
+            set offset = offset + 1
+        if text_length(out) < 1: return err("YDBv1 quoted savepoint name cannot be empty")
+        return ok(out)
+    return err("YDBv1 SAVEPOINT identifier is invalid")
+
+fn yaza_db_parse_tx_control_v1(source: Text, tokens: List[YazaSqlTokenV1]) -> Result[Option[YazaDbTxControlCommandV1], Text]:
+    var count: Number = list_count(tokens) - 1
+    if count <= 0: return ok(none)
+    let last_tok: YazaSqlTokenV1 = list_get(tokens, count - 1)
+    if last_tok.kind == 6 and last_tok.end_byte - last_tok.start_byte == 1 and text_byte(source, last_tok.start_byte) == 59:
+        set count = count - 1
+    if count <= 0: return ok(none)
+    if yaza_sql_v2_is_keyword(source, tokens, 0, "BEGIN"):
+        if count == 1 or (count == 2 and (yaza_sql_v2_is_keyword(source, tokens, 1, "TRANSACTION") or yaza_sql_v2_is_keyword(source, tokens, 1, "WORK"))):
+            return ok(some(YazaDbTxControlCommandV1(yaza_db_sql_statement_kind_begin_v1(), "")))
+        return err("YDBv1 BEGIN supports optional TRANSACTION or WORK keyword only")
+    if yaza_sql_v2_is_keyword(source, tokens, 0, "START"):
+        if count == 2 and yaza_sql_v2_is_keyword(source, tokens, 1, "TRANSACTION"):
+            return ok(some(YazaDbTxControlCommandV1(yaza_db_sql_statement_kind_begin_v1(), "")))
+        return err("YDBv1 START expects START TRANSACTION")
+    if yaza_sql_v2_is_keyword(source, tokens, 0, "COMMIT") or yaza_sql_v2_is_keyword(source, tokens, 0, "END"):
+        if count == 1 or (count == 2 and (yaza_sql_v2_is_keyword(source, tokens, 1, "TRANSACTION") or yaza_sql_v2_is_keyword(source, tokens, 1, "WORK"))):
+            return ok(some(YazaDbTxControlCommandV1(yaza_db_sql_statement_kind_commit_v1(), "")))
+        return err("YDBv1 COMMIT/END supports optional TRANSACTION or WORK keyword only")
+    if yaza_sql_v2_is_keyword(source, tokens, 0, "SAVEPOINT"):
+        if count != 2: return err("YDBv1 SAVEPOINT requires exactly one savepoint identifier")
+        let sp_name: Text = yaza_db_tx_normalize_savepoint_name_v1(source, list_get(tokens, 1))?
+        return ok(some(YazaDbTxControlCommandV1(yaza_db_sql_statement_kind_savepoint_v1(), sp_name)))
+    if yaza_sql_v2_is_keyword(source, tokens, 0, "RELEASE"):
+        if count == 2:
+            let sp_name: Text = yaza_db_tx_normalize_savepoint_name_v1(source, list_get(tokens, 1))?
+            return ok(some(YazaDbTxControlCommandV1(yaza_db_sql_statement_kind_release_v1(), sp_name)))
+        if count == 3 and yaza_sql_v2_is_keyword(source, tokens, 1, "SAVEPOINT"):
+            let sp_name: Text = yaza_db_tx_normalize_savepoint_name_v1(source, list_get(tokens, 2))?
+            return ok(some(YazaDbTxControlCommandV1(yaza_db_sql_statement_kind_release_v1(), sp_name)))
+        return err("YDBv1 RELEASE expects RELEASE [SAVEPOINT] <name>")
+    if yaza_sql_v2_is_keyword(source, tokens, 0, "ROLLBACK"):
+        if count == 1 or (count == 2 and (yaza_sql_v2_is_keyword(source, tokens, 1, "TRANSACTION") or yaza_sql_v2_is_keyword(source, tokens, 1, "WORK"))):
+            return ok(some(YazaDbTxControlCommandV1(yaza_db_sql_statement_kind_rollback_v1(), "")))
+        var to_pos: Number = 1
+        if count >= 2 and (yaza_sql_v2_is_keyword(source, tokens, 1, "TRANSACTION") or yaza_sql_v2_is_keyword(source, tokens, 1, "WORK")):
+            set to_pos = 2
+        if count > to_pos and yaza_sql_v2_is_keyword(source, tokens, to_pos, "TO"):
+            var name_pos: Number = to_pos + 1
+            if count > name_pos and yaza_sql_v2_is_keyword(source, tokens, name_pos, "SAVEPOINT"):
+                set name_pos = name_pos + 1
+            if count == name_pos + 1:
+                let sp_name: Text = yaza_db_tx_normalize_savepoint_name_v1(source, list_get(tokens, name_pos))?
+                return ok(some(YazaDbTxControlCommandV1(yaza_db_sql_statement_kind_rollback_to_v1(), sp_name)))
+            return err("YDBv1 ROLLBACK TO SAVEPOINT requires a savepoint identifier")
+        return err("YDBv1 ROLLBACK supports ROLLBACK [TRANSACTION|WORK] [TO [SAVEPOINT] <name>]")
+    return ok(none)
+
+fn yaza_db_statement_is_ddl_keyword_v1(source: Text, tokens: List[YazaSqlTokenV1]) -> Boolean:
+    if list_count(tokens) < 2: return false
+    return yaza_sql_v2_is_keyword(source, tokens, 0, "CREATE") or yaza_sql_v2_is_keyword(source, tokens, 0, "DROP") or yaza_sql_v2_is_keyword(source, tokens, 0, "ALTER")
+
+fn yaza_db_error_closed_handles_v1(message: Text) -> Boolean:
+    return yaza_db_sql_insert_writer_handles_closed_v1(message) or yaza_db_sql_update_handles_closed_v1(message) or yaza_db_sql_delete_handles_closed_v1(message) or text_starts_with(message, "YDBv1 write transaction ") or text_starts_with(message, "YDBv1 explicit transaction rollback exceeded") or text_starts_with(message, "YDBv1 ABORT append failed") or text_starts_with(message, "YDBv1 ABORT is durable")
+
+fn yaza_db_execute_dml_in_tx_v1(transaction: YazaDbWriteTransactionV1, source: Text, parameters: List[YazaSqlValueV1], cached_catalog: Option[YazaDbCatalogSnapshotWithRootsV1], cached_index_rows: Option[List[YazaDbRowV1]]) -> Result[YazaDbTxDmlResultV1, Text]:
+    let tokens: List[YazaSqlTokenV1] = yaza_sql_lex_v1(source)?
+    if list_count(tokens) < 2: return err("YDBv1 SQL statement has no executable tokens")
+    if yaza_db_statement_is_ddl_keyword_v1(source, tokens):
+        return err("YDBv1 DDL statements are not supported inside an explicit transaction")
+    let write_allowed: Boolean = yaza_db_sql_write_allowed_during_index_build_with_cache_v1(transaction.storage, cached_index_rows)?
+    if not write_allowed:
+        return err("YDBv1 writes are fenced while a secondary index build is incomplete")
+    if yaza_sql_v2_is_keyword(source, tokens, 0, "INSERT"):
+        return yaza_db_execute_insert_in_tx_v1(transaction, source, parameters, cached_catalog, cached_index_rows)
+    if yaza_sql_v2_is_keyword(source, tokens, 0, "UPDATE"):
+        return yaza_db_execute_update_in_tx_v1(transaction, source, parameters, cached_catalog, cached_index_rows)
+    if yaza_sql_v2_is_keyword(source, tokens, 0, "DELETE"):
+        return yaza_db_execute_delete_in_tx_v1(transaction, source, parameters, cached_catalog, cached_index_rows)
+    return err("YDBv1 explicit transaction DML requires INSERT, UPDATE, or DELETE")
+
 fn yaza_db_sql_explain_select_v1(storage: YazaDbStorageHandleV1, source: Text, parameters: List[YazaSqlValueV1], tokens: List[YazaSqlTokenV1]) -> Result[Text, Text]:
     if list_count(parameters) != 0: return err("YDBv1 EXPLAIN does not consume runtime bind values")
     let explain_token: YazaSqlTokenV1 = list_get(tokens, 0)
@@ -100,7 +226,13 @@ fn yaza_db_sql_write_allowed_during_index_build_v1(storage: YazaDbStorageHandleV
     let building: Boolean = yaza_db_index_catalog_has_building_v1(storage.file, storage.header, visible_ts)?
     return ok(not building)
 
-fn yaza_db_execute_statement_with_delete_checkpoint_policy_profiled_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], query_profile_ns: List[Number], defer_delete_checkpoint: Boolean) -> Result[YazaDbSqlStatementResultV1, Text]:
+fn yaza_db_sql_write_allowed_during_index_build_with_cache_v1(storage: YazaDbStorageHandleV1, cached_index_rows: Option[List[YazaDbRowV1]]) -> Result[Boolean, Text]:
+    if storage.header.catalog_root == 0: return ok(true)
+    if option_is_some(cached_index_rows):
+        return ok(not yaza_db_index_catalog_has_building_from_rows_v1(option_unwrap(cached_index_rows)))
+    return yaza_db_sql_write_allowed_during_index_build_v1(storage)
+
+fn yaza_db_execute_statement_with_cache_and_policy_profiled_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], cached_catalog: Option[YazaDbCatalogSnapshotWithRootsV1], cached_index_rows: Option[List[YazaDbRowV1]], query_profile_ns: List[Number], defer_dml_checkpoint: Boolean) -> Result[YazaDbSqlStatementResultV1, Text]:
     if storage.root != wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid): return err("YDBv1 SQL statement storage and WAL handles belong to different databases")
     let lexed: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(source)
     if not result_is_ok(lexed): return err(result_unwrap_error(lexed))
@@ -122,31 +254,24 @@ fn yaza_db_execute_statement_with_delete_checkpoint_policy_profiled_v1(storage: 
         return ok(YazaDbSqlStatementResultV1(yaza_db_sql_statement_kind_select_v1(), some(query), none, none, storage, wal))
 
     if yaza_sql_v2_is_keyword(source, tokens, 0, "INSERT"):
-        let insert_allowed: Boolean = yaza_db_sql_write_allowed_during_index_build_v1(storage)?
+        let insert_allowed: Boolean = yaza_db_sql_write_allowed_during_index_build_with_cache_v1(storage, cached_index_rows)?
         if not insert_allowed:
             return err("YDBv1 writes are fenced while a secondary index build is incomplete")
-        let committed: YazaDbWriteCommitV1 = yaza_db_execute_insert_v1(storage, wal, source, parameters)?
+        let committed: YazaDbWriteCommitV1 = yaza_db_execute_insert_with_policy_v1(storage, wal, source, parameters, defer_dml_checkpoint, cached_catalog, cached_index_rows)?
         return ok(YazaDbSqlStatementResultV1(yaza_db_sql_statement_kind_insert_v1(), none, some(committed), none, committed.storage, committed.wal))
 
     if yaza_sql_v2_is_keyword(source, tokens, 0, "DELETE"):
-        let delete_allowed: Boolean = yaza_db_sql_write_allowed_during_index_build_v1(storage)?
+        let delete_allowed: Boolean = yaza_db_sql_write_allowed_during_index_build_with_cache_v1(storage, cached_index_rows)?
         if not delete_allowed:
             return err("YDBv1 writes are fenced while a secondary index build is incomplete")
-        var delete_result: Result[YazaDbWriteCommitV1, Text] = err("YDBv1 DELETE execution path was not selected")
-        if list_count(query_profile_ns) >= 34:
-            set delete_result = yaza_db_execute_delete_with_checkpoint_policy_profiled_v1(storage, wal, source, parameters, defer_delete_checkpoint, query_profile_ns)
-        elif defer_delete_checkpoint:
-            set delete_result = yaza_db_execute_delete_deferred_checkpoint_v1(storage, wal, source, parameters)
-        else:
-            set delete_result = yaza_db_execute_delete_v1(storage, wal, source, parameters)
-        let committed: YazaDbWriteCommitV1 = delete_result?
+        let committed: YazaDbWriteCommitV1 = yaza_db_execute_delete_with_cache_and_policy_profiled_v1(storage, wal, source, parameters, defer_dml_checkpoint, cached_catalog, cached_index_rows, query_profile_ns)?
         return ok(YazaDbSqlStatementResultV1(yaza_db_sql_statement_kind_delete_v1(), none, some(committed), none, committed.storage, committed.wal))
 
     if yaza_sql_v2_is_keyword(source, tokens, 0, "UPDATE"):
-        let update_allowed: Boolean = yaza_db_sql_write_allowed_during_index_build_v1(storage)?
+        let update_allowed: Boolean = yaza_db_sql_write_allowed_during_index_build_with_cache_v1(storage, cached_index_rows)?
         if not update_allowed:
             return err("YDBv1 writes are fenced while a secondary index build is incomplete")
-        let committed: YazaDbWriteCommitV1 = yaza_db_execute_update_v1(storage, wal, source, parameters)?
+        let committed: YazaDbWriteCommitV1 = yaza_db_execute_update_with_policy_v1(storage, wal, source, parameters, defer_dml_checkpoint, cached_catalog, cached_index_rows)?
         return ok(YazaDbSqlStatementResultV1(yaza_db_sql_statement_kind_update_v1(), none, some(committed), none, committed.storage, committed.wal))
 
     if yaza_sql_v2_is_keyword(source, tokens, 0, "CREATE"):
@@ -282,8 +407,14 @@ fn yaza_db_execute_statement_with_delete_checkpoint_policy_profiled_v1(storage: 
 
     return err("YDBv1 SQL statement profile supports SELECT, EXPLAIN SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, CREATE INDEX, CREATE VIEW, DROP TABLE, DROP INDEX, DROP VIEW, ALTER TABLE ADD COLUMN, and ALTER TABLE ADD CHECK")
 
+fn yaza_db_execute_statement_with_delete_checkpoint_policy_profiled_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], query_profile_ns: List[Number], defer_delete_checkpoint: Boolean) -> Result[YazaDbSqlStatementResultV1, Text]:
+    return yaza_db_execute_statement_with_cache_and_policy_profiled_v1(storage, wal, source, parameters, none, none, query_profile_ns, defer_delete_checkpoint)
+
 fn yaza_db_execute_statement_profiled_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], query_profile_ns: List[Number]) -> Result[YazaDbSqlStatementResultV1, Text]:
     return yaza_db_execute_statement_with_delete_checkpoint_policy_profiled_v1(storage, wal, source, parameters, query_profile_ns, false)
+
+fn yaza_db_execute_session_statement_with_cache_profiled_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], cached_catalog: Option[YazaDbCatalogSnapshotWithRootsV1], cached_index_rows: Option[List[YazaDbRowV1]], query_profile_ns: List[Number]) -> Result[YazaDbSqlStatementResultV1, Text]:
+    return yaza_db_execute_statement_with_cache_and_policy_profiled_v1(storage, wal, source, parameters, cached_catalog, cached_index_rows, query_profile_ns, true)
 
 fn yaza_db_execute_session_statement_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1]) -> Result[YazaDbSqlStatementResultV1, Text]:
     return yaza_db_execute_statement_with_delete_checkpoint_policy_profiled_v1(storage, wal, source, parameters, List[Number](), true)

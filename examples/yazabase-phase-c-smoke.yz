@@ -1,0 +1,271 @@
+# Phase C Multi-Node & Autoscale Validation Fixture (C1 Replication, C2 HA Raft, C3 Router & Autoscale)
+use "std/fs"
+use "std/http"
+use "std/json"
+use "std/net"
+use "std/time"
+use "std/ywt"
+use "../yazabase/api_v1"
+use "../yazabase/autoscale_v1"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/cluster_api_v1"
+use "../yazabase/cluster_ha_v1"
+use "../yazabase/replication_v1"
+use "../yazabase/router_v1"
+use "../yazabase/session_v1"
+use "../yazabase/sql_executor_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/wal_v1"
+
+fn pc_expect(cond: Boolean, label: Text) -> Result[Boolean, Text]:
+    if not cond:
+        return err("phase-c assertion failed: " + label)
+    return ok(true)
+
+fn pc_init_db(dir_path: Text, db_name: Text) -> Result[YazaDbSessionV1, Text]:
+    let root: Number = root_open(dir_path)?
+    let boot: YazaDbCatalogBootstrapV1 = yaza_db_catalog_create_v1(root, db_name)?
+    let _wc: Boolean = yaza_db_wal_log_close_v1(boot.wal)?
+    let _sc: Boolean = yaza_db_storage_close_v1(boot.storage)?
+    return yaza_db_session_open_v1(root, db_name)
+
+fn pc_exec_sess(sess: YazaDbSessionV1, sql: Text) -> Result[YazaDbSessionV1, Text]:
+    let r: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(sess, sql, List[YazaSqlValueV1]())?
+    return ok(r.session)
+
+fn pc_query_int(sess: YazaDbSessionV1, sql: Text) -> Result[Number, Text]:
+    let res: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(sess, sql, List[YazaSqlValueV1]())?
+    let qr: YazaSqlQueryResultV1 = option_unwrap(res.statement.query_result)
+    if list_count(qr.rows) < 1:
+        return err("expected >= 1 row for query: " + sql)
+    return ok(list_get(list_get(qr.rows, 0), 0).integer_value)
+
+async fn pc_write_wire(conn: Number, wire: Bytes) -> Result[Number, Text]:
+    return tcp_write(conn, wire, 5000)
+
+fn pc_run(base_root: Text) -> Result[Boolean, Text]:
+    let db_name: Text = "cluster.yzdb"
+    let auth_secret: Text = "yazabase-phase-c-secret-minimum-32-chars-ok"
+
+    # --- Phase C1: WAL Streaming Replication ---
+    var primary: YazaDbSessionV1 = pc_init_db(base_root + "/primary", db_name)?
+    set primary = pc_exec_sess(primary, "CREATE TABLE orders (id INTEGER PRIMARY KEY, shard_key TEXT, amount INTEGER)")?
+    set primary = pc_exec_sess(primary, "INSERT INTO orders (id, shard_key, amount) VALUES (1, 'k1', 100)")?
+
+    let backup_root: Number = root_open(base_root + "/backup")?
+    let snap_exp: YazaDbReplicationSnapshotExportV1 = yaza_db_replication_export_snapshot_v1(primary, backup_root, db_name)?
+    set primary = snap_exp.session
+
+    var rep1_root: Number = root_open(base_root + "/replica1")?
+    var rep1: YazaDbSessionV1 = yaza_db_replication_bootstrap_replica_v1(backup_root, db_name, rep1_root)?
+    let init_cnt: Number = pc_query_int(rep1, "SELECT COUNT(*) FROM orders")?
+    let _a1: Boolean = pc_expect(init_cnt == 1, "replica1 bootstrap sees 1 initial row")?
+
+    # More writes on primary (INSERT, UPDATE, DELETE + new table DDL)
+    set primary = pc_exec_sess(primary, "INSERT INTO orders (id, shard_key, amount) VALUES (2, 'k2', 200)")?
+    set primary = pc_exec_sess(primary, "INSERT INTO orders (id, shard_key, amount) VALUES (3, 'k3', 300)")?
+    set primary = pc_exec_sess(primary, "UPDATE orders SET amount = 250 WHERE id = 2")?
+    set primary = pc_exec_sess(primary, "DELETE FROM orders WHERE id = 1")?
+    set primary = pc_exec_sess(primary, "CREATE TABLE audit (id INTEGER PRIMARY KEY, msg TEXT)")?
+    set primary = pc_exec_sess(primary, "INSERT INTO audit (id, msg) VALUES (10, 'replicated_ddl')")?
+
+    # Stream via HTTP GET /api/v1/replication/wal & POST /api/v1/replication/ack over tcp_pair_create
+    var repl_state: YazaDbReplicationStateV1 = yaza_db_replication_default_state_v1("primary", "node-primary", 1)
+    let ha_primary: YazaDbHaStateV1 = yaza_db_ha_default_state_v1("node-primary", "primary", 1, primary.wal.next_lsn, 3000)
+
+    let tok: Text = ywt_create("cluster", "yazabase", time_now_unix_ms() / 1000 + 3600, auth_secret)
+    let target_url: Text = "/api/v1/replication/wal?from_lsn=" + number_text(rep1.wal.next_lsn) + "&max_bytes=1048576"
+    let raw_req: Text = "GET " + target_url + " HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer " + tok + "\r\nContent-Length: 0\r\n\r\n"
+    let http_req: HttpRequest = http_parse_request(bytes_from_text(raw_req))?
+    let api_out: YazaApiClusterResponseV1 = yaza_api_route_request_cluster_v1(primary, base_root + "/primary", db_name, http_req, auth_secret, yaza_api_server_state_default(db_name), repl_state, ha_primary)?
+    set repl_state = api_out.repl_state
+    let _a2: Boolean = pc_expect(api_out.response.status_code == 200, "GET /api/v1/replication/wal returned 200")?
+
+    # Exercise TCP framing builder & parser over tcp_pair_create
+    let s1: Number = tcp_pair_create()?
+    let s2: Number = tcp_pair_peer(s1)?
+    let resp_wire: Bytes = http_format_response(api_out.response)
+    let wt: Task[Result[Number, Text]] = spawn pc_write_wire(s1, resp_wire)
+    let body_txt: Text = yaza_db_replication_http_read_response_v1(s2, 5000)?
+    let _wr: Number = wt.await?
+    let _cp1: Boolean = tcp_close(s1)?
+    let _cp2: Boolean = tcp_close(s2)?
+
+    let chunk: YazaDbWalChunkV1 = yaza_db_replication_parse_wal_chunk_json_v1(body_txt)?
+    let applied: YazaDbReplicationApplyOutcomeV1 = yaza_db_replication_apply_wal_chunk_v1(rep1, chunk)?
+    set rep1 = applied.session
+    let _a3: Boolean = pc_expect(applied.applied_records > 0 and applied.applied_lsn == primary.wal.next_lsn, "replica1 caught up to primary LSN")?
+
+    # Idempotent duplicate apply check
+    let applied_dup: YazaDbReplicationApplyOutcomeV1 = yaza_db_replication_apply_wal_chunk_v1(rep1, chunk)?
+    set rep1 = applied_dup.session
+    let _a4: Boolean = pc_expect(applied_dup.applied_records == 0, "duplicate WAL chunk is idempotent")?
+
+    # Verify SELECT parity on replica1 (including DDL table audit)
+    let ord_cnt: Number = pc_query_int(rep1, "SELECT COUNT(*) FROM orders")?
+    let ord_amt2: Number = pc_query_int(rep1, "SELECT amount FROM orders WHERE id = 2")?
+    let aud_id10: Number = pc_query_int(rep1, "SELECT id FROM audit WHERE id = 10")?
+    let _a5: Boolean = pc_expect(ord_cnt == 2, "replica1 has 2 orders after DML")?
+    let _a6: Boolean = pc_expect(ord_amt2 == 250, "replica1 sees updated amount=250")?
+    let _a7: Boolean = pc_expect(aud_id10 == 10, "replica1 sees replicated audit table")?
+
+    # Ack via POST /api/v1/replication/ack & verify quorum
+    let ack_body: Text = "{\"replica_id\":\"replica-1\",\"applied_lsn\":" + number_text(rep1.wal.next_lsn) + "}"
+    let ack_raw: Text = "POST /api/v1/replication/ack HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer " + tok + "\r\nContent-Type: application/json\r\nContent-Length: " + number_text(text_length(ack_body)) + "\r\n\r\n" + ack_body
+    let ack_http: HttpRequest = http_parse_request(bytes_from_text(ack_raw))?
+    let ack_out: YazaApiClusterResponseV1 = yaza_api_route_request_cluster_v1(primary, base_root + "/primary", db_name, ack_http, auth_secret, yaza_api_server_state_default(db_name), repl_state, ha_primary)?
+    set repl_state = ack_out.repl_state
+    let _a8: Boolean = pc_expect(yaza_db_replication_quorum_satisfied_v1(repl_state, primary.wal.next_lsn), "sync_quorum=1 satisfied after ack")?
+
+    # Verify 409 Conflict guard on replica HTTP write
+    let write_body: Text = "{\"sql\":\"INSERT INTO orders (id, shard_key, amount) VALUES (99, 'x', 1)\"}"
+    let w_raw: Text = "POST /api/v1/sql HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer " + tok + "\r\nContent-Type: application/json\r\nContent-Length: " + number_text(text_length(write_body)) + "\r\n\r\n" + write_body
+    let w_http: HttpRequest = http_parse_request(bytes_from_text(w_raw))?
+    let w_res: YazaApiSessionResponseV1 = yaza_api_route_request_state_with_role_v1(rep1, base_root + "/replica1", db_name, w_http, auth_secret, yaza_api_server_state_default(db_name), "replica")?
+    set rep1 = w_res.session
+    let _a9: Boolean = pc_expect(w_res.response.status_code == 409, "replica HTTP write rejected with 409 Conflict")?
+
+    # Verify replica ARIES recovery cleanly survives close/reopen after WAL replay
+    let _rc: Boolean = yaza_db_session_close_v1(rep1)?
+    set rep1_root = root_open(base_root + "/replica1")?
+    set rep1 = yaza_db_session_open_v1(rep1_root, db_name)?
+    let reopened_amt2: Number = pc_query_int(rep1, "SELECT amount FROM orders WHERE id = 2")?
+    let _a10: Boolean = pc_expect(reopened_amt2 == 250, "replica ARIES reopen preserves replayed data")?
+
+    # --- Phase C2: HA Raft Election, Persistent Meta, Heartbeat Fencing, Promotion ---
+    let ha_n2: YazaDbHaStateV1 = yaza_db_ha_default_state_v1("replica-1", "replica", 1, rep1.wal.next_lsn, 3000)
+    let r2_root: Number = root_open(base_root + "/replica2")?
+    let r3_root: Number = root_open(base_root + "/replica3")?
+    let ha_n3: YazaDbHaStateV1 = yaza_db_ha_default_state_v1("replica-2", "replica", 1, rep1.wal.next_lsn, 3000)
+    let ha_old_lag: YazaDbHaStateV1 = yaza_db_ha_default_state_v1("stale-node", "primary", 1, 0, 3000)
+
+    let roots_list: List[Number] = List[Number]()
+    let _r1: Boolean = list_try_push(roots_list, rep1_root)
+    let _r2: Boolean = list_try_push(roots_list, r2_root)
+    let _r3: Boolean = list_try_push(roots_list, r3_root)
+    let nodes_list: List[YazaDbHaStateV1] = List[YazaDbHaStateV1]()
+    let _n1: Boolean = list_try_push(nodes_list, ha_n2)
+    let _n2: Boolean = list_try_push(nodes_list, ha_n3)
+    let _n3: Boolean = list_try_push(nodes_list, ha_old_lag)
+
+    let elect: YazaDbHaElectionOutcomeV1 = yaza_db_ha_run_election_round_v1(roots_list, nodes_list, 0)?
+    let _a11: Boolean = pc_expect(elect.elected and elect.winner_id == "replica-1" and elect.term == 2 and elect.votes_granted >= 2, "Raft election promoted up-to-date replica-1 in term 2")?
+
+    # Verify durable cluster_raft.meta reload
+    let reloaded_meta: YazaDbHaStateV1 = yaza_db_ha_load_meta_v1(rep1_root, yaza_db_ha_default_state_v1("fallback", "replica", 1, 0, 3000))?
+    let _a12: Boolean = pc_expect(reloaded_meta.role == "primary" and reloaded_meta.term == 2 and reloaded_meta.voted_for == "replica-1", "cluster_raft.meta persisted term & vote")?
+
+    # Verify stale-leader fencing
+    let stale_hb: YazaDbHeartbeatV1 = YazaDbHeartbeatV1(1, "stale-node", 0, time_now_unix_ms())
+    let hb_res: YazaDbHeartbeatResponseV1 = yaza_db_ha_handle_heartbeat_v1(rep1_root, reloaded_meta, stale_hb)?
+    let _a13: Boolean = pc_expect(hb_res.fenced and not hb_res.accepted, "stale term-1 heartbeat fenced by term-2 primary")?
+
+    # Verify replica promotion + checkpoint publish
+    let prom: YazaDbHaPromoteOutcomeV1 = yaza_db_ha_promote_replica_v1(rep1, reloaded_meta, 3)?
+    set rep1 = prom.session
+    let _a14: Boolean = pc_expect(prom.state.role == "primary" and prom.state.term == 3, "promote_replica_v1 published term 3 primary")?
+    set rep1 = pc_exec_sess(rep1, "INSERT INTO orders (id, shard_key, amount) VALUES (4, 'k4', 400)")?
+    let ord_cnt3: Number = pc_query_int(rep1, "SELECT COUNT(*) FROM orders")?
+    let _a15: Boolean = pc_expect(ord_cnt3 == 3, "promoted primary accepts writes")?
+
+    # --- Phase C3: R/W Splitting Router & 3-Shard FNV-1a & Scatter-Gather ---
+    let p_node: YazaDbRouterNodeV1 = YazaDbRouterNodeV1("primary", "127.0.0.1:8080", "primary", 5000, true)
+    let rep_nodes: List[YazaDbRouterNodeV1] = List[YazaDbRouterNodeV1]()
+    let _rn1: Boolean = list_try_push(rep_nodes, YazaDbRouterNodeV1("rep-1", "127.0.0.1:8081", "replica", 5000, true))
+    let _rn2: Boolean = list_try_push(rep_nodes, YazaDbRouterNodeV1("rep-2", "127.0.0.1:8082", "replica", 4950, true))
+    var router: YazaDbRwRouterV1 = yaza_db_router_new_v1(p_node, rep_nodes, 5000, 128)
+
+    let dw: YazaDbRouteDecisionV1 = yaza_db_router_select_target_v1(router, "INSERT INTO orders VALUES (5, 'k5', 500)", 0)?
+    let _a16: Boolean = pc_expect(dw.target.node_id == "primary" and dw.reason == "write_or_tx", "write routed to primary")?
+    let dtx: YazaDbRouteDecisionV1 = yaza_db_router_select_target_v1(router, "BEGIN", 0)?
+    let _a17: Boolean = pc_expect(dtx.target.node_id == "primary" and dtx.reason == "write_or_tx", "BEGIN routed to primary")?
+
+    let dr1: YazaDbRouteDecisionV1 = yaza_db_router_select_target_v1(router, "SELECT * FROM orders", 4900)?
+    set router = dr1.router
+    let _a18: Boolean = pc_expect(dr1.target.node_id == "rep-1", "first read routed to rep-1")?
+    let dr2: YazaDbRouteDecisionV1 = yaza_db_router_select_target_v1(router, "SELECT * FROM orders", 4900)?
+    set router = dr2.router
+    let _a19: Boolean = pc_expect(dr2.target.node_id == "rep-2", "second read round-robined to rep-2")?
+    let dr_lag: YazaDbRouteDecisionV1 = yaza_db_router_select_target_v1(router, "SELECT * FROM orders", 5001)?
+    let _a20: Boolean = pc_expect(dr_lag.target.node_id == "primary" and dr_lag.reason == "primary_fallback_lag_or_health", "unmet min_lsn falls back to primary")?
+
+    # 3-shard FNV-1a distribution + scatter-gather SELECT
+    let shards: List[YazaDbShardNodeV1] = List[YazaDbShardNodeV1]()
+    let _sn0: Boolean = list_try_push(shards, YazaDbShardNodeV1(0, "shard-0", "127.0.0.1:9000"))
+    let _sn1: Boolean = list_try_push(shards, YazaDbShardNodeV1(1, "shard-1", "127.0.0.1:9001"))
+    let _sn2: Boolean = list_try_push(shards, YazaDbShardNodeV1(2, "shard-2", "127.0.0.1:9002"))
+    let ring: YazaDbShardRingV1 = yaza_db_shard_ring_new_v1(shards)?
+
+    var sh0: YazaDbSessionV1 = pc_init_db(base_root + "/shard0", "s0.yzdb")?
+    var sh1: YazaDbSessionV1 = pc_init_db(base_root + "/shard1", "s1.yzdb")?
+    var sh2: YazaDbSessionV1 = pc_init_db(base_root + "/shard2", "s2.yzdb")?
+    set sh0 = pc_exec_sess(sh0, "CREATE TABLE items (id INTEGER PRIMARY KEY, shard_id INTEGER)")?
+    set sh1 = pc_exec_sess(sh1, "CREATE TABLE items (id INTEGER PRIMARY KEY, shard_id INTEGER)")?
+    set sh2 = pc_exec_sess(sh2, "CREATE TABLE items (id INTEGER PRIMARY KEY, shard_id INTEGER)")?
+
+    var cnt0: Number = 0
+    var cnt1: Number = 0
+    var cnt2: Number = 0
+    var key_i: Number = 1
+    while key_i <= 30:
+        let target_shard: YazaDbShardNodeV1 = yaza_db_shard_route_key_v1(ring, "tenant-" + number_text(key_i))?
+        let sql_ins: Text = "INSERT INTO items (id, shard_id) VALUES (" + number_text(key_i) + ", " + number_text(target_shard.shard_id) + ")"
+        if target_shard.shard_id == 0:
+            set sh0 = pc_exec_sess(sh0, sql_ins)?
+            set cnt0 = cnt0 + 1
+        elif target_shard.shard_id == 1:
+            set sh1 = pc_exec_sess(sh1, sql_ins)?
+            set cnt1 = cnt1 + 1
+        else:
+            set sh2 = pc_exec_sess(sh2, sql_ins)?
+            set cnt2 = cnt2 + 1
+        set key_i = key_i + 1
+    let _a21: Boolean = pc_expect(cnt0 > 0 and cnt1 > 0 and cnt2 > 0, "FNV-1a distributed 30 keys across all 3 shards")?
+
+    let shard_sessions: List[YazaDbSessionV1] = List[YazaDbSessionV1]()
+    let _ps0: Boolean = list_try_push(shard_sessions, sh0)
+    let _ps1: Boolean = list_try_push(shard_sessions, sh1)
+    let _ps2: Boolean = list_try_push(shard_sessions, sh2)
+    let sg: YazaDbScatterGatherResultV1 = yaza_db_shard_scatter_gather_select_v1(shard_sessions, "SELECT id, shard_id FROM items")?
+    let _a22: Boolean = pc_expect(sg.total_rows == 30 and sg.shard_count == 3, "scatter-gather merged all 30 sharded rows")?
+
+    # --- Phase C3: Autoscale Hysteresis, Cooldown, and Scale-Up/Down ---
+    let pol: YazaDbAutoscalePolicyV1 = YazaDbAutoscalePolicyV1(1, 4, 75, 25, 16, 1000, 1048576, 2, 2, 10000)
+    var as_st: YazaDbAutoscaleStateV1 = yaza_db_autoscale_default_state_v1()
+    let d_h1: YazaDbAutoscaleDecisionV1 = yaza_db_autoscale_evaluate_v1(pol, as_st, YazaDbAutoscaleMetricsV1(85, 5, 1200, 0, 2, 1000))
+    set as_st = d_h1.state
+    let _a23: Boolean = pc_expect(d_h1.action == "hold" and d_h1.reason == "hysteresis_high_window", "single high spike waits for hysteresis window")?
+    let d_h2: YazaDbAutoscaleDecisionV1 = yaza_db_autoscale_evaluate_v1(pol, as_st, YazaDbAutoscaleMetricsV1(90, 8, 2200, 0, 2, 2000))
+    set as_st = d_h2.state
+    let _a24: Boolean = pc_expect(d_h2.action == "scale_up" and d_h2.target_replicas == 3, "second consecutive high triggers scale_up -> 3")?
+    let d_cd: YazaDbAutoscaleDecisionV1 = yaza_db_autoscale_evaluate_v1(pol, as_st, YazaDbAutoscaleMetricsV1(95, 20, 4000, 0, 3, 5000))
+    let _a25: Boolean = pc_expect(d_cd.action == "hold" and d_cd.reason == "cooldown_active", "cooldown blocks immediate repeat scaling")?
+    let d_l1: YazaDbAutoscaleDecisionV1 = yaza_db_autoscale_evaluate_v1(pol, as_st, YazaDbAutoscaleMetricsV1(10, 0, 50, 0, 3, 20000))
+    set as_st = d_l1.state
+    let _a26: Boolean = pc_expect(d_l1.action == "hold" and d_l1.reason == "hysteresis_low_window", "first low sample waits")?
+    let d_l2: YazaDbAutoscaleDecisionV1 = yaza_db_autoscale_evaluate_v1(pol, as_st, YazaDbAutoscaleMetricsV1(10, 0, 40, 0, 3, 21000))
+    let _a27: Boolean = pc_expect(d_l2.action == "scale_down" and d_l2.target_replicas == 2, "second consecutive low after cooldown triggers scale_down -> 2")?
+
+    # Close all open sessions & directory handles
+    let _cp: Boolean = yaza_db_session_close_v1(primary)?
+    let _crp: Boolean = yaza_db_session_close_v1(rep1)?
+    var si: Number = 0
+    while si < list_count(sg.sessions):
+        let ss: YazaDbSessionV1 = list_get(sg.sessions, si)
+        let _csg: Boolean = yaza_db_session_close_v1(ss)?
+        set si = si + 1
+    let _c2: Boolean = close(backup_root)?
+    let _c4: Boolean = close(r2_root)?
+    let _c5: Boolean = close(r3_root)?
+    return ok(true)
+
+start:
+    if arg_count() < 1:
+        say "usage: yazabase-phase-c-smoke <root-dir>"
+        exit(2)
+    let ok_res: Result[Boolean, Text] = pc_run(arg(1))
+    if not result_is_ok(ok_res):
+        say "yazabase-phase-c-smoke: FAIL: " + result_unwrap_error(ok_res)
+        exit(1)
+    say "yazabase-phase-c-smoke: PASS"
+    exit(0)

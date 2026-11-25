@@ -3,6 +3,7 @@
 # SQL NULL is preserved; general MVCC visibility and in-progress versions
 # remain outside this read-only profile.
 use "./btree_scan_v1"
+use "./buffer_pool_v1"
 use "./catalog_schema_v1"
 use "./catalog_snapshot_v1"
 use "./catalog_storage_v1"
@@ -10,6 +11,7 @@ use "./catalog_v1"
 use "./index_catalog_v1"
 use "./key_codec_v1"
 use "./mvcc_history_v1"
+use "./plan_cache_v1"
 use "./row_v1"
 use "./sql_binder_v1"
 use "./sql_executor_v1"
@@ -663,8 +665,16 @@ fn yaza_db_query_collect_key_equality_v1(plan: YazaSqlBoundPlanV1, prepared: Lis
     if left_state == 2 or right_state == 2: return 2
     return 0
 
-fn yaza_db_query_clustered_equality_lookup_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, plan: YazaSqlBoundPlanV1, table_schema: YazaSqlTableSchemaV1, schema_version: Number, key_ordinals: List[Number], visible_ts: Number, parameters: List[YazaSqlValueV1], profile_ns: List[Number]) -> Result[Option[List[YazaDbRowV1]], Text]:
-    if plan.where_root < 0 or plan.where_root >= list_count(plan.expressions) or list_count(key_ordinals) < 1: return ok(none)
+shape YazaDbQueryPooledSelectResultV1:
+    query_result: YazaSqlQueryResultV1
+    missed_pages: List[YazaDbValidatedPageV1]
+
+shape YazaDbQueryRowsLookupResultV1:
+    rows: Option[List[YazaDbRowV1]]
+    missed_pages: List[YazaDbValidatedPageV1]
+
+fn yaza_db_query_clustered_equality_lookup_with_pool_misses_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, plan: YazaSqlBoundPlanV1, table_schema: YazaSqlTableSchemaV1, schema_version: Number, key_ordinals: List[Number], visible_ts: Number, parameters: List[YazaSqlValueV1], buffer_pool: Option[YazaDbBufferPoolV1], profile_ns: List[Number]) -> Result[YazaDbQueryRowsLookupResultV1, Text]:
+    if plan.where_root < 0 or plan.where_root >= list_count(plan.expressions) or list_count(key_ordinals) < 1: return ok(YazaDbQueryRowsLookupResultV1(none, List[YazaDbValidatedPageV1]()))
     let point_profile_enabled: Boolean = list_count(profile_ns) >= 18
     var point_stage_started_ns: Number = 0
     if point_profile_enabled: set point_stage_started_ns = monotonic_ns()
@@ -696,12 +706,12 @@ fn yaza_db_query_clustered_equality_lookup_v1(file: Number, file_header: YazaDbF
                         if point_profile_enabled: set point_stage_started_ns = yaza_db_query_profile_record_ns_v1(profile_ns, 14, point_stage_started_ns, monotonic_ns())
                         if point_profile_enabled: set point_stage_started_ns = yaza_db_query_profile_record_ns_v1(profile_ns, 15, point_stage_started_ns, monotonic_ns())
                         if point_profile_enabled: set point_stage_started_ns = monotonic_ns()
-                        let seek: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_profiled_v1(file, file_header, root_page_id, search_key, profile_ns)?
+                        let seek: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_profiled_with_pool_v1(file, file_header, root_page_id, search_key, buffer_pool, profile_ns)?
                         if point_profile_enabled: set point_stage_started_ns = yaza_db_query_profile_record_ns_v1(profile_ns, 16, point_stage_started_ns, monotonic_ns())
                         if point_profile_enabled: set point_stage_started_ns = monotonic_ns()
                         let rows: List[YazaDbRowV1] = yaza_db_btree_read_rows_from_seek_for_schema_v1(file, file_header, table_schema.columns, schema_version, key_ordinals, visible_ts, search_key, seek)?
                         if point_profile_enabled: let ignored_row_profile: Number = yaza_db_query_profile_record_ns_v1(profile_ns, 17, point_stage_started_ns, monotonic_ns())
-                        return ok(some(rows))
+                        return ok(YazaDbQueryRowsLookupResultV1(some(rows), seek.missed_pages))
 
     let type_ids_result: Result[List[Number], Text] = list_try_new()
     if not result_is_ok(type_ids_result): return err(result_unwrap_error(type_ids_result))
@@ -730,27 +740,34 @@ fn yaza_db_query_clustered_equality_lookup_v1(file: Number, file_header: YazaDbF
 
     let predicate_state: Number = yaza_db_query_collect_key_equality_v1(plan, prepared, key_ordinals, values, nulls, seen, plan.where_root, 0)
     if point_profile_enabled: set point_stage_started_ns = yaza_db_query_profile_record_ns_v1(profile_ns, 14, point_stage_started_ns, monotonic_ns())
-    if predicate_state == 1: return ok(none)
+    if predicate_state == 1: return ok(YazaDbQueryRowsLookupResultV1(none, List[YazaDbValidatedPageV1]()))
     var key_index: Number = 0
     while key_index < list_count(key_ordinals):
         let ordinal: Number = list_get(key_ordinals, key_index)
-        if ordinal < 0 or ordinal >= list_count(seen) or not list_get(seen, ordinal): return ok(none)
+        if ordinal < 0 or ordinal >= list_count(seen) or not list_get(seen, ordinal): return ok(YazaDbQueryRowsLookupResultV1(none, List[YazaDbValidatedPageV1]()))
         set key_index = key_index + 1
     if predicate_state == 2:
         let empty_rows_result: Result[List[YazaDbRowV1], Text] = list_try_new()
         if not result_is_ok(empty_rows_result): return err(result_unwrap_error(empty_rows_result))
-        return ok(some(result_unwrap(empty_rows_result)))
+        return ok(YazaDbQueryRowsLookupResultV1(some(result_unwrap(empty_rows_result)), List[YazaDbValidatedPageV1]()))
 
     if point_profile_enabled: set point_stage_started_ns = monotonic_ns()
     let search_key: Bytes = yaza_db_key_encode_composite_v1(values, nulls, table_schema.columns, key_ordinals)?
     if point_profile_enabled: set point_stage_started_ns = yaza_db_query_profile_record_ns_v1(profile_ns, 15, point_stage_started_ns, monotonic_ns())
     if point_profile_enabled: set point_stage_started_ns = monotonic_ns()
-    let seek: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_profiled_v1(file, file_header, root_page_id, search_key, profile_ns)?
+    let seek: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_profiled_with_pool_v1(file, file_header, root_page_id, search_key, buffer_pool, profile_ns)?
     if point_profile_enabled: set point_stage_started_ns = yaza_db_query_profile_record_ns_v1(profile_ns, 16, point_stage_started_ns, monotonic_ns())
     if point_profile_enabled: set point_stage_started_ns = monotonic_ns()
     let rows: List[YazaDbRowV1] = yaza_db_btree_read_rows_from_seek_for_schema_v1(file, file_header, table_schema.columns, schema_version, key_ordinals, visible_ts, search_key, seek)?
     if point_profile_enabled: let ignored_row_profile: Number = yaza_db_query_profile_record_ns_v1(profile_ns, 17, point_stage_started_ns, monotonic_ns())
-    return ok(some(rows))
+    return ok(YazaDbQueryRowsLookupResultV1(some(rows), seek.missed_pages))
+
+fn yaza_db_query_clustered_equality_lookup_with_pool_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, plan: YazaSqlBoundPlanV1, table_schema: YazaSqlTableSchemaV1, schema_version: Number, key_ordinals: List[Number], visible_ts: Number, parameters: List[YazaSqlValueV1], buffer_pool: Option[YazaDbBufferPoolV1], profile_ns: List[Number]) -> Result[Option[List[YazaDbRowV1]], Text]:
+    let lookup: YazaDbQueryRowsLookupResultV1 = yaza_db_query_clustered_equality_lookup_with_pool_misses_v1(file, file_header, root_page_id, plan, table_schema, schema_version, key_ordinals, visible_ts, parameters, buffer_pool, profile_ns)?
+    return ok(lookup.rows)
+
+fn yaza_db_query_clustered_equality_lookup_v1(file: Number, file_header: YazaDbFileHeaderV1, root_page_id: Number, plan: YazaSqlBoundPlanV1, table_schema: YazaSqlTableSchemaV1, schema_version: Number, key_ordinals: List[Number], visible_ts: Number, parameters: List[YazaSqlValueV1], profile_ns: List[Number]) -> Result[Option[List[YazaDbRowV1]], Text]:
+    return yaza_db_query_clustered_equality_lookup_with_pool_v1(file, file_header, root_page_id, plan, table_schema, schema_version, key_ordinals, visible_ts, parameters, none, profile_ns)
 
 shape YazaDbSecondaryIndexMatchV1:
     root_page_id: Number
@@ -767,7 +784,7 @@ fn yaza_db_query_find_secondary_index_v1(index_rows: List[YazaDbRowV1], table_id
         set index_row_index = index_row_index + 1
     return none
 
-fn yaza_db_query_secondary_equality_lookup_v1(file: Number, file_header: YazaDbFileHeaderV1, table_root_page_id: Number, plan: YazaSqlBoundPlanV1, table_schema: YazaSqlTableSchemaV1, schema_version: Number, clustered_key_ordinals: List[Number], visible_ts: Number, parameters: List[YazaSqlValueV1], cached_index_rows: Option[List[YazaDbRowV1]]) -> Result[Option[List[YazaDbRowV1]], Text]:
+fn yaza_db_query_secondary_equality_lookup_with_pool_v1(file: Number, file_header: YazaDbFileHeaderV1, table_root_page_id: Number, plan: YazaSqlBoundPlanV1, table_schema: YazaSqlTableSchemaV1, schema_version: Number, clustered_key_ordinals: List[Number], visible_ts: Number, parameters: List[YazaSqlValueV1], cached_index_rows: Option[List[YazaDbRowV1]], buffer_pool: Option[YazaDbBufferPoolV1]) -> Result[Option[List[YazaDbRowV1]], Text]:
     if plan.right_table_id != 0 or plan.where_root < 0 or plan.where_root >= list_count(plan.expressions): return ok(none)
     let predicate: YazaSqlBoundExpressionNodeV1 = list_get(plan.expressions, plan.where_root)
     if predicate.kind != 1 or predicate.operator != 1 or predicate.column_ordinal < 0 or predicate.column_ordinal >= list_count(table_schema.columns): return ok(none)
@@ -831,7 +848,7 @@ fn yaza_db_query_secondary_equality_lookup_v1(file: Number, file_header: YazaDbF
             if not list_try_push(prefix_values, null_suffix) or not list_try_push(prefix_nulls, true): return err("YDBv1 secondary-index lookup could not pad its prefix tuple")
         set prefix_column = prefix_column + 1
     let prefix_key: Bytes = yaza_db_key_encode_composite_v1(prefix_values, prefix_nulls, entry_columns, [0])?
-    let matching_entries: List[YazaDbRowV1] = yaza_db_btree_read_rows_with_key_prefix_v1(file, file_header, index_root_page_id, entry_columns, 1, entry_key_ordinals, visible_ts, prefix_key, 65536)?
+    let matching_entries: List[YazaDbRowV1] = yaza_db_btree_read_rows_with_key_prefix_and_pool_v1(file, file_header, index_root_page_id, entry_columns, 1, entry_key_ordinals, visible_ts, prefix_key, 65536, buffer_pool)?
     let output_result: Result[List[YazaDbRowV1], Text] = list_try_new()
     if not result_is_ok(output_result): return err(result_unwrap_error(output_result))
     let output: List[YazaDbRowV1] = result_unwrap(output_result)
@@ -871,7 +888,7 @@ fn yaza_db_query_secondary_equality_lookup_v1(file: Number, file_header: YazaDbF
                 return err("YDBv1 secondary-index lookup could not construct its clustered key")
             set key_index = key_index + 1
         let clustered_key: Bytes = yaza_db_key_encode_composite_v1(source_values, source_nulls, table_schema.columns, clustered_key_ordinals)?
-        let source_rows: List[YazaDbRowV1] = yaza_db_btree_read_rows_by_key_for_schema_v1(file, file_header, table_root_page_id, table_schema.columns, schema_version, clustered_key_ordinals, visible_ts, clustered_key)?
+        let source_rows: List[YazaDbRowV1] = yaza_db_btree_read_rows_by_key_with_pool_for_schema_v1(file, file_header, table_root_page_id, table_schema.columns, schema_version, clustered_key_ordinals, visible_ts, clustered_key, buffer_pool)?
         if list_count(source_rows) != 1: return err("YDBv1 ACTIVE secondary index has a missing or duplicate clustered row")
         let source_row: YazaDbRowV1 = list_get(source_rows, 0)
         if list_get(source_row.nulls, predicate.column_ordinal) or yaza_sql_executor_compare_values_v1(plan.source, list_get(source_row.values, predicate.column_ordinal), target) != 0:
@@ -885,6 +902,9 @@ fn yaza_db_query_secondary_equality_lookup_v1(file: Number, file_header: YazaDbF
         if not list_try_push(output, source_row): return err("YDBv1 secondary-index lookup could not append its clustered row")
         set entry_index = entry_index + 1
     return ok(some(output))
+
+fn yaza_db_query_secondary_equality_lookup_v1(file: Number, file_header: YazaDbFileHeaderV1, table_root_page_id: Number, plan: YazaSqlBoundPlanV1, table_schema: YazaSqlTableSchemaV1, schema_version: Number, clustered_key_ordinals: List[Number], visible_ts: Number, parameters: List[YazaSqlValueV1], cached_index_rows: Option[List[YazaDbRowV1]]) -> Result[Option[List[YazaDbRowV1]], Text]:
+    return yaza_db_query_secondary_equality_lookup_with_pool_v1(file, file_header, table_root_page_id, plan, table_schema, schema_version, clustered_key_ordinals, visible_ts, parameters, cached_index_rows, none)
 
 fn yaza_db_query_secondary_index_prefix_successor_v1(prefix: Bytes) -> Result[Bytes, Text]:
     let prefix_length: Number = bytes_length(prefix)
@@ -922,7 +942,7 @@ fn yaza_db_query_secondary_index_value_prefix_v1(target: YazaSqlValueV1, entry_c
         set column_index = column_index + 1
     return yaza_db_key_encode_composite_v1(values, nulls, entry_columns, [0])
 
-fn yaza_db_query_secondary_range_lookup_v1(file: Number, file_header: YazaDbFileHeaderV1, table_root_page_id: Number, plan: YazaSqlBoundPlanV1, table_schema: YazaSqlTableSchemaV1, schema_version: Number, clustered_key_ordinals: List[Number], visible_ts: Number, parameters: List[YazaSqlValueV1], cached_index_rows: Option[List[YazaDbRowV1]]) -> Result[Option[List[YazaDbRowV1]], Text]:
+fn yaza_db_query_secondary_range_lookup_with_pool_v1(file: Number, file_header: YazaDbFileHeaderV1, table_root_page_id: Number, plan: YazaSqlBoundPlanV1, table_schema: YazaSqlTableSchemaV1, schema_version: Number, clustered_key_ordinals: List[Number], visible_ts: Number, parameters: List[YazaSqlValueV1], cached_index_rows: Option[List[YazaDbRowV1]], buffer_pool: Option[YazaDbBufferPoolV1]) -> Result[Option[List[YazaDbRowV1]], Text]:
     if plan.right_table_id != 0 or plan.where_root < 0 or plan.where_root >= list_count(plan.expressions): return ok(none)
     let predicate: YazaSqlBoundExpressionNodeV1 = list_get(plan.expressions, plan.where_root)
     if predicate.kind != 1 or predicate.operator < 3 or predicate.operator > 6 or predicate.column_ordinal < 0 or predicate.column_ordinal >= list_count(table_schema.columns): return ok(none)
@@ -981,7 +1001,7 @@ fn yaza_db_query_secondary_range_lookup_v1(file: Number, file_header: YazaDbFile
     if predicate.operator == 3: set end_key = prefix_key
     elif predicate.operator == 4: set end_key = successor_key
 
-    let matching_entries: List[YazaDbRowV1] = yaza_db_btree_read_rows_unfiltered_range_for_schema_v1(file, file_header, index_root_page_id, entry_columns, 1, entry_key_ordinals, visible_ts, start_after_key, end_key, end_key_inclusive)?
+    let matching_entries: List[YazaDbRowV1] = yaza_db_btree_read_rows_unfiltered_range_with_pool_for_schema_v1(file, file_header, index_root_page_id, entry_columns, 1, entry_key_ordinals, visible_ts, start_after_key, end_key, end_key_inclusive, buffer_pool)?
     let output_created: Result[List[YazaDbRowV1], Text] = list_try_new()
     if not result_is_ok(output_created): return err(result_unwrap_error(output_created))
     let output: List[YazaDbRowV1] = result_unwrap(output_created)
@@ -1023,7 +1043,7 @@ fn yaza_db_query_secondary_range_lookup_v1(file: Number, file_header: YazaDbFile
                     return err("YDBv1 secondary-index range could not construct its clustered key")
                 set key_index = key_index + 1
             let clustered_key: Bytes = yaza_db_key_encode_composite_v1(source_values, source_nulls, table_schema.columns, clustered_key_ordinals)?
-            let source_rows: List[YazaDbRowV1] = yaza_db_btree_read_rows_by_key_for_schema_v1(file, file_header, table_root_page_id, table_schema.columns, schema_version, clustered_key_ordinals, visible_ts, clustered_key)?
+            let source_rows: List[YazaDbRowV1] = yaza_db_btree_read_rows_by_key_with_pool_for_schema_v1(file, file_header, table_root_page_id, table_schema.columns, schema_version, clustered_key_ordinals, visible_ts, clustered_key, buffer_pool)?
             if list_count(source_rows) != 1: return err("YDBv1 ACTIVE secondary index range has a missing or duplicate clustered row")
             let source_row: YazaDbRowV1 = list_get(source_rows, 0)
             if list_get(source_row.nulls, predicate.column_ordinal) or yaza_sql_executor_compare_values_v1(plan.source, list_get(source_row.values, predicate.column_ordinal), indexed_value) != 0:
@@ -1037,6 +1057,9 @@ fn yaza_db_query_secondary_range_lookup_v1(file: Number, file_header: YazaDbFile
             if not list_try_push(output, source_row): return err("YDBv1 secondary-index range could not append a clustered row")
         set entry_index = entry_index + 1
     return ok(some(output))
+
+fn yaza_db_query_secondary_range_lookup_v1(file: Number, file_header: YazaDbFileHeaderV1, table_root_page_id: Number, plan: YazaSqlBoundPlanV1, table_schema: YazaSqlTableSchemaV1, schema_version: Number, clustered_key_ordinals: List[Number], visible_ts: Number, parameters: List[YazaSqlValueV1], cached_index_rows: Option[List[YazaDbRowV1]]) -> Result[Option[List[YazaDbRowV1]], Text]:
+    return yaza_db_query_secondary_range_lookup_with_pool_v1(file, file_header, table_root_page_id, plan, table_schema, schema_version, clustered_key_ordinals, visible_ts, parameters, cached_index_rows, none)
 
 fn yaza_db_query_prefix_limit_eligible_v1(plan: YazaSqlBoundPlanV1) -> Boolean:
     if not plan.has_limit or plan.limit > yaza_db_btree_max_rows_v1() or plan.where_root >= 0 or plan.having_root >= 0 or plan.distinct: return false
@@ -1353,18 +1376,17 @@ fn yaza_db_execute_single_select_with_loaded_catalog_profiled_v1(file: Number, f
     let combined_budget: YazaDbQueryCteBudgetV1 = yaza_db_query_validate_cte_result_budget_v1(combined, 0, 0, 0, statement_prior_work_units)?
     return ok(combined)
 
-fn yaza_db_execute_single_select_with_loaded_catalog_and_index_rows_profiled_v1(file: Number, file_header: YazaDbFileHeaderV1, source: Text, tokens: List[YazaSqlTokenV1], parameters: List[YazaSqlValueV1], virtual_relations: List[YazaDbQueryVirtualRelationV1], statement_prior_work_units: Number, base_loaded: YazaDbCatalogSnapshotWithRootsV1, cached_index_rows: Option[List[YazaDbRowV1]], profile_ns: List[Number]) -> Result[YazaSqlQueryResultV1, Text]:
+shape YazaDbQueryPlannedSelectResultV1:
+    query_result: YazaSqlQueryResultV1
+    missed_pages: List[YazaDbValidatedPageV1]
+    cache_entry: Option[YazaDbSelectPlanCacheEntryV1]
+
+fn yaza_db_execute_bound_select_plan_pooled_profiled_v1(file: Number, file_header: YazaDbFileHeaderV1, cache_source: Text, plan: YazaSqlBoundPlanV1, parameters: List[YazaSqlValueV1], virtual_relations: List[YazaDbQueryVirtualRelationV1], statement_prior_work_units: Number, base_loaded: YazaDbCatalogSnapshotWithRootsV1, loaded: YazaDbCatalogSnapshotWithRootsV1, cached_index_rows: Option[List[YazaDbRowV1]], cached_key_ordinals: Option[List[Number]], buffer_pool: Option[YazaDbBufferPoolV1], profile_ns: List[Number]) -> Result[YazaDbQueryPlannedSelectResultV1, Text]:
     if statement_prior_work_units < 0 or statement_prior_work_units > yaza_sql_executor_max_work_units_v1(): return err("YDBv1 SELECT prior statement work is outside its bound")
     let profile_enabled: Boolean = list_count(profile_ns) >= 4
     var profile_started_ns: Number = 0
-    var loaded: YazaDbCatalogSnapshotWithRootsV1 = base_loaded
-    if list_count(virtual_relations) > 0:
-        set loaded = yaza_db_query_catalog_with_virtual_relations_v1(base_loaded, virtual_relations)?
     let catalog_snapshot: YazaSqlCatalogSnapshotV1 = loaded.sql_snapshot
-    if profile_enabled: set profile_started_ns = monotonic_ns()
-    let parsed: YazaSqlSelectAstV3 = yaza_sql_parse_select_tokens_v3(source, tokens)?
-    let plan: YazaSqlBoundPlanV1 = yaza_sql_bind_select_v1(source, parsed, catalog_snapshot)?
-    if profile_enabled: set profile_started_ns = yaza_db_query_profile_record_ns_v1(profile_ns, 1, profile_started_ns, monotonic_ns())
+    let plan_catalog_version: Number = plan.catalog_version
     let virtual_index: Number = yaza_db_query_virtual_relation_index_v1(virtual_relations, plan.table_id)
     var uses_virtual_relation: Boolean = virtual_index >= 0 or yaza_db_query_virtual_relation_index_v1(virtual_relations, plan.right_table_id) >= 0
     var stage_probe: Number = 0
@@ -1384,9 +1406,11 @@ fn yaza_db_execute_single_select_with_loaded_catalog_and_index_rows_profiled_v1(
                 let stage: YazaSqlBoundJoinStageV1 = list_get(plan.join_stages, stage_index)
                 set joined_table = yaza_db_query_join_stage_current_with_virtual_relations_v1(file, file_header, catalog, loaded, plan, stage, joined_table, virtual_relations)?
                 set stage_index = stage_index + 1
-            return yaza_sql_execute_memory_with_subqueries_and_prior_v1(plan, joined_table, parameters, scoped_subqueries, statement_prior_work_units)
+            let jres: YazaSqlQueryResultV1 = yaza_sql_execute_memory_with_subqueries_and_prior_v1(plan, joined_table, parameters, scoped_subqueries, statement_prior_work_units)?
+            return ok(YazaDbQueryPlannedSelectResultV1(jres, List[YazaDbValidatedPageV1](), none))
         if virtual_index >= 0:
-            return yaza_sql_execute_memory_with_subqueries_and_prior_v1(plan, list_get(virtual_relations, virtual_index).memory, parameters, scoped_subqueries, statement_prior_work_units)
+            let vres: YazaSqlQueryResultV1 = yaza_sql_execute_memory_with_subqueries_and_prior_v1(plan, list_get(virtual_relations, virtual_index).memory, parameters, scoped_subqueries, statement_prior_work_units)?
+            return ok(YazaDbQueryPlannedSelectResultV1(vres, List[YazaDbValidatedPageV1](), none))
     let subquery_values: List[YazaSqlSubqueryValuesV1] = yaza_db_query_materialize_subqueries_with_virtual_relations_and_prior_v1(file, file_header, plan, parameters, virtual_relations, statement_prior_work_units)?
     let table_index: Number = yaza_db_catalog_snapshot_table_index_v1(catalog_snapshot.tables, plan.table_id)
     if table_index < 0 or table_index >= list_count(loaded.root_page_ids) or table_index >= list_count(loaded.table_schema_versions): return err("YDBv1 bound table has no persisted root page or schema version")
@@ -1405,19 +1429,22 @@ fn yaza_db_execute_single_select_with_loaded_catalog_and_index_rows_profiled_v1(
         let right_key_ordinals: List[Number] = yaza_db_query_clustered_key_ordinals_v1(file, file_header, catalog, plan.right_table_id, right_table_root_page_id, catalog_snapshot.version, list_count(right_table_schema.columns))?
         let left_stored_rows: List[YazaDbRowV1] = yaza_db_btree_read_rows_for_schema_v1(file, file_header, table_root_page_id, table_schema.columns, table_schema_version, left_key_ordinals, catalog_snapshot.version, 65536)?
         let right_stored_rows: List[YazaDbRowV1] = yaza_db_btree_read_rows_for_schema_v1(file, file_header, right_table_root_page_id, right_table_schema.columns, right_table_schema_version, right_key_ordinals, catalog_snapshot.version, 65536)?
-        let left_memory_table: YazaSqlMemoryTableV1 = yaza_db_query_memory_table_v1(plan.table_id, catalog_snapshot.version, table_schema.columns, left_stored_rows)?
-        let right_memory_table: YazaSqlMemoryTableV1 = yaza_db_query_memory_table_v1(plan.right_table_id, catalog_snapshot.version, right_table_schema.columns, right_stored_rows)?
+        let left_memory_table: YazaSqlMemoryTableV1 = yaza_db_query_memory_table_v1(plan.table_id, plan_catalog_version, table_schema.columns, left_stored_rows)?
+        let right_memory_table: YazaSqlMemoryTableV1 = yaza_db_query_memory_table_v1(plan.right_table_id, plan_catalog_version, right_table_schema.columns, right_stored_rows)?
         var joined_table: YazaSqlMemoryTableV1 = yaza_sql_join_dispatch_memory_v1(plan, left_memory_table, right_memory_table)?
         var stage_index: Number = 0
         while stage_index < list_count(plan.join_stages):
             let stage: YazaSqlBoundJoinStageV1 = list_get(plan.join_stages, stage_index)
             set joined_table = yaza_db_query_join_stage_current_v1(file, file_header, catalog, loaded, plan, stage, joined_table)?
             set stage_index = stage_index + 1
-        return yaza_sql_execute_memory_with_subqueries_v1(plan, joined_table, parameters, subquery_values)
+        let jres: YazaSqlQueryResultV1 = yaza_sql_execute_memory_with_subqueries_v1(plan, joined_table, parameters, subquery_values)?
+        return ok(YazaDbQueryPlannedSelectResultV1(jres, List[YazaDbValidatedPageV1](), none))
     var access_component_started_ns: Number = 0
     if list_count(profile_ns) >= 7: set access_component_started_ns = monotonic_ns()
     var key_ordinals_result: Result[List[Number], Text] = err("YDBv1 clustered key metadata was not loaded")
-    if option_is_some(cached_index_rows):
+    if option_is_some(cached_key_ordinals):
+        set key_ordinals_result = ok(option_unwrap(cached_key_ordinals))
+    elif option_is_some(cached_index_rows):
         set key_ordinals_result = yaza_db_query_clustered_key_ordinals_from_rows_v1(option_unwrap(cached_index_rows), plan.table_id, table_root_page_id, list_count(table_schema.columns))
     else:
         set key_ordinals_result = yaza_db_query_clustered_key_ordinals_v1(file, file_header, catalog, plan.table_id, table_root_page_id, catalog_snapshot.version, list_count(table_schema.columns))
@@ -1425,19 +1452,24 @@ fn yaza_db_execute_single_select_with_loaded_catalog_and_index_rows_profiled_v1(
     if list_count(profile_ns) >= 7 and access_component_started_ns > 0:
         let ignored_key_metadata_profile: Number = yaza_db_query_profile_record_ns_v1(profile_ns, 4, access_component_started_ns, monotonic_ns())
         set access_component_started_ns = monotonic_ns()
-    let point_lookup: Option[List[YazaDbRowV1]] = yaza_db_query_clustered_equality_lookup_v1(file, file_header, table_root_page_id, plan, table_schema, table_schema_version, key_ordinals, catalog_snapshot.version, parameters, profile_ns)?
+    let point_lookup_res: YazaDbQueryRowsLookupResultV1 = yaza_db_query_clustered_equality_lookup_with_pool_misses_v1(file, file_header, table_root_page_id, plan, table_schema, table_schema_version, key_ordinals, catalog_snapshot.version, parameters, buffer_pool, profile_ns)?
+    let point_lookup: Option[List[YazaDbRowV1]] = point_lookup_res.rows
+    var missed_pages: List[YazaDbValidatedPageV1] = point_lookup_res.missed_pages
     if list_count(profile_ns) >= 7 and access_component_started_ns > 0:
         let ignored_primary_lookup_profile: Number = yaza_db_query_profile_record_ns_v1(profile_ns, 5, access_component_started_ns, monotonic_ns())
     var secondary_lookup: Option[List[YazaDbRowV1]] = none
     if not option_is_some(point_lookup) and plan.where_root >= 0:
         if list_count(profile_ns) >= 7: set access_component_started_ns = monotonic_ns()
-        set secondary_lookup = yaza_db_query_secondary_equality_lookup_v1(file, file_header, table_root_page_id, plan, table_schema, table_schema_version, key_ordinals, catalog_snapshot.version, parameters, cached_index_rows)?
+        set secondary_lookup = yaza_db_query_secondary_equality_lookup_with_pool_v1(file, file_header, table_root_page_id, plan, table_schema, table_schema_version, key_ordinals, catalog_snapshot.version, parameters, cached_index_rows, buffer_pool)?
         if not option_is_some(secondary_lookup):
-            set secondary_lookup = yaza_db_query_secondary_range_lookup_v1(file, file_header, table_root_page_id, plan, table_schema, table_schema_version, key_ordinals, catalog_snapshot.version, parameters, cached_index_rows)?
+            set secondary_lookup = yaza_db_query_secondary_range_lookup_with_pool_v1(file, file_header, table_root_page_id, plan, table_schema, table_schema_version, key_ordinals, catalog_snapshot.version, parameters, cached_index_rows, buffer_pool)?
         if list_count(profile_ns) >= 7 and access_component_started_ns > 0:
             let ignored_secondary_lookup_profile: Number = yaza_db_query_profile_record_ns_v1(profile_ns, 6, access_component_started_ns, monotonic_ns())
+    var cache_entry: Option[YazaDbSelectPlanCacheEntryV1] = none
+    if text_length(cache_source) > 0 and list_count(virtual_relations) == 0 and statement_prior_work_units == 0 and plan.right_table_id == 0 and list_count(plan.join_stages) == 0 and list_count(plan.subqueries) == 0:
+        set cache_entry = some(YazaDbSelectPlanCacheEntryV1(cache_source, file_header.catalog_root, plan.table_id, table_index, table_root_page_id, table_schema_version, key_ordinals, plan))
     if yaza_db_query_stream_aggregate_eligible_v1(plan, virtual_relations, statement_prior_work_units) and not option_is_some(point_lookup) and not option_is_some(secondary_lookup):
-        let prepared_aggregate: List[YazaSqlValueV1] = yaza_db_query_prepare_filter_v1(plan, catalog_snapshot.version, table_schema.columns, parameters)?
+        let prepared_aggregate: List[YazaSqlValueV1] = yaza_db_query_prepare_filter_v1(plan, plan_catalog_version, table_schema.columns, parameters)?
         let range_bounds: YazaDbQueryIntegerKeyRangeBoundsV1 = yaza_db_query_primary_integer_range_bounds_v1(plan, prepared_aggregate, table_schema.columns, key_ordinals)?
         var start_after_key: Bytes = bytes_from_text("")
         var end_key: Bytes = bytes_from_text("")
@@ -1446,7 +1478,7 @@ fn yaza_db_execute_single_select_with_loaded_catalog_and_index_rows_profiled_v1(
         if option_is_some(range_bounds.end):
             set end_key = option_unwrap(range_bounds.end).key
             set end_key_inclusive = option_unwrap(range_bounds.end).inclusive
-        let aggregate_scan: YazaDbBtreeScanResultV1 = yaza_db_btree_read_stream_aggregate_for_schema_v1(file, file_header, table_root_page_id, table_schema.columns, table_schema_version, key_ordinals, catalog_snapshot.version, start_after_key, end_key, end_key_inclusive, plan, prepared_aggregate, subquery_values, profile_ns)?
+        let aggregate_scan: YazaDbBtreeScanResultV1 = yaza_db_btree_read_stream_aggregate_with_pool_for_schema_v1(file, file_header, table_root_page_id, table_schema.columns, table_schema_version, key_ordinals, catalog_snapshot.version, start_after_key, end_key, end_key_inclusive, plan, prepared_aggregate, subquery_values, buffer_pool, profile_ns)?
         if not option_is_some(aggregate_scan.aggregate_row): return err("YDBv1 streaming aggregate scan returned no aggregate row")
         if profile_enabled: set profile_started_ns = yaza_db_query_profile_record_ns_v1(profile_ns, 2, profile_started_ns, monotonic_ns())
         if profile_enabled: set profile_started_ns = monotonic_ns()
@@ -1456,16 +1488,18 @@ fn yaza_db_execute_single_select_with_loaded_catalog_and_index_rows_profiled_v1(
         if not list_try_reserve(output_rows, 1) or not list_try_push(output_rows, option_unwrap(aggregate_scan.aggregate_row)): return err("SQL executor could not store streaming aggregate output")
         let streamed_result: YazaSqlQueryResultV1 = YazaSqlQueryResultV1(plan.projections, output_rows, aggregate_scan.work_units, 0, 0, 0)
         if profile_enabled: let ignored_profile_end: Number = yaza_db_query_profile_record_ns_v1(profile_ns, 3, profile_started_ns, monotonic_ns())
-        return ok(streamed_result)
+        return ok(YazaDbQueryPlannedSelectResultV1(streamed_result, aggregate_scan.missed_pages, cache_entry))
     var stored_rows: List[YazaDbRowV1] = List[YazaDbRowV1]()
     var filter_was_pushed: Boolean = false
     var prior_scan_work_units: Number = 0
     if option_is_some(point_lookup): set stored_rows = option_unwrap(point_lookup)
     elif option_is_some(secondary_lookup): set stored_rows = option_unwrap(secondary_lookup)
     elif yaza_db_query_prefix_limit_eligible_v1(plan):
-        set stored_rows = yaza_db_btree_read_rows_prefix_for_schema_v1(file, file_header, table_root_page_id, table_schema.columns, table_schema_version, key_ordinals, catalog_snapshot.version, plan.limit)?
+        let prefix_scan: YazaDbBtreeScanResultV1 = yaza_db_btree_read_rows_prefix_with_stats_and_pool_for_schema_v1(file, file_header, table_root_page_id, table_schema.columns, table_schema_version, key_ordinals, catalog_snapshot.version, plan.limit, buffer_pool)?
+        set stored_rows = prefix_scan.rows
+        set missed_pages = prefix_scan.missed_pages
     elif plan.where_root >= 0 and not yaza_db_query_has_correlated_subquery_v1(plan):
-        let prepared_filter: List[YazaSqlValueV1] = yaza_db_query_prepare_filter_v1(plan, catalog_snapshot.version, table_schema.columns, parameters)?
+        let prepared_filter: List[YazaSqlValueV1] = yaza_db_query_prepare_filter_v1(plan, plan_catalog_version, table_schema.columns, parameters)?
         let range_bounds: YazaDbQueryIntegerKeyRangeBoundsV1 = yaza_db_query_primary_integer_range_bounds_v1(plan, prepared_filter, table_schema.columns, key_ordinals)?
         var start_after_key: Bytes = bytes_from_text("")
         var end_key: Bytes = bytes_from_text("")
@@ -1474,28 +1508,66 @@ fn yaza_db_execute_single_select_with_loaded_catalog_and_index_rows_profiled_v1(
         if option_is_some(range_bounds.end):
             set end_key = option_unwrap(range_bounds.end).key
             set end_key_inclusive = option_unwrap(range_bounds.end).inclusive
-        var filter_scan_result: Result[YazaDbBtreeScanResultV1, Text] = err("YDBv1 filtered scan was not selected")
-        if list_count(profile_ns) >= 14:
-            set filter_scan_result = yaza_db_btree_read_rows_where_range_profiled_with_stats_for_schema_v1(file, file_header, table_root_page_id, table_schema.columns, table_schema_version, key_ordinals, catalog_snapshot.version, start_after_key, end_key, end_key_inclusive, plan, prepared_filter, subquery_values, profile_ns)
-        else:
-            set filter_scan_result = yaza_db_btree_read_rows_where_range_with_stats_for_schema_v1(file, file_header, table_root_page_id, table_schema.columns, table_schema_version, key_ordinals, catalog_snapshot.version, start_after_key, end_key, end_key_inclusive, plan, prepared_filter, subquery_values)
+        let filter_scan_result: Result[YazaDbBtreeScanResultV1, Text] = yaza_db_btree_read_rows_where_range_profiled_with_stats_and_pool_for_schema_v1(file, file_header, table_root_page_id, table_schema.columns, table_schema_version, key_ordinals, catalog_snapshot.version, start_after_key, end_key, end_key_inclusive, plan, prepared_filter, subquery_values, buffer_pool, profile_ns)
         let filter_scan: YazaDbBtreeScanResultV1 = filter_scan_result?
         set stored_rows = filter_scan.rows
+        set missed_pages = filter_scan.missed_pages
         set prior_scan_work_units = filter_scan.work_units
         set filter_was_pushed = true
     else:
-        if list_count(profile_ns) >= 14:
-            set stored_rows = yaza_db_btree_read_rows_profiled_for_schema_v1(file, file_header, table_root_page_id, table_schema.columns, table_schema_version, key_ordinals, catalog_snapshot.version, 65536, profile_ns)?
-        else:
-            set stored_rows = yaza_db_btree_read_rows_for_schema_v1(file, file_header, table_root_page_id, table_schema.columns, table_schema_version, key_ordinals, catalog_snapshot.version, 65536)?
+        let full_scan: YazaDbBtreeScanResultV1 = yaza_db_btree_read_rows_internal_filtered_with_pool_profiled_v1(0, bytes_from_text(""), 0, file, file_header, table_root_page_id, table_schema.columns, table_schema_version, key_ordinals, catalog_snapshot.version, 65536, false, 0, List[YazaDbTxnStatusV1](), false, false, bytes_from_text(""), false, bytes_from_text(""), false, none, List[YazaSqlValueV1](), List[YazaSqlSubqueryValuesV1](), buffer_pool, profile_ns, false)?
+        set stored_rows = full_scan.rows
+        set missed_pages = full_scan.missed_pages
     if profile_enabled: set profile_started_ns = yaza_db_query_profile_record_ns_v1(profile_ns, 2, profile_started_ns, monotonic_ns())
     if profile_enabled: set profile_started_ns = monotonic_ns()
-    let memory_table: YazaSqlMemoryTableV1 = yaza_db_query_memory_table_v1(plan.table_id, catalog_snapshot.version, table_schema.columns, stored_rows)?
+    let memory_table: YazaSqlMemoryTableV1 = yaza_db_query_memory_table_v1(plan.table_id, plan_catalog_version, table_schema.columns, stored_rows)?
     var result: Result[YazaSqlQueryResultV1, Text] = err("YDBv1 query execution did not run")
     if filter_was_pushed: set result = yaza_sql_execute_memory_with_scan_v1(plan, memory_table, parameters, subquery_values, prior_scan_work_units, statement_prior_work_units, true)
     else: set result = yaza_sql_execute_memory_with_subqueries_and_prior_v1(plan, memory_table, parameters, subquery_values, statement_prior_work_units)
     if profile_enabled: let ignored_profile_end: Number = yaza_db_query_profile_record_ns_v1(profile_ns, 3, profile_started_ns, monotonic_ns())
-    return result
+    let unwrapped_res: YazaSqlQueryResultV1 = result?
+    return ok(YazaDbQueryPlannedSelectResultV1(unwrapped_res, missed_pages, cache_entry))
+
+fn yaza_db_execute_single_select_pooled_with_loaded_catalog_profiled_v1(file: Number, file_header: YazaDbFileHeaderV1, source: Text, tokens: List[YazaSqlTokenV1], parameters: List[YazaSqlValueV1], virtual_relations: List[YazaDbQueryVirtualRelationV1], statement_prior_work_units: Number, base_loaded: YazaDbCatalogSnapshotWithRootsV1, cached_index_rows: Option[List[YazaDbRowV1]], buffer_pool: Option[YazaDbBufferPoolV1], profile_ns: List[Number]) -> Result[YazaDbQueryPooledSelectResultV1, Text]:
+    if statement_prior_work_units < 0 or statement_prior_work_units > yaza_sql_executor_max_work_units_v1(): return err("YDBv1 SELECT prior statement work is outside its bound")
+    let profile_enabled: Boolean = list_count(profile_ns) >= 4
+    var profile_started_ns: Number = 0
+    var loaded: YazaDbCatalogSnapshotWithRootsV1 = base_loaded
+    if list_count(virtual_relations) > 0:
+        set loaded = yaza_db_query_catalog_with_virtual_relations_v1(base_loaded, virtual_relations)?
+    let catalog_snapshot: YazaSqlCatalogSnapshotV1 = loaded.sql_snapshot
+    if profile_enabled: set profile_started_ns = monotonic_ns()
+    let parsed: YazaSqlSelectAstV3 = yaza_sql_parse_select_tokens_v3(source, tokens)?
+    let plan: YazaSqlBoundPlanV1 = yaza_sql_bind_select_v1(source, parsed, catalog_snapshot)?
+    if profile_enabled: set profile_started_ns = yaza_db_query_profile_record_ns_v1(profile_ns, 1, profile_started_ns, monotonic_ns())
+    let executed: YazaDbQueryPlannedSelectResultV1 = yaza_db_execute_bound_select_plan_pooled_profiled_v1(file, file_header, "", plan, parameters, virtual_relations, statement_prior_work_units, base_loaded, loaded, cached_index_rows, none, buffer_pool, profile_ns)?
+    return ok(YazaDbQueryPooledSelectResultV1(executed.query_result, executed.missed_pages))
+
+fn yaza_db_execute_single_select_with_cache_entry_profiled_v1(file: Number, file_header: YazaDbFileHeaderV1, source: Text, tokens: List[YazaSqlTokenV1], parameters: List[YazaSqlValueV1], catalog: YazaDbCatalogSnapshotWithRootsV1, index_rows: List[YazaDbRowV1], buffer_pool: Option[YazaDbBufferPoolV1], profile_ns: List[Number]) -> Result[YazaDbQueryPlannedSelectResultV1, Text]:
+    let profile_enabled: Boolean = list_count(profile_ns) >= 4
+    var profile_started_ns: Number = 0
+    if profile_enabled: set profile_started_ns = monotonic_ns()
+    let parsed: YazaSqlSelectAstV3 = yaza_sql_parse_select_tokens_v3(source, tokens)?
+    let plan: YazaSqlBoundPlanV1 = yaza_sql_bind_select_v1(source, parsed, catalog.sql_snapshot)?
+    if profile_enabled: set profile_started_ns = yaza_db_query_profile_record_ns_v1(profile_ns, 1, profile_started_ns, monotonic_ns())
+    return yaza_db_execute_bound_select_plan_pooled_profiled_v1(file, file_header, source, plan, parameters, List[YazaDbQueryVirtualRelationV1](), 0, catalog, catalog, some(index_rows), none, buffer_pool, profile_ns)
+
+fn yaza_db_execute_cached_select_plan_pooled_profiled_v1(file: Number, file_header: YazaDbFileHeaderV1, parameters: List[YazaSqlValueV1], loaded: YazaDbCatalogSnapshotWithRootsV1, cached_index_rows: Option[List[YazaDbRowV1]], entry: YazaDbSelectPlanCacheEntryV1, buffer_pool: Option[YazaDbBufferPoolV1], profile_ns: List[Number]) -> Result[YazaDbQueryPooledSelectResultV1, Text]:
+    if file_header.catalog_root != entry.catalog_root:
+        return err("YDBv1 cached SELECT plan catalog root is stale")
+    if entry.table_index < 0 or entry.table_index >= list_count(loaded.sql_snapshot.tables) or entry.table_index >= list_count(loaded.root_page_ids) or entry.table_index >= list_count(loaded.table_schema_versions):
+        return err("YDBv1 cached SELECT plan table index is stale")
+    if list_get(loaded.sql_snapshot.tables, entry.table_index).table_id != entry.table_id or list_get(loaded.root_page_ids, entry.table_index) != entry.table_root_page_id or list_get(loaded.table_schema_versions, entry.table_index) != entry.table_schema_version:
+        return err("YDBv1 cached SELECT plan table schema or root is stale")
+    let executed: YazaDbQueryPlannedSelectResultV1 = yaza_db_execute_bound_select_plan_pooled_profiled_v1(file, file_header, "", entry.plan, parameters, List[YazaDbQueryVirtualRelationV1](), 0, loaded, loaded, cached_index_rows, some(entry.key_ordinals), buffer_pool, profile_ns)?
+    return ok(YazaDbQueryPooledSelectResultV1(executed.query_result, executed.missed_pages))
+
+fn yaza_db_execute_single_select_with_loaded_catalog_index_and_pool_profiled_v1(file: Number, file_header: YazaDbFileHeaderV1, source: Text, tokens: List[YazaSqlTokenV1], parameters: List[YazaSqlValueV1], virtual_relations: List[YazaDbQueryVirtualRelationV1], statement_prior_work_units: Number, base_loaded: YazaDbCatalogSnapshotWithRootsV1, cached_index_rows: Option[List[YazaDbRowV1]], buffer_pool: Option[YazaDbBufferPoolV1], profile_ns: List[Number]) -> Result[YazaSqlQueryResultV1, Text]:
+    let pooled: YazaDbQueryPooledSelectResultV1 = yaza_db_execute_single_select_pooled_with_loaded_catalog_profiled_v1(file, file_header, source, tokens, parameters, virtual_relations, statement_prior_work_units, base_loaded, cached_index_rows, buffer_pool, profile_ns)?
+    return ok(pooled.query_result)
+
+fn yaza_db_execute_single_select_with_loaded_catalog_and_index_rows_profiled_v1(file: Number, file_header: YazaDbFileHeaderV1, source: Text, tokens: List[YazaSqlTokenV1], parameters: List[YazaSqlValueV1], virtual_relations: List[YazaDbQueryVirtualRelationV1], statement_prior_work_units: Number, base_loaded: YazaDbCatalogSnapshotWithRootsV1, cached_index_rows: Option[List[YazaDbRowV1]], profile_ns: List[Number]) -> Result[YazaSqlQueryResultV1, Text]:
+    return yaza_db_execute_single_select_with_loaded_catalog_index_and_pool_profiled_v1(file, file_header, source, tokens, parameters, virtual_relations, statement_prior_work_units, base_loaded, cached_index_rows, none, profile_ns)
 
 fn yaza_db_execute_single_select_with_tokens_and_virtual_relations_and_prior_profiled_v1(file: Number, file_header: YazaDbFileHeaderV1, source: Text, tokens: List[YazaSqlTokenV1], parameters: List[YazaSqlValueV1], virtual_relations: List[YazaDbQueryVirtualRelationV1], statement_prior_work_units: Number, profile_ns: List[Number]) -> Result[YazaSqlQueryResultV1, Text]:
     if statement_prior_work_units < 0 or statement_prior_work_units > yaza_sql_executor_max_work_units_v1(): return err("YDBv1 SELECT prior statement work is outside its bound")
@@ -1511,6 +1583,12 @@ fn yaza_db_execute_single_select_with_cached_catalog_profiled_v1(file: Number, f
 
 fn yaza_db_execute_single_select_with_cached_catalog_and_index_rows_profiled_v1(file: Number, file_header: YazaDbFileHeaderV1, source: Text, tokens: List[YazaSqlTokenV1], parameters: List[YazaSqlValueV1], catalog: YazaDbCatalogSnapshotWithRootsV1, index_rows: List[YazaDbRowV1], profile_ns: List[Number]) -> Result[YazaSqlQueryResultV1, Text]:
     return yaza_db_execute_single_select_with_loaded_catalog_and_index_rows_profiled_v1(file, file_header, source, tokens, parameters, List[YazaDbQueryVirtualRelationV1](), 0, catalog, some(index_rows), profile_ns)
+
+fn yaza_db_execute_single_select_with_cached_catalog_index_and_pool_pooled_profiled_v1(file: Number, file_header: YazaDbFileHeaderV1, source: Text, tokens: List[YazaSqlTokenV1], parameters: List[YazaSqlValueV1], catalog: YazaDbCatalogSnapshotWithRootsV1, index_rows: List[YazaDbRowV1], buffer_pool: Option[YazaDbBufferPoolV1], profile_ns: List[Number]) -> Result[YazaDbQueryPooledSelectResultV1, Text]:
+    return yaza_db_execute_single_select_pooled_with_loaded_catalog_profiled_v1(file, file_header, source, tokens, parameters, List[YazaDbQueryVirtualRelationV1](), 0, catalog, some(index_rows), buffer_pool, profile_ns)
+
+fn yaza_db_execute_single_select_with_cached_catalog_index_and_pool_profiled_v1(file: Number, file_header: YazaDbFileHeaderV1, source: Text, tokens: List[YazaSqlTokenV1], parameters: List[YazaSqlValueV1], catalog: YazaDbCatalogSnapshotWithRootsV1, index_rows: List[YazaDbRowV1], buffer_pool: Option[YazaDbBufferPoolV1], profile_ns: List[Number]) -> Result[YazaSqlQueryResultV1, Text]:
+    return yaza_db_execute_single_select_with_loaded_catalog_index_and_pool_profiled_v1(file, file_header, source, tokens, parameters, List[YazaDbQueryVirtualRelationV1](), 0, catalog, some(index_rows), buffer_pool, profile_ns)
 
 fn yaza_db_execute_single_select_with_cached_catalog_v1(file: Number, file_header: YazaDbFileHeaderV1, source: Text, tokens: List[YazaSqlTokenV1], parameters: List[YazaSqlValueV1], catalog: YazaDbCatalogSnapshotWithRootsV1) -> Result[YazaSqlQueryResultV1, Text]:
     return yaza_db_execute_single_select_with_cached_catalog_profiled_v1(file, file_header, source, tokens, parameters, catalog, List[Number]())

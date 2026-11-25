@@ -1,0 +1,367 @@
+# High-Availability Raft-Style Leader Election, Term Fencing, and Replica Promotion (Phase C2)
+# Persists term/vote/leader state atomically to cluster_raft.meta using write_exact + sync + rename + sync_directory.
+
+use "std/fs"
+use "std/http"
+use "std/json"
+use "std/time"
+use "./checkpoint_v1"
+use "./session_v1"
+
+shape YazaDbHaPeerV1:
+    node_id: Text
+    endpoint: Text
+    last_lsn: Number
+    reachable: Boolean
+
+shape YazaDbHaStateV1:
+    node_id: Text
+    role: Text
+    term: Number
+    voted_for: Text
+    leader_id: Text
+    self_lsn: Number
+    election_timeout_ms: Number
+    last_heartbeat_ms: Number
+    peers: List[YazaDbHaPeerV1]
+
+shape YazaDbVoteRequestV1:
+    term: Number
+    candidate_id: Text
+    candidate_lsn: Number
+
+shape YazaDbVoteResponseV1:
+    state: YazaDbHaStateV1
+    term: Number
+    voter_id: Text
+    vote_granted: Boolean
+    reason: Text
+
+shape YazaDbHeartbeatV1:
+    term: Number
+    leader_id: Text
+    commit_lsn: Number
+    now_ms: Number
+
+shape YazaDbHeartbeatResponseV1:
+    state: YazaDbHaStateV1
+    term: Number
+    accepted: Boolean
+    fenced: Boolean
+
+shape YazaDbHaElectionOutcomeV1:
+    nodes: List[YazaDbHaStateV1]
+    winner_id: Text
+    elected: Boolean
+    votes_granted: Number
+    term: Number
+
+shape YazaDbHaPromoteOutcomeV1:
+    session: YazaDbSessionV1
+    state: YazaDbHaStateV1
+
+shape YazaDbHaHttpOutcomeV1:
+    session: YazaDbSessionV1
+    state: YazaDbHaStateV1
+    response: HttpResponse
+
+fn yaza_db_ha_default_state_v1(node_id: Text, role: Text, term: Number, self_lsn: Number, election_timeout_ms: Number) -> YazaDbHaStateV1:
+    let peers_res: Result[List[YazaDbHaPeerV1], Text] = list_try_new()
+    var peers: List[YazaDbHaPeerV1] = List[YazaDbHaPeerV1]()
+    if result_is_ok(peers_res):
+        set peers = result_unwrap(peers_res)
+    var eff_role: Text = role
+    if eff_role == "": set eff_role = "replica"
+    var eff_term: Number = term
+    if eff_term < 1: set eff_term = 1
+    var leader_id: Text = ""
+    if eff_role == "primary":
+        set leader_id = node_id
+    return YazaDbHaStateV1(node_id, eff_role, eff_term, "", leader_id, self_lsn, election_timeout_ms, monotonic_ms(), peers)
+
+fn yaza_db_ha_with_peers_v1(state: YazaDbHaStateV1, peers: List[YazaDbHaPeerV1]) -> YazaDbHaStateV1:
+    return YazaDbHaStateV1(state.node_id, state.role, state.term, state.voted_for, state.leader_id, state.self_lsn, state.election_timeout_ms, state.last_heartbeat_ms, peers)
+
+fn yaza_db_ha_with_lsn_v1(state: YazaDbHaStateV1, self_lsn: Number) -> YazaDbHaStateV1:
+    return YazaDbHaStateV1(state.node_id, state.role, state.term, state.voted_for, state.leader_id, self_lsn, state.election_timeout_ms, state.last_heartbeat_ms, state.peers)
+
+fn yaza_db_ha_state_json_v1(state: YazaDbHaStateV1) -> Text:
+    let peers_res: Result[List[Text], Text] = list_try_new()
+    var peer_jsons: List[Text] = List[Text]()
+    if result_is_ok(peers_res):
+        set peer_jsons = result_unwrap(peers_res)
+    var i: Number = 0
+    while i < list_count(state.peers):
+        let p: YazaDbHaPeerV1 = list_get(state.peers, i)
+        var r_str: Text = "false"
+        if p.reachable: set r_str = "true"
+        let pj: Text = "{\"node_id\":\"" + json_escape_text(p.node_id) + "\",\"endpoint\":\"" + json_escape_text(p.endpoint) + "\",\"last_lsn\":" + number_text(p.last_lsn) + ",\"reachable\":" + r_str + "}"
+        let _p: Boolean = list_try_push(peer_jsons, pj)
+        set i = i + 1
+    return "{\"node_id\":\"" + json_escape_text(state.node_id) + "\",\"role\":\"" + json_escape_text(state.role) + "\",\"term\":" + number_text(state.term) + ",\"voted_for\":\"" + json_escape_text(state.voted_for) + "\",\"leader_id\":\"" + json_escape_text(state.leader_id) + "\",\"self_lsn\":" + number_text(state.self_lsn) + ",\"election_timeout_ms\":" + number_text(state.election_timeout_ms) + ",\"last_heartbeat_ms\":" + number_text(state.last_heartbeat_ms) + ",\"peers\":" + json_array(peer_jsons) + "}"
+
+fn yaza_db_ha_save_meta_v1(root: Number, state: YazaDbHaStateV1) -> Result[Boolean, Text]:
+    if root < 0:
+        return err("YDBv1 HA save_meta requires an open root directory handle")
+    let _rm: Result[Boolean, Text] = remove(root, "cluster_raft.meta.tmp")
+    let f: Number = create_exclusive(root, "cluster_raft.meta.tmp")?
+    let meta_json: Text = yaza_db_ha_state_json_v1(state)
+    let raw: Bytes = bytes_from_text(meta_json)
+    let w_res: Result[Number, Text] = write_exact(f, 0, raw)
+    if not result_is_ok(w_res):
+        let _c: Result[Boolean, Text] = close(f)
+        let _d: Result[Boolean, Text] = remove(root, "cluster_raft.meta.tmp")
+        return err(result_unwrap_error(w_res))
+    let w_len: Number = result_unwrap(w_res)
+    if w_len != bytes_length(raw):
+        let _c: Result[Boolean, Text] = close(f)
+        let _d: Result[Boolean, Text] = remove(root, "cluster_raft.meta.tmp")
+        return err("YDBv1 HA cluster_raft.meta write was incomplete")
+    let synced: Boolean = sync(f)?
+    let closed: Boolean = close(f)?
+    if not synced or not closed:
+        let _d: Result[Boolean, Text] = remove(root, "cluster_raft.meta.tmp")
+        return err("YDBv1 HA cluster_raft.meta sync or close failed")
+    let renamed: Boolean = rename(root, "cluster_raft.meta.tmp", "cluster_raft.meta")?
+    if not renamed:
+        return err("YDBv1 HA cluster_raft.meta atomic rename failed")
+    let dir_synced: Boolean = sync_directory(root)?
+    if not dir_synced:
+        return err("YDBv1 HA cluster_raft.meta directory sync failed")
+    return ok(true)
+
+fn yaza_db_ha_load_meta_v1(root: Number, default_state: YazaDbHaStateV1) -> Result[YazaDbHaStateV1, Text]:
+    if root < 0:
+        return err("YDBv1 HA load_meta requires an open root directory handle")
+    let f_res: Result[Number, Text] = open_read(root, "cluster_raft.meta")
+    if not result_is_ok(f_res):
+        return ok(default_state)
+    let f: Number = result_unwrap(f_res)
+    let sz_res: Result[Number, Text] = file_size(f)
+    if not result_is_ok(sz_res):
+        let _c: Result[Boolean, Text] = close(f)
+        return err(result_unwrap_error(sz_res))
+    let sz: Number = result_unwrap(sz_res)
+    if sz <= 0 or sz > 1048576:
+        let _c: Result[Boolean, Text] = close(f)
+        return err("YDBv1 HA cluster_raft.meta size is invalid")
+    let raw_res: Result[Bytes, Text] = read_exact(f, 0, sz)
+    let _c: Result[Boolean, Text] = close(f)
+    if not result_is_ok(raw_res):
+        return err(result_unwrap_error(raw_res))
+    let txt: Text = bytes_try_to_text(result_unwrap(raw_res))?
+    let node_id_opt: Option[Text] = json_extract_string(txt, "node_id")
+    let role_opt: Option[Text] = json_extract_string(txt, "role")
+    let term_opt: Option[Number] = json_extract_number(txt, "term")
+    let voted_opt: Option[Text] = json_extract_string(txt, "voted_for")
+    let leader_opt: Option[Text] = json_extract_string(txt, "leader_id")
+    let lsn_opt: Option[Number] = json_extract_number(txt, "self_lsn")
+    var node_id: Text = default_state.node_id
+    if option_is_some(node_id_opt): set node_id = option_unwrap(node_id_opt)
+    var role: Text = default_state.role
+    if option_is_some(role_opt): set role = option_unwrap(role_opt)
+    var term: Number = default_state.term
+    if option_is_some(term_opt): set term = option_unwrap(term_opt)
+    var voted_for: Text = default_state.voted_for
+    if option_is_some(voted_opt): set voted_for = option_unwrap(voted_opt)
+    var leader_id: Text = default_state.leader_id
+    if option_is_some(leader_opt): set leader_id = option_unwrap(leader_opt)
+    var self_lsn: Number = default_state.self_lsn
+    if option_is_some(lsn_opt): set self_lsn = option_unwrap(lsn_opt)
+    return ok(YazaDbHaStateV1(node_id, role, term, voted_for, leader_id, self_lsn, default_state.election_timeout_ms, default_state.last_heartbeat_ms, default_state.peers))
+
+fn yaza_db_ha_handle_request_vote_v1(root: Number, state: YazaDbHaStateV1, req: YazaDbVoteRequestV1) -> Result[YazaDbVoteResponseV1, Text]:
+    if req.term < state.term:
+        return ok(YazaDbVoteResponseV1(state, state.term, state.node_id, false, "stale_term"))
+
+    var cur_term: Number = state.term
+    var cur_voted: Text = state.voted_for
+    var cur_role: Text = state.role
+    var cur_leader: Text = state.leader_id
+    if req.term > state.term:
+        set cur_term = req.term
+        set cur_voted = ""
+        if cur_role == "primary" or cur_role == "candidate":
+            set cur_role = "replica"
+        set cur_leader = ""
+
+    if cur_voted != "" and cur_voted != req.candidate_id:
+        let next_s: YazaDbHaStateV1 = YazaDbHaStateV1(state.node_id, cur_role, cur_term, cur_voted, cur_leader, state.self_lsn, state.election_timeout_ms, state.last_heartbeat_ms, state.peers)
+        if root >= 0:
+            let _saved: Boolean = yaza_db_ha_save_meta_v1(root, next_s)?
+        return ok(YazaDbVoteResponseV1(next_s, cur_term, state.node_id, false, "already_voted"))
+
+    if req.candidate_lsn < state.self_lsn:
+        let next_s: YazaDbHaStateV1 = YazaDbHaStateV1(state.node_id, cur_role, cur_term, cur_voted, cur_leader, state.self_lsn, state.election_timeout_ms, state.last_heartbeat_ms, state.peers)
+        if root >= 0:
+            let _saved: Boolean = yaza_db_ha_save_meta_v1(root, next_s)?
+        return ok(YazaDbVoteResponseV1(next_s, cur_term, state.node_id, false, "stale_lsn"))
+
+    let granted_state: YazaDbHaStateV1 = YazaDbHaStateV1(state.node_id, cur_role, cur_term, req.candidate_id, cur_leader, state.self_lsn, state.election_timeout_ms, monotonic_ms(), state.peers)
+    if root >= 0:
+        let _saved: Boolean = yaza_db_ha_save_meta_v1(root, granted_state)?
+    return ok(YazaDbVoteResponseV1(granted_state, cur_term, state.node_id, true, "granted"))
+
+fn yaza_db_ha_handle_heartbeat_v1(root: Number, state: YazaDbHaStateV1, hb: YazaDbHeartbeatV1) -> Result[YazaDbHeartbeatResponseV1, Text]:
+    if hb.term < state.term:
+        return ok(YazaDbHeartbeatResponseV1(state, state.term, false, true))
+
+    var next_role: Text = state.role
+    if hb.leader_id != state.node_id:
+        set next_role = "replica"
+    else:
+        set next_role = "primary"
+    var next_voted: Text = state.voted_for
+    if hb.term > state.term:
+        set next_voted = ""
+    let next_s: YazaDbHaStateV1 = YazaDbHaStateV1(state.node_id, next_role, hb.term, next_voted, hb.leader_id, state.self_lsn, state.election_timeout_ms, hb.now_ms, state.peers)
+    if root >= 0 and (hb.term != state.term or state.leader_id != hb.leader_id or state.role != next_role):
+        let _saved: Boolean = yaza_db_ha_save_meta_v1(root, next_s)?
+    return ok(YazaDbHeartbeatResponseV1(next_s, hb.term, true, false))
+
+fn yaza_db_ha_step_down_v1(root: Number, state: YazaDbHaStateV1, new_term: Number, new_leader_id: Text) -> Result[YazaDbHaStateV1, Text]:
+    if new_term < state.term:
+        return ok(state)
+    var next_voted: Text = state.voted_for
+    if new_term > state.term:
+        set next_voted = ""
+    let next_s: YazaDbHaStateV1 = YazaDbHaStateV1(state.node_id, "replica", new_term, next_voted, new_leader_id, state.self_lsn, state.election_timeout_ms, monotonic_ms(), state.peers)
+    if root >= 0:
+        let _saved: Boolean = yaza_db_ha_save_meta_v1(root, next_s)?
+    return ok(next_s)
+
+fn yaza_db_ha_run_election_round_v1(roots: List[Number], nodes: List[YazaDbHaStateV1], candidate_idx: Number) -> Result[YazaDbHaElectionOutcomeV1, Text]:
+    let n: Number = list_count(nodes)
+    if n < 1 or candidate_idx < 0 or candidate_idx >= n:
+        return err("YDBv1 HA election candidate index is out of range")
+    if list_count(roots) != n:
+        return err("YDBv1 HA election roots length must match nodes length")
+
+    let cand_init: YazaDbHaStateV1 = list_get(nodes, candidate_idx)
+    let new_term: Number = cand_init.term + 1
+    var cand_state: YazaDbHaStateV1 = YazaDbHaStateV1(cand_init.node_id, "candidate", new_term, cand_init.node_id, "", cand_init.self_lsn, cand_init.election_timeout_ms, monotonic_ms(), cand_init.peers)
+    let cand_root: Number = list_get(roots, candidate_idx)
+    if cand_root >= 0:
+        let _saved: Boolean = yaza_db_ha_save_meta_v1(cand_root, cand_state)?
+
+    var votes: Number = 1
+    let updated_res: Result[List[YazaDbHaStateV1], Text] = list_try_new()
+    if not result_is_ok(updated_res):
+        return err("YDBv1 HA election node list allocation failed")
+    let updated: List[YazaDbHaStateV1] = result_unwrap(updated_res)
+    var max_seen_term: Number = new_term
+
+    let vote_req: YazaDbVoteRequestV1 = YazaDbVoteRequestV1(new_term, cand_state.node_id, cand_state.self_lsn)
+    var i: Number = 0
+    while i < n:
+        if i == candidate_idx:
+            let _p: Boolean = list_try_push(updated, cand_state)
+        else:
+            let peer_root: Number = list_get(roots, i)
+            let peer_state: YazaDbHaStateV1 = list_get(nodes, i)
+            let vres: YazaDbVoteResponseV1 = yaza_db_ha_handle_request_vote_v1(peer_root, peer_state, vote_req)?
+            if vres.term > max_seen_term:
+                set max_seen_term = vres.term
+            if vres.vote_granted:
+                set votes = votes + 1
+            let _p: Boolean = list_try_push(updated, vres.state)
+        set i = i + 1
+
+    let quorum: Number = (n / 2) + 1
+    let won: Boolean = votes >= quorum and max_seen_term == new_term
+    if won:
+        set cand_state = YazaDbHaStateV1(cand_state.node_id, "primary", new_term, cand_state.node_id, cand_state.node_id, cand_state.self_lsn, cand_state.election_timeout_ms, monotonic_ms(), cand_state.peers)
+        if cand_root >= 0:
+            let _saved: Boolean = yaza_db_ha_save_meta_v1(cand_root, cand_state)?
+    else:
+        set cand_state = YazaDbHaStateV1(cand_state.node_id, "replica", max_seen_term, cand_state.voted_for, "", cand_state.self_lsn, cand_state.election_timeout_ms, monotonic_ms(), cand_state.peers)
+        if cand_root >= 0:
+            let _saved: Boolean = yaza_db_ha_save_meta_v1(cand_root, cand_state)?
+
+    let final_res: Result[List[YazaDbHaStateV1], Text] = list_try_new()
+    if not result_is_ok(final_res):
+        return err("YDBv1 HA election result list allocation failed")
+    let final_nodes: List[YazaDbHaStateV1] = result_unwrap(final_res)
+    var winner_id: Text = ""
+    if won: set winner_id = cand_state.node_id
+    set i = 0
+    while i < n:
+        if i == candidate_idx:
+            let _p: Boolean = list_try_push(final_nodes, cand_state)
+        else:
+            let node_s: YazaDbHaStateV1 = list_get(updated, i)
+            if won:
+                let hb: YazaDbHeartbeatV1 = YazaDbHeartbeatV1(new_term, cand_state.node_id, cand_state.self_lsn, monotonic_ms())
+                let hbr: YazaDbHeartbeatResponseV1 = yaza_db_ha_handle_heartbeat_v1(list_get(roots, i), node_s, hb)?
+                let _p: Boolean = list_try_push(final_nodes, hbr.state)
+            else:
+                let _p: Boolean = list_try_push(final_nodes, node_s)
+        set i = i + 1
+    return ok(YazaDbHaElectionOutcomeV1(final_nodes, winner_id, won, votes, cand_state.term))
+
+fn yaza_db_ha_promote_replica_v1(session: YazaDbSessionV1, state: YazaDbHaStateV1, new_term: Number) -> Result[YazaDbHaPromoteOutcomeV1, Text]:
+    if not session.is_open:
+        return err("YDBv1 HA promote requires an open replica session")
+    if option_is_some(session.explicit_tx):
+        return err("YDBv1 HA promote cannot run during an active explicit transaction")
+    if new_term <= state.term:
+        return err("YDBv1 HA promote requires new_term > current term to fence prior primary")
+    let ckpt: YazaDbCheckpointResultV1 = yaza_db_checkpoint_clean_v1(session.storage, session.wal, 0)?
+    let next_session: YazaDbSessionV1 = YazaDbSessionV1(session.root, ckpt.storage, ckpt.wal, session.catalog_cache, session.index_rows_cache, session.buffer_pool, none, true, session.plan_cache)
+    let next_state: YazaDbHaStateV1 = YazaDbHaStateV1(state.node_id, "primary", new_term, state.node_id, state.node_id, ckpt.wal.next_lsn, state.election_timeout_ms, monotonic_ms(), state.peers)
+    let _saved: Boolean = yaza_db_ha_save_meta_v1(session.root, next_state)?
+    return ok(YazaDbHaPromoteOutcomeV1(next_session, next_state))
+
+fn yaza_db_ha_handle_http_v1(session: YazaDbSessionV1, state: YazaDbHaStateV1, request: HttpRequest) -> Result[YazaDbHaHttpOutcomeV1, Text]:
+    if request.path == "/api/v1/cluster/status":
+        if request.method != "GET":
+            return ok(YazaDbHaHttpOutcomeV1(session, state, http_response_method_not_allowed("use GET for /api/v1/cluster/status", true)))
+        let live_state: YazaDbHaStateV1 = yaza_db_ha_with_lsn_v1(state, session.wal.next_lsn)
+        return ok(YazaDbHaHttpOutcomeV1(session, live_state, http_response_ok_json(yaza_db_ha_state_json_v1(live_state))))
+
+    if request.path == "/api/v1/cluster/vote":
+        if request.method != "POST":
+            return ok(YazaDbHaHttpOutcomeV1(session, state, http_response_method_not_allowed("use POST for /api/v1/cluster/vote", true)))
+        let term_opt: Option[Number] = json_extract_number(request.body_text, "term")
+        let cand_opt: Option[Text] = json_extract_string(request.body_text, "candidate_id")
+        let lsn_opt: Option[Number] = json_extract_number(request.body_text, "candidate_lsn")
+        if not option_is_some(term_opt) or not option_is_some(cand_opt) or not option_is_some(lsn_opt):
+            return ok(YazaDbHaHttpOutcomeV1(session, state, http_response_bad_request("cluster vote requires term, candidate_id, candidate_lsn", true)))
+        let live_state: YazaDbHaStateV1 = yaza_db_ha_with_lsn_v1(state, session.wal.next_lsn)
+        let req: YazaDbVoteRequestV1 = YazaDbVoteRequestV1(option_unwrap(term_opt), option_unwrap(cand_opt), option_unwrap(lsn_opt))
+        let vres: YazaDbVoteResponseV1 = yaza_db_ha_handle_request_vote_v1(session.root, live_state, req)?
+        var granted_str: Text = "false"
+        if vres.vote_granted: set granted_str = "true"
+        let body: Text = "{\"term\":" + number_text(vres.term) + ",\"voter_id\":\"" + json_escape_text(vres.voter_id) + "\",\"vote_granted\":" + granted_str + ",\"reason\":\"" + json_escape_text(vres.reason) + "\"}"
+        return ok(YazaDbHaHttpOutcomeV1(session, vres.state, http_response_ok_json(body)))
+
+    if request.path == "/api/v1/cluster/heartbeat":
+        if request.method != "POST":
+            return ok(YazaDbHaHttpOutcomeV1(session, state, http_response_method_not_allowed("use POST for /api/v1/cluster/heartbeat", true)))
+        let term_opt: Option[Number] = json_extract_number(request.body_text, "term")
+        let lead_opt: Option[Text] = json_extract_string(request.body_text, "leader_id")
+        let lsn_opt: Option[Number] = json_extract_number(request.body_text, "commit_lsn")
+        if not option_is_some(term_opt) or not option_is_some(lead_opt):
+            return ok(YazaDbHaHttpOutcomeV1(session, state, http_response_bad_request("cluster heartbeat requires term and leader_id", true)))
+        var commit_lsn: Number = 0
+        if option_is_some(lsn_opt): set commit_lsn = option_unwrap(lsn_opt)
+        let live_state: YazaDbHaStateV1 = yaza_db_ha_with_lsn_v1(state, session.wal.next_lsn)
+        let hb: YazaDbHeartbeatV1 = YazaDbHeartbeatV1(option_unwrap(term_opt), option_unwrap(lead_opt), commit_lsn, monotonic_ms())
+        let hres: YazaDbHeartbeatResponseV1 = yaza_db_ha_handle_heartbeat_v1(session.root, live_state, hb)?
+        var acc_str: Text = "false"
+        if hres.accepted: set acc_str = "true"
+        var fen_str: Text = "false"
+        if hres.fenced: set fen_str = "true"
+        let body: Text = "{\"term\":" + number_text(hres.term) + ",\"accepted\":" + acc_str + ",\"fenced\":" + fen_str + "}"
+        return ok(YazaDbHaHttpOutcomeV1(session, hres.state, http_response_ok_json(body)))
+
+    if request.path == "/api/v1/cluster/promote":
+        if request.method != "POST":
+            return ok(YazaDbHaHttpOutcomeV1(session, state, http_response_method_not_allowed("use POST for /api/v1/cluster/promote", true)))
+        let term_opt: Option[Number] = json_extract_number(request.body_text, "term")
+        var new_term: Number = state.term + 1
+        if option_is_some(term_opt): set new_term = option_unwrap(term_opt)
+        let promoted: YazaDbHaPromoteOutcomeV1 = yaza_db_ha_promote_replica_v1(session, state, new_term)?
+        return ok(YazaDbHaHttpOutcomeV1(promoted.session, promoted.state, http_response_ok_json(yaza_db_ha_state_json_v1(promoted.state))))
+
+    return ok(YazaDbHaHttpOutcomeV1(session, state, http_response_not_found("route not found: " + request.path, true)))

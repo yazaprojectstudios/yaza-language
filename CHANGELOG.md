@@ -6,6 +6,13 @@ All notable changes to the **YAZA Programming Language**, **YazaBase SQL Engine*
 
 ## [v1.0.2] — 2026-11-21
 
+### YazaBase Phase A/B/C & Performance Update — 2026-11-25
+- **Clustered Server, Replication & HA (`buffer_pool_v1.yz`, `plan_cache_v1.yz`, `explicit_tx_v1.yz`, `group_commit_v1.yz`, `replication_v1.yz`, `cluster_ha_v1.yz`, `router_v1.yz`, `autoscale_v1.yz`, `pg_wire_v1.yz`):**
+  - Added CLOCK LRU buffer pool (`page_read = 0` on warm reads), 64-entry prepared `SELECT` plan cache, single-shot staged dirty-page overlay + deferred checkpointing, Group Commit (`100 tx → 1 WAL fsync`), explicit multi-statement MVCC transactions (`BEGIN`/`COMMIT`/`ROLLBACK`/`SAVEPOINT`), Physical WAL Streaming Replication, Raft-Lite leader election/failover, Lag-Aware R/W & FNV-1a Hash-Shard routing, autoscale policies, and PostgreSQL Wire Protocol v3 (`pg_wire_v1`).
+- **Write & Scan Engine Optimizations (`sql_insert_write_v1.yz`, `page_v1.yz`, `btree_scan_v1.yz`, `page_wal_v1.yz`):**
+  - Eliminated redundant `2×N` preflight page CRC32C decodes via fence- & cursor-aware leaf caching, replaced `can_append` per-slot allocations with zero-alloc bulk leaf slot writing, and added direct page streaming aggregate scans (`COUNT(*)`, scalar `SUM`/`MIN`/`MAX` over fixed numeric/float64 columns).
+  - Measured (`-O2`, Apple M5): Warm Point `SELECT` **`3.57 µs`** median (`3.49 µs` min), 10k Full Scan `COUNT(*)` **`111 µs`** (**27.4×** faster) & `SUM(val)` **`130 µs`** (**21.4×** faster), `INSERT` Batch **`0.85 ms` p50 / 50 rows** (`26.94 ms` across `10×50`), `UPDATE` Batch **`~40.7k rows/s`**, `DELETE` Batch **`~47.3k rows/s`**.
+
 ### Highlights
 `v1.0.2` is the post-audit production hardening, performance optimization, and full ecosystem synchronization release across the **4 Core Technology Pillars**:
 

@@ -3,6 +3,7 @@
 # integer expressions. It preflights row, overflow, and index changes before WAL.
 use "./catalog_snapshot_v1"
 use "./catalog_storage_v1"
+use "./index_catalog_v1"
 use "./key_codec_v1"
 use "./mvcc_history_v1"
 use "./overflow_v1"
@@ -15,6 +16,7 @@ use "./sql_delete_query_v1"
 use "./sql_executor_v1"
 use "./sql_insert_bind_v1"
 use "./sql_insert_exec_v1"
+use "./sql_lexer_v1"
 use "./sql_parser_v3"
 use "./sql_update_v1"
 use "./sql_foreign_key_v1"
@@ -46,6 +48,18 @@ shape YazaDbSqlUpdateOverflowBudgetV1:
 shape YazaSqlUpdatePredicateSourceV1:
     source: Text
     positional_source_ordinals: List[Number]
+
+shape YazaDbSqlUpdatePreparedPlanV1:
+    table: YazaSqlTableSchemaV1
+    table_schema_version: Number
+    row_count: Number
+    targets: List[YazaDbSqlUpdateTargetV1]
+    total_index_writes: Number
+    overflow_budget: YazaDbSqlUpdateOverflowBudgetV1
+    mutation_count: Number
+    reserve_pages: Number
+    required_wal_bytes: Number
+    groups: List[YazaDbWriteLeafUpdateGroupV1]
 
 fn yaza_db_sql_update_unique_batch_conflict_v1(prior_targets: List[YazaDbSqlUpdateTargetV1], candidate: YazaDbSecondaryIndexUpdateV1) -> Boolean:
     let index_id: Number = candidate.old_target.index.index_id
@@ -338,12 +352,166 @@ fn yaza_db_sql_update_materialize_assignments_v1(source: Text, update: YazaSqlUp
         set parameter_index = parameter_index + 1
     return ok(assignments)
 
-fn yaza_db_execute_update_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1]) -> Result[YazaDbWriteCommitV1, Text]:
-    if storage.root != wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid): return err("YDBv1 SQL UPDATE storage and WAL handles belong to different databases")
+fn yaza_db_sql_update_handles_closed_v1(message: Text) -> Boolean:
+    return text_starts_with(message, "YDBv1 grouped LEAF_UPDATE failed; writer handles were closed") or text_starts_with(message, "YDBv1 leaf mutation failed; writer handles were closed") or text_starts_with(message, "YDBv1 COMMIT append failed or has an uncertain durable outcome") or text_starts_with(message, "YDBv1 COMMIT is durable") or text_starts_with(message, "YDBv1 active-index writer handles were closed") or text_starts_with(message, "YDBv1 overflow staging failed; writer handles were closed") or text_starts_with(message, "YDBv1 staged commit cannot combine") or text_starts_with(message, "YDBv1 staged commit page-ID")
+
+fn yaza_db_sql_update_close_after_error_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, message: Text) -> Unit:
+    if not yaza_db_sql_update_handles_closed_v1(message):
+        yaza_db_sql_update_close_v1(storage, wal)
+    return
+
+fn yaza_db_sql_update_index_before_v1(left_pos: Number, right_pos: Number, updates: List[YazaDbSecondaryIndexUpdateV1]) -> Boolean:
+    let left_target: YazaDbSecondaryIndexTargetV1 = list_get(updates, left_pos).old_target
+    let right_target: YazaDbSecondaryIndexTargetV1 = list_get(updates, right_pos).old_target
+    if left_target.page_id != right_target.page_id: return left_target.page_id < right_target.page_id
+    let cmp: Number = yaza_db_compare_bytes_v1(left_target.entry.key, right_target.entry.key)
+    if cmp != 0: return cmp < 0
+    return left_pos < right_pos
+
+fn yaza_db_sql_update_index_swap_v1(order: List[Number], left: Number, right: Number) -> Boolean:
+    if left < 0 or right < 0 or left >= list_count(order) or right >= list_count(order): return false
+    let left_val: Number = list_get(order, left)
+    let right_val: Number = list_get(order, right)
+    if not list_try_set(order, left, right_val): return false
+    if not list_try_set(order, right, left_val): return false
+    return true
+
+fn yaza_db_sql_update_index_sift_down_v1(order: List[Number], updates: List[YazaDbSecondaryIndexUpdateV1], start: Number, end: Number) -> Boolean:
+    var root: Number = start
+    while root * 2 + 1 < end:
+        let left: Number = root * 2 + 1
+        var greatest: Number = root
+        if yaza_db_sql_update_index_before_v1(list_get(order, greatest), list_get(order, left), updates): set greatest = left
+        let right: Number = left + 1
+        if right < end and yaza_db_sql_update_index_before_v1(list_get(order, greatest), list_get(order, right), updates): set greatest = right
+        if greatest == root: return true
+        if not yaza_db_sql_update_index_swap_v1(order, root, greatest): return false
+        set root = greatest
+    return true
+
+fn yaza_db_sql_update_sort_index_updates_v1(order: List[Number], updates: List[YazaDbSecondaryIndexUpdateV1]) -> Boolean:
+    let count: Number = list_count(order)
+    if count < 1 or count != list_count(updates): return false
+    var start: Number = count / 2
+    while start > 0:
+        set start = start - 1
+        if not yaza_db_sql_update_index_sift_down_v1(order, updates, start, count): return false
+    var end: Number = count
+    while end > 1:
+        if not yaza_db_sql_update_index_swap_v1(order, 0, end - 1): return false
+        set end = end - 1
+        if not yaza_db_sql_update_index_sift_down_v1(order, updates, 0, end): return false
+    return true
+
+fn yaza_db_sql_update_apply_secondary_index_tombstones_v1(transaction: YazaDbWriteTransactionV1, updates: List[YazaDbSecondaryIndexUpdateV1]) -> Result[YazaDbWriteTransactionV1, Text]:
+    let count: Number = list_count(updates)
+    if count == 0: return ok(transaction)
+    let order_result: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(order_result):
+        yaza_db_sql_update_close_v1(transaction.storage, transaction.wal)
+        return err("YDBv1 UPDATE secondary-index order allocation failed")
+    let order: List[Number] = result_unwrap(order_result)
+    if not list_try_reserve(order, count):
+        yaza_db_sql_update_close_v1(transaction.storage, transaction.wal)
+        return err("YDBv1 UPDATE secondary-index order reservation failed")
+    var idx: Number = 0
+    while idx < count:
+        if not list_try_push(order, idx):
+            yaza_db_sql_update_close_v1(transaction.storage, transaction.wal)
+            return err("YDBv1 UPDATE secondary-index order initialization failed")
+        set idx = idx + 1
+    if not yaza_db_sql_update_sort_index_updates_v1(order, updates):
+        yaza_db_sql_update_close_v1(transaction.storage, transaction.wal)
+        return err("YDBv1 UPDATE secondary-index order sort failed")
+    let groups_result: Result[List[YazaDbWriteLeafUpdateGroupV1], Text] = list_try_new()
+    if not result_is_ok(groups_result):
+        yaza_db_sql_update_close_v1(transaction.storage, transaction.wal)
+        return err("YDBv1 UPDATE secondary-index group allocation failed")
+    var groups: List[YazaDbWriteLeafUpdateGroupV1] = result_unwrap(groups_result)
+    if not list_try_reserve(groups, 128):
+        yaza_db_sql_update_close_v1(transaction.storage, transaction.wal)
+        return err("YDBv1 UPDATE secondary-index group reservation failed")
+    var current: YazaDbWriteTransactionV1 = transaction
+    var current_page_id: Number = -1
+    var current_updates: List[YazaDbWriteLeafUpdateV1] = List[YazaDbWriteLeafUpdateV1]()
+    var updates_initialized: Boolean = false
+    var sorted_idx: Number = 0
+    while sorted_idx < count:
+        let upd: YazaDbSecondaryIndexUpdateV1 = list_get(updates, list_get(order, sorted_idx))
+        let old_target: YazaDbSecondaryIndexTargetV1 = upd.old_target
+        if not updates_initialized or old_target.page_id != current_page_id:
+            if updates_initialized:
+                if not list_try_push(groups, YazaDbWriteLeafUpdateGroupV1(current_page_id, current_updates)):
+                    yaza_db_sql_update_close_v1(current.storage, current.wal)
+                    return err("YDBv1 UPDATE secondary-index group append failed")
+                if list_count(groups) == 128:
+                    let mutated: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_mutate_leaf_groups_v1(current, groups)
+                    if not result_is_ok(mutated): return err("YDBv1 SQL UPDATE secondary-index mutation failed; reopen through recovery before reuse: " + result_unwrap_error(mutated))
+                    set current = result_unwrap(mutated)
+                    let next_groups_result: Result[List[YazaDbWriteLeafUpdateGroupV1], Text] = list_try_new()
+                    if not result_is_ok(next_groups_result):
+                        yaza_db_sql_update_close_v1(current.storage, current.wal)
+                        return err("YDBv1 UPDATE secondary-index next-group allocation failed")
+                    set groups = result_unwrap(next_groups_result)
+                    if not list_try_reserve(groups, 128):
+                        yaza_db_sql_update_close_v1(current.storage, current.wal)
+                        return err("YDBv1 UPDATE secondary-index next-group reservation failed")
+            let batch_result: Result[List[YazaDbWriteLeafUpdateV1], Text] = list_try_new()
+            if not result_is_ok(batch_result):
+                yaza_db_sql_update_close_v1(current.storage, current.wal)
+                return err("YDBv1 UPDATE secondary-index leaf batch allocation failed")
+            set current_updates = result_unwrap(batch_result)
+            set current_page_id = old_target.page_id
+            set updates_initialized = true
+        if not list_try_push(current_updates, YazaDbWriteLeafUpdateV1(old_target.entry.key, old_target.tombstone)):
+            yaza_db_sql_update_close_v1(current.storage, current.wal)
+            return err("YDBv1 UPDATE secondary-index leaf batch append failed")
+        set sorted_idx = sorted_idx + 1
+    if updates_initialized:
+        if not list_try_push(groups, YazaDbWriteLeafUpdateGroupV1(current_page_id, current_updates)):
+            yaza_db_sql_update_close_v1(current.storage, current.wal)
+            return err("YDBv1 UPDATE secondary-index final group append failed")
+    if list_count(groups) > 0:
+        let mutated: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_mutate_leaf_groups_v1(current, groups)
+        if not result_is_ok(mutated): return err("YDBv1 SQL UPDATE secondary-index mutation failed; reopen through recovery before reuse: " + result_unwrap_error(mutated))
+        set current = result_unwrap(mutated)
+    return ok(current)
+
+fn yaza_db_sql_update_build_groups_v1(targets: List[YazaDbSqlUpdateTargetV1], columns: List[YazaSqlColumnSchemaV1], encode_commit_ts: Number, schema_version: Number) -> Result[List[YazaDbWriteLeafUpdateGroupV1], Text]:
+    let row_count: Number = list_count(targets)
+    let groups_result: Result[List[YazaDbWriteLeafUpdateGroupV1], Text] = list_try_new()
+    if not result_is_ok(groups_result): return err("YDBv1 UPDATE could not allocate leaf update groups")
+    let groups: List[YazaDbWriteLeafUpdateGroupV1] = result_unwrap(groups_result)
+    var group_start: Number = 0
+    while group_start < row_count:
+        let first_target: YazaDbSqlUpdateTargetV1 = list_get(targets, group_start)
+        var group_end: Number = group_start + 1
+        while group_end < row_count and list_get(targets, group_end).page_id == first_target.page_id:
+            set group_end = group_end + 1
+        let batch_result: Result[List[YazaDbWriteLeafUpdateV1], Text] = list_try_new()
+        if not result_is_ok(batch_result): return err("YDBv1 UPDATE could not allocate leaf-page update batch")
+        let batch_updates: List[YazaDbWriteLeafUpdateV1] = result_unwrap(batch_result)
+        if not list_try_reserve(batch_updates, group_end - group_start): return err("YDBv1 UPDATE could not reserve leaf-page update batch")
+        var gidx: Number = group_start
+        while gidx < group_end:
+            let target: YazaDbSqlUpdateTargetV1 = list_get(targets, gidx)
+            let encoded_row: Bytes = yaza_db_row_encode_for_schema_with_overflow_v1(target.values, target.nulls, target.overflow_refs, columns, encode_commit_ts, schema_version)?
+            if not list_try_push(batch_updates, YazaDbWriteLeafUpdateV1(target.key, encoded_row)): return err("YDBv1 UPDATE could not stage a leaf-page update")
+            set gidx = gidx + 1
+        if not list_try_push(groups, YazaDbWriteLeafUpdateGroupV1(first_target.page_id, batch_updates)): return err("YDBv1 UPDATE could not stage a leaf-page group")
+        set group_start = group_end
+    return ok(groups)
+
+fn yaza_db_sql_update_prepare_plan_v1(file: Number, read_header: YazaDbFileHeaderV1, encode_commit_ts: Number, source: Text, parameters: List[YazaSqlValueV1], cached_catalog: Option[YazaDbCatalogSnapshotWithRootsV1], cached_index_rows: Option[List[YazaDbRowV1]]) -> Result[YazaDbSqlUpdatePreparedPlanV1, Text]:
     let update: YazaSqlUpdateAstV1 = yaza_sql_parse_update_v1(source)?
     let statement_parameters: List[YazaSqlBoundParameterV1] = yaza_sql_update_bind_statement_parameters_v1(source, parameters)?
     let predicate_source: YazaSqlUpdatePredicateSourceV1 = yaza_sql_update_normalize_predicate_source_v1(update.predicate_select_source)?
-    let loaded: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(storage.file, storage.header)?
+    var loaded_result: Result[YazaDbCatalogSnapshotWithRootsV1, Text] = err("YDBv1 UPDATE catalog was not loaded")
+    if option_is_some(cached_catalog):
+        set loaded_result = ok(option_unwrap(cached_catalog))
+    else:
+        set loaded_result = yaza_db_catalog_snapshot_load_with_roots_v1(file, read_header)
+    let loaded: YazaDbCatalogSnapshotWithRootsV1 = loaded_result?
     var view_index: Number = 0
     while view_index < list_count(loaded.views):
         if yaza_sql_bind_v1_identifier_matches(source, update.table_name.first_token, list_get(loaded.views, view_index).name):
@@ -358,9 +526,14 @@ fn yaza_db_execute_update_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1
     let table: YazaSqlTableSchemaV1 = list_get(loaded.sql_snapshot.tables, table_index)
     let table_schema_version: Number = list_get(loaded.table_schema_versions, table_index)
     let table_root_page_id: Number = list_get(loaded.root_page_ids, table_index)
-    let catalog: YazaDbCatalogRootV1 = yaza_db_catalog_storage_read_root_v1(storage.file, storage.header)?
-    let key_ordinals: List[Number] = yaza_db_query_clustered_key_ordinals_v1(storage.file, storage.header, catalog, plan.table_id, table_root_page_id, loaded.sql_snapshot.version, list_count(table.columns))?
-    let indexes: List[YazaDbSecondaryIndexV1] = yaza_db_index_maintenance_load_v1(storage, loaded, table_index)?
+    var index_rows_result: Result[List[YazaDbRowV1], Text] = err("YDBv1 UPDATE index catalog was not loaded")
+    if option_is_some(cached_index_rows):
+        set index_rows_result = ok(option_unwrap(cached_index_rows))
+    else:
+        set index_rows_result = yaza_db_index_catalog_rows_v1(file, read_header, loaded.sql_snapshot.version)
+    let index_rows: List[YazaDbRowV1] = index_rows_result?
+    let key_ordinals: List[Number] = yaza_db_query_clustered_key_ordinals_from_rows_v1(index_rows, plan.table_id, table_root_page_id, list_count(table.columns))?
+    let indexes: List[YazaDbSecondaryIndexV1] = yaza_db_index_maintenance_load_from_rows_v1(loaded, table_index, key_ordinals, index_rows)?
     let assignments: List[YazaDbSqlUpdateAssignmentValueV1] = yaza_db_sql_update_materialize_assignments_v1(source, update, table, key_ordinals, parameters)?
     let predicate_parameters_result: Result[List[YazaSqlValueV1], Text] = list_try_new()
     if not result_is_ok(predicate_parameters_result): return err("YDBv1 UPDATE could not allocate WHERE parameter values")
@@ -386,8 +559,11 @@ fn yaza_db_execute_update_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1
         if not list_try_push(predicate_parameters, list_get(parameters, statement_parameter_index)): return err("YDBv1 UPDATE could not append a WHERE parameter value")
         set predicate_parameter_index = predicate_parameter_index + 1
     if parameter_style == 2 and list_count(predicate_source.positional_source_ordinals) != list_count(plan.parameters): return err("YDBv1 UPDATE positional predicate metadata does not match its bound plan")
-    let query_result: YazaSqlQueryResultV1 = yaza_db_execute_select_v1(storage.file, storage.header, predicate_source.source, predicate_parameters)?
+    let predicate_tokens: List[YazaSqlTokenV1] = yaza_sql_lex_v1(predicate_source.source)?
+    let query_result: YazaSqlQueryResultV1 = yaza_db_execute_single_select_with_cached_catalog_and_index_rows_profiled_v1(file, read_header, predicate_source.source, predicate_tokens, predicate_parameters, loaded, index_rows, List[Number]())?
     let row_count: Number = list_count(query_result.rows)
+    if row_count == 0:
+        return ok(YazaDbSqlUpdatePreparedPlanV1(table, table_schema_version, 0, List[YazaDbSqlUpdateTargetV1](), 0, YazaDbSqlUpdateOverflowBudgetV1(0, 0), 0, 0, 0, List[YazaDbWriteLeafUpdateGroupV1]()))
     let column_count: Number = list_count(table.columns)
     if row_count > 900 or row_count * column_count > 1048576: return err("YDBv1 UPDATE result exceeds the bounded 900-row atomic transaction/cell profile")
     let targets_result: Result[List[YazaDbSqlUpdateTargetV1], Text] = list_try_new()
@@ -398,6 +574,10 @@ fn yaza_db_execute_update_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1
     var total_row_bytes: Number = 0
     var total_index_writes: Number = 0
     var previous_key: Bytes = bytes_from_text("")
+    var cached_leaf_page_id: Number = -1
+    var cached_leaf_page: Bytes = bytes_from_text("")
+    var cached_leaf_header: YazaDbPageHeaderV1 = YazaDbPageHeaderV1(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    var cached_next_slot: Number = 0
     var row_index: Number = 0
     while row_index < row_count:
         let old_row: List[YazaSqlValueV1] = list_get(query_result.rows, row_index)
@@ -418,14 +598,31 @@ fn yaza_db_execute_update_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1
         let old_key: Bytes = yaza_db_sql_update_key_v1(values, table.columns, key_ordinals)?
         if bytes_length(old_key) > 2048 or total_key_bytes > 67108864 - bytes_length(old_key): return err("YDBv1 UPDATE key metadata exceeds its memory bound")
         if row_index > 0 and yaza_db_compare_bytes_v1(previous_key, old_key) >= 0: return err("YDBv1 UPDATE result is not in strict clustered-key order")
-        let seek: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(storage.file, storage.header, table_root_page_id, old_key)?
-        let page: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, seek.leaf_page_id)?
-        let page_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, seek.leaf_page_id)?
-        let slot_index: Number = yaza_db_page_lower_bound_v1(page, old_key, seek.leaf_page_id)?
-        if slot_index >= page_header.count: return err("YDBv1 UPDATE selected a row absent from its current leaf")
-        let stored_key: Bytes = yaza_db_page_slot_key_v1(page, slot_index, seek.leaf_page_id)?
+        var leaf_page_id: Number = -1
+        var page: Bytes = bytes_from_text("")
+        var page_header: YazaDbPageHeaderV1 = YazaDbPageHeaderV1(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        var slot_index: Number = -1
+        if cached_leaf_page_id >= 2:
+            let cached_slot: Number = yaza_db_page_lower_bound_from_validated_header_v1(cached_leaf_page, cached_leaf_header, old_key, cached_next_slot)?
+            if cached_slot < cached_leaf_header.count:
+                let cached_slot_data: YazaDbPageSlotV1 = yaza_db_page_slot_from_validated_header_v1(cached_leaf_page, cached_leaf_header, cached_slot)?
+                let cached_key: Bytes = yaza_db_page_slot_key_from_validated_header_v1(cached_leaf_page, cached_leaf_header, cached_slot_data)?
+                if bytes_equal(cached_key, old_key):
+                    set leaf_page_id = cached_leaf_page_id
+                    set page = cached_leaf_page
+                    set page_header = cached_leaf_header
+                    set slot_index = cached_slot
+        if leaf_page_id < 0:
+            let seek: YazaDbBtreeSeekV1 = yaza_db_btree_seek_leaf_v1(file, read_header, table_root_page_id, old_key)?
+            set leaf_page_id = seek.leaf_page_id
+            set page = seek.leaf_page
+            set page_header = seek.leaf_header
+            set slot_index = yaza_db_page_lower_bound_validated_header_v1(page, page_header, old_key)?
+            if slot_index >= page_header.count: return err("YDBv1 UPDATE selected a row absent from its current leaf")
+        if slot_index < 0 or slot_index >= page_header.count: return err("YDBv1 UPDATE selected a row absent from its current leaf")
+        let old_slot: YazaDbPageSlotV1 = yaza_db_page_slot_from_validated_header_v1(page, page_header, slot_index)?
+        let stored_key: Bytes = yaza_db_page_slot_key_from_validated_header_v1(page, page_header, old_slot)?
         if not bytes_equal(stored_key, old_key): return err("YDBv1 UPDATE selected a row whose clustered key changed")
-        let old_slot: YazaDbPageSlotV1 = yaza_db_page_slot_v1(page, slot_index, seek.leaf_page_id)?
         let decoded_old: YazaDbRowV1 = yaza_db_row_decode_for_schema_v1(old_slot.payload, table.columns, table_schema_version)?
         let overflow_refs_result: Result[List[YazaDbOverflowRefV1], Text] = list_try_new()
         if not result_is_ok(overflow_refs_result): return err("YDBv1 UPDATE could not allocate overflow-reference metadata")
@@ -459,7 +656,13 @@ fn yaza_db_execute_update_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1
             let prior_overflow_ref: YazaDbOverflowRefV1 = list_get(decoded_old.overflow_refs, assignment.column_ordinal)
             if prior_overflow_ref.first_page_id > 0:
                 let prior_value: YazaSqlValueV1 = list_get(old_row, assignment.column_ordinal)
-                if assignment_value.is_null or assignment_value.type_id != 9 or assignment_value.text_value != prior_value.text_value:
+                var same_overflow_value: Boolean = false
+                if not assignment_value.is_null and assignment_value.type_id == prior_value.type_id:
+                    if assignment_value.type_id == 9 and assignment_value.text_value == prior_value.text_value:
+                        set same_overflow_value = true
+                    elif assignment_value.type_id == 16 and bytes_equal(assignment_value.bytes_value, prior_value.bytes_value):
+                        set same_overflow_value = true
+                if not same_overflow_value:
                     if not list_try_set(overflow_refs, assignment.column_ordinal, yaza_db_row_empty_overflow_ref_v1()): return err("YDBv1 UPDATE could not invalidate the replaced overflow reference")
             if not list_try_set(values, assignment.column_ordinal, assignment_value) or not list_try_set(nulls, assignment.column_ordinal, assignment_value.is_null): return err("YDBv1 UPDATE could not apply a typed row assignment")
             set assignment_index = assignment_index + 1
@@ -473,7 +676,7 @@ fn yaza_db_execute_update_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1
         var index_number: Number = 0
         while index_number < list_count(indexes):
             let index: YazaDbSecondaryIndexV1 = list_get(indexes, index_number)
-            let update_index: Option[YazaDbSecondaryIndexUpdateV1] = yaza_db_index_maintenance_prepare_update_v1(storage.file, storage.header, index, old_row, old_nulls, values, nulls)?
+            let update_index: Option[YazaDbSecondaryIndexUpdateV1] = yaza_db_index_maintenance_prepare_update_v1(file, read_header, index, old_row, old_nulls, values, nulls)?
             if option_is_some(update_index):
                 let prepared_update: YazaDbSecondaryIndexUpdateV1 = option_unwrap(update_index)
                 if index.plan.is_unique and yaza_db_sql_update_unique_batch_conflict_v1(targets, prepared_update): return err("YDBv1 UNIQUE INDEX rejects duplicate non-NULL values produced by one UPDATE statement")
@@ -481,10 +684,14 @@ fn yaza_db_execute_update_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1
                 set total_index_writes = total_index_writes + 2
                 if not list_try_push(index_updates, prepared_update): return err("YDBv1 UPDATE could not retain a secondary-index update")
             set index_number = index_number + 1
-        let preflight_row: Bytes = yaza_db_row_preflight_for_schema_v1(values, nulls, table.columns, storage.header.next_commit_ts, table_schema_version)?
+        let preflight_row: Bytes = yaza_db_row_preflight_for_schema_v1(values, nulls, table.columns, encode_commit_ts, table_schema_version)?
         if bytes_length(preflight_row) > 4096: return err("YDBv1 UPDATE encoded row set exceeds its 64 MiB preflight bound")
         if total_row_bytes > 67108864 - bytes_length(preflight_row): return err("YDBv1 UPDATE encoded row set exceeds its 64 MiB preflight bound")
-        if not list_try_push(targets, YazaDbSqlUpdateTargetV1(old_key, seek.leaf_page_id, values, nulls, overflow_refs, index_updates)): return err("YDBv1 UPDATE could not retain a preflighted row")
+        if not list_try_push(targets, YazaDbSqlUpdateTargetV1(old_key, leaf_page_id, values, nulls, overflow_refs, index_updates)): return err("YDBv1 UPDATE could not retain a preflighted row")
+        set cached_leaf_page_id = leaf_page_id
+        set cached_leaf_page = page
+        set cached_leaf_header = page_header
+        set cached_next_slot = slot_index + 1
         set total_key_bytes = total_key_bytes + bytes_length(old_key)
         set total_row_bytes = total_row_bytes + bytes_length(preflight_row)
         set previous_key = old_key
@@ -498,9 +705,9 @@ fn yaza_db_execute_update_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1
     while row_index < row_count:
         if not list_try_push(foreign_rows, list_get(targets, row_index).values): return err("YDBv1 UPDATE could not retain a row for foreign-key validation")
         set row_index = row_index + 1
-    let foreign_keys_valid: Boolean = yaza_db_sql_foreign_key_validate_rows_v1(storage.file, storage.header, loaded, plan.table_id, foreign_rows)?
+    let foreign_keys_valid: Boolean = yaza_db_sql_foreign_key_validate_rows_v1(file, read_header, loaded, plan.table_id, foreign_rows)?
     if not foreign_keys_valid: return err("YDBv1 UPDATE foreign-key preflight did not complete")
-    let checks_valid: Boolean = yaza_db_sql_check_validate_rows_v1(storage.file, storage.header, loaded, plan.table_id, foreign_rows)?
+    let checks_valid: Boolean = yaza_db_sql_check_validate_rows_v1(file, read_header, loaded, plan.table_id, foreign_rows)?
     if not checks_valid: return err("YDBv1 UPDATE CHECK preflight did not complete")
     let mutation_count: Number = row_count + total_index_writes
     if mutation_count > 900: return err("YDBv1 UPDATE rows and active index entries exceed the 900-row atomic transaction bound")
@@ -508,22 +715,75 @@ fn yaza_db_execute_update_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1
     var reserve_pages: Number = yaza_db_write_transaction_default_free_page_reserve_v1()
     if overflow_budget.page_count + 64 > reserve_pages: set reserve_pages = overflow_budget.page_count + 64
     if reserve_pages > yaza_db_storage_preallocated_page_count_v1(): return err("YDBv1 SQL UPDATE overflow chain exceeds the bounded transaction page-reserve profile")
-    let begun: YazaDbWriteTransactionV1 = yaza_db_write_transaction_begin_with_reserve_v1(storage, wal, reserve_pages)?
-    if begun.commit_ts != storage.header.next_commit_ts:
-        yaza_db_sql_update_close_v1(begun.storage, begun.wal)
-        return err("YDBv1 UPDATE commit timestamp changed after row preflight; reopen through recovery before reuse")
     let leaf_record_bytes: Number = yaza_db_wal_header_size_v1() + yaza_db_wal_leaf_mutation_payload_size_v1()
     let allocation_record_bytes: Number = yaza_db_wal_header_size_v1() + yaza_db_page_space_payload_size_v1()
     let page_image_record_bytes: Number = yaza_db_wal_header_size_v1() + yaza_db_wal_page_image_payload_size_v1()
     let required_wal_bytes: Number = (mutation_count + 1) * leaf_record_bytes + overflow_budget.page_count * (allocation_record_bytes + page_image_record_bytes)
-    if not yaza_db_write_transaction_tail_fits_bytes_v1(begun, required_wal_bytes):
-        yaza_db_sql_update_close_v1(begun.storage, begun.wal)
-        return err("YDBv1 UPDATE result exceeds the bounded WAL recovery-tail budget; reopen through recovery before reuse")
-    var current: YazaDbWriteTransactionV1 = begun
-    set row_index = 0
-    while row_index < row_count:
-        let target: YazaDbSqlUpdateTargetV1 = list_get(targets, row_index)
-        let staged: Result[YazaDbWriteOverflowRowV1, Text] = yaza_db_write_transaction_stage_overflow_text_with_refs_v1(current, target.values, target.nulls, table.columns, target.overflow_refs)
+    var groups: List[YazaDbWriteLeafUpdateGroupV1] = List[YazaDbWriteLeafUpdateGroupV1]()
+    if overflow_budget.page_count == 0 and row_count > 0:
+        set groups = yaza_db_sql_update_build_groups_v1(targets, table.columns, encode_commit_ts, table_schema_version)?
+    return ok(YazaDbSqlUpdatePreparedPlanV1(table, table_schema_version, row_count, targets, total_index_writes, overflow_budget, mutation_count, reserve_pages, required_wal_bytes, groups))
+
+fn yaza_db_sql_update_execute_nonstaged_in_tx_v1(initial_tx: YazaDbWriteTransactionV1, plan: YazaDbSqlUpdatePreparedPlanV1) -> Result[YazaDbWriteTransactionV1, Text]:
+    var current: YazaDbWriteTransactionV1 = initial_tx
+    if plan.overflow_budget.page_count == 0 and plan.row_count > 0:
+        var chunk_start: Number = 0
+        while chunk_start < list_count(plan.groups):
+            var chunk_end: Number = chunk_start + 128
+            if chunk_end > list_count(plan.groups): set chunk_end = list_count(plan.groups)
+            let chunk_result: Result[List[YazaDbWriteLeafUpdateGroupV1], Text] = list_try_new()
+            if not result_is_ok(chunk_result):
+                yaza_db_sql_update_close_v1(current.storage, current.wal)
+                return err("YDBv1 UPDATE could not allocate leaf group chunk")
+            let chunk: List[YazaDbWriteLeafUpdateGroupV1] = result_unwrap(chunk_result)
+            if not list_try_reserve(chunk, chunk_end - chunk_start):
+                yaza_db_sql_update_close_v1(current.storage, current.wal)
+                return err("YDBv1 UPDATE could not reserve leaf group chunk")
+            var cidx: Number = chunk_start
+            while cidx < chunk_end:
+                if not list_try_push(chunk, list_get(plan.groups, cidx)):
+                    yaza_db_sql_update_close_v1(current.storage, current.wal)
+                    return err("YDBv1 UPDATE could not populate leaf group chunk")
+                set cidx = cidx + 1
+            let mutated_chunk: Result[YazaDbWriteTransactionV1, Text] = yaza_db_write_transaction_mutate_leaf_groups_v1(current, chunk)
+            if not result_is_ok(mutated_chunk):
+                let message: Text = result_unwrap_error(mutated_chunk)
+                yaza_db_sql_update_close_after_error_v1(current.storage, current.wal, message)
+                return err("YDBv1 SQL UPDATE mutation failed; reopen through recovery before reuse: " + message)
+            set current = result_unwrap(mutated_chunk)
+            set chunk_start = chunk_end
+        if plan.total_index_writes > 0:
+            let flat_result: Result[List[YazaDbSecondaryIndexUpdateV1], Text] = list_try_new()
+            if not result_is_ok(flat_result):
+                yaza_db_sql_update_close_v1(current.storage, current.wal)
+                return err("YDBv1 UPDATE could not allocate secondary-index update list")
+            let all_index_updates: List[YazaDbSecondaryIndexUpdateV1] = result_unwrap(flat_result)
+            var row_index: Number = 0
+            while row_index < plan.row_count:
+                let target: YazaDbSqlUpdateTargetV1 = list_get(plan.targets, row_index)
+                var index_number: Number = 0
+                while index_number < list_count(target.index_updates):
+                    if not list_try_push(all_index_updates, list_get(target.index_updates, index_number)):
+                        yaza_db_sql_update_close_v1(current.storage, current.wal)
+                        return err("YDBv1 UPDATE could not collect secondary-index update")
+                    set index_number = index_number + 1
+                set row_index = row_index + 1
+            set current = yaza_db_sql_update_apply_secondary_index_tombstones_v1(current, all_index_updates)?
+            var entry_index: Number = 0
+            while entry_index < list_count(all_index_updates):
+                let idx_update: YazaDbSecondaryIndexUpdateV1 = list_get(all_index_updates, entry_index)
+                let inserted_idx: Result[YazaDbWriteTransactionV1, Text] = yaza_db_index_maintenance_write_entry_v1(current, idx_update.old_target.index, idx_update.new_entry)
+                if not result_is_ok(inserted_idx):
+                    let message: Text = result_unwrap_error(inserted_idx)
+                    yaza_db_sql_update_close_after_error_v1(current.storage, current.wal, message)
+                    return err("YDBv1 SQL UPDATE secondary-index insert failed; reopen through recovery before reuse: " + message)
+                set current = result_unwrap(inserted_idx)
+                set entry_index = entry_index + 1
+        return ok(current)
+    var row_index: Number = 0
+    while row_index < plan.row_count:
+        let target: YazaDbSqlUpdateTargetV1 = list_get(plan.targets, row_index)
+        let staged: Result[YazaDbWriteOverflowRowV1, Text] = yaza_db_write_transaction_stage_overflow_text_with_refs_v1(current, target.values, target.nulls, plan.table.columns, target.overflow_refs)
         if not result_is_ok(staged):
             let message: Text = result_unwrap_error(staged)
             if not text_starts_with(message, "YDBv1 overflow staging failed; writer handles were closed"):
@@ -531,7 +791,7 @@ fn yaza_db_execute_update_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1
             return err("YDBv1 SQL UPDATE overflow staging failed; reopen through recovery before reuse: " + message)
         let staged_row: YazaDbWriteOverflowRowV1 = result_unwrap(staged)
         set current = staged_row.transaction
-        let encoded_result: Result[Bytes, Text] = yaza_db_row_encode_for_schema_with_overflow_v1(target.values, target.nulls, staged_row.references, table.columns, current.commit_ts, table_schema_version)
+        let encoded_result: Result[Bytes, Text] = yaza_db_row_encode_for_schema_with_overflow_v1(target.values, target.nulls, staged_row.references, plan.table.columns, current.commit_ts, plan.table_schema_version)
         if not result_is_ok(encoded_result):
             yaza_db_sql_update_close_v1(current.storage, current.wal)
             return err("YDBv1 SQL UPDATE row encoding failed after overflow staging; reopen through recovery: " + result_unwrap_error(encoded_result))
@@ -545,10 +805,71 @@ fn yaza_db_execute_update_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1
             set current = result_unwrap(updated_index)
             set index_number = index_number + 1
         set row_index = row_index + 1
-    let committed: Result[YazaDbWriteCommitV1, Text] = yaza_db_write_transaction_commit_v1(current)
+    return ok(current)
+
+fn yaza_db_execute_update_in_tx_v1(transaction: YazaDbWriteTransactionV1, source: Text, parameters: List[YazaSqlValueV1], cached_catalog: Option[YazaDbCatalogSnapshotWithRootsV1], cached_index_rows: Option[List[YazaDbRowV1]]) -> Result[YazaDbTxDmlResultV1, Text]:
+    if not transaction.active or transaction.storage.root != transaction.wal.root or not bytes_equal(transaction.storage.header.db_uuid, transaction.wal.db_uuid):
+        return err("YDBv1 SQL UPDATE explicit transaction handles are inactive or mismatched")
+    if transaction.txn_id != transaction.storage.header.next_txn_id or transaction.commit_ts != transaction.storage.header.next_commit_ts:
+        return err("YDBv1 SQL UPDATE explicit transaction counters are stale")
+    let read_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(transaction.storage.header.db_uuid, transaction.storage.header.checkpoint_lsn, transaction.storage.header.next_txn_id, transaction.commit_ts + 1, transaction.storage.header.catalog_root, transaction.storage.header.page_count, transaction.storage.header.flags)
+    let plan: YazaDbSqlUpdatePreparedPlanV1 = yaza_db_sql_update_prepare_plan_v1(transaction.storage.file, read_header, transaction.commit_ts, source, parameters, cached_catalog, cached_index_rows)?
+    if plan.row_count == 0:
+        return ok(YazaDbTxDmlResultV1(transaction, 0))
+    if not yaza_db_write_transaction_tail_fits_bytes_v1(transaction, plan.required_wal_bytes):
+        return err("YDBv1 UPDATE result exceeds the bounded WAL recovery-tail budget for the active transaction")
+    let free_pages: Number = yaza_db_allocator_count_free_pages_v1(transaction.storage, plan.reserve_pages)?
+    if free_pages < plan.reserve_pages:
+        return err("YDBv1 UPDATE active transaction does not have enough preallocated free pages remaining")
+    let next_tx: YazaDbWriteTransactionV1 = yaza_db_sql_update_execute_nonstaged_in_tx_v1(transaction, plan)?
+    return ok(YazaDbTxDmlResultV1(next_tx, plan.row_count))
+
+fn yaza_db_execute_update_with_sync_policy_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], defer_checkpoint: Boolean, sync_commit_wal: Boolean, cached_catalog: Option[YazaDbCatalogSnapshotWithRootsV1], cached_index_rows: Option[List[YazaDbRowV1]]) -> Result[YazaDbWriteCommitV1, Text]:
+    if storage.root != wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid): return err("YDBv1 SQL UPDATE storage and WAL handles belong to different databases")
+    let plan: YazaDbSqlUpdatePreparedPlanV1 = yaza_db_sql_update_prepare_plan_v1(storage.file, storage.header, storage.header.next_commit_ts, source, parameters, cached_catalog, cached_index_rows)?
+    if plan.row_count == 0:
+        return ok(YazaDbWriteCommitV1(storage, wal, 0, storage.header.next_commit_ts - 1, 0))
+    var begun_result: Result[YazaDbWriteTransactionV1, Text] = err("YDBv1 UPDATE transaction begin path was not selected")
+    if defer_checkpoint:
+        set begun_result = yaza_db_write_transaction_begin_with_reserve_deferred_checkpoint_v1(storage, wal, plan.reserve_pages)
+    else:
+        set begun_result = yaza_db_write_transaction_begin_with_reserve_v1(storage, wal, plan.reserve_pages)
+    let begun: YazaDbWriteTransactionV1 = begun_result?
+    if begun.commit_ts != storage.header.next_commit_ts:
+        yaza_db_sql_update_close_v1(begun.storage, begun.wal)
+        return err("YDBv1 UPDATE commit timestamp changed after row preflight; reopen through recovery before reuse")
+    if not yaza_db_write_transaction_tail_fits_bytes_v1(begun, plan.required_wal_bytes):
+        yaza_db_sql_update_close_v1(begun.storage, begun.wal)
+        return err("YDBv1 UPDATE result exceeds the bounded WAL recovery-tail budget; reopen through recovery before reuse")
+    var current: YazaDbWriteTransactionV1 = begun
+    if plan.overflow_budget.page_count == 0 and plan.row_count > 0 and plan.total_index_writes == 0 and list_count(plan.groups) <= 128:
+        let staged_result: Result[YazaDbStagedLeafBatchV1, Text] = yaza_db_write_transaction_stage_leaf_update_groups_profiled_v1(current, plan.groups, List[Number]())
+        if not result_is_ok(staged_result):
+            let message: Text = result_unwrap_error(staged_result)
+            yaza_db_sql_update_close_after_error_v1(current.storage, current.wal, message)
+            return err("YDBv1 SQL UPDATE staged mutation failed; reopen through recovery before reuse: " + message)
+        let staged: YazaDbStagedLeafBatchV1 = result_unwrap(staged_result)
+        let committed_staged: Result[YazaDbWriteCommitV1, Text] = yaza_db_write_transaction_commit_staged_pages_sync_policy_v1(staged.transaction, staged.page_ids, staged.pages, not defer_checkpoint, sync_commit_wal)
+        if not result_is_ok(committed_staged):
+            let message: Text = result_unwrap_error(committed_staged)
+            yaza_db_sql_update_close_after_error_v1(staged.transaction.storage, staged.transaction.wal, message)
+            return err("YDBv1 SQL UPDATE commit failed; reopen through recovery before reuse: " + message)
+        let staged_commit: YazaDbWriteCommitV1 = result_unwrap(committed_staged)
+        return ok(YazaDbWriteCommitV1(staged_commit.storage, staged_commit.wal, staged_commit.txn_id, staged_commit.commit_ts, plan.row_count))
+    set current = yaza_db_sql_update_execute_nonstaged_in_tx_v1(current, plan)?
+    let committed: Result[YazaDbWriteCommitV1, Text] = yaza_db_write_transaction_commit_with_sync_policy_v1(current, not defer_checkpoint, 0, sync_commit_wal)
     if not result_is_ok(committed):
         let message: Text = result_unwrap_error(committed)
-        yaza_db_sql_update_close_v1(current.storage, current.wal)
+        yaza_db_sql_update_close_after_error_v1(current.storage, current.wal, message)
         return err("YDBv1 SQL UPDATE commit failed; reopen through recovery before reuse: " + message)
     let result: YazaDbWriteCommitV1 = result_unwrap(committed)
-    return ok(YazaDbWriteCommitV1(result.storage, result.wal, result.txn_id, result.commit_ts, row_count))
+    return ok(YazaDbWriteCommitV1(result.storage, result.wal, result.txn_id, result.commit_ts, plan.row_count))
+
+fn yaza_db_execute_update_with_policy_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], defer_checkpoint: Boolean, cached_catalog: Option[YazaDbCatalogSnapshotWithRootsV1], cached_index_rows: Option[List[YazaDbRowV1]]) -> Result[YazaDbWriteCommitV1, Text]:
+    return yaza_db_execute_update_with_sync_policy_v1(storage, wal, source, parameters, defer_checkpoint, true, cached_catalog, cached_index_rows)
+
+fn yaza_db_execute_update_deferred_checkpoint_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1]) -> Result[YazaDbWriteCommitV1, Text]:
+    return yaza_db_execute_update_with_policy_v1(storage, wal, source, parameters, true, none, none)
+
+fn yaza_db_execute_update_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1]) -> Result[YazaDbWriteCommitV1, Text]:
+    return yaza_db_execute_update_with_policy_v1(storage, wal, source, parameters, false, none, none)

@@ -1,0 +1,272 @@
+# Bounded 4-way set-associative CLOCK LRU buffer pool for validated 16 KiB YDBv1 pages.
+# Only pre-validated pages (CRC32C + allocation bitmap verified) are admitted, and
+# cache writes are strictly guarded to the outer session arena so scoped borrows
+# never leak across arena_scope boundaries.
+use "./page_v1"
+use "./storage_v1"
+
+shape YazaDbBufferPoolStatsV1:
+    capacity: Number
+    hits: Number
+    misses: Number
+    evictions: Number
+    invalidations: Number
+    resident_count: Number
+
+shape YazaDbBufferPoolV1:
+    file: Number
+    db_uuid: Bytes
+    capacity: Number
+    num_sets: Number
+    page_ids: List[Number]
+    pages: List[Bytes]
+    headers: List[YazaDbPageHeaderV1]
+    ref_bits: List[Number]
+    set_hands: List[Number]
+    stats: List[Number]
+
+fn yaza_db_buffer_pool_default_capacity_v1() -> Number:
+    return 512
+
+fn yaza_db_buffer_pool_new_v1(file: Number, db_uuid: Bytes, capacity: Number) -> Result[YazaDbBufferPoolV1, Text]:
+    if file < 0 or bytes_length(db_uuid) != 16:
+        return err("YDBv1 buffer pool requires an open file handle and 16-byte DB UUID")
+    if capacity < 16 or capacity > 8192 or capacity % 4 != 0:
+        return err("YDBv1 buffer pool capacity must be a multiple of 4 between 16 and 8192 pages")
+    let num_sets: Number = capacity / 4
+    let page_ids_res: Result[List[Number], Text] = list_try_new()
+    let pages_res: Result[List[Bytes], Text] = list_try_new()
+    let headers_res: Result[List[YazaDbPageHeaderV1], Text] = list_try_new()
+    let ref_bits_res: Result[List[Number], Text] = list_try_new()
+    let hands_res: Result[List[Number], Text] = list_try_new()
+    let stats_res: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(page_ids_res) or not result_is_ok(pages_res) or not result_is_ok(headers_res) or not result_is_ok(ref_bits_res) or not result_is_ok(hands_res) or not result_is_ok(stats_res):
+        return err("YDBv1 buffer pool could not allocate slot backing vectors")
+    let page_ids: List[Number] = result_unwrap(page_ids_res)
+    let pages: List[Bytes] = result_unwrap(pages_res)
+    let headers: List[YazaDbPageHeaderV1] = result_unwrap(headers_res)
+    let ref_bits: List[Number] = result_unwrap(ref_bits_res)
+    let set_hands: List[Number] = result_unwrap(hands_res)
+    let stats: List[Number] = result_unwrap(stats_res)
+    if not list_try_reserve(page_ids, capacity) or not list_try_reserve(pages, capacity) or not list_try_reserve(headers, capacity) or not list_try_reserve(ref_bits, capacity) or not list_try_reserve(set_hands, num_sets) or not list_try_reserve(stats, 5):
+        return err("YDBv1 buffer pool could not reserve slot capacity")
+    let empty_page: Bytes = bytes_try_new_zeroed(0)?
+    let empty_header: YazaDbPageHeaderV1 = YazaDbPageHeaderV1(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    var slot: Number = 0
+    while slot < capacity:
+        if not list_try_push(page_ids, -1) or not list_try_push(pages, empty_page) or not list_try_push(headers, empty_header) or not list_try_push(ref_bits, 0):
+            return err("YDBv1 buffer pool failed while initializing frame slots")
+        set slot = slot + 1
+    var set_index: Number = 0
+    while set_index < num_sets:
+        if not list_try_push(set_hands, 0):
+            return err("YDBv1 buffer pool failed while initializing clock hands")
+        set set_index = set_index + 1
+    var stat_index: Number = 0
+    while stat_index < 5:
+        if not list_try_push(stats, 0):
+            return err("YDBv1 buffer pool failed while initializing telemetry counters")
+        set stat_index = stat_index + 1
+    return ok(YazaDbBufferPoolV1(file, db_uuid, capacity, num_sets, page_ids, pages, headers, ref_bits, set_hands, stats))
+
+fn yaza_db_buffer_pool_get_v1(pool: YazaDbBufferPoolV1, file: Number, db_uuid: Bytes, page_id: Number) -> Option[YazaDbValidatedPageV1]:
+    if page_id < 2 or pool.file != file or pool.capacity < 4 or pool.num_sets < 1:
+        return none
+    if not bytes_equal(pool.db_uuid, db_uuid):
+        return none
+    let base: Number = (page_id % pool.num_sets) * 4
+    var way: Number = 0
+    while way < 4:
+        let slot: Number = base + way
+        if list_get(pool.page_ids, slot) == page_id:
+            let _ref: Boolean = list_try_set(pool.ref_bits, slot, 1)
+            let _hit: Boolean = list_try_set(pool.stats, 0, list_get(pool.stats, 0) + 1)
+            return some(YazaDbValidatedPageV1(list_get(pool.pages, slot), list_get(pool.headers, slot)))
+        set way = way + 1
+    let _miss: Boolean = list_try_set(pool.stats, 1, list_get(pool.stats, 1) + 1)
+    return none
+
+fn yaza_db_buffer_pool_put_v1(pool: YazaDbBufferPoolV1, file: Number, db_uuid: Bytes, page_id: Number, page: Bytes, header: YazaDbPageHeaderV1) -> Boolean:
+    if arena_live_scopes() != 0:
+        return false
+    if page_id < 2 or pool.file != file or pool.num_sets < 1 or not bytes_equal(pool.db_uuid, db_uuid):
+        return false
+    if bytes_length(page) != yaza_db_page_size_v1() or header.page_id != page_id:
+        return false
+    let set_index: Number = page_id % pool.num_sets
+    let base: Number = set_index * 4
+    var empty_slot: Number = -1
+    var way: Number = 0
+    while way < 4:
+        let slot: Number = base + way
+        let existing_id: Number = list_get(pool.page_ids, slot)
+        if existing_id == page_id:
+            let ok_page: Boolean = list_try_set(pool.pages, slot, page)
+            let ok_hdr: Boolean = list_try_set(pool.headers, slot, header)
+            let _ref: Boolean = list_try_set(pool.ref_bits, slot, 1)
+            return ok_page and ok_hdr
+        if existing_id < 0 and empty_slot < 0:
+            set empty_slot = slot
+        set way = way + 1
+    if empty_slot >= 0:
+        let ok_page: Boolean = list_try_set(pool.pages, empty_slot, page)
+        let ok_hdr: Boolean = list_try_set(pool.headers, empty_slot, header)
+        if not ok_page or not ok_hdr:
+            return false
+        let _id: Boolean = list_try_set(pool.page_ids, empty_slot, page_id)
+        let _ref: Boolean = list_try_set(pool.ref_bits, empty_slot, 1)
+        let _res: Boolean = list_try_set(pool.stats, 4, list_get(pool.stats, 4) + 1)
+        return true
+    var hand: Number = list_get(pool.set_hands, set_index) % 4
+    var steps: Number = 0
+    var victim_slot: Number = base + hand
+    while steps < 8:
+        let slot: Number = base + hand
+        if list_get(pool.ref_bits, slot) == 0:
+            set victim_slot = slot
+            set hand = (hand + 1) % 4
+            break
+        let _clr: Boolean = list_try_set(pool.ref_bits, slot, 0)
+        set hand = (hand + 1) % 4
+        set steps = steps + 1
+    let ok_page: Boolean = list_try_set(pool.pages, victim_slot, page)
+    let ok_hdr: Boolean = list_try_set(pool.headers, victim_slot, header)
+    if not ok_page or not ok_hdr:
+        return false
+    let _id: Boolean = list_try_set(pool.page_ids, victim_slot, page_id)
+    let _ref: Boolean = list_try_set(pool.ref_bits, victim_slot, 1)
+    let _hand: Boolean = list_try_set(pool.set_hands, set_index, hand)
+    let _evict: Boolean = list_try_set(pool.stats, 2, list_get(pool.stats, 2) + 1)
+    return true
+
+fn yaza_db_buffer_pool_invalidate_page_v1(pool: YazaDbBufferPoolV1, page_id: Number) -> Boolean:
+    if page_id < 2 or pool.num_sets < 1:
+        return false
+    let base: Number = (page_id % pool.num_sets) * 4
+    var way: Number = 0
+    while way < 4:
+        let slot: Number = base + way
+        if list_get(pool.page_ids, slot) == page_id:
+            let _id: Boolean = list_try_set(pool.page_ids, slot, -1)
+            let _ref: Boolean = list_try_set(pool.ref_bits, slot, 0)
+            let _inv: Boolean = list_try_set(pool.stats, 3, list_get(pool.stats, 3) + 1)
+            let cur_res: Number = list_get(pool.stats, 4)
+            if cur_res > 0:
+                let _res: Boolean = list_try_set(pool.stats, 4, cur_res - 1)
+            return true
+        set way = way + 1
+    return false
+
+fn yaza_db_buffer_pool_clear_v1(pool: YazaDbBufferPoolV1) -> Boolean:
+    if pool.capacity < 4 or list_count(pool.page_ids) != pool.capacity:
+        return false
+    var slot: Number = 0
+    var cleared: Number = 0
+    while slot < pool.capacity:
+        if list_get(pool.page_ids, slot) >= 0:
+            let _id: Boolean = list_try_set(pool.page_ids, slot, -1)
+            let _ref: Boolean = list_try_set(pool.ref_bits, slot, 0)
+            set cleared = cleared + 1
+        set slot = slot + 1
+    if cleared > 0:
+        let _inv: Boolean = list_try_set(pool.stats, 3, list_get(pool.stats, 3) + cleared)
+    let _res: Boolean = list_try_set(pool.stats, 4, 0)
+    return true
+
+fn yaza_db_buffer_pool_stats_v1(pool: YazaDbBufferPoolV1) -> YazaDbBufferPoolStatsV1:
+    if list_count(pool.stats) < 5:
+        return YazaDbBufferPoolStatsV1(pool.capacity, 0, 0, 0, 0, 0)
+    return YazaDbBufferPoolStatsV1(pool.capacity, list_get(pool.stats, 0), list_get(pool.stats, 1), list_get(pool.stats, 2), list_get(pool.stats, 3), list_get(pool.stats, 4))
+
+fn yaza_db_buffer_pool_fork_with_misses_v1(pool: YazaDbBufferPoolV1, file: Number, db_uuid: Bytes, misses: List[YazaDbValidatedPageV1]) -> YazaDbBufferPoolV1:
+    if arena_live_scopes() != 0 or list_count(misses) == 0 or pool.capacity < 4 or pool.num_sets < 1 or pool.file != file or not bytes_equal(pool.db_uuid, db_uuid):
+        return pool
+    let page_ids_res: Result[List[Number], Text] = list_try_new()
+    let pages_res: Result[List[Bytes], Text] = list_try_new()
+    let headers_res: Result[List[YazaDbPageHeaderV1], Text] = list_try_new()
+    let ref_bits_res: Result[List[Number], Text] = list_try_new()
+    let hands_res: Result[List[Number], Text] = list_try_new()
+    let stats_res: Result[List[Number], Text] = list_try_new()
+    let empty_res: Result[Bytes, Text] = bytes_try_new_zeroed(0)
+    if not result_is_ok(page_ids_res) or not result_is_ok(pages_res) or not result_is_ok(headers_res) or not result_is_ok(ref_bits_res) or not result_is_ok(hands_res) or not result_is_ok(stats_res) or not result_is_ok(empty_res):
+        return pool
+    let cloned_page_ids: List[Number] = result_unwrap(page_ids_res)
+    let cloned_pages: List[Bytes] = result_unwrap(pages_res)
+    let cloned_headers: List[YazaDbPageHeaderV1] = result_unwrap(headers_res)
+    let cloned_ref_bits: List[Number] = result_unwrap(ref_bits_res)
+    let cloned_set_hands: List[Number] = result_unwrap(hands_res)
+    let cloned_stats: List[Number] = result_unwrap(stats_res)
+    let empty_page: Bytes = result_unwrap(empty_res)
+    let empty_header: YazaDbPageHeaderV1 = YazaDbPageHeaderV1(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    if not list_try_reserve(cloned_page_ids, pool.capacity) or not list_try_reserve(cloned_pages, pool.capacity) or not list_try_reserve(cloned_headers, pool.capacity) or not list_try_reserve(cloned_ref_bits, pool.capacity) or not list_try_reserve(cloned_set_hands, pool.num_sets) or not list_try_reserve(cloned_stats, 5):
+        return pool
+    var slot: Number = 0
+    while slot < pool.capacity:
+        let pid: Number = list_get(pool.page_ids, slot)
+        if pid >= 2:
+            if not list_try_push(cloned_page_ids, pid) or not list_try_push(cloned_pages, list_get(pool.pages, slot)) or not list_try_push(cloned_headers, list_get(pool.headers, slot)) or not list_try_push(cloned_ref_bits, list_get(pool.ref_bits, slot)):
+                return pool
+        else:
+            if not list_try_push(cloned_page_ids, -1) or not list_try_push(cloned_pages, empty_page) or not list_try_push(cloned_headers, empty_header) or not list_try_push(cloned_ref_bits, 0):
+                return pool
+        set slot = slot + 1
+    var si: Number = 0
+    while si < pool.num_sets:
+        if not list_try_push(cloned_set_hands, list_get(pool.set_hands, si)):
+            return pool
+        set si = si + 1
+    var st: Number = 0
+    while st < 5:
+        if not list_try_push(cloned_stats, list_get(pool.stats, st)):
+            return pool
+        set st = st + 1
+    var mi: Number = 0
+    while mi < list_count(misses):
+        let entry: YazaDbValidatedPageV1 = list_get(misses, mi)
+        let pid: Number = entry.header.page_id
+        if pid >= 2 and bytes_length(entry.page) == yaza_db_page_size_v1():
+            let set_index: Number = pid % pool.num_sets
+            let base: Number = set_index * 4
+            var empty_slot: Number = -1
+            var replaced_slot: Number = -1
+            var way: Number = 0
+            while way < 4:
+                let wslot: Number = base + way
+                let existing_id: Number = list_get(cloned_page_ids, wslot)
+                if existing_id == pid:
+                    set replaced_slot = wslot
+                    break
+                if existing_id < 0 and empty_slot < 0:
+                    set empty_slot = wslot
+                set way = way + 1
+            if replaced_slot >= 0:
+                let _p: Boolean = list_try_set(cloned_pages, replaced_slot, entry.page)
+                let _h: Boolean = list_try_set(cloned_headers, replaced_slot, entry.header)
+                let _r: Boolean = list_try_set(cloned_ref_bits, replaced_slot, 1)
+            elif empty_slot >= 0:
+                let _p: Boolean = list_try_set(cloned_pages, empty_slot, entry.page)
+                let _h: Boolean = list_try_set(cloned_headers, empty_slot, entry.header)
+                let _i: Boolean = list_try_set(cloned_page_ids, empty_slot, pid)
+                let _r: Boolean = list_try_set(cloned_ref_bits, empty_slot, 1)
+                let _rc: Boolean = list_try_set(cloned_stats, 4, list_get(cloned_stats, 4) + 1)
+            else:
+                var hand: Number = list_get(cloned_set_hands, set_index) % 4
+                var steps: Number = 0
+                var victim_slot: Number = base + hand
+                while steps < 8:
+                    let wslot: Number = base + hand
+                    if list_get(cloned_ref_bits, wslot) == 0:
+                        set victim_slot = wslot
+                        set hand = (hand + 1) % 4
+                        break
+                    let _clr: Boolean = list_try_set(cloned_ref_bits, wslot, 0)
+                    set hand = (hand + 1) % 4
+                    set steps = steps + 1
+                let _p: Boolean = list_try_set(cloned_pages, victim_slot, entry.page)
+                let _h: Boolean = list_try_set(cloned_headers, victim_slot, entry.header)
+                let _i: Boolean = list_try_set(cloned_page_ids, victim_slot, pid)
+                let _r: Boolean = list_try_set(cloned_ref_bits, victim_slot, 1)
+                let _hd: Boolean = list_try_set(cloned_set_hands, set_index, hand)
+                let _ev: Boolean = list_try_set(cloned_stats, 2, list_get(cloned_stats, 2) + 1)
+        set mi = mi + 1
+    return YazaDbBufferPoolV1(file, db_uuid, pool.capacity, pool.num_sets, cloned_page_ids, cloned_pages, cloned_headers, cloned_ref_bits, cloned_set_hands, cloned_stats)

@@ -37,6 +37,10 @@ shape YazaDbWriteCommitV1:
     commit_ts: Number
     affected_rows: Number
 
+shape YazaDbTxDmlResultV1:
+    transaction: YazaDbWriteTransactionV1
+    affected_rows: Number
+
 shape YazaDbWriteLeafUpdateV1:
     key: Bytes
     row_payload: Bytes
@@ -70,6 +74,107 @@ shape YazaDbWriteOverflowRowV1:
 shape YazaDbWriteOverflowChainV1:
     transaction: YazaDbWriteTransactionV1
     reference: YazaDbOverflowRefV1
+
+shape YazaDbStagedLeafBatchV1:
+    transaction: YazaDbWriteTransactionV1
+    page_ids: List[Number]
+    pages: List[Bytes]
+
+shape YazaDbDirtyPageOverlayV1:
+    page_ids: List[Number]
+    pages: List[Bytes]
+
+shape YazaDbOverlayFlushResultV1:
+    overlay: YazaDbDirtyPageOverlayV1
+    flushed_pages: Number
+    fsync_count: Number
+
+shape YazaDbOverlayCommitResultV1:
+    commit: YazaDbWriteCommitV1
+    overlay: YazaDbDirtyPageOverlayV1
+
+fn yaza_db_dirty_overlay_new_v1() -> Result[YazaDbDirtyPageOverlayV1, Text]:
+    let ids_res: Result[List[Number], Text] = list_try_new()
+    let pages_res: Result[List[Bytes], Text] = list_try_new()
+    if not result_is_ok(ids_res) or not result_is_ok(pages_res):
+        return err("YDBv1 dirty page overlay could not be allocated")
+    return ok(YazaDbDirtyPageOverlayV1(result_unwrap(ids_res), result_unwrap(pages_res)))
+
+fn yaza_db_dirty_overlay_find_v1(overlay: YazaDbDirtyPageOverlayV1, page_id: Number) -> Number:
+    var i: Number = 0
+    while i < list_count(overlay.page_ids):
+        if list_get(overlay.page_ids, i) == page_id:
+            return i
+        set i = i + 1
+    return -1
+
+fn yaza_db_dirty_overlay_put_many_v1(overlay: YazaDbDirtyPageOverlayV1, page_ids: List[Number], pages: List[Bytes]) -> Result[YazaDbDirtyPageOverlayV1, Text]:
+    let count: Number = list_count(page_ids)
+    if count != list_count(pages):
+        return err("YDBv1 dirty page overlay page-ID and image counts disagree")
+    let new_ids_res: Result[List[Number], Text] = list_try_new()
+    let new_pages_res: Result[List[Bytes], Text] = list_try_new()
+    if not result_is_ok(new_ids_res) or not result_is_ok(new_pages_res):
+        return err("YDBv1 dirty page overlay copy could not be allocated")
+    let new_ids: List[Number] = result_unwrap(new_ids_res)
+    let new_pages: List[Bytes] = result_unwrap(new_pages_res)
+    let old_count: Number = list_count(overlay.page_ids)
+    let _ri: Boolean = list_try_reserve(new_ids, old_count + count)
+    let _rp: Boolean = list_try_reserve(new_pages, old_count + count)
+    var oi: Number = 0
+    while oi < old_count:
+        let oid: Number = list_get(overlay.page_ids, oi)
+        var opage: Bytes = list_get(overlay.pages, oi)
+        var si: Number = 0
+        while si < count:
+            if list_get(page_ids, si) == oid:
+                set opage = list_get(pages, si)
+            set si = si + 1
+        if not list_try_push(new_ids, oid) or not list_try_push(new_pages, opage):
+            return err("YDBv1 dirty page overlay could not retain existing page")
+        set oi = oi + 1
+    var ni: Number = 0
+    while ni < count:
+        let nid: Number = list_get(page_ids, ni)
+        if yaza_db_dirty_overlay_find_v1(overlay, nid) < 0:
+            if not list_try_push(new_ids, nid) or not list_try_push(new_pages, list_get(pages, ni)):
+                return err("YDBv1 dirty page overlay could not append page")
+        set ni = ni + 1
+    return ok(YazaDbDirtyPageOverlayV1(new_ids, new_pages))
+
+fn yaza_db_dirty_overlay_read_page_validated_v1(overlay: YazaDbDirtyPageOverlayV1, file: Number, file_header: YazaDbFileHeaderV1, page_id: Number) -> Result[YazaDbValidatedPageV1, Text]:
+    let existing: Number = yaza_db_dirty_overlay_find_v1(overlay, page_id)
+    if existing >= 0:
+        let page: Bytes = list_get(overlay.pages, existing)
+        let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, page_id)?
+        return ok(YazaDbValidatedPageV1(page, header))
+    return yaza_db_storage_read_page_validated_with_header_file_v1(file, file_header, page_id)
+
+fn yaza_db_dirty_overlay_flush_after_wal_sync_v1(overlay: YazaDbDirtyPageOverlayV1, storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1) -> Result[YazaDbOverlayFlushResultV1, Text]:
+    let page_count: Number = list_count(overlay.page_ids)
+    if page_count != list_count(overlay.pages):
+        let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(wal)
+        let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(storage)
+        return err("YDBv1 dirty page overlay image count mismatch; writer handles were closed and recovery is required")
+    if page_count == 0:
+        return ok(YazaDbOverlayFlushResultV1(overlay, 0, 0))
+    let wal_sync: Result[Boolean, Text] = sync(wal.file)
+    if not result_is_ok(wal_sync) or not result_unwrap(wal_sync):
+        let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(wal)
+        let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(storage)
+        return err("YDBv1 group commit WAL sync failed before overlay flush; reopen through recovery before reuse")
+    var idx: Number = 0
+    while idx < page_count:
+        let page_id: Number = list_get(overlay.page_ids, idx)
+        let page_image: Bytes = list_get(overlay.pages, idx)
+        let written: Result[Number, Text] = yaza_db_storage_write_validated_page_v1(storage.file, storage.header, page_id, page_image)
+        if not result_is_ok(written) or result_unwrap(written) != yaza_db_page_size_v1():
+            let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(wal)
+            let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(storage)
+            return err("YDBv1 WAL is durable, but an overlay data-page write failed; reopen through recovery before reuse")
+        set idx = idx + 1
+    let empty_overlay: YazaDbDirtyPageOverlayV1 = yaza_db_dirty_overlay_new_v1()?
+    return ok(YazaDbOverlayFlushResultV1(empty_overlay, page_count, 1))
 
 fn yaza_db_write_transaction_default_free_page_reserve_v1() -> Number:
     return 2048
@@ -290,6 +395,10 @@ fn yaza_db_write_transaction_begin_with_reserve_v1(storage: YazaDbStorageHandleV
     let capacity: YazaDbWriteCapacityV1 = yaza_db_write_transaction_prepare_capacity_v1(storage, wal, minimum_free_pages)?
     return yaza_db_write_transaction_begin_prepared_v1(capacity.storage, capacity.wal)
 
+fn yaza_db_write_transaction_begin_with_reserve_deferred_checkpoint_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, minimum_free_pages: Number) -> Result[YazaDbWriteTransactionV1, Text]:
+    let capacity: YazaDbWriteCapacityV1 = yaza_db_write_transaction_prepare_capacity_v1(storage, wal, minimum_free_pages)?
+    return yaza_db_write_transaction_begin_prepared_deferred_checkpoint_v1(capacity.storage, capacity.wal)
+
 fn yaza_db_write_transaction_begin_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1) -> Result[YazaDbWriteTransactionV1, Text]:
     return yaza_db_write_transaction_begin_with_reserve_v1(storage, wal, yaza_db_write_transaction_default_free_page_reserve_v1())
 
@@ -330,6 +439,11 @@ fn yaza_db_write_transaction_leaf_group_fail_v1(transaction: YazaDbWriteTransact
     let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(transaction.storage)
     return err("YDBv1 grouped LEAF_UPDATE failed; writer handles were closed and recovery is required: " + message)
 
+fn yaza_db_write_transaction_leaf_group_stage_fail_v1(transaction: YazaDbWriteTransactionV1, wal: YazaDbWalLogV1, message: Text) -> Result[YazaDbStagedLeafBatchV1, Text]:
+    let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(wal)
+    let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(transaction.storage)
+    return err("YDBv1 grouped LEAF_UPDATE failed; writer handles were closed and recovery is required: " + message)
+
 fn yaza_db_write_transaction_profile_record_ns_v1(profile_ns: List[Number], slot: Number, started_ns: Number, finished_ns: Number) -> Number:
     if slot < 0 or slot >= list_count(profile_ns) or started_ns <= 0 or finished_ns < started_ns: return finished_ns
     let previous: Number = list_get(profile_ns, slot)
@@ -346,17 +460,22 @@ fn yaza_db_write_transaction_mutate_leaf_group_profiled_v1(transaction: YazaDbWr
 fn yaza_db_write_transaction_mutate_leaf_group_v1(transaction: YazaDbWriteTransactionV1, page_id: Number, updates: List[YazaDbWriteLeafUpdateV1]) -> Result[YazaDbWriteTransactionV1, Text]:
     return yaza_db_write_transaction_mutate_leaf_group_profiled_v1(transaction, page_id, updates, List[Number]())
 
-fn yaza_db_write_transaction_mutate_leaf_groups_profiled_v1(transaction: YazaDbWriteTransactionV1, groups: List[YazaDbWriteLeafUpdateGroupV1], profile_ns: List[Number]) -> Result[YazaDbWriteTransactionV1, Text]:
+fn yaza_db_write_transaction_stage_leaf_update_groups_profiled_v1(transaction: YazaDbWriteTransactionV1, groups: List[YazaDbWriteLeafUpdateGroupV1], profile_ns: List[Number]) -> Result[YazaDbStagedLeafBatchV1, Text]:
     let profile_enabled: Boolean = list_count(profile_ns) >= 34
     let group_count: Number = list_count(groups)
     if not transaction.active or transaction.txn_id < 1 or group_count < 1 or group_count > 128:
-        return yaza_db_write_transaction_leaf_group_fail_v1(transaction, transaction.wal, "multi-leaf update group metadata is outside its bound")
+        return yaza_db_write_transaction_leaf_group_stage_fail_v1(transaction, transaction.wal, "multi-leaf update group metadata is outside its bound")
     if transaction.storage.root != transaction.wal.root or not bytes_equal(transaction.storage.header.db_uuid, transaction.wal.db_uuid):
-        return yaza_db_write_transaction_leaf_group_fail_v1(transaction, transaction.wal, "storage and WAL handles belong to different databases")
+        return yaza_db_write_transaction_leaf_group_stage_fail_v1(transaction, transaction.wal, "storage and WAL handles belong to different databases")
+    let capacity_check: Result[Number, Text] = yaza_db_storage_validate_header_capacity_v1(transaction.storage.file, transaction.storage.header)
+    if not result_is_ok(capacity_check):
+        return yaza_db_write_transaction_leaf_group_stage_fail_v1(transaction, transaction.wal, result_unwrap_error(capacity_check))
+    let page_ids_result: Result[List[Number], Text] = list_try_new()
     let pages_result: Result[List[Bytes], Text] = list_try_new()
-    if not result_is_ok(pages_result): return yaza_db_write_transaction_leaf_group_fail_v1(transaction, transaction.wal, "could not allocate staged update leaf images")
+    if not result_is_ok(page_ids_result) or not result_is_ok(pages_result): return yaza_db_write_transaction_leaf_group_stage_fail_v1(transaction, transaction.wal, "could not allocate staged update leaf images")
+    let page_ids: List[Number] = result_unwrap(page_ids_result)
     let pages: List[Bytes] = result_unwrap(pages_result)
-    if not list_try_reserve(pages, group_count): return yaza_db_write_transaction_leaf_group_fail_v1(transaction, transaction.wal, "could not reserve staged update leaf images")
+    if not list_try_reserve(page_ids, group_count) or not list_try_reserve(pages, group_count): return yaza_db_write_transaction_leaf_group_stage_fail_v1(transaction, transaction.wal, "could not reserve staged update leaf images")
     var profile_started_ns: Number = 0
     if profile_enabled: set profile_started_ns = monotonic_ns()
     var update_count: Number = 0
@@ -365,27 +484,22 @@ fn yaza_db_write_transaction_mutate_leaf_groups_profiled_v1(transaction: YazaDbW
         let group: YazaDbWriteLeafUpdateGroupV1 = list_get(groups, group_index)
         let group_updates: Number = list_count(group.updates)
         if group.page_id < 2 or group_updates < 1 or group_updates > 65536 - update_count:
-            return yaza_db_write_transaction_leaf_group_fail_v1(transaction, transaction.wal, "leaf update group count or target page is outside its bound")
+            return yaza_db_write_transaction_leaf_group_stage_fail_v1(transaction, transaction.wal, "leaf update group count or target page is outside its bound")
         var prior_group_index: Number = 0
         while prior_group_index < group_index:
             let prior_group: YazaDbWriteLeafUpdateGroupV1 = list_get(groups, prior_group_index)
             if prior_group.page_id == group.page_id:
-                return yaza_db_write_transaction_leaf_group_fail_v1(transaction, transaction.wal, "one leaf appears in multiple update groups")
+                return yaza_db_write_transaction_leaf_group_stage_fail_v1(transaction, transaction.wal, "one leaf appears in multiple update groups")
             set prior_group_index = prior_group_index + 1
-        let allocated: Result[Boolean, Text] = yaza_db_storage_validate_leaf_page_allocated_v1(transaction.storage, group.page_id)
-        if not result_is_ok(allocated): return yaza_db_write_transaction_leaf_group_fail_v1(transaction, transaction.wal, result_unwrap_error(allocated))
-        let page_result: Result[Bytes, Text] = yaza_db_storage_read_page_v1(transaction.storage.file, transaction.storage.header, group.page_id)
-        if not result_is_ok(page_result): return yaza_db_write_transaction_leaf_group_fail_v1(transaction, transaction.wal, result_unwrap_error(page_result))
-        let page: Bytes = result_unwrap(page_result)
-        let header_result: Result[YazaDbPageHeaderV1, Text] = yaza_db_page_header_decode_v1(page, group.page_id)
-        if not result_is_ok(header_result): return yaza_db_write_transaction_leaf_group_fail_v1(transaction, transaction.wal, result_unwrap_error(header_result))
-        let header: YazaDbPageHeaderV1 = result_unwrap(header_result)
-        if header.page_type != 1 or header.level != 0: return yaza_db_write_transaction_leaf_group_fail_v1(transaction, transaction.wal, "target is not a level-zero LEAF")
-        if not list_try_push(pages, page): return yaza_db_write_transaction_leaf_group_fail_v1(transaction, transaction.wal, "could not stage an original update leaf image")
+        let validated_result: Result[YazaDbValidatedPageV1, Text] = yaza_db_storage_read_page_validated_with_header_file_v1(transaction.storage.file, transaction.storage.header, group.page_id)
+        if not result_is_ok(validated_result): return yaza_db_write_transaction_leaf_group_stage_fail_v1(transaction, transaction.wal, result_unwrap_error(validated_result))
+        let validated: YazaDbValidatedPageV1 = result_unwrap(validated_result)
+        if validated.header.page_type != 1 or validated.header.level != 0: return yaza_db_write_transaction_leaf_group_stage_fail_v1(transaction, transaction.wal, "target is not a level-zero LEAF")
+        if not list_try_push(page_ids, group.page_id) or not list_try_push(pages, validated.page): return yaza_db_write_transaction_leaf_group_stage_fail_v1(transaction, transaction.wal, "could not stage an original update leaf image")
         set update_count = update_count + group_updates
         set group_index = group_index + 1
     if update_count < 1 or group_count > 9223372036854775807 - list_count(transaction.pending_pages) or not yaza_db_write_transaction_tail_fits_v1(transaction, group_count + list_count(transaction.pending_pages)):
-        return yaza_db_write_transaction_leaf_group_fail_v1(transaction, transaction.wal, "multi-leaf update exceeds the bounded WAL recovery tail")
+        return yaza_db_write_transaction_leaf_group_stage_fail_v1(transaction, transaction.wal, "multi-leaf update exceeds the bounded WAL recovery tail")
     if profile_enabled: set profile_started_ns = yaza_db_write_transaction_profile_record_ns_v1(profile_ns, 29, profile_started_ns, monotonic_ns())
 
     let record_bytes: Number = yaza_db_wal_header_size_v1() + yaza_db_wal_leaf_mutation_payload_size_v1()
@@ -397,63 +511,77 @@ fn yaza_db_write_transaction_mutate_leaf_groups_profiled_v1(transaction: YazaDbW
         let group: YazaDbWriteLeafUpdateGroupV1 = list_get(groups, group_index)
         let before_image: Bytes = list_get(pages, group_index)
         let record_lsn_result: Result[Number, Text] = yaza_db_wal_record_lsn_for_append_v1(current_wal, record_bytes)
-        if not result_is_ok(record_lsn_result): return yaza_db_write_transaction_leaf_group_fail_v1(transaction, current_wal, result_unwrap_error(record_lsn_result))
+        if not result_is_ok(record_lsn_result): return yaza_db_write_transaction_leaf_group_stage_fail_v1(transaction, current_wal, result_unwrap_error(record_lsn_result))
         let record_lsn: Number = result_unwrap(record_lsn_result)
         let keys_result: Result[List[Bytes], Text] = list_try_new()
         let payloads_result: Result[List[Bytes], Text] = list_try_new()
-        if not result_is_ok(keys_result) or not result_is_ok(payloads_result): return yaza_db_write_transaction_leaf_group_fail_v1(transaction, current_wal, "could not allocate batched leaf-update values")
+        if not result_is_ok(keys_result) or not result_is_ok(payloads_result): return yaza_db_write_transaction_leaf_group_stage_fail_v1(transaction, current_wal, "could not allocate batched leaf-update values")
         let keys: List[Bytes] = result_unwrap(keys_result)
         let payloads: List[Bytes] = result_unwrap(payloads_result)
-        if not list_try_reserve(keys, list_count(group.updates)) or not list_try_reserve(payloads, list_count(group.updates)): return yaza_db_write_transaction_leaf_group_fail_v1(transaction, current_wal, "could not reserve batched leaf-update values")
+        if not list_try_reserve(keys, list_count(group.updates)) or not list_try_reserve(payloads, list_count(group.updates)): return yaza_db_write_transaction_leaf_group_stage_fail_v1(transaction, current_wal, "could not reserve batched leaf-update values")
         var update_index: Number = 0
         while update_index < list_count(group.updates):
             let update: YazaDbWriteLeafUpdateV1 = list_get(group.updates, update_index)
             let stamped_result: Result[Bytes, Text] = yaza_db_row_set_undo_ref_v1(update.row_payload, record_lsn)
-            if not result_is_ok(stamped_result): return yaza_db_write_transaction_leaf_group_fail_v1(transaction, current_wal, result_unwrap_error(stamped_result))
-            if not list_try_push(keys, update.key) or not list_try_push(payloads, result_unwrap(stamped_result)): return yaza_db_write_transaction_leaf_group_fail_v1(transaction, current_wal, "could not stage a row in the batched leaf update")
+            if not result_is_ok(stamped_result): return yaza_db_write_transaction_leaf_group_stage_fail_v1(transaction, current_wal, result_unwrap_error(stamped_result))
+            if not list_try_push(keys, update.key) or not list_try_push(payloads, result_unwrap(stamped_result)): return yaza_db_write_transaction_leaf_group_stage_fail_v1(transaction, current_wal, "could not stage a row in the batched leaf update")
             set update_index = update_index + 1
         var after_result: Result[Bytes, Text] = yaza_db_page_replace_leaf_slots_v1(before_image, record_lsn, keys, payloads)
         if list_count(group.updates) == 1:
             let only_update: YazaDbWriteLeafUpdateV1 = list_get(group.updates, 0)
             set after_result = yaza_db_page_replace_leaf_slot_v1(before_image, record_lsn, only_update.key, list_get(payloads, 0))
-        if not result_is_ok(after_result): return yaza_db_write_transaction_leaf_group_fail_v1(transaction, current_wal, result_unwrap_error(after_result))
+        if not result_is_ok(after_result): return yaza_db_write_transaction_leaf_group_stage_fail_v1(transaction, current_wal, result_unwrap_error(after_result))
         let after_image: Bytes = result_unwrap(after_result)
         if profile_enabled: set profile_started_ns = yaza_db_write_transaction_profile_record_ns_v1(profile_ns, 30, profile_started_ns, monotonic_ns())
         if profile_enabled: set profile_started_ns = monotonic_ns()
-        var payload_result: Result[Bytes, Text] = yaza_db_wal_leaf_mutation_payload_encode_v1(yaza_db_wal_type_leaf_update_v1(), group.page_id, record_lsn, before_image, after_image)
-        if list_count(group.updates) > 1: set payload_result = yaza_db_wal_leaf_mutation_payload_encode_batch_v2(yaza_db_wal_type_leaf_update_v1(), group.page_id, record_lsn, before_image, after_image)
-        if not result_is_ok(payload_result): return yaza_db_write_transaction_leaf_group_fail_v1(transaction, current_wal, result_unwrap_error(payload_result))
+        var upd_format_ver: Number = 1
+        if list_count(group.updates) > 1: set upd_format_ver = 2
+        let payload_result: Result[Bytes, Text] = yaza_db_wal_leaf_mutation_payload_encode_trusted_v1(upd_format_ver, yaza_db_wal_type_leaf_update_v1(), group.page_id, record_lsn, before_image, after_image)
+        if not result_is_ok(payload_result): return yaza_db_write_transaction_leaf_group_stage_fail_v1(transaction, current_wal, result_unwrap_error(payload_result))
         let input_record: YazaDbWalRecordV1 = YazaDbWalRecordV1(0, last_lsn, transaction.txn_id, yaza_db_wal_type_leaf_update_v1(), 0, result_unwrap(payload_result))
         let appended_result: Result[YazaDbWalAppendV1, Text] = yaza_db_wal_log_append_unflushed_v1(current_wal, input_record)
-        if not result_is_ok(appended_result): return yaza_db_write_transaction_leaf_group_fail_v1(transaction, current_wal, result_unwrap_error(appended_result))
+        if not result_is_ok(appended_result): return yaza_db_write_transaction_leaf_group_stage_fail_v1(transaction, current_wal, result_unwrap_error(appended_result))
         let appended: YazaDbWalAppendV1 = result_unwrap(appended_result)
-        if appended.record.lsn != record_lsn: return yaza_db_write_transaction_leaf_group_fail_v1(transaction, appended.log, "WAL assigned an unexpected page LSN")
+        if appended.record.lsn != record_lsn: return yaza_db_write_transaction_leaf_group_stage_fail_v1(transaction, appended.log, "WAL assigned an unexpected page LSN")
         set current_wal = appended.log
         set last_lsn = appended.record.lsn
-        if not list_try_set(pages, group_index, after_image): return yaza_db_write_transaction_leaf_group_fail_v1(transaction, current_wal, "could not retain a final update leaf image")
+        if not list_try_set(pages, group_index, after_image): return yaza_db_write_transaction_leaf_group_stage_fail_v1(transaction, current_wal, "could not retain a final update leaf image")
         if profile_enabled: set profile_started_ns = yaza_db_write_transaction_profile_record_ns_v1(profile_ns, 31, profile_started_ns, monotonic_ns())
         set group_index = group_index + 1
 
+    let next_transaction: YazaDbWriteTransactionV1 = YazaDbWriteTransactionV1(transaction.storage, current_wal, transaction.txn_id, transaction.commit_ts, last_lsn, transaction.pending_pages, transaction.pending_keys_hex, transaction.pending_rows_hex, true)
+    return ok(YazaDbStagedLeafBatchV1(next_transaction, page_ids, pages))
+
+fn yaza_db_write_transaction_mutate_leaf_groups_profiled_v1(transaction: YazaDbWriteTransactionV1, groups: List[YazaDbWriteLeafUpdateGroupV1], profile_ns: List[Number]) -> Result[YazaDbWriteTransactionV1, Text]:
+    let profile_enabled: Boolean = list_count(profile_ns) >= 34
+    let staged: YazaDbStagedLeafBatchV1 = yaza_db_write_transaction_stage_leaf_update_groups_profiled_v1(transaction, groups, profile_ns)?
+    let next_transaction: YazaDbWriteTransactionV1 = staged.transaction
+    var profile_started_ns: Number = 0
     if profile_enabled: set profile_started_ns = monotonic_ns()
-    let wal_sync: Result[Boolean, Text] = sync(current_wal.file)
-    if not result_is_ok(wal_sync): return yaza_db_write_transaction_leaf_group_fail_v1(transaction, current_wal, "multi-leaf update WAL sync failed: " + result_unwrap_error(wal_sync))
-    if not result_unwrap(wal_sync): return yaza_db_write_transaction_leaf_group_fail_v1(transaction, current_wal, "multi-leaf update WAL sync failed; reopen through recovery")
+    let wal_sync: Result[Boolean, Text] = sync(next_transaction.wal.file)
+    if not result_is_ok(wal_sync): return yaza_db_write_transaction_leaf_group_fail_v1(next_transaction, next_transaction.wal, "multi-leaf update WAL sync failed: " + result_unwrap_error(wal_sync))
+    if not result_unwrap(wal_sync): return yaza_db_write_transaction_leaf_group_fail_v1(next_transaction, next_transaction.wal, "multi-leaf update WAL sync failed; reopen through recovery")
     if profile_enabled: set profile_started_ns = yaza_db_write_transaction_profile_record_ns_v1(profile_ns, 32, profile_started_ns, monotonic_ns())
     if profile_enabled: set profile_started_ns = monotonic_ns()
-    set group_index = 0
+    var group_index: Number = 0
+    let group_count: Number = list_count(staged.page_ids)
     while group_index < group_count:
-        let group: YazaDbWriteLeafUpdateGroupV1 = list_get(groups, group_index)
-        let page_write: Result[Number, Text] = yaza_db_storage_write_page_v1(transaction.storage.file, transaction.storage.header, list_get(pages, group_index))
-        if not result_is_ok(page_write): return yaza_db_write_transaction_leaf_group_fail_v1(transaction, current_wal, "durable multi-leaf update WAL is present but a final page write failed: " + result_unwrap_error(page_write))
-        if result_unwrap(page_write) != yaza_db_page_size_v1(): return yaza_db_write_transaction_leaf_group_fail_v1(transaction, current_wal, "durable multi-leaf update WAL is present but a final page write was incomplete")
+        let page_write: Result[Number, Text] = yaza_db_storage_write_validated_page_v1(next_transaction.storage.file, next_transaction.storage.header, list_get(staged.page_ids, group_index), list_get(staged.pages, group_index))
+        if not result_is_ok(page_write): return yaza_db_write_transaction_leaf_group_fail_v1(next_transaction, next_transaction.wal, "durable multi-leaf update WAL is present but a final page write failed: " + result_unwrap_error(page_write))
+        if result_unwrap(page_write) != yaza_db_page_size_v1(): return yaza_db_write_transaction_leaf_group_fail_v1(next_transaction, next_transaction.wal, "durable multi-leaf update WAL is present but a final page write was incomplete")
         set group_index = group_index + 1
     if profile_enabled: let ignored_page_write_profile: Number = yaza_db_write_transaction_profile_record_ns_v1(profile_ns, 33, profile_started_ns, monotonic_ns())
-    return ok(YazaDbWriteTransactionV1(transaction.storage, current_wal, transaction.txn_id, transaction.commit_ts, last_lsn, transaction.pending_pages, transaction.pending_keys_hex, transaction.pending_rows_hex, true))
+    return ok(next_transaction)
 
 fn yaza_db_write_transaction_mutate_leaf_groups_v1(transaction: YazaDbWriteTransactionV1, groups: List[YazaDbWriteLeafUpdateGroupV1]) -> Result[YazaDbWriteTransactionV1, Text]:
     return yaza_db_write_transaction_mutate_leaf_groups_profiled_v1(transaction, groups, List[Number]())
 
 fn yaza_db_write_transaction_leaf_insert_group_fail_v1(transaction: YazaDbWriteTransactionV1, wal: YazaDbWalLogV1, message: Text) -> Result[YazaDbWriteTransactionV1, Text]:
+    let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(wal)
+    let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(transaction.storage)
+    return err("YDBv1 grouped LEAF_INSERT failed; writer handles were closed and recovery is required: " + message)
+
+fn yaza_db_write_transaction_leaf_insert_group_stage_fail_v1(transaction: YazaDbWriteTransactionV1, wal: YazaDbWalLogV1, message: Text) -> Result[YazaDbStagedLeafBatchV1, Text]:
     let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(wal)
     let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(transaction.storage)
     return err("YDBv1 grouped LEAF_INSERT failed; writer handles were closed and recovery is required: " + message)
@@ -518,43 +646,48 @@ fn yaza_db_write_transaction_insert_leaf_group_v1(transaction: YazaDbWriteTransa
     if result_unwrap(page_write) != yaza_db_page_size_v1(): return yaza_db_write_transaction_leaf_insert_group_fail_v1(transaction, current_wal, "durable group WAL is present but the final page write was incomplete")
     return ok(YazaDbWriteTransactionV1(transaction.storage, current_wal, transaction.txn_id, transaction.commit_ts, last_lsn, transaction.pending_pages, transaction.pending_keys_hex, transaction.pending_rows_hex, true))
 
-fn yaza_db_write_transaction_insert_leaf_groups_v1(transaction: YazaDbWriteTransactionV1, groups: List[YazaDbWriteLeafInsertGroupV1]) -> Result[YazaDbWriteTransactionV1, Text]:
+fn yaza_db_write_transaction_stage_leaf_insert_groups_with_overlay_v1(transaction: YazaDbWriteTransactionV1, groups: List[YazaDbWriteLeafInsertGroupV1], overlay: Option[YazaDbDirtyPageOverlayV1]) -> Result[YazaDbStagedLeafBatchV1, Text]:
     let group_count: Number = list_count(groups)
     if not transaction.active or transaction.txn_id < 1 or group_count < 1 or group_count > 128:
-        return yaza_db_write_transaction_leaf_insert_group_fail_v1(transaction, transaction.wal, "multi-leaf group metadata is outside its bound")
+        return yaza_db_write_transaction_leaf_insert_group_stage_fail_v1(transaction, transaction.wal, "multi-leaf group metadata is outside its bound")
     if transaction.storage.root != transaction.wal.root or not bytes_equal(transaction.storage.header.db_uuid, transaction.wal.db_uuid):
-        return yaza_db_write_transaction_leaf_insert_group_fail_v1(transaction, transaction.wal, "storage and WAL handles belong to different databases")
+        return yaza_db_write_transaction_leaf_insert_group_stage_fail_v1(transaction, transaction.wal, "storage and WAL handles belong to different databases")
+    if not option_is_some(overlay):
+        let capacity_check: Result[Number, Text] = yaza_db_storage_validate_header_capacity_v1(transaction.storage.file, transaction.storage.header)
+        if not result_is_ok(capacity_check):
+            return yaza_db_write_transaction_leaf_insert_group_stage_fail_v1(transaction, transaction.wal, result_unwrap_error(capacity_check))
+    let page_ids_result: Result[List[Number], Text] = list_try_new()
     let pages_result: Result[List[Bytes], Text] = list_try_new()
-    if not result_is_ok(pages_result): return yaza_db_write_transaction_leaf_insert_group_fail_v1(transaction, transaction.wal, "could not allocate staged leaf images")
+    if not result_is_ok(page_ids_result) or not result_is_ok(pages_result): return yaza_db_write_transaction_leaf_insert_group_stage_fail_v1(transaction, transaction.wal, "could not allocate staged leaf images")
+    let page_ids: List[Number] = result_unwrap(page_ids_result)
     let pages: List[Bytes] = result_unwrap(pages_result)
-    if not list_try_reserve(pages, group_count): return yaza_db_write_transaction_leaf_insert_group_fail_v1(transaction, transaction.wal, "could not reserve staged leaf images")
+    if not list_try_reserve(page_ids, group_count) or not list_try_reserve(pages, group_count): return yaza_db_write_transaction_leaf_insert_group_stage_fail_v1(transaction, transaction.wal, "could not reserve staged leaf images")
     var insert_count: Number = 0
     var group_index: Number = 0
     while group_index < group_count:
         let group: YazaDbWriteLeafInsertGroupV1 = list_get(groups, group_index)
         let group_insert_count: Number = list_count(group.inserts)
         if group.page_id < 2 or group_insert_count < 1 or group_insert_count > 900 - insert_count:
-            return yaza_db_write_transaction_leaf_insert_group_fail_v1(transaction, transaction.wal, "leaf group count or target page is outside its bound")
+            return yaza_db_write_transaction_leaf_insert_group_stage_fail_v1(transaction, transaction.wal, "leaf group count or target page is outside its bound")
         var prior_group_index: Number = 0
         while prior_group_index < group_index:
             let prior_group: YazaDbWriteLeafInsertGroupV1 = list_get(groups, prior_group_index)
             if prior_group.page_id == group.page_id:
-                return yaza_db_write_transaction_leaf_insert_group_fail_v1(transaction, transaction.wal, "one leaf appears in multiple groups")
+                return yaza_db_write_transaction_leaf_insert_group_stage_fail_v1(transaction, transaction.wal, "one leaf appears in multiple groups")
             set prior_group_index = prior_group_index + 1
-        let allocated: Result[Boolean, Text] = yaza_db_storage_validate_leaf_page_allocated_v1(transaction.storage, group.page_id)
-        if not result_is_ok(allocated): return yaza_db_write_transaction_leaf_insert_group_fail_v1(transaction, transaction.wal, result_unwrap_error(allocated))
-        let page_result: Result[Bytes, Text] = yaza_db_storage_read_page_v1(transaction.storage.file, transaction.storage.header, group.page_id)
-        if not result_is_ok(page_result): return yaza_db_write_transaction_leaf_insert_group_fail_v1(transaction, transaction.wal, result_unwrap_error(page_result))
-        let page: Bytes = result_unwrap(page_result)
-        let header_result: Result[YazaDbPageHeaderV1, Text] = yaza_db_page_header_decode_v1(page, group.page_id)
-        if not result_is_ok(header_result): return yaza_db_write_transaction_leaf_insert_group_fail_v1(transaction, transaction.wal, result_unwrap_error(header_result))
-        let header: YazaDbPageHeaderV1 = result_unwrap(header_result)
-        if header.page_type != 1 or header.level != 0: return yaza_db_write_transaction_leaf_insert_group_fail_v1(transaction, transaction.wal, "target is not a level-zero LEAF")
-        if not list_try_push(pages, page): return yaza_db_write_transaction_leaf_insert_group_fail_v1(transaction, transaction.wal, "could not stage an original leaf image")
+        var validated_result: Result[YazaDbValidatedPageV1, Text] = err("YDBv1 staged leaf read did not execute")
+        if option_is_some(overlay):
+            set validated_result = yaza_db_dirty_overlay_read_page_validated_v1(option_unwrap(overlay), transaction.storage.file, transaction.storage.header, group.page_id)
+        else:
+            set validated_result = yaza_db_storage_read_page_validated_with_header_file_v1(transaction.storage.file, transaction.storage.header, group.page_id)
+        if not result_is_ok(validated_result): return yaza_db_write_transaction_leaf_insert_group_stage_fail_v1(transaction, transaction.wal, result_unwrap_error(validated_result))
+        let validated: YazaDbValidatedPageV1 = result_unwrap(validated_result)
+        if validated.header.page_type != 1 or validated.header.level != 0: return yaza_db_write_transaction_leaf_insert_group_stage_fail_v1(transaction, transaction.wal, "target is not a level-zero LEAF")
+        if not list_try_push(page_ids, group.page_id) or not list_try_push(pages, validated.page): return yaza_db_write_transaction_leaf_insert_group_stage_fail_v1(transaction, transaction.wal, "could not stage an original leaf image")
         set insert_count = insert_count + group_insert_count
         set group_index = group_index + 1
-    if insert_count < 2 or not yaza_db_write_transaction_tail_fits_v1(transaction, group_count + list_count(transaction.pending_pages)):
-        return yaza_db_write_transaction_leaf_insert_group_fail_v1(transaction, transaction.wal, "group exceeds the bounded WAL recovery tail")
+    if insert_count < 1 or not yaza_db_write_transaction_tail_fits_v1(transaction, group_count + list_count(transaction.pending_pages)):
+        return yaza_db_write_transaction_leaf_insert_group_stage_fail_v1(transaction, transaction.wal, "group exceeds the bounded WAL recovery tail")
     var previous_key: Bytes = bytes_from_text("")
     var has_previous_key: Boolean = false
     set group_index = 0
@@ -564,9 +697,9 @@ fn yaza_db_write_transaction_insert_leaf_groups_v1(transaction: YazaDbWriteTrans
         while insert_index < list_count(group.inserts):
             let insert: YazaDbWriteLeafInsertV1 = list_get(group.inserts, insert_index)
             if bytes_length(insert.key) < 1 or bytes_length(insert.key) > 2048:
-                return yaza_db_write_transaction_leaf_insert_group_fail_v1(transaction, transaction.wal, "insert key length is outside its page bound")
+                return yaza_db_write_transaction_leaf_insert_group_stage_fail_v1(transaction, transaction.wal, "insert key length is outside its page bound")
             if has_previous_key and yaza_db_compare_bytes_v1(previous_key, insert.key) >= 0:
-                return yaza_db_write_transaction_leaf_insert_group_fail_v1(transaction, transaction.wal, "multi-leaf keys are not strictly increasing")
+                return yaza_db_write_transaction_leaf_insert_group_stage_fail_v1(transaction, transaction.wal, "multi-leaf keys are not strictly increasing")
             set previous_key = insert.key
             set has_previous_key = true
             set insert_index = insert_index + 1
@@ -580,43 +713,63 @@ fn yaza_db_write_transaction_insert_leaf_groups_v1(transaction: YazaDbWriteTrans
         let before_image: Bytes = list_get(pages, group_index)
         var current_page: Bytes = list_get(pages, group_index)
         let lsn_result: Result[Number, Text] = yaza_db_wal_record_lsn_for_append_v1(current_wal, record_bytes)
-        if not result_is_ok(lsn_result): return yaza_db_write_transaction_leaf_insert_group_fail_v1(transaction, current_wal, result_unwrap_error(lsn_result))
+        if not result_is_ok(lsn_result): return yaza_db_write_transaction_leaf_insert_group_stage_fail_v1(transaction, current_wal, result_unwrap_error(lsn_result))
         let record_lsn: Number = result_unwrap(lsn_result)
+        let bulk_keys_res: Result[List[Bytes], Text] = list_try_new()
+        let bulk_payloads_res: Result[List[Bytes], Text] = list_try_new()
+        if not result_is_ok(bulk_keys_res) or not result_is_ok(bulk_payloads_res):
+            return yaza_db_write_transaction_leaf_insert_group_stage_fail_v1(transaction, current_wal, "could not allocate bulk leaf keys/payloads")
+        let bulk_keys: List[Bytes] = result_unwrap(bulk_keys_res)
+        let bulk_payloads: List[Bytes] = result_unwrap(bulk_payloads_res)
+        let group_inserts_len: Number = list_count(group.inserts)
+        let _r1: Boolean = list_try_reserve(bulk_keys, group_inserts_len)
+        let _r2: Boolean = list_try_reserve(bulk_payloads, group_inserts_len)
         var insert_index: Number = 0
-        while insert_index < list_count(group.inserts):
+        while insert_index < group_inserts_len:
             let insert: YazaDbWriteLeafInsertV1 = list_get(group.inserts, insert_index)
-            let after_result: Result[Bytes, Text] = yaza_db_page_insert_sorted_slot_v1(current_page, insert.key, insert.row_payload)
-            if not result_is_ok(after_result): return yaza_db_write_transaction_leaf_insert_group_fail_v1(transaction, current_wal, result_unwrap_error(after_result))
-            set current_page = result_unwrap(after_result)
+            if not list_try_push(bulk_keys, insert.key) or not list_try_push(bulk_payloads, insert.row_payload):
+                return yaza_db_write_transaction_leaf_insert_group_stage_fail_v1(transaction, current_wal, "could not stage bulk leaf key/payload")
             set insert_index = insert_index + 1
-        if not yaza_db_write_uint_le_v1(current_page, 0, record_lsn, 8): return yaza_db_write_transaction_leaf_insert_group_fail_v1(transaction, current_wal, "grouped insert page LSN could not be stamped")
+        let after_result: Result[Bytes, Text] = yaza_db_page_insert_sorted_slots_bulk_v1(current_page, bulk_keys, bulk_payloads)
+        if not result_is_ok(after_result): return yaza_db_write_transaction_leaf_insert_group_stage_fail_v1(transaction, current_wal, result_unwrap_error(after_result))
+        set current_page = result_unwrap(after_result)
+        if not yaza_db_write_uint_le_v1(current_page, 0, record_lsn, 8): return yaza_db_write_transaction_leaf_insert_group_stage_fail_v1(transaction, current_wal, "grouped insert page LSN could not be stamped")
         let finalized_result: Result[Bytes, Text] = yaza_db_page_finalize_v1(current_page)
-        if not result_is_ok(finalized_result): return yaza_db_write_transaction_leaf_insert_group_fail_v1(transaction, current_wal, result_unwrap_error(finalized_result))
+        if not result_is_ok(finalized_result): return yaza_db_write_transaction_leaf_insert_group_stage_fail_v1(transaction, current_wal, result_unwrap_error(finalized_result))
         let after_image: Bytes = result_unwrap(finalized_result)
-        var payload_result: Result[Bytes, Text] = yaza_db_wal_leaf_mutation_payload_encode_v1(yaza_db_wal_type_leaf_insert_v1(), group.page_id, record_lsn, before_image, after_image)
-        if list_count(group.inserts) > 1:
-            set payload_result = yaza_db_wal_leaf_mutation_payload_encode_group_v3(yaza_db_wal_type_leaf_insert_v1(), group.page_id, record_lsn, before_image, after_image)
-        if not result_is_ok(payload_result): return yaza_db_write_transaction_leaf_insert_group_fail_v1(transaction, current_wal, result_unwrap_error(payload_result))
+        var ins_format_ver: Number = 1
+        if list_count(group.inserts) > 1: set ins_format_ver = 3
+        let payload_result: Result[Bytes, Text] = yaza_db_wal_leaf_mutation_payload_encode_trusted_v1(ins_format_ver, yaza_db_wal_type_leaf_insert_v1(), group.page_id, record_lsn, before_image, after_image)
+        if not result_is_ok(payload_result): return yaza_db_write_transaction_leaf_insert_group_stage_fail_v1(transaction, current_wal, result_unwrap_error(payload_result))
         let input_record: YazaDbWalRecordV1 = YazaDbWalRecordV1(0, last_lsn, transaction.txn_id, yaza_db_wal_type_leaf_insert_v1(), 0, result_unwrap(payload_result))
         let appended_result: Result[YazaDbWalAppendV1, Text] = yaza_db_wal_log_append_unflushed_v1(current_wal, input_record)
-        if not result_is_ok(appended_result): return yaza_db_write_transaction_leaf_insert_group_fail_v1(transaction, current_wal, result_unwrap_error(appended_result))
+        if not result_is_ok(appended_result): return yaza_db_write_transaction_leaf_insert_group_stage_fail_v1(transaction, current_wal, result_unwrap_error(appended_result))
         let appended: YazaDbWalAppendV1 = result_unwrap(appended_result)
-        if appended.record.lsn != record_lsn: return yaza_db_write_transaction_leaf_insert_group_fail_v1(transaction, appended.log, "WAL assigned an unexpected page LSN")
+        if appended.record.lsn != record_lsn: return yaza_db_write_transaction_leaf_insert_group_stage_fail_v1(transaction, appended.log, "WAL assigned an unexpected page LSN")
         set current_wal = appended.log
         set last_lsn = appended.record.lsn
-        if not list_try_set(pages, group_index, after_image): return yaza_db_write_transaction_leaf_insert_group_fail_v1(transaction, current_wal, "could not retain final leaf image")
+        if not list_try_set(pages, group_index, after_image): return yaza_db_write_transaction_leaf_insert_group_stage_fail_v1(transaction, current_wal, "could not retain final leaf image")
         set group_index = group_index + 1
-    let wal_sync: Result[Boolean, Text] = sync(current_wal.file)
-    if not result_is_ok(wal_sync): return yaza_db_write_transaction_leaf_insert_group_fail_v1(transaction, current_wal, "group WAL sync failed: " + result_unwrap_error(wal_sync))
-    if not result_unwrap(wal_sync): return yaza_db_write_transaction_leaf_insert_group_fail_v1(transaction, current_wal, "group WAL sync failed; reopen through recovery")
-    set group_index = 0
+    let next_transaction: YazaDbWriteTransactionV1 = YazaDbWriteTransactionV1(transaction.storage, current_wal, transaction.txn_id, transaction.commit_ts, last_lsn, transaction.pending_pages, transaction.pending_keys_hex, transaction.pending_rows_hex, true)
+    return ok(YazaDbStagedLeafBatchV1(next_transaction, page_ids, pages))
+
+fn yaza_db_write_transaction_stage_leaf_insert_groups_v1(transaction: YazaDbWriteTransactionV1, groups: List[YazaDbWriteLeafInsertGroupV1]) -> Result[YazaDbStagedLeafBatchV1, Text]:
+    return yaza_db_write_transaction_stage_leaf_insert_groups_with_overlay_v1(transaction, groups, none)
+
+fn yaza_db_write_transaction_insert_leaf_groups_v1(transaction: YazaDbWriteTransactionV1, groups: List[YazaDbWriteLeafInsertGroupV1]) -> Result[YazaDbWriteTransactionV1, Text]:
+    let staged: YazaDbStagedLeafBatchV1 = yaza_db_write_transaction_stage_leaf_insert_groups_v1(transaction, groups)?
+    let next_transaction: YazaDbWriteTransactionV1 = staged.transaction
+    let wal_sync: Result[Boolean, Text] = sync(next_transaction.wal.file)
+    if not result_is_ok(wal_sync): return yaza_db_write_transaction_leaf_insert_group_fail_v1(next_transaction, next_transaction.wal, "group WAL sync failed: " + result_unwrap_error(wal_sync))
+    if not result_unwrap(wal_sync): return yaza_db_write_transaction_leaf_insert_group_fail_v1(next_transaction, next_transaction.wal, "group WAL sync failed; reopen through recovery")
+    var group_index: Number = 0
+    let group_count: Number = list_count(staged.page_ids)
     while group_index < group_count:
-        let group: YazaDbWriteLeafInsertGroupV1 = list_get(groups, group_index)
-        let page_write: Result[Number, Text] = yaza_db_storage_write_page_v1(transaction.storage.file, transaction.storage.header, list_get(pages, group_index))
-        if not result_is_ok(page_write): return yaza_db_write_transaction_leaf_insert_group_fail_v1(transaction, current_wal, "durable group WAL is present but a final page write failed: " + result_unwrap_error(page_write))
-        if result_unwrap(page_write) != yaza_db_page_size_v1(): return yaza_db_write_transaction_leaf_insert_group_fail_v1(transaction, current_wal, "durable group WAL is present but a final page write was incomplete")
+        let page_write: Result[Number, Text] = yaza_db_storage_write_validated_page_v1(next_transaction.storage.file, next_transaction.storage.header, list_get(staged.page_ids, group_index), list_get(staged.pages, group_index))
+        if not result_is_ok(page_write): return yaza_db_write_transaction_leaf_insert_group_fail_v1(next_transaction, next_transaction.wal, "durable group WAL is present but a final page write failed: " + result_unwrap_error(page_write))
+        if result_unwrap(page_write) != yaza_db_page_size_v1(): return yaza_db_write_transaction_leaf_insert_group_fail_v1(next_transaction, next_transaction.wal, "durable group WAL is present but a final page write was incomplete")
         set group_index = group_index + 1
-    return ok(YazaDbWriteTransactionV1(transaction.storage, current_wal, transaction.txn_id, transaction.commit_ts, last_lsn, transaction.pending_pages, transaction.pending_keys_hex, transaction.pending_rows_hex, true))
+    return ok(next_transaction)
 
 fn yaza_db_write_transaction_free_page_v1(transaction: YazaDbWriteTransactionV1, page_id: Number) -> Result[YazaDbWriteTransactionV1, Text]:
     if not transaction.active: return err("YDBv1 PAGE_FREE requires an active write transaction")
@@ -1144,7 +1297,7 @@ fn yaza_db_write_transaction_validate_durable_head_v1(transaction: YazaDbWriteTr
     if first_record.lsn != 0 or first_record.rec_type != yaza_db_wal_type_mtr_end_v1() or first_record.prev_lsn != 0 or first_record.txn_id != transaction.txn_id: return err("YDBv1 LSN-zero transaction head is not its durable MTR_END record")
     return ok(true)
 
-fn yaza_db_write_transaction_commit_with_checkpoint_policy_v1(transaction: YazaDbWriteTransactionV1, checkpoint_immediately: Boolean, target_catalog_root: Number) -> Result[YazaDbWriteCommitV1, Text]:
+fn yaza_db_write_transaction_commit_with_sync_policy_v1(transaction: YazaDbWriteTransactionV1, checkpoint_immediately: Boolean, target_catalog_root: Number, sync_commit_wal: Boolean) -> Result[YazaDbWriteCommitV1, Text]:
     if not transaction.active or transaction.txn_id != transaction.storage.header.next_txn_id or transaction.commit_ts != transaction.storage.header.next_commit_ts: return err("YDBv1 write transaction state or counters are stale")
     let durable_head: Result[Boolean, Text] = yaza_db_write_transaction_validate_durable_head_v1(transaction)
     if not result_is_ok(durable_head):
@@ -1205,7 +1358,11 @@ fn yaza_db_write_transaction_commit_with_checkpoint_policy_v1(transaction: YazaD
         let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(current.storage)
         return err("YDBv1 COMMIT payload could not be prepared: " + result_unwrap_error(payload_result))
     let payload: Bytes = result_unwrap(payload_result)
-    let commit_result: Result[YazaDbWalAppendV1, Text] = yaza_db_wal_log_append_v1(current.wal, YazaDbWalRecordV1(0, current.last_lsn, current.txn_id, commit_record_type, 0, payload))
+    var commit_result: Result[YazaDbWalAppendV1, Text] = err("YDBv1 COMMIT append path was not selected")
+    if sync_commit_wal:
+        set commit_result = yaza_db_wal_log_append_v1(current.wal, YazaDbWalRecordV1(0, current.last_lsn, current.txn_id, commit_record_type, 0, payload))
+    else:
+        set commit_result = yaza_db_wal_log_append_unflushed_v1(current.wal, YazaDbWalRecordV1(0, current.last_lsn, current.txn_id, commit_record_type, 0, payload))
     if not result_is_ok(commit_result):
         let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(current.wal)
         let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(current.storage)
@@ -1227,12 +1384,253 @@ fn yaza_db_write_transaction_commit_with_checkpoint_policy_v1(transaction: YazaD
     let deferred_storage: YazaDbStorageHandleV1 = YazaDbStorageHandleV1(current.storage.root, current.storage.file, current.storage.lock, current.storage.identity_lock, target_header)
     return ok(YazaDbWriteCommitV1(deferred_storage, commit.log, current.txn_id, current.commit_ts, 0))
 
+fn yaza_db_write_transaction_commit_with_checkpoint_policy_v1(transaction: YazaDbWriteTransactionV1, checkpoint_immediately: Boolean, target_catalog_root: Number) -> Result[YazaDbWriteCommitV1, Text]:
+    return yaza_db_write_transaction_commit_with_sync_policy_v1(transaction, checkpoint_immediately, target_catalog_root, true)
+
 fn yaza_db_write_transaction_commit_v1(transaction: YazaDbWriteTransactionV1) -> Result[YazaDbWriteCommitV1, Text]:
     return yaza_db_write_transaction_commit_with_checkpoint_policy_v1(transaction, true, 0)
 
 fn yaza_db_write_transaction_commit_deferred_checkpoint_v1(transaction: YazaDbWriteTransactionV1) -> Result[YazaDbWriteCommitV1, Text]:
     return yaza_db_write_transaction_commit_with_checkpoint_policy_v1(transaction, false, 0)
 
+fn yaza_db_write_transaction_commit_unflushed_v1(transaction: YazaDbWriteTransactionV1) -> Result[YazaDbWriteCommitV1, Text]:
+    return yaza_db_write_transaction_commit_with_sync_policy_v1(transaction, false, 0, false)
+
 fn yaza_db_write_transaction_commit_catalog_root_v1(transaction: YazaDbWriteTransactionV1, new_catalog_root: Number) -> Result[YazaDbWriteCommitV1, Text]:
     if new_catalog_root < 2 or new_catalog_root == transaction.storage.header.catalog_root: return err("YDBv1 catalog-root migration requires a distinct valid target page")
     return yaza_db_write_transaction_commit_with_checkpoint_policy_v1(transaction, true, new_catalog_root)
+
+fn yaza_db_write_transaction_commit_staged_pages_sync_policy_v1(transaction: YazaDbWriteTransactionV1, staged_page_ids: List[Number], staged_pages: List[Bytes], checkpoint_immediately: Boolean, sync_commit_wal: Boolean) -> Result[YazaDbWriteCommitV1, Text]:
+    if not transaction.active or transaction.txn_id != transaction.storage.header.next_txn_id or transaction.commit_ts != transaction.storage.header.next_commit_ts:
+        return err("YDBv1 write transaction state or counters are stale")
+    if list_count(transaction.pending_pages) != 0:
+        let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(transaction.wal)
+        let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(transaction.storage)
+        return err("YDBv1 staged commit cannot combine with unfinalized pending rows")
+    let staged_count: Number = list_count(staged_page_ids)
+    if staged_count != list_count(staged_pages):
+        let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(transaction.wal)
+        let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(transaction.storage)
+        return err("YDBv1 staged commit page-ID and image counts disagree")
+    let capacity_check: Result[Number, Text] = yaza_db_storage_validate_header_capacity_v1(transaction.storage.file, transaction.storage.header)
+    if not result_is_ok(capacity_check):
+        let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(transaction.wal)
+        let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(transaction.storage)
+        return err(result_unwrap_error(capacity_check))
+    let durable_head: Result[Boolean, Text] = yaza_db_write_transaction_validate_durable_head_v1(transaction)
+    if not result_is_ok(durable_head):
+        let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(transaction.wal)
+        let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(transaction.storage)
+        return err(result_unwrap_error(durable_head))
+    let payload_result: Result[Bytes, Text] = yaza_db_wal_commit_payload_encode_v1(transaction.commit_ts)
+    if not result_is_ok(payload_result):
+        let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(transaction.wal)
+        let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(transaction.storage)
+        return err("YDBv1 COMMIT payload could not be prepared: " + result_unwrap_error(payload_result))
+    let payload: Bytes = result_unwrap(payload_result)
+    var commit_result: Result[YazaDbWalAppendV1, Text] = err("YDBv1 staged COMMIT append path was not selected")
+    if sync_commit_wal:
+        set commit_result = yaza_db_wal_log_append_v1(transaction.wal, YazaDbWalRecordV1(0, transaction.last_lsn, transaction.txn_id, yaza_db_wal_type_commit_v1(), 0, payload))
+    else:
+        set commit_result = yaza_db_wal_log_append_unflushed_v1(transaction.wal, YazaDbWalRecordV1(0, transaction.last_lsn, transaction.txn_id, yaza_db_wal_type_commit_v1(), 0, payload))
+    if not result_is_ok(commit_result):
+        let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(transaction.wal)
+        let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(transaction.storage)
+        return err("YDBv1 COMMIT append failed or has an uncertain durable outcome; reopen through recovery before reuse: " + result_unwrap_error(commit_result))
+    let commit: YazaDbWalAppendV1 = result_unwrap(commit_result)
+    var page_index: Number = 0
+    while page_index < staged_count:
+        let page_id: Number = list_get(staged_page_ids, page_index)
+        let page_image: Bytes = list_get(staged_pages, page_index)
+        let written: Result[Number, Text] = yaza_db_storage_write_validated_page_v1(transaction.storage.file, transaction.storage.header, page_id, page_image)
+        if not result_is_ok(written) or result_unwrap(written) != yaza_db_page_size_v1():
+            let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(commit.log)
+            let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(transaction.storage)
+            var write_error: Text = "data-page write was incomplete"
+            if not result_is_ok(written): set write_error = result_unwrap_error(written)
+            return err("YDBv1 COMMIT is durable, but a data-page write failed; reopen through recovery before reuse: " + write_error)
+        set page_index = page_index + 1
+    let next_txn_id: Number = transaction.txn_id + 1
+    let next_commit_ts: Number = transaction.commit_ts + 1
+    let target_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(transaction.storage.header.db_uuid, transaction.storage.header.checkpoint_lsn, next_txn_id, next_commit_ts, transaction.storage.header.catalog_root, transaction.storage.header.page_count, transaction.storage.header.flags)
+    let recovery_tail_bytes: Number = commit.log.next_lsn - transaction.storage.header.checkpoint_lsn
+    let must_checkpoint: Boolean = checkpoint_immediately or recovery_tail_bytes >= 33554432
+    if must_checkpoint:
+        let published: Result[YazaDbCheckpointResultV1, Text] = yaza_db_checkpoint_publish_state_v1(transaction.storage, commit.log, target_header)
+        if not result_is_ok(published):
+            let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(commit.log)
+            let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(transaction.storage)
+            return err("YDBv1 COMMIT is durable, but checkpoint publication failed; the transaction committed. Reopen through recovery before continuing: " + result_unwrap_error(published))
+        let checkpoint: YazaDbCheckpointResultV1 = result_unwrap(published)
+        return ok(YazaDbWriteCommitV1(checkpoint.storage, checkpoint.wal, transaction.txn_id, transaction.commit_ts, 0))
+    let deferred_storage: YazaDbStorageHandleV1 = YazaDbStorageHandleV1(transaction.storage.root, transaction.storage.file, transaction.storage.lock, transaction.storage.identity_lock, target_header)
+    return ok(YazaDbWriteCommitV1(deferred_storage, commit.log, transaction.txn_id, transaction.commit_ts, 0))
+
+fn yaza_db_write_transaction_commit_staged_pages_v1(transaction: YazaDbWriteTransactionV1, staged_page_ids: List[Number], staged_pages: List[Bytes], checkpoint_immediately: Boolean) -> Result[YazaDbWriteCommitV1, Text]:
+    return yaza_db_write_transaction_commit_staged_pages_sync_policy_v1(transaction, staged_page_ids, staged_pages, checkpoint_immediately, true)
+
+fn yaza_db_write_transaction_commit_staged_overlay_v1(transaction: YazaDbWriteTransactionV1, staged_page_ids: List[Number], staged_pages: List[Bytes], overlay: YazaDbDirtyPageOverlayV1) -> Result[YazaDbOverlayCommitResultV1, Text]:
+    if not transaction.active or transaction.txn_id != transaction.storage.header.next_txn_id or transaction.commit_ts != transaction.storage.header.next_commit_ts:
+        return err("YDBv1 write transaction state or counters are stale")
+    if list_count(transaction.pending_pages) != 0:
+        let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(transaction.wal)
+        let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(transaction.storage)
+        return err("YDBv1 staged commit cannot combine with unfinalized pending rows")
+    let staged_count: Number = list_count(staged_page_ids)
+    if staged_count != list_count(staged_pages):
+        let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(transaction.wal)
+        let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(transaction.storage)
+        return err("YDBv1 staged commit page-ID and image counts disagree")
+    if transaction.last_lsn < 0 or transaction.wal.next_lsn <= transaction.last_lsn:
+        let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(transaction.wal)
+        let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(transaction.storage)
+        return err("YDBv1 write transaction has no durable WAL head record")
+    let payload_result: Result[Bytes, Text] = yaza_db_wal_commit_payload_encode_v1(transaction.commit_ts)
+    if not result_is_ok(payload_result):
+        let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(transaction.wal)
+        let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(transaction.storage)
+        return err("YDBv1 COMMIT payload could not be prepared: " + result_unwrap_error(payload_result))
+    let commit_result: Result[YazaDbWalAppendV1, Text] = yaza_db_wal_log_append_unflushed_v1(transaction.wal, YazaDbWalRecordV1(0, transaction.last_lsn, transaction.txn_id, yaza_db_wal_type_commit_v1(), 0, result_unwrap(payload_result)))
+    if not result_is_ok(commit_result):
+        let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(transaction.wal)
+        let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(transaction.storage)
+        return err("YDBv1 COMMIT append failed or has an uncertain durable outcome; reopen through recovery before reuse: " + result_unwrap_error(commit_result))
+    let commit: YazaDbWalAppendV1 = result_unwrap(commit_result)
+    let next_overlay_res: Result[YazaDbDirtyPageOverlayV1, Text] = yaza_db_dirty_overlay_put_many_v1(overlay, staged_page_ids, staged_pages)
+    if not result_is_ok(next_overlay_res):
+        let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(commit.log)
+        let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(transaction.storage)
+        return err("YDBv1 COMMIT is durable, but dirty overlay update failed; reopen through recovery before reuse: " + result_unwrap_error(next_overlay_res))
+    let next_txn_id: Number = transaction.txn_id + 1
+    let next_commit_ts: Number = transaction.commit_ts + 1
+    let target_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(transaction.storage.header.db_uuid, transaction.storage.header.checkpoint_lsn, next_txn_id, next_commit_ts, transaction.storage.header.catalog_root, transaction.storage.header.page_count, transaction.storage.header.flags)
+    let deferred_storage: YazaDbStorageHandleV1 = YazaDbStorageHandleV1(transaction.storage.root, transaction.storage.file, transaction.storage.lock, transaction.storage.identity_lock, target_header)
+    return ok(YazaDbOverlayCommitResultV1(YazaDbWriteCommitV1(deferred_storage, commit.log, transaction.txn_id, transaction.commit_ts, 0), result_unwrap(next_overlay_res)))
+
+fn yaza_db_write_transaction_undo_to_lsn_v1(transaction: YazaDbWriteTransactionV1, stop_lsn: Number) -> Result[YazaDbWriteTransactionV1, Text]:
+    if not transaction.active or transaction.txn_id < 1: return err("YDBv1 rollback requires an active write transaction")
+    if stop_lsn < 0 or stop_lsn > transaction.last_lsn: return err("YDBv1 rollback target LSN is outside the active transaction chain")
+    let failures_res: Result[TextList, Text] = text_list_try_new()
+    if not result_is_ok(failures_res): return err("YDBv1 rollback could not allocate error metadata")
+    let failures: TextList = result_unwrap(failures_res)
+    var current_wal_file: Number = transaction.wal.file
+    var current_wal_segment_index: Number = transaction.wal.segment_index
+    var current_wal_segment_base_lsn: Number = transaction.wal.segment_base_lsn
+    var current_wal_next_lsn: Number = transaction.wal.next_lsn
+    var head_lsn: Number = transaction.last_lsn
+    var cursor_lsn: Number = transaction.last_lsn
+    var steps: Number = 0
+    while cursor_lsn > stop_lsn:
+        if steps >= 65536:
+            let step_wal: YazaDbWalLogV1 = YazaDbWalLogV1(transaction.wal.root, transaction.wal.db_uuid, current_wal_file, current_wal_segment_index, current_wal_segment_base_lsn, current_wal_next_lsn)
+            let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(step_wal)
+            let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(transaction.storage)
+            return err("YDBv1 explicit transaction rollback exceeded 65,536-record chain bound; reopen through recovery")
+        var step_failed: Boolean = false
+        arena_scope 8388608:
+            let step_wal: YazaDbWalLogV1 = YazaDbWalLogV1(transaction.wal.root, transaction.wal.db_uuid, current_wal_file, current_wal_segment_index, current_wal_segment_base_lsn, current_wal_next_lsn)
+            let seg_res: Result[Number, Text] = yaza_db_wal_segment_count_for_v1(transaction.storage.root, transaction.storage.header.db_uuid)
+            if not result_is_ok(seg_res):
+                set step_failed = true
+                let ignored_p: Boolean = list_try_push(failures, result_unwrap_error(seg_res))
+            else:
+                let seg_count: Number = result_unwrap(seg_res)
+                let rec: YazaDbCheckpointUndoRecordV1 = yaza_db_checkpoint_read_undo_record_v1(transaction.storage.root, transaction.storage.header.db_uuid, cursor_lsn, seg_count, step_wal.next_lsn)
+                if rec.lsn != cursor_lsn or rec.txn_id != transaction.txn_id:
+                    set step_failed = true
+                    let ignored_p: Boolean = list_try_push(failures, "YDBv1 rollback could not follow an exact WAL transaction link")
+                elif rec.rec_type == yaza_db_wal_type_page_alloc_v1() or rec.rec_type == yaza_db_wal_type_page_free_v1():
+                    var undo_op: Number = 1
+                    if rec.operation == 1: set undo_op = 2
+                    let pay_res: Result[Bytes, Text] = yaza_db_compensation_payload_encode_v1(undo_op, rec.page_id, rec.bitmap_page_id, rec.bit_index, rec.prev_lsn, rec.lsn)
+                    if not result_is_ok(pay_res):
+                        set step_failed = true
+                        let ignored_p: Boolean = list_try_push(failures, result_unwrap_error(pay_res))
+                    else:
+                        let clr_in: YazaDbWalRecordV1 = YazaDbWalRecordV1(0, head_lsn, transaction.txn_id, yaza_db_wal_type_compensation_v1(), 0, result_unwrap(pay_res))
+                        let app_res: Result[YazaDbWalAppendV1, Text] = yaza_db_wal_log_append_v1(step_wal, clr_in)
+                        if not result_is_ok(app_res):
+                            set step_failed = true
+                            let ignored_p: Boolean = list_try_push(failures, result_unwrap_error(app_res))
+                        else:
+                            let app: YazaDbWalAppendV1 = result_unwrap(app_res)
+                            let applied_res: Result[Boolean, Text] = yaza_db_allocator_redo_compensation_v1(transaction.storage, app.record, app.log.next_lsn)
+                            if not result_is_ok(applied_res):
+                                let ignored_c: Result[Boolean, Text] = yaza_db_wal_log_close_v1(app.log)
+                                set step_failed = true
+                                let ignored_p: Boolean = list_try_push(failures, result_unwrap_error(applied_res))
+                            else:
+                                set current_wal_file = app.log.file
+                                set current_wal_segment_index = app.log.segment_index
+                                set current_wal_segment_base_lsn = app.log.segment_base_lsn
+                                set current_wal_next_lsn = app.log.next_lsn
+                                set head_lsn = app.record.lsn
+                                set cursor_lsn = rec.prev_lsn
+                elif rec.rec_type == yaza_db_wal_type_leaf_insert_v1() or rec.rec_type == yaza_db_wal_type_leaf_update_v1() or rec.rec_type == yaza_db_wal_type_leaf_delete_v1():
+                    let app_res: Result[YazaDbWalAppendV1, Text] = yaza_db_checkpoint_append_leaf_undo_clr_v1(transaction.storage, step_wal, transaction.txn_id, head_lsn, rec.lsn, seg_count)
+                    if not result_is_ok(app_res):
+                        set step_failed = true
+                        let ignored_p: Boolean = list_try_push(failures, result_unwrap_error(app_res))
+                    else:
+                        let app: YazaDbWalAppendV1 = result_unwrap(app_res)
+                        set current_wal_file = app.log.file
+                        set current_wal_segment_index = app.log.segment_index
+                        set current_wal_segment_base_lsn = app.log.segment_base_lsn
+                        set current_wal_next_lsn = app.log.next_lsn
+                        set head_lsn = app.record.lsn
+                        set cursor_lsn = rec.prev_lsn
+                elif rec.rec_type == yaza_db_wal_type_node_split_v1():
+                    let app_res: Result[YazaDbWalAppendV1, Text] = yaza_db_checkpoint_append_node_split_undo_clr_v1(transaction.storage, step_wal, transaction.txn_id, head_lsn, rec.lsn, seg_count)
+                    if not result_is_ok(app_res):
+                        set step_failed = true
+                        let ignored_p: Boolean = list_try_push(failures, result_unwrap_error(app_res))
+                    else:
+                        let app: YazaDbWalAppendV1 = result_unwrap(app_res)
+                        set current_wal_file = app.log.file
+                        set current_wal_segment_index = app.log.segment_index
+                        set current_wal_segment_base_lsn = app.log.segment_base_lsn
+                        set current_wal_next_lsn = app.log.next_lsn
+                        set head_lsn = app.record.lsn
+                        set cursor_lsn = rec.prev_lsn
+                elif rec.rec_type == yaza_db_wal_type_compensation_v1():
+                    set cursor_lsn = rec.undo_next_lsn
+                elif rec.rec_type == yaza_db_wal_type_mtr_end_v1():
+                    set cursor_lsn = rec.prev_lsn
+                else:
+                    set step_failed = true
+                    let ignored_p: Boolean = list_try_push(failures, "YDBv1 rollback encountered a WAL record without an implemented inverse")
+        if step_failed:
+            let fail_wal: YazaDbWalLogV1 = YazaDbWalLogV1(transaction.wal.root, transaction.wal.db_uuid, current_wal_file, current_wal_segment_index, current_wal_segment_base_lsn, current_wal_next_lsn)
+            let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(fail_wal)
+            let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(transaction.storage)
+            if list_count(failures) > 0: return err(list_get(failures, 0))
+            return err("YDBv1 rollback step failed; reopen through recovery")
+        set steps = steps + 1
+    let out_wal: YazaDbWalLogV1 = YazaDbWalLogV1(transaction.wal.root, transaction.wal.db_uuid, current_wal_file, current_wal_segment_index, current_wal_segment_base_lsn, current_wal_next_lsn)
+    return ok(YazaDbWriteTransactionV1(transaction.storage, out_wal, transaction.txn_id, transaction.commit_ts, head_lsn, transaction.pending_pages, transaction.pending_keys_hex, transaction.pending_rows_hex, true))
+
+fn yaza_db_write_transaction_abort_v1(transaction: YazaDbWriteTransactionV1) -> Result[YazaDbWriteCommitV1, Text]:
+    if not transaction.active or transaction.txn_id != transaction.storage.header.next_txn_id:
+        return err("YDBv1 abort requires an active matching transaction")
+    let undone: YazaDbWriteTransactionV1 = yaza_db_write_transaction_undo_to_lsn_v1(transaction, 0)?
+    let empty_payload: Bytes = bytes_try_new_zeroed(0)?
+    let abort_record: YazaDbWalRecordV1 = YazaDbWalRecordV1(0, undone.last_lsn, undone.txn_id, yaza_db_wal_type_abort_v1(), 0, empty_payload)
+    let aborted_res: Result[YazaDbWalAppendV1, Text] = yaza_db_wal_log_append_v1(undone.wal, abort_record)
+    if not result_is_ok(aborted_res):
+        let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(undone.wal)
+        let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(undone.storage)
+        return err("YDBv1 ABORT append failed; reopen through recovery: " + result_unwrap_error(aborted_res))
+    let aborted: YazaDbWalAppendV1 = result_unwrap(aborted_res)
+    let next_txn_id: Number = undone.txn_id + 1
+    let target_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(undone.storage.header.db_uuid, undone.storage.header.checkpoint_lsn, next_txn_id, undone.storage.header.next_commit_ts, undone.storage.header.catalog_root, undone.storage.header.page_count, undone.storage.header.flags)
+    let recovery_tail_bytes: Number = aborted.log.next_lsn - undone.storage.header.checkpoint_lsn
+    if recovery_tail_bytes >= 33554432:
+        let published: Result[YazaDbCheckpointResultV1, Text] = yaza_db_checkpoint_publish_state_v1(undone.storage, aborted.log, target_header)
+        if not result_is_ok(published):
+            let ignored_wal_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(aborted.log)
+            let ignored_storage_close: Result[Boolean, Text] = yaza_db_storage_close_v1(undone.storage)
+            return err("YDBv1 ABORT is durable, but checkpoint publication failed: " + result_unwrap_error(published))
+        let checkpoint: YazaDbCheckpointResultV1 = result_unwrap(published)
+        return ok(YazaDbWriteCommitV1(checkpoint.storage, checkpoint.wal, undone.txn_id, 0, 0))
+    let next_storage: YazaDbStorageHandleV1 = YazaDbStorageHandleV1(undone.storage.root, undone.storage.file, undone.storage.lock, undone.storage.identity_lock, target_header)
+    return ok(YazaDbWriteCommitV1(next_storage, aborted.log, undone.txn_id, 0, 0))
