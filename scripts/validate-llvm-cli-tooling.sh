@@ -18,7 +18,7 @@ trap cleanup EXIT INT TERM
 
 printf '==> 1. Testing --help and --version\n'
 "$COMPILER" --help | grep -q "YAZA LLVM"
-"$COMPILER" --version | grep -q "YAZA LLVM 1.0.2"
+"$COMPILER" --version | grep -q "YAZA LLVM 1.1.0"
 printf '  [PASS] --help and --version verified\n'
 
 printf '==> 2. Testing check subcommand\n'

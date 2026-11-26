@@ -123,11 +123,11 @@ fi
 
 PKG_SCRIPTS="$STAGE_DIR/scripts"
 install -d "$PKG_SCRIPTS"
-cat <<'EOF' > "$PKG_SCRIPTS/postinstall"
+cat <<EOF > "$PKG_SCRIPTS/postinstall"
 #!/bin/sh
 printf '\n'
 printf '  ███▄      ▄███    Welcome to YAZA Programming Language!\n'
-printf '   ▀███▄  ▄███▀     Version 1.0.2 · Zero-GC Arena · Native LLVM · YazaBase\n'
+printf '   ▀███▄  ▄███▀     Version $VERSION · Zero-GC Arena · Native LLVM · YazaBase\n'
 printf '     ▀███▄ ▀█▀\n'
 printf '     ▄███▀          Installed CLI tools to: /usr/local/bin/yaza & yazabase\n'
 printf '   ▄███▀            Docs: https://yazastudios.id/docs/\n\n'

@@ -1,37 +1,37 @@
 # YAZA
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Release](https://img.shields.io/badge/Release-v1.0.2-green.svg)](https://github.com/yazaprojectstudios/yaza-language/releases)
-[![Build Matrix](https://img.shields.io/badge/Platforms-macOS%20%7C%20Linux%20%7C%20Windows%20experimental%20%7C%20Android%20%26%20iOS%20ARM64-yellow.svg)](https://github.com/yazaprojectstudios/yaza-language/actions)
+[![Release](https://img.shields.io/badge/Release-v1.1.0-green.svg)](https://github.com/yazaprojectstudios/yaza-language/releases)
+[![Build Matrix](https://img.shields.io/badge/Platforms-macOS%20%7C%20Linux%20%7C%20Windows%20%7C%20Android%20%26%20iOS%20ARM64-blue.svg)](https://github.com/yazaprojectstudios/yaza-language/actions)
 [![Zero-GC](https://img.shields.io/badge/Memory-Zero--GC%20%28Scoped%20Arenas%29-mint.svg)](#memory-model-arena_scope)
-[![Benchmarks](https://img.shields.io/badge/Arena--SSR%20HTML-53%2C668%20req%2Fs%20%40%207.05%20MB%20RSS-yellowgreen.svg)](#post-audit-ecosystem-benchmarks-21-nov-2026--apple-m5--macos-265-arm64)
-[![YBIF](https://img.shields.io/badge/YBIF%20Binary%20Format-6.22x%20Scalar%20%7C%202.13x%20SQL%20vs%20JSON-teal.svg)](#database-support)
+[![Benchmarks](https://img.shields.io/badge/Microservice%20%26%20SSR-116%2C072%20req%2Fs%20%40%20c%3D32-yellowgreen.svg)](#benchmarks)
+[![YazaBase](https://img.shields.io/badge/YazaBase%201.1.0-3.56%20%C2%B5s%20PK%20%7C%20Tier%201--3-teal.svg)](#database-support--binary-format-ybif)
 
-**YAZA** is an **all-in-one self-hosted systems programming language** designed to build your entire stack in one native language: high-concurrency cloud backends, single-binary fullstack web applications, native mobile core engines, statistical/data-science pipelines, and ACID SQL databases. It compiles directly to native machine code via **LLVM** (`-O2`), eliminates garbage collection pauses using deterministic **Scoped Arenas (`arena_scope`)**, and ships with **YazaBase** (a built-in ACID Clustered B+Tree SQL engine — embedded & clustered HA/PostgreSQL-compatible), the **YBIF** binary interchange format, and the **Mobile Native Engine (RFC 0010)** for Android and iOS.
+**YAZA** is an **all-in-one self-hosted systems programming language** designed to build your entire stack in one native language: high-concurrency cloud backends, single-binary fullstack web applications, native mobile core engines, statistical/data-science pipelines, and ACID SQL databases. It compiles directly to native machine code via **LLVM** (`-O2`), eliminates garbage collection pauses using deterministic **Scoped Arenas (`arena_scope`)**, and ships with **YazaBase 1.1.0** (a built-in ACID Clustered B+Tree SQL engine — embedded & clustered HA/PostgreSQL-compatible with AES-256 Page Encryption, Vector Search/HNSW, FTS BM25, PITR/CDC, FNV-1a Sharding, Migrations & JSONB `YJB1`), the **YBIF** binary interchange format, and the **Mobile Native Engine (RFC 0010)** for Android and iOS.
 
 ---
 
-## Key Features & Four Core Technology Pillars (`v1.0.2`)
+## Key Features & Four Core Technology Pillars (`v1.1.0`)
 
 1. **Mobile Native Engine (RFC 0010 — Android & iOS ARM64):**
    - **LLVM AOT ARM64 Native Core Engine** (zero JIT, zero Garbage Collector) structured with modular MVI/Outbox `src/` modules (`state/`, `actions/`, `domain/`, `effects/`), `"YBIF"` binary state snapshots, task arenas, and embedded `YazaBase` (`--export-request` via `std/db/yazabase_mobile_kv`), connected to `"Welcome to YAZA Mobile"` 100% native Dumb UI (**Kotlin** on Android, **Swift / SwiftUI** on iOS) through the versioned **Thin C ABI Bridge** (`runtime/mobile/include/yaza_mobile_v1.h`, featuring `YAZA_MOBILE_EVENT_V1_ACTION = 4`, `512 KiB` max input payload, explicit buffer ownership, monotonic refcounted handle registry, `0` memory leaks).
-   - **CLI Tooling:** `yaza new --mobile <name>`, `yaza init --mobile [dir]`, `yaza mobile doctor`, and `yaza mobile run --target android|ios` (automatic device/simulator detection or boot + debounced live watch & reload) produce production ARM64 artifacts: `android-arm64/libyaza_mobile.so` (`190,432 B` / ~190 KB), `ios-arm64/libyaza_mobile.a` (`237,480 B` / ~237 KB), and `ios-simulator-arm64/libyaza_mobile.a` (`233,440 B` / ~233 KB).
-   - **Measured C ABI Bridge Performance:** `0.125 µs` (`create+destroy`, `6.24M ops/s`), `0.166 µs` (`1 B dispatch`, `6.05M ops/s`), `0.708 µs` (`1 KiB snapshot`, `1.37M ops/s`), `19.750 µs` (`32 KiB snapshot`, `52.2K ops/s`) at `~2.141 MiB RSS`.
-2. **Arena-SSR MVC & HTML-over-the-Wire (`std/web/*`):**
-   - **Zero-GC Per-Request Arena SSR** combined with partial DOM updates via **`X-Yaza-Fragment` + `yaza-live.js`** (~0.7 kB per interaction without heavy client JS bundles or SPA hydration), compiled type-safe HTML5 `view` syntax, binary `multipart/form-data` upload with magic-byte checks, HTTP 206 seekable streaming, and compile-time layer boundary checks (`yaza arch check`).
+   - **CLI Tooling:** `yaza new --mobile <name>`, `yaza init --mobile [dir]`, `yaza mobile doctor`, and `yaza mobile run --target android|ios` produce `v1.1.0` ARM64 artifacts: `android-arm64/libyaza_mobile.so` (`217,264 B`), `ios-arm64/libyaza_mobile.a` (`293,344 B`), and `ios-simulator-arm64/libyaza_mobile.a` (`289,240 B`).
+   - **Measured C ABI Bridge Performance (`2026-11-26`):** `0.167 µs` (`create+destroy`, `4.70M ops/s`), `0.291 µs` (`1 B dispatch`, `3.46M ops/s`), `0.792 µs` (`1 KiB snapshot`, `1.24M ops/s`), `15.834 µs` (`32 KiB snapshot`, `61.8K ops/s`) at `2.188 MiB RSS`.
+2. **Arena-SSR MVC, Microservices & HTML-over-the-Wire (`std/web/*`):**
+   - **Zero-GC Per-Request Arena SSR** combined with partial DOM updates via **`X-Yaza-Fragment` + `yaza-live.js`**, compiled type-safe HTML5 `view` syntax, binary `multipart/form-data` upload with magic-byte checks, HTTP 206 seekable streaming, and compile-time layer boundary checks (`yaza arch check`).
    - **6 Production CLI Project Templates:** `--minimal-api`, `--api`, `--web`, `--mvc` (alias `--fullstack`), `--microservice`, and `--mobile`.
-   - **Post-Audit Loopback Benchmarks vs Node.js `v26.0.0`:** **`53,668 req/s`** Full SSR HTML (`p50 142 µs`, `7.05 MB RSS` vs Node.js v26 `36,960 req/s` & `73.53 MB RSS`), **`49,703 req/s`** Hypermedia Fragment (`p50 131 µs` vs Node.js v26 `37,612 req/s`), **`69,571 req/s`** JSON API Parity (`113 µs` p50), plus an internal multi-route Content SSR workload (**`1,337.0 req/s`** 114-section full index render / `55,624 B`, **`5,951.4 req/s`** fragment filter, **`3,488.2 req/s`** JSON API).
+   - **Measured Loopback Throughput (`2026-11-26`, `-O2`):** **`116,072 req/s`** Quote+HMAC microservice (`c=32`, #1 vs Rust/Go/Nim/Node/Python), **`88,138 req/s`** (`c=8`) / **`102,337 req/s`** (`c=32`) JSON API, **`68,557 req/s`** Arena-SSR Hypermedia Fragment & **`79,362 req/s`** JSON API Parity at **`7.13 MB RSS`** (`246.8 KB` binary).
 3. **Security-by-Construction (Default in Runtime & Standard Library):**
-   - Verified under `ASan+UBSan`, `TSan`, macOS `leaks --atExit` (`0 leaks`), and a hostile TCP soak of 10,000 valid requests + 200 malformed/smuggling/oversized payloads (`0` crashes, `0` FD leaks):
+   - Verified under `ASan+UBSan`, `TSan` (200k concurrent scopes across 8 workers, `0` data races), macOS `leaks --atExit` (`0 leaks`), and hostile TCP soak:
    - Auto HTML/attribute escaping (`std/web/view.yz`, blocking `svg`/`math`, `srcdoc`, `javascript:`/`data:`, and `on*` event attributes) + `yaza audit --security`.
    - Session-bound CSRF token with constant-time comparison, `HttpOnly`/`Secure`/`SameSite` cookies, and automatic CSP, `X-Frame-Options: DENY`, and `X-Content-Type-Options: nosniff` headers.
    - Strict `\r\n` HTTP parser against request smuggling & keep-alive desync, capability-rooted VFS (`O_NOFOLLOW` anti-symlink/path traversal), magic-byte verification on multipart uploads, and compiler-optimization-resistant cryptographic zeroization (`volatile` wipe + memory fence).
-4. **YazaBase (Embedded + Server/HA SQL Engine) & Binary Format YBIF (`std/ybif.yz` + C Direct Encoder):**
-   - **Full-Power ACID Storage, Server & HA Cluster Engine (`YazaBase`):** Built-in 16 KiB Clustered B+Tree engine with ARIES WAL CRC32C crash recovery, **CLOCK LRU Buffer Pool** (`page_read = 0`), **64-Entry Prepared SELECT Plan Cache**, **Group Commit** (`100 tx -> 1 WAL fsync`), explicit multi-statement MVCC transactions (`BEGIN`/`COMMIT`/`ROLLBACK`/`SAVEPOINT`), secondary & unique indexes, `ALTER TABLE`, **Physical WAL Streaming Replication**, **Raft-Lite HA Leader Election & Auto-Failover**, **Lag-Aware R/W & FNV-1a Hash-Shard Router**, **Autoscale Policies**, and **`pgwire v3`** (`psql`-compatible).
-   - **Latest Measured YazaBase Engine Speed (`-O2`, Apple M5):** Warm Point `SELECT` **`3.57 µs`** median (`3.49 µs` min, `page_read = 0`), 10k-row Full Scan **`111 µs`** `COUNT(*)` (`0.111 ms`) & **`130 µs`** `SUM(val)` (`0.130 ms`, **~2× faster than PostgreSQL**), `MIN`/`MAX` **`130–136 µs`**, durable `INSERT` Batch **`0.85 ms` p50 / 50 rows** (`26.94 ms` for 500 rows across 10 tx incl. 10× fsync), `UPDATE` Batch **`~40.7k rows/s`** (`1.10 ms` p50), `DELETE` Batch **`~47.3k rows/s`** (`0.96 ms` p50).
-   - **YAZA Binary Interchange Format (`YBIF`):** Length-prefixed binary wire format (`std/ybif.yz` & C direct encoder `yazabase_result_encode_ybif`) achieving **6.22× faster** encode+decode than JSON on scalar records (`3.26M ops/s`, 31.9% smaller) and **2.13× faster** on 16-row SQL result batches (`2.59M ops/s`, `896 B` vs `1,188 B`, 24.6% smaller).
-   - **Pluggable External Database Adapters & JDBC 4.2:** Native wire-protocol clients for **PostgreSQL** (v3 + SCRAM-SHA-256 + native socket TLS & 16-byte `CancelRequest`), **MySQL** (v10 + `caching_sha2_password`), **MSSQL** (TDS), **NoSQL** (Redis RESP / MongoDB BSON), plus official **YazaBase JDBC Driver (`yazabase-jdbc-1.0.0.jar`)** for DBeaver, DataGrip & JetBrains IDEs.
-   - **Zero-GC In-Process Statistical, DataFrame & Visualization Suite (`std/data/*`):** Built-in single-binary statistical and analytics toolkit combining Neumaier compensated summation, Welford 1-pass moments, partial-pivoting Gaussian linear algebra, Columnar Arena DataFrame, 30+ statistical/ML methods (`ml_ols_fit`, `ml_multiple_ols_fit`, `ml_logistic_fit`, `ml_pca_first_component`, `ml_knn_classify`, `ml_kmeans_1d`, `ml_roc_auc`), **18 zero-JS Frontend SVG chart types**, and **6 Terminal CLI chart types**.
+4. **YazaBase 1.1.0 (Tier 1/2/3 Embedded + Clustered HA SQL Engine) & Binary Format YBIF:**
+   - **Tier 1 / Tier 2 / Tier 3 Engine:** Built-in 16 KiB Clustered B+Tree engine with ARIES WAL CRC32C recovery, **CLOCK LRU Buffer Pool** (`page_read = 0`), **64-Entry Prepared Plan Cache**, **Group Commit** (`100 tx -> 1 fsync`), explicit multi-statement MVCC (`BEGIN`/`COMMIT`/`ROLLBACK`/`SAVEPOINT`), **Transparent Page Encryption (`YDE1`, AES-256-CTR + HMAC)**, **Concurrent Actor Engine**, **Vector Search (Flat + HNSW)**, **Full-Text Search BM25**, **PITR & CDC Stream**, **Horizontal FNV-1a Sharding (`68.8 ns/route`)**, **Online Schema Migrations**, **Binary JSONB (`YJB1`) + GIN-style Index**, **WAL Streaming Replication**, **Raft-Lite HA**, and **`pgwire v3`** (`16.0 (YazaBase 1.1.0)`).
+   - **Measured YazaBase 1.1.0 Speed (`-O2`, Apple M5, `2026-11-26`):** Warm Point `SELECT` **`3.560 µs`** median (`3.500 µs` min, `page_read = 0`), 10k-row Full Scan **`111.0 µs`** `COUNT(*)` & **`130.6 µs`** `SUM(val)`, Embedded durable `INSERT` **`3.151 ms` p50** (**16×** faster than v1.0.2 at `16.50 MiB` RSS), **1.4× faster** PK lookup & **1.3× faster** Full Scan than PostgreSQL 18 (`0.022 ms` vs `0.031 ms`, `0.188 ms` vs `0.243 ms`).
+   - **YAZA Binary Interchange Format (`YBIF`):** Direct C encoder `yazabase_result_encode_ybif` achieves **`2.17×` faster** throughput & **`24.6%` smaller** size than JSON (`8.255 ms`, `896 B` vs `17.947 ms`, `1,188 B` across 20k × 16-row batches); scalar `std/ybif` is **`1.86×` faster** & **`31.9%` smaller**.
+   - **Pluggable External Database Adapters & JDBC 4.2:** Native wire-protocol clients for **PostgreSQL** (`std/pg/transport` + SCRAM-SHA-256 + TLS + `CancelRequest`), **MySQL**, **MSSQL**, **Redis/MongoDB**, plus official **YazaBase JDBC Driver (`yazabase-jdbc-1.1.0.jar`)**.
+   - **Zero-GC Statistical, DataFrame & Visualization Suite (`std/data/*`):** Welford 1M **`9.13 ms`** (**37.5×** Python), OLS 1M **`6.97 ms`** (**23.2×**), DataFrame 5K ETL **`3.84 ms`**, **86/86 SciPy golden PASS** (`max_rel_err = 2.10e-15`), 18 zero-JS SVG chart types, and 6 terminal CLI charts.
 
 ---
 
@@ -50,14 +50,15 @@ irm https://yazastudios.id/install.ps1 | iex
 ```
 
 ### Manual Release Archives
-Pre-built archives for the released targets are available on the [Releases](https://github.com/yazaprojectstudios/yaza-language/releases/tag/v1.0.2) page and [yazastudios.id/docs/install](https://yazastudios.id/docs/install/):
-- `yaza-1.0.2-darwin-arm64.tar.gz` & `yaza-1.0.2-macos-arm64.pkg` (Apple Silicon)
-- `yaza-1.0.2-darwin-x64.tar.gz` (macOS Intel)
-- `yaza-1.0.2-linux-x64.tar.gz` (Linux x86-64)
-- `yaza-1.0.2-linux-arm64.tar.gz` (Linux ARM64)
-- `yaza-1.0.2-windows-x64.zip` (Windows x64, experimental)
-- `yaza-1.0.2-mobile-sdk.tar.gz` (Mobile Native Engine SDK: `android-arm64/libyaza_mobile.so`, `ios-arm64/libyaza_mobile.a`, `ios-simulator-arm64/libyaza_mobile.a`, and `include/yaza_mobile_v1.h`)
-- `yaza-language-support-1.0.2.vsix` (VS Code Extension)
+Pre-built archives for the released targets are available on the [Releases](https://github.com/yazaprojectstudios/yaza-language/releases/tag/v1.1.0) page and [yazastudios.id/docs/install](https://yazastudios.id/docs/install/):
+- `yaza-1.1.0-darwin-arm64.tar.gz` & `yaza-1.1.0-macos-arm64.pkg` (Apple Silicon)
+- `yaza-1.1.0-darwin-x64.tar.gz` (macOS Intel)
+- `yaza-1.1.0-linux-x64.tar.gz` (Linux x86-64)
+- `yaza-1.1.0-linux-arm64.tar.gz` (Linux ARM64)
+- `yaza-1.1.0-windows-x64.zip` (Windows x64)
+- `yaza-1.1.0-mobile-sdk.tar.gz` (Mobile Native Engine SDK: `android-arm64/libyaza_mobile.so`, `ios-arm64/libyaza_mobile.a`, `ios-simulator-arm64/libyaza_mobile.a`, and `include/yaza_mobile_v1.h`)
+- `yazabase-1.1.0-*.tar.gz` / `.zip` & `yazabase-jdbc-1.1.0.jar` (Standalone YazaBase + JDBC 4.2 Driver)
+- `yaza-language-support-1.1.0.vsix` (VS Code Extension)
 
 Extract the archive and add its `bin/` directory to your system `PATH`.
 Compiling `.yz` programs on Linux needs Clang and the libcurl development
@@ -292,8 +293,8 @@ process arena hard cap, the current runtime reads
 
 YAZA provides first-class standard library drivers with wire-protocol implementations plus the **YBIF** binary interchange format:
 
-1. **YazaBase (`std/db/yazabase` & `std/db/yazabase_embedded`):** Embedded + Clustered ACID SQL engine with 16 KiB Clustered B+Tree indexing, ARIES write-ahead logging, CLOCK LRU Buffer Pool (`3.57 µs` median warm point SELECT, `page_read = 0`), 64-entry Prepared Plan Cache, 10k-row direct streaming aggregates (`111 µs` `COUNT(*)`, `130 µs` `SUM(val)`), Group Commit (`100 tx → 1 fsync`, `0.85 ms` p50 per 50-row INSERT batch), explicit multi-statement MVCC transactions (`BEGIN`/`COMMIT`/`ROLLBACK`/`SAVEPOINT`), Physical WAL Streaming Replication, Raft-Lite HA auto-failover, FNV-1a hash-sharding router, `pgwire v3` (`psql`-compatible), official **YazaBase JDBC 4.2 Driver (`yazabase-jdbc-1.0.0.jar`)**, and `--export-request` mobile KV persistence (`std/db/yazabase_mobile_kv`).
-2. **YBIF Binary Format (`std/ybif` & `yazabase_result_encode_ybif`):** Deterministic binary wire format with 4-byte magic (`YBIF`), versioned header, and length-prefixed typed cells — **6.22× faster** than JSON on scalar records (`3.26M ops/s`, 31.9% smaller) and **2.13× faster** on 16-row SQL result sets (`2.59M ops/s`, `896 B` vs `1,188 B`, 24.6% smaller).
+1. **YazaBase 1.1.0 (`std/db/yazabase` & `std/db/yazabase_embedded`):** Tier 1/2/3 Embedded + Clustered ACID SQL engine with 16 KiB Clustered B+Tree indexing, ARIES write-ahead logging, CLOCK LRU Buffer Pool (`3.560 µs` median warm point SELECT, `page_read = 0`), 64-entry Prepared Plan Cache, 10k-row direct streaming aggregates (`111.0 µs` `COUNT(*)`, `130.6 µs` `SUM(val)`), Group Commit (`100 tx → 1 fsync`), explicit MVCC (`BEGIN`/`COMMIT`/`ROLLBACK`/`SAVEPOINT`), Transparent Page Encryption (`YDE1`, AES-256-CTR + HMAC), Vector Search (Flat + HNSW), FTS BM25, PITR & CDC, Horizontal FNV-1a Sharding (`68.8 ns/route`), Online Schema Migrations, Native Binary JSONB (`YJB1`), WAL Streaming Replication, Raft-Lite HA, `pgwire v3` (`16.0 (YazaBase 1.1.0)`), official **YazaBase JDBC 4.2 Driver (`yazabase-jdbc-1.1.0.jar`)**, and `--export-request` mobile KV persistence (`std/db/yazabase_mobile_kv`).
+2. **YBIF Binary Format (`std/ybif` & `yazabase_result_encode_ybif`):** Deterministic binary wire format with 4-byte magic (`YBIF`), versioned header, and length-prefixed typed cells — direct C encoder runs **2.17× faster** & **24.6% smaller** than JSON across `20,000` × 16-row SQL batches (`8.255 ms`, `896 B` vs `17.947 ms`, `1,188 B`); scalar `std/ybif` runs **1.86× faster** & **31.9% smaller**.
 3. **PostgreSQL (`std/db/postgres` & `std/pg/transport`):** Pure YAZA client implementing PostgreSQL Wire Protocol v3, SCRAM-SHA-256 authentication with channel-binding support, native socket TLS (`SSLRequest` + `libcurl` TLS upgrade + loopback `getpeername` inspection), native 16-byte `CancelRequest`, and typed `DbValue` mapping.
 4. **MySQL (`std/db/mysql`):** Wire Protocol v10 client with `caching_sha2_password` scramble and command batching.
 5. **Microsoft SQL Server (`std/db/mssql`):** Tabular Data Stream (TDS) wire protocol with prelogin handshake and batch execution.
@@ -317,66 +318,55 @@ yazabase restore ./backups my_db ./data_restored
 
 ## Benchmarks
 
-Independent loopback benchmarks conducted on **18 November 2026** (macOS arm64, 10 logical CPUs, local TCP loopback `127.0.0.1`, 2,000 keep-alive requests across 3 randomized rounds, 0 failed requests):
+Full reproducible benchmarks conducted on **26 November 2026** (Apple M5, macOS 26.5 arm64, 10 logical CPUs, `YAZA LLVM 1.1.0 -O2`, 0 failed checks — [complete v1.1.0 report](docs/benchmarks/v1.1.0-2026-11-26.md)):
 
-### HTTP/1.1 Loopback Throughput (`GET /api/response`, 1-Item JSON, $c=8$)
+### Cloud-Native Microservice Comparison (6 Runtimes, Persistent DB + HMAC-SHA256)
 
-| Runtime | Requests / sec | Median Latency ($p50$) |
-| :--- | :--- | :--- |
-| **YAZA v1.0.0 (`-O2`)** | **93,854 req/s** | **78 µs** |
-| **Rust (`rustc -O`)** | 90,163 req/s | 84 µs |
-| **Node.js v26** | 88,488 req/s | 89 µs |
-| **Nim (`-d:release`)** | 86,253 req/s | 87 µs |
-| **Go 1.27.3** | 83,480 req/s | 87 µs |
-| **PHP 8.5** | 27,457 req/s | 291 µs |
-| **Python 3.14** | 18,950 req/s | 422 µs |
+Endpoints: `GET /healthz`, `GET /api/v1/quote` (math + HMAC-SHA256), `POST /api/v1/orders` (JSON parse + HMAC-SHA256), and `GET /api/v1/catalog?id=500` (10,000-row persistent embedded DB PK lookup: YazaBase vs SQLite 3):
 
-*At higher concurrency ($c=32$): Go achieves 111.9k req/s, Rust achieves 109.7k req/s, and YAZA sustains 102.8k req/s.*
+| Runtime | Quote + HMAC ($c=8$) | Quote + HMAC ($c=32$) | Order POST ($c=8$) | Embedded DB Lookup ($c=8$) | Peak RSS | Binary Size |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **YAZA v1.1.0 (`-O2`)** | `88,816 req/s` (`83 µs`) | **`116,072 req/s`** (`256 µs`) | `84,320 req/s` (`88 µs`) | `65,118 req/s` (`111 µs`) | `12.44 MiB` | `1,896.5 KB` |
+| **Rust 1.99 (`-O2`)** | `90,186 req/s` (`78 µs`) | `110,442 req/s` (`268 µs`) | `95,012 req/s` (`78 µs`) | `67,340 req/s` (`107 µs`) | `3.31 MiB` | `549.3 KB` |
+| **Go 1.27 (`net/http`)** | `84,732 req/s` (`86 µs`) | `113,342 req/s` (`239 µs`) | `85,553 req/s` (`85 µs`) | `67,784 req/s` (`104 µs`) | `20.97 MiB` | `9,192.0 KB` |
+| **Nim 2.2.12 (`-d:release`)** | `87,760 req/s` (`84 µs`) | `91,687 req/s` (`331 µs`) | `79,282 req/s` (`91 µs`) | `78,775 req/s` (`92 µs`) | `6.64 MiB` | `359.1 KB` |
+| **Node.js v26 (`node:http`)** | `82,882 req/s` (`92 µs`) | `85,969 req/s` (`321 µs`) | `70,056 req/s` (`106 µs`) | `71,155 req/s` (`89 µs`) | `79.45 MiB` | VM |
+| **Python 3 (`http.server`)** | `19,368 req/s` (`378 µs`) | `18,939 req/s` (`1,571 µs`) | `18,098 req/s` (`389 µs`) | `11,527 req/s` (`641 µs`) | `21.34 MiB` | VM |
 
-### Memory Footprint Under Load (200,000 Request Scopes)
+### HTTP/1.1 Loopback API (`GET /api/response`, 1-Item JSON, 26 Nov 2026)
 
-| Runtime | Peak RSS | Binary Size | Memory vs YAZA |
+| Runtime | $c=1$ req/s ($p50$) | $c=8$ req/s ($p50$) | $c=32$ req/s ($p50$ / $p99$) |
+| :--- | ---: | ---: | ---: |
+| **Rust (`rustc 1.99.1 -O`)** | `36,252` (`26 µs`) | `91,720` (`80 µs`) | `107,513` (`270 µs` / `796 µs`) |
+| **YAZA v1.1.0 (`-O2`)** | `26,406` (`36 µs`) | **`88,138`** (`85 µs`) | **`102,337`** (`273 µs` / `834 µs`) |
+| **Go (`go1.27.3`)** | `24,345` (`38 µs`) | `74,462` (`98 µs`) | `97,422` (`277 µs` / `1,086 µs`) |
+| **Node.js `v26.0.0`** | `26,499` (`36 µs`) | `74,560` (`98 µs`) | `77,820` (`346 µs` / `1,044 µs`) |
+| **Nim (`2.2.12 -d:release`)** | `27,360` (`35 µs`) | `75,984` (`94 µs`) | `76,637` (`384 µs` / `800 µs`) |
+| **PHP `8.5.6`** | `8,785` (`109 µs`) | `23,506` (`303 µs`) | `24,189` (`1,252 µs` / `2,085 µs`) |
+| **Python `http.server`** | `12,425` (`78 µs`) | `17,779` (`403 µs`) | `17,430` (`1,715 µs` / `4,115 µs`) |
+
+*On `POST /api/echo` ($c=8$): YAZA sustains **`87,414 req/s`** (`83 µs` $p50$), beating Go (`67,397`), Nim (`72,407`), and Node.js (`80,066`).*
+
+### Fullstack Arena-SSR ($c=8$, 26 Nov 2026)
+
+| Runtime / Footprint | Full SSR HTML | Hypermedia Fragment | JSON API (16 items) | Static CSS (200 / 304) | Peak RSS |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| **YAZA v1.1.0 (`246.8 KB` bin)** | `32,356 req/s` (`171 µs`) | **`68,557 req/s`** (`108 µs`) | **`79,362 req/s`** (`96 µs`) | `73,872` / `85,973 req/s` | **`7.13 MB`** |
+| **Go `1.27.3` (`12.18 MB` bin)** | `42,706 req/s` (`155 µs`) | `40,400 req/s` (`163 µs`) | `76,236 req/s` (`87 µs`) | `68,315` / `86,952 req/s` | `22.55 MB` (`3.2×`) |
+| **Node.js `v26.0.0` (V8)** | `38,571 req/s` (`177 µs`) | `41,212 req/s` (`173 µs`) | `77,751 req/s` (`75 µs`) | `71,633` / `83,706 req/s` | `73.47 MB` (`10.3×`) |
+
+### Data Science, Statistical Computing & SciPy Golden Cross-Validation (`std/data/*`, 26 Nov 2026)
+
+Executed via `scripts/bench-data-science.sh` and `scripts/validate-data-science.sh` on `darwin arm64` (Apple M5, `YAZA LLVM 1.1.0 -O2`, `debug`, and `ASan+UBSan`) comparing **YAZA v1.1.0 (`-O2` · `std/data/*`)** against **Python 3 (`stdlib`)** + 86-case SciPy golden fixtures (`tests/stdlib/data_science_golden.json`):
+
+| Workload | YAZA v1.1.0 (`-O2` · `std/data/*`) | Pure Python 3 (`stdlib`) | Speedup / Notes |
 | :--- | :--- | :--- | :--- |
-| **Nim (`-d:release`)** | 1.44 MB | 99 KB | $0.92\times$ |
-| **YAZA v1.0.0 (`-O2`)** | **1.56 MB** | **189.9 KB** | **Baseline ($1\times$)** |
-| **Rust (`rustc -O`)** | 1.59 MB | 472 KB | $1.02\times$ |
-| **Go 1.27.3** | 4.48 MB | 2.21 MB | $2.87\times$ |
-| **Python 3.14** | 8.30 MB | N/A (Interpreter) | $5.32\times$ |
-| **Node.js v26** | **53.09 MB** | N/A (V8 Engine) | **$34\times$ more RAM** |
-
-*Deterministic reclaim verification: 1,000,000 request scopes (`10 × 256 B`) reclaimed in **521.00 ms** at **1.59 MB** RSS.*
-
-### Fullstack Web & MVC (Arena-SSR, 19 Nov 2026)
-
-Reproducible **8-framework HTTP/1.1 SSR & Web benchmark** (`darwin arm64`, `c = 8`, isolated OS processes, 16 XSS-escaped rows + CSRF inputs + strict Web CSP + JSON API, 0 errors) comparing compiled **YAZA v1.0.0 native `view` Arena-SSR (`-O2`)** against Go, Node.js, Fastify, Express, PHP, React 19 SSR, and Next.js 16 Production SSR:
-
-| Framework / Runtime (`c = 8`) | Full SSR HTML (p50 · p95) | Fragment (`#task-board`) | JSON API (16 items) | Peak RSS | Cold Start | Footprint |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **YAZA v1.0.0 Arena-SSR (`-O2`, native `view`)** | **`29,024 req/s`** (`167 µs` · `326 µs`) | **`37,990 req/s`** (`123 µs` · `246 µs`) | `33,437 req/s` (`138 µs`) | **`3.17 MB`** | **`31.8 ms`** | **`208.4 KB` binary** |
-| **Go `1.27.3` (`net/http` + `html/template`)** | `28,743 req/s` (`162 µs` · `464 µs`) | `27,991 req/s` (`173 µs` · `442 µs`) | `41,848 req/s` (`107 µs`) | `22.05 MB` (`7.0×`) | `614.1 ms` | `12.18 MB` binary |
-| **Node.js `v26.0.0` (raw `node:http`)** | `27,430 req/s` (`182 µs` · `414 µs`) | `28,733 req/s` (`178 µs` · `359 µs`) | `38,894 req/s` (`96 µs`) | `73.86 MB` (`23.3×`) | `113.6 ms` | V8 runtime |
-| **Fastify `5.12.8` (Node.js v26)** | `25,295 req/s` (`202 µs` · `450 µs`) | `25,772 req/s` (`199 µs` · `415 µs`) | `39,740 req/s` (`105 µs`) | `86.44 MB` (`27.3×`) | `163.6 ms` | Node + `node_modules` |
-| **Express `5.3.0` (Node.js v26)** | `22,553 req/s` (`238 µs` · `530 µs`) | `22,492 req/s` (`239 µs` · `487 µs`) | `36,257 req/s` (`118 µs`) | `77.81 MB` (`24.5×`) | `136.3 ms` | Node + `node_modules` |
-| **PHP `8.5.6` (built-in server)** | `12,001 req/s` (`435 µs` · `854 µs`) | `13,425 req/s` (`366 µs` · `785 µs`) | `14,502 req/s` (`338 µs`) | `29.47 MB` (`9.3×`) | `136.0 ms` | PHP 8.5 runtime |
-| **React `19.3.1` SSR (`renderToString`)** | `6,304 req/s` (`1,006 µs` · `2,075 µs`) | `6,953 req/s` (`913 µs` · `1,830 µs`) | **`45,394 req/s`** (`75 µs`) | `140.75 MB` (`44.4×`) | `107.4 ms` | Node + React 19 |
-| **Next.js `16.4.6` Production SSR (`next start`)** | `4,473 req/s` (`1,386 µs` · `2,711 µs`) | — | `10,693 req/s` (`439 µs`) | `212.30 MB` (`67.0×`) | `197.2 ms` | `365 MB` `node_modules` + `.next` |
-
-*Static asset delivery (`20,158 B` YAZA UI v1.0 CSS): YAZA **`63,268 req/s`** (`200 OK`) & **`82,539 req/s`** (`304 ETag`).*
-
-See [docs/benchmarks/fullstack-ssr-2026-11-19.md](docs/benchmarks/fullstack-ssr-2026-11-19.md), `scripts/bench-web-frameworks.mjs`, and [yazastudios.id/benchmarks](https://yazastudios.id/benchmarks/#fullstack-ssr) for full methodology and reproduction steps.
-
-### Data Science, Statistical Computing & SciPy Golden Cross-Validation (`std/data/*`, 21 Nov 2026)
-
-Executed via `scripts/bench-data-science.sh` and `scripts/validate-data-science.sh` on `darwin arm64` (Apple M5, `-O2`, `debug`, and `ASan+UBSan`), comparing compiled **YAZA v1.0.2 (`-O2` · `std/data/*`)** against **NumPy `2.5.5` / SciPy `1.18.1` (vectorized C / Accelerate BLAS)** and **Pure Python `3.14.5` (`stdlib` / loops)**:
-
-| Workload | YAZA v1.0.2 (`-O2` · `std/data/*`) | NumPy `2.5.5` / SciPy `1.18.1` | Pure Python `3.14.5` | Notes |
-| :--- | :--- | :--- | :--- | :--- |
-| **Welford 4-Moment Stats (Mean, Var, Skew, Kurt · 1M pts)** | **`15.05 ms`** (1-pass Welford) | `16.52 ms` (`scipy.stats.describe`) · `1.10 ms` (raw array ops) | `284.41 ms` | **1.10× faster** than `scipy.stats.describe`; **18.9×** vs pure Python |
-| **Centered 1-Pass OLS Regression + $R^2$ (1M pts)** | **`8.62 ms`** (1-pass `ml_ols_fit`) | **`2.37 ms`** (`scipy.stats.linregress`) | `147.29 ms` | SciPy vectorized BLAS is 3.6× faster; YAZA is **17.1×** vs pure Python |
-| **Vector Z-Score + Sequential EWMA + Dot (100K pts)** | **`6.15 ms`** | `13.13 ms` (vector Z-score/dot + EWMA recurrence) | `14.19 ms` | **2.13× faster** than NumPy + Python recurrence |
-| **Silverman Gaussian KDE (5,000 obs × 64 grid = 320K evals)** | **`21.16 ms`** | **`3.74 ms`** (`gaussian_kde`) · **`1.92 ms`** (2D broadcast) | `21.46 ms` | NumPy/SciPy SIMD batch `exp` leads on 2D grid evaluation |
-| **Columnar DataFrame ETL (5,000-row CSV Parse + FillNA + Filter + GroupBy + Inner Join)** | **`4.21 ms`** (`2.67 ms` parse + `1.55 ms` ops) | — | `5.13 ms` (`3.71 ms` `csv.DictReader` + `1.42 ms` dict ops) | **1.22× faster** total ETL (**1.39× faster** CSV parse) |
-| **Process Peak RSS (Full Benchmark + DataFrame ETL)** | **`17.98 MiB`** (`18,857,984 B` · 0 GC) | `128.89 MB` (Python + NumPy/SciPy runtime) | `28.17 MB` | **7.2× lower RAM** than Python + NumPy/SciPy |
+| **Welford 4-Moment Stats (Mean, Var, Skew, Kurt · 1M pts)** | **`9.13 ms`** (1-pass Welford) | `342.65 ms` | **37.5× faster**; ill-conditioned var exact (`1`) vs `0.0` |
+| **Centered 1-Pass OLS Regression + $R^2$ (1M pts)** | **`6.97 ms`** (1-pass `ml_ols_fit`) | `161.74 ms` | **23.2× faster**; shifted OLS exact (`2`) vs `nan` |
+| **Vector Z-Score + Sequential EWMA + Dot (100K pts)** | **`4.36 ms`** | `16.03 ms` | **3.68× faster** |
+| **Silverman Gaussian KDE (320K evals)** | **`17.99 ms`** | `23.71 ms` | **1.32× faster** |
+| **Columnar DataFrame ETL (5,000-row CSV Parse + FillNA + Filter + GroupBy + Inner Join)** | **`3.84 ms`** (`2.44 ms` parse + `1.40 ms` ops) | `8.02 ms` (`4.98 ms` parse + `3.04 ms` ops) | **2.09× faster** total ETL |
+| **Process Peak RSS (Full Suite + DataFrame ETL)** | **`18.02 MiB`** (`18,890,752 B` · 0 GC) | `31.88 MB` | **1.77× lower RAM** · 86/86 SciPy golden PASS (`qnorm max_rel_err=2.10e-15`) |
 
 #### Automated 86-Case SciPy `1.18.1` Golden Cross-Validation (`tests/stdlib/data_science_golden.json`)
 
@@ -401,28 +391,26 @@ sh scripts/validate-data-science.sh
 sh scripts/bench-data-science.sh
 ```
 
-### Post-Audit Ecosystem Benchmarks (21 Nov 2026 · Apple M5 · macOS 26.5 arm64)
+### Full Ecosystem Summary (`26 Nov 2026` · `YAZA LLVM 1.1.0` · Apple M5 arm64)
 
-Full reproducible audit measurements across the compiled toolchain (`YAZA LLVM 1.0.2`), Arena runtime, Arena-SSR, internal multi-route Content SSR workload, YazaBase SQL + YBIF, and the Mobile C ABI Engine ([full report](docs/benchmarks/audit-2026-11-21.md)):
+Full reproducible measurements across the `YAZA LLVM 1.1.0` toolchain, Arena runtime, Microservice, Arena-SSR, Core, Search, YazaBase Tier 1/2/3 + YBIF, Data Science, and Mobile C ABI ([full report](docs/benchmarks/v1.1.0-2026-11-26.md)):
 
 | Subsystem | Measured Result (`-O2`) | Latency (`p50` / `p95`) | Memory / Artifact Footprint |
 | --- | --- | --- | --- |
-| **Arena 1M Scope Cycles** | **`38,064,786 scopes/sec`** (`26.27 ms`) | `26.27 ns/scope` | **`1.44 MiB`** Peak RSS · `0 B` retained |
-| **Multi-Worker Soak (200K reqs, 8 workers)** | **`4,023,821 req/sec`** (`0.050 s`) | `1.00 µs` / `4.00 µs` | `1.4 -> 4.8 MiB` RSS · `0` errors |
-| **Arena-SSR Full HTML / JSON API (`c=8`)** | **`53,668`** HTML · **`69,571`** JSON req/s | `142 µs` / `113 µs` (`p50`) | **`7.05 MB`** RSS · `246.4 KB` binary |
-| **Internal Content SSR App (114-section / 6,236-record, `c=8`)** | `1,337` SSR · `5,951` Frag · `3,488` JSON req/s | `5.72 ms` · `1.20 ms` · `2.03 ms` | `218.2 MiB` plateau · `448.6 KB` binary |
-| **Data Science (1M Welford / 1M OLS vs Pure Python)** | **`5.28 ms`** / **`4.99 ms`** (**68.8×** / **35.4×** pure Python) | `15.36 ms` KDE (320K) | **`9.75 MiB`** RSS · Neumaier/Welford default |
-| **YazaBase Warm Point `SELECT` (CLOCK LRU + Plan Cache)** | **`3.57 µs` median** (`3.49 µs` min · `page_read = 0`) | `3.57 µs` / `3.71 µs` | 0 disk reads · 64-entry plan cache |
-| **YazaBase 10k-Row Analytical Full Scan (`COUNT(*)` / `SUM`)** | **`111 µs`** `COUNT(*)` · **`130 µs`** `SUM(val)` | **27.4×** / **21.4×** faster | Surpasses PostgreSQL (`~265 µs`) & matches SQLite (`~107 µs`) |
-| **YazaBase Batch DML (`INSERT` 10×50 / `UPDATE` / `DELETE`)** | **`0.85 ms` p50/50** · **`40.7k`** upd/s · **`47.3k`** del/s | `100 tx → 1 fsync` Group Commit | Raft-Lite HA · WAL Streaming Replication · `pgwire v3` |
-| **YBIF Binary Format (`yazabase_result_encode_ybif`)** | **`3.26M`** scalar/s (`6.22×`) · **`2.59M`** batch/s (`2.13×`) | vs JSON encode+decode | 31.9% smaller scalar · 24.6% smaller SQL |
-| **Mobile Native Engine C ABI (`1 B` / `1 KiB` / `32 KiB`)** | **`6.05M`** / **`1.37M`** / **`52.2K ops/s`** | `0.166 µs` / `0.708 µs` / `19.75 µs` | **`190 KB`** Android `.so` · **`237 KB`** iOS `.a` |
+| **Core (7 Workloads) & 5M Binary Search** | **`6.136 ms`** Core mean · **`97.224 ms`** Search (`ListView`) | Core beats Rust `6.234 ms` | Search beats C/Rust noinline, Nim, Go |
+| **Arena 1M Scope Cycles & 200K Soak** | **`29.57M scopes/s`** (`33.82 ns`) · **`4.52M req/s`** soak | `1.00 µs` / `3.00 µs` soak | **`1.422 MiB`** RSS · `0 B` retained · 11/11 gates |
+| **Cloud-Native Microservice (`c=8` / `c=32`)** | **`88,816`** / **`116,072 req/s`** Quote+HMAC · **`65,118`** DB | `83 µs` (`c=8`) · `256 µs` (`c=32`) | **`12.44 MiB`** RSS (vs Node `79.45 MiB`) |
+| **Fullstack Arena-SSR (`c=8`)** | **`68,557`** Frag · **`79,362`** JSON · **`32,356`** SSR req/s | `108 µs` / `96 µs` / `171 µs` | **`7.13 MB`** RSS · `246.8 KB` binary |
+| **YazaBase Warm Point `SELECT` & 10k Scans** | **`3.560 µs`** PK · **`111.0 µs`** `COUNT(*)` · **`130.6 µs`** `SUM` | `0` disk reads · `16.50 MiB` RSS | Embedded INSERT `3.151 ms` p50 (**16×** vs v1.0.2) |
+| **YazaBase vs SQLite 3 / PG 18 & Tier 1/2/3** | **`0.022 ms`** PK · **`0.188 ms`** SUM · **`68.8 ns`** Shard | **1.4×** PK & **1.3×** Scan vs PG 18 | Crypto `YDE1` `399.5 µs`/pg · FTS `8.5 µs`/q · JSONB |
+| **YBIF Binary Format vs JSON (`20k×`)** | Direct C **`8.255 ms`** (`2.17×`) · Scalar **`6.432 ms`** (`1.86×`) | vs JSON `17.947 ms` / `11.978 ms` | **24.6% smaller** SQL (`896 B`) · **31.9%** scalar (`49 B`) |
+| **Mobile Native Engine C ABI (`1 B` / `1 KiB` / `32 KiB`)** | **`4.70M`** init · **`3.46M`** / **`1.24M`** / **`61.8K ops/s`** | `0.167 µs` / `0.291 µs` / `0.792 µs` / `15.83 µs` | **`2.188 MiB`** RSS · Android `217 KB` · iOS `293 KB` |
 
 ---
 
 ## Security & Verification
 
-YAZA v1.0.0 enforces **11 out of 11 verified safety gates** in continuous integration:
+YAZA `v1.1.0` enforces **11 out of 11 verified safety gates** across CI and host sanitizer suites (`11/11 PASS` on `2026-11-26`):
 
 1. **ThreadSanitizer (`TSan`):** 200,000 concurrent request scopes across 8 async worker threads completed with **0 data races** (`scripts/validate-runtime-v1-sanitizers.sh`).
 2. **AddressSanitizer (`ASan`):** 100% of use-after-free and dangling pointer attempts trapped via deterministic arena-reset poisoning.

@@ -70,7 +70,7 @@ YB_STAGE="$DIST_DIR/yazabase-$VERSION-$PLATFORM"
 rm -rf "$YAZA_STAGE" "$YB_STAGE"
 
 mkdir -p "$YAZA_STAGE/bin" "$YAZA_STAGE/runtime/src" \
-  "$YAZA_STAGE/runtime/include" "$YAZA_STAGE/std" "$YAZA_STAGE/templates" \
+  "$YAZA_STAGE/runtime/include" "$YAZA_STAGE/std" "$YAZA_STAGE/yazabase" "$YAZA_STAGE/templates" \
   "$YAZA_STAGE/include" "$YAZA_STAGE/lib" "$YAZA_STAGE/bindings" \
   "$YAZA_STAGE/share/yaza/providers/argon2/include" \
   "$YAZA_STAGE/share/yaza/providers/argon2/lib"
@@ -89,6 +89,7 @@ cp "$PROJECT_DIR/runtime/watch-run.sh" "$YAZA_STAGE/runtime/"
 cp "$ARGON2_ROOT/include/argon2.h" "$YAZA_STAGE/share/yaza/providers/argon2/include/"
 cp "$ARGON2_ROOT/lib/libargon2.a" "$YAZA_STAGE/share/yaza/providers/argon2/lib/"
 cp -R "$PROJECT_DIR/std/." "$YAZA_STAGE/std/"
+cp -R "$PROJECT_DIR/yazabase/." "$YAZA_STAGE/yazabase/"
 cp -R "$PROJECT_DIR/templates/." "$YAZA_STAGE/templates/"
 cp -R "$PROJECT_DIR/bindings/." "$YAZA_STAGE/bindings/"
 cp "$PROJECT_DIR/README.md" "$YAZA_STAGE/"
