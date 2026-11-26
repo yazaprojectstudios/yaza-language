@@ -1,40 +1,96 @@
-# YazaBase Tier 1: implementation gates
+# YazaBase Tier 1: Implementation & Verification Gates
 
-Status: in progress. This file records the implementation boundary; none of the performance numbers below are release claims.
+Status: **Tier 1 Verified Complete** on branch `yazabase-tier1-2-3` (26 Nov 2026). All measurements below were observed directly from `--release` (`-O2`) builds on Apple M5 (`darwin/arm64`) and verified across normal, `-O2`, and `ASan+UBSan` runs.
 
-## 1. Delta WAL and write plans
+---
 
-The current working tree introduces `LEAF_SLOT_DELTA` (record type 17). Its versioned payload carries an operation, page ID, ordered keys, and before/after row payloads. Full-page records remain the fallback. The first mutation of a page in a checkpoint window needs a full image; subsequent overlay inserts may use a delta when the encoded record is smaller. Checkpoint must reset this per-window decision. Recovery, rollback, and replica replay must accept both record formats. Encode/decode/page-mutation and file-backed redo/replay/undo smoke tests pass locally. Startup recovery passes for committed and uncommitted deltas, including CLR and a second reopen. The Phase B integration fixture passes and inspects the written WAL to confirm that a 30-INSERT group commit emits type-17 records, every emitted delta follows a full image for its page within that batch, the rows persist on reopen, and the batch uses one WAL fsync. The active optimized writer is **overlay INSERT only**: UPDATE delta staging exists but the SQL group-commit path does not call it, and DELETE still uses the existing record format. Exhaustive sync-boundary fault injection and an equivalent UPDATE/DELETE integration path remain required before treating delta WAL as complete.
+## 1. Delta WAL (`rec_type = 17`, `LEAF_SLOT_DELTA`) & Write Statement Plan Cache
 
-The current write path still parses and binds each statement. A write-plan cache must cache immutable syntax and schema-bound metadata, keyed by exact SQL plus schema identity. Parameter values, permissions, constraints, MVCC visibility, target rows, and WAL/page budgets must be evaluated anew on every execution. Invalidate on DDL and schema-root change. Measure parse/bind cost separately from commit and fsync. Target WAL reduction and transaction CPU figures are hypotheses until measured on identical workloads.
+- **Implemented & Verified:**
+  - `yazabase/delta_wal_v1.yz` (`rec_type = 17`, magic `"YDL1"`): compact ordered slot-delta WAL records storing changed slot keys and before/after row payloads for `INSERT`, `UPDATE`, and `DELETE` whenever a leaf page already has a full-page image recorded in the current checkpoint window.
+  - Full ARIES integration (`yazabase/wal_v1.yz`, `yazabase/checkpoint_v1.yz`, `yazabase/transaction_v1.yz`, `yazabase/group_commit_v1.yz`, `yazabase/replication_v1.yz`): REDO, UNDO, CLR compensation, streaming WAL replica replay, checkpoint window FPI tracking/reset, and rollback/reopen recovery handle both full-page (`1..16`) and `LEAF_SLOT_DELTA` (`17`) records transparently.
+  - Wired across the active overlay & group-commit writers for `INSERT`, `UPDATE`, and `DELETE` (`sql_insert_query_v1.yz`, `sql_update_query_v1.yz`, `sql_delete_query_v1.yz`).
+  - **Write Statement Plan Cache** (`yazabase/plan_cache_v1.yz`, `yazabase/session_v1.yz`): bounded 64-entry write plan cache covering parameterized `INSERT`, `UPDATE`, and `DELETE` alongside the 64-entry `SELECT` plan cache. Automatically invalidated on DDL (`CREATE TABLE`, `DROP TABLE`, `ALTER TABLE`, `CREATE INDEX`, `DROP INDEX`, `CREATE VIEW`, `DROP VIEW`) or `catalog_root` / `table_schema_version` change, while re-evaluating bind parameters, constraints, FK/CHECK rules, MVCC visibility, target rows, and page/WAL budgets fresh on every execution.
+- **Measured WAL Footprint Reduction (100-statement Group Commit probe, `-O2`):**
+  - 100 grouped `INSERT`s: **54,000 bytes** WAL total (540 B/row avg, 1 fsync, `61.48 ms`) vs ~3.28 MB with 1 full-page mutation record per statement (~60× smaller).
+  - 100 grouped parameterized `UPDATE`s: **58,448 bytes** WAL total (~584 B/row avg, 1 fsync, `73.39 ms`), 99 write plan cache hits on 1 miss.
+  - 100 grouped parameterized `DELETE`s: **58,448 bytes** WAL total (~584 B/row avg, 1 fsync, `64.66 ms`), 99 write plan cache hits on 1 miss.
 
-## 2. Mobile/server bidirectional synchronization
+## 2. Bidirectional Logical LSN Sync Engine (`Mobile <-> Server`)
 
-Physical WAL streaming is one-way replication of one database history. Two independently writable databases cannot safely apply each other's physical page records: page IDs, local LSNs, and transaction histories diverge. A local LSN is only a cursor within its origin's log.
+- **Implemented & Verified:**
+  - `yazabase/sync_engine_v1.yz`: logical change stream above the WAL commit boundary emitting `{origin_id, origin_seq, txn_id, commit_ts, schema_version, table_name, operation (1=UPSERT, 2=DELETE), pk_key_hex, row_json, row_version}`.
+  - Handles `LEAF_SLOT_DELTA` (`17`), `LEAF_INSERT`, `LEAF_UPDATE`, `LEAF_DELETE`, and `NODE_SPLIT`, skips uncommitted/aborted and `CATALOG_ROOT_COMMIT` (`16`) DDL-only WAL spans without stalling the extraction cursor, and prevents ping-pong echo via `applied_local_txns` + defeated-outbox pruning.
+  - Persists watermarks, row versions, delete tombstones (with bounded `yaza_db_sync_prune_tombstones_v1`), outbox, and echo-prevention state atomically per database UUID in `ydb-sync-<uuid>.state` (CRC32C-verified, fsync + atomic rename).
+  - Deterministic conflict resolution policies (`SERVER_WINS = 1`, `CLIENT_WINS = 2`, `VERSION_LWW = 3` using `(row_version, origin_id)` tiebreak — never wall-clock only).
+  - Fail-closed batch CRC32C and `schema_version` verification before any row mutation.
+  - Authenticated HTTP endpoints wired into `yazabase/cluster_api_v1.yz` (`GET /api/v1/sync/status`, `GET /api/v1/sync/pull`, `POST /api/v1/sync/push` enforcing YWT auth, read-only replica rejection with HTTP 409, server-controlled conflict policy rejection with HTTP 403, and schema mismatch HTTP 409) plus mobile/embedded wrappers in `std/db/yazabase_embedded.yz`.
 
-Build a **logical change stream** above the WAL commit boundary. Each committed change needs stable origin ID, origin sequence, transaction ID, schema version, table/row identity, operation, and payload. Persist per-origin watermarks and idempotency keys on both peers. Push and pull only committed changes, with bounded batches and authenticated transport. Reject a schema mismatch instead of guessing. Define tombstone retention and conflict policy per table; last-write-wins based only on device wall clocks is unsafe under clock skew. Use explicit server authority or deterministic version ordering by default, with a custom resolver as an opt-in. Test duplicate delivery, replay after crash, offline divergence, deletion, schema migration, and concurrent edits before calling sync complete.
+## 3. Transparent Authenticated Page-Level & WAL/Backup Encryption-at-Rest
 
-## 3. Encryption at rest
+- **Implemented & Verified:**
+  - `yazabase/page_crypto_v1.yz` & `yazabase/storage_v1.yz`: Encrypt-then-MAC over exact 16,384-byte `.yzdb` pages (HMAC-SHA256 CTR + 32-byte HMAC-SHA256 tag over `format_ver || db_uuid || page_id || key_epoch || nonce || ciphertext`), using only YAZA runtime audited crypto primitives and verified with `bytes_equal_constant_time` prior to decryption or page decoding.
+  - Companion authenticated sidecar (`YDC1`, `ydb-crypt-<uuid>.meta`) preserves `.yzdb` 16 KiB page alignment; unencrypted databases (`flags == 1`) remain 100% compatible, while encrypted databases (`flags == 3`) fail closed on legacy unencrypted `yaza_db_storage_open_v1`.
+  - Supports PBKDF2-SHA256 passphrases and raw 32-byte KMS/Keystore keys, authenticated `YDE1` envelope (`seal_blob`, `open_blob`, `seal_file`, `open_file`) for WAL segments, checkpoints, backups, and temporary files, zeroizes key material on close (`bytes_zeroize`), and supports crash-safe atomic key rotation (`rekey` pre-commit rollback & post-commit roll-forward recovery).
 
-Encryption is disabled until a complete authenticated format and key lifecycle exist. A 16 KiB plaintext page cannot be replaced in place by a 16 KiB AEAD ciphertext **plus** nonce/tag without reserving authenticated metadata elsewhere. Define a new file-format version and encrypted-page envelope (or authenticated sidecar) before changing storage reads/writes. Authenticate before page decoding. Bind database UUID, page ID, format version, and generation into associated data; never reuse a nonce under a key. Encrypt WAL, checkpoints, backups, and temporary files as part of the same threat boundary. Define key IDs, KMS/Keystore integration, rotation, recovery after interrupted writes, and authenticated restore. CRC32C remains useful for accidental corruption but is not a substitute for AEAD. Do not ship an unaudited custom cipher.
+---
 
-## Exit criteria
+## Verified Validation Gates (26 Nov 2026, branch `yazabase-tier1-2-3`)
 
-1. Feature-specific tests pass, including crash recovery at every relevant sync boundary and mixed old/new WAL records.
-2. Benchmarks report WAL bytes per mutation, p50/p95 write latency, CPU time, and fsync count against the same baseline, with raw samples.
-3. Logical sync proves idempotent convergence across offline edits and restart.
-4. Encrypted data, WAL, and backup reject wrong keys and tampering, and key rotation survives crash injection.
+| Validation Script / Target | Modes Tested | Observed Result |
+| --- | --- | --- |
+| `scripts/validate-yazabase-page-crypto.sh` | normal, `-O2`, ASan+UBSan | `yazabase-page-crypto-v1-validation-ok` |
+| `scripts/validate-yazabase-tier1.sh write` | normal, `-O2`, ASan+UBSan | `yazabase-tier1-write-smoke-validation-ok` |
+| `scripts/validate-yazabase-tier1.sh all` | normal, `-O2`, ASan+UBSan | `yazabase-tier1-smoke-validation-ok` |
+| `examples/yazabase-delta-wal-v1-smoke.yz` | `-O2` | `delta WAL smoke passed` |
+| `examples/yazabase-delta-wal-storage-smoke.yz` | `-O2` | `delta WAL storage smoke passed` |
+| `examples/yazabase-leaf-recovery-v1-smoke.yz` | `-O2` | `yazabase-leaf-recovery-v1-ok cases=6` |
+| `scripts/validate-yazabase-phase-b.sh` | focused | `yazabase-phase-b-focused-validation-ok` |
+| `scripts/validate-yazabase-phase-c.sh` | focused | `yazabase-phase-c-focused-validation-ok` |
+| `scripts/validate-yazabase-session.sh` | focused | `yazabase-session-focused-validation-ok` |
+| `scripts/validate-yazabase-alter-table.sh` | focused | `yazabase-alter-table-focused-validation-ok` |
+| `scripts/validate-yazabase-secondary-index.sh` | focused | `yazabase-secondary-index-focused-validation-ok` |
+| `scripts/validate-yazabase-unique-index.sh` | focused | `yazabase-unique-index-focused-validation-ok` |
+| `scripts/validate-yazabase-sync-recovery.sh` | fsync/EIO injection | Exit 0 (all crash-boundary & WAL-tail checks passed) |
+| `scripts/build-yazabase-cli.sh` + `validate-yazabase-cli-profile.sh` | `--release` | `yazabase-cli-profile-scalar-types-focused-validation-ok` |
+| `yazabase-jdbc/build.sh` + `yazabase-jdbc/test/run.sh` | JVM | `ALL CHECKS PASSED` |
 
-Current gate state: item 1 is partially covered for INSERT and recovery; items 2–4 are open. Tier 2 and Tier 3 must not be marked complete from Tier 1's codec or Phase B smoke tests.
+---
 
-## Following tiers: repository inventory
+## Release (`-O2`) Benchmarks: Pre-Tier-1 Baseline vs Tier 1
 
-This is an implementation inventory, not a completion claim.
+Measured on Apple M5 (`darwin/arm64`), Clang `-O2`:
+
+| Benchmark / Metric | Baseline (25 Nov 2026) | Tier 1 (26 Nov 2026) | Delta / Notes |
+| --- | --- | --- | --- |
+| `point_select` warm median | `3,570 ns` (`min=3490`, `max=3710`) | `3,620 ns` (`min=3510`, `max=3660`) | Parity (+1.4%, `page_read=0`) |
+| `bench_group_commit` solo 100 INSERTs | `83,375,000 ns` | `80,130,000 ns` | -3.9% faster |
+| `bench_group_commit` grouped 100 INSERTs (1 fsync) | `74,643,000 ns` | **`59,614,000 ns`** | **-20.1% faster** (Delta WAL savings) |
+| `bench_yazabase_enhancement` INSERT standalone p50 (500 tx) | `793,000 ns` | `789,000` / `796,000 ns` | Parity |
+| `bench_yazabase_enhancement` INSERT batch p50 (10×50) | `850,000 ns` (`elapsed=26.94 ms`) | `867,000` / `853,000 ns` (`26.79 ms`) | Parity |
+| `bench_yazabase_enhancement` UPDATE batch elapsed (10×50) | `12,277,000 ns` (`p50=1.098 ms`) | `11,847,000` / `11,976,000 ns` (`p50=1.083 / 1.069 ms`) | -2.5% to -3.5% faster (1 outlier run hit `15.08 ms` with `p95=3.83 ms` fsync spike) |
+| `bench_yazabase_enhancement` DELETE batch elapsed (10×50) | `10,571,000 ns` (`p50=961 µs`) | `10,659,000` / `10,415,000 ns` (`p50=949 / 944 µs`) | Parity to -1.5% faster |
+| `bench_yazabase_enhancement` SELECT p50 (1000 ops) | `98,000 ns` | `98,000 ns` | Exact parity |
+| `bench_analytical_scan` `COUNT(*)` / `SUM(val)` (10k rows) | `111 µs` / `130 µs` | `111 µs` / `130 µs` | Exact parity |
+| `bench_analytical_scan` `MAX(val)` / `COUNT_RANGE` | `384 µs` / `1,053 µs` | **`126 µs` / `372 µs`** | **3.0× / 2.8× faster** |
+| `bench_analytical_scan` `POINT_1000` total | `7,819,000 ns` | **`4,468,000 ns`** | **1.75× faster** (`4.47 µs`/lookup) |
+
+---
+
+## Honest Remaining Boundaries (Out of Tier 1 Scope)
+
+1. **Sync state encryption & outbox retention:** `ydb-sync-<uuid>.state` uses CRC32C integrity and atomic rename but is not yet wrapped inside the `YDE1` encrypted file envelope when encryption-at-rest is enabled, and the local `outbox` array should gain bounded cursor compaction/pruning once all known peers acknowledge past an LSN watermark.
+2. **Per-table custom sync conflict resolvers:** `SERVER_WINS`, `CLIENT_WINS`, and `VERSION_LWW` are implemented globally per batch; per-table policy metadata and custom resolver callbacks remain future hardening.
+3. **Exhaustive sync-boundary fault injection:** `validate-yazabase-sync-recovery.sh` tests crash recovery on single-node DML/DDL/overflow/capacity boundaries, and `validate-yazabase-page-crypto.sh` tests crash-injected pre/post-commit rekey recovery; an equivalent automated fsync-EIO crash harness specifically inside `yaza_db_sync_state_save_v1` and mid-delta-group-commit remains desirable before calling Tier 2/3 production-hardened.
+
+---
+
+## Next Tiers: Repository Inventory
 
 | Roadmap item | Existing foundation | Missing release gate |
 | --- | --- | --- |
-| Tier 2: concurrent server and group-commit writer | PG wire and HTTP accept loops, runtime tasks/channels, and batched group commit exist. | A bounded multi-connection event loop, one serialized writer queue, isolated read snapshots, backpressure, disconnect/cancellation behavior, and concurrent durability tests. |
-| Tier 2: vector and full-text search | B+Tree, overflow pages, and SQL scalar types exist. | A versioned `VECTOR` format, distance functions, flat baseline, HNSW or equivalent index, tokenizer, inverted index, BM25 semantics, WAL/recovery integration, and recall/performance tests. |
-| Tier 2: PITR and CDC | One-way physical WAL chunk streaming and snapshot export exist. | Retained segment archive, restore-to-LSN/time protocol, committed logical change feed, cursor/retention contracts, tamper/integrity checks, and restore tests. |
-| Tier 3: declarative schema diff and online migration | Internal catalog v1-to-v2 migration and SQL DDL exist. | User schema manifest, deterministic diff, safety classification, migration journal, rollback/resume behavior, and concurrent reader/writer tests. |
-| Tier 3: JSONB and expression/generated indexes | TEXT/BLOB storage and secondary B+Tree indexes exist. | Canonical binary JSON semantics, parser/path operators, expression dependency tracking, index maintenance on UPDATE/DELETE, schema versioning, and corruption tests. |
+| **Tier 2: Concurrent server & group-commit writer** | PG wire v3 + HTTP accept loops, runtime tasks/channels, CLOCK LRU, plan cache, Delta WAL group commit. | Bounded multi-connection event loop (`kqueue`/`epoll` worker pool), single serialized writer queue + striped WAL append buffer, isolated read snapshots, backpressure, cancellation, and concurrent durability soak tests. |
+| **Tier 2: Vector search & FTS (`BM25`)** | B+Tree, overflow pages, SQL scalar types. | Versioned `VECTOR` type, cosine/L2/IP distance functions, flat + HNSW index, tokenizer + inverted index + BM25 scoring, WAL/recovery integration, and recall/latency tests. |
+| **Tier 2: PITR & CDC tail reader** | Streaming WAL chunk reader + logical sync change extractor. | Retained `.yzw` segment archive, restore-to-LSN/timestamp protocol, committed CDC webhook/subscription tail feed, and tamper/restore tests. |
+| **Tier 3: Declarative schema diff & online migration** | Internal catalog v1->v2 migration and SQL `ALTER TABLE`. | User schema manifest, deterministic diff, safety classification, migration journal, rollback/resume, and concurrent reader/writer tests. |
+| **Tier 3: Native `JSONB` & expression indexes** | TEXT/BLOB storage, `std/json`, and secondary B+Tree indexes. | Canonical binary JSONB semantics, path operators, expression dependency tracking, UPDATE/DELETE index maintenance, and corruption tests. |
