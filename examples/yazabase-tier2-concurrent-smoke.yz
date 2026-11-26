@@ -1,0 +1,269 @@
+# Tier 2.1 Concurrent Engine Validation:
+# 1. Atomic/Striped WAL Ring Buffer (4 parallel producer threads -> 1 fsync sweep + backpressure)
+# 2. 16-Stripe CLOCK LRU Buffer Pool (4 parallel reader threads, exact hit/miss accounting)
+# 3. Concurrent Coalescing Group Commit Pipeline (4 parallel writers + backpressure)
+# 4. Multi-Worker HTTP Server + Concurrent Read & Write SQL clients
+
+use "std/async"
+use "std/fs"
+use "std/http"
+use "std/net"
+use "std/sync"
+use "std/time"
+use "std/ywt"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/concurrent_engine_v1"
+use "../yazabase/page_v1"
+use "../yazabase/session_v1"
+use "../yazabase/sql_executor_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/wal_v1"
+
+fn t2c_expect(cond: Boolean, label: Text) -> Result[Boolean, Text]:
+    if not cond:
+        return err("tier2-concurrent failed: " + label)
+    return ok(true)
+
+async fn t2c_ring_producer_task(ring: YazaDbWalRingBufferV1, worker_id: Number, count: Number) -> Number:
+    var ok_cnt: Number = 0
+    var i: Number = 0
+    while i < count:
+        let msg: Bytes = bytes_from_text("wal-w" + number_text(worker_id) + "-i" + number_text(i) + ";")
+        let app: Result[YazaDbWalRingAppendResultV1, Text] = yaza_db_wal_ring_reserve_and_append_v1(ring, msg)
+        if result_is_ok(app):
+            set ok_cnt = ok_cnt + 1
+        set i = i + 1
+    return ok_cnt
+
+async fn t2c_cbuf_reader_task(pool: YazaDbConcurrentBufferPoolV1, db_uuid: Bytes, start_pid: Number, pid_count: Number, iters: Number) -> Number:
+    var hits: Number = 0
+    var i: Number = 0
+    while i < iters:
+        let pid: Number = start_pid + (i % pid_count)
+        let got: Option[YazaDbValidatedPageV1] = yaza_db_cbuf_get_v1(pool, 7, db_uuid, pid)
+        if option_is_some(got):
+            set hits = hits + 1
+        set i = i + 1
+    return hits
+
+async fn t2c_concurrent_writer_task(engine: YazaDbConcurrentEngineV1, worker_id: Number, count: Number) -> Number:
+    var ok_cnt: Number = 0
+    var i: Number = 0
+    while i < count:
+        let row_id: Number = worker_id * 100 + i + 1
+        let sql: Text = "INSERT INTO ct_items (id, val, tag) VALUES (" + number_text(row_id) + ", " + number_text(row_id * 10) + ", 'w" + number_text(worker_id) + "')"
+        let wr: Result[YazaDbGroupCommitItemResultV1, Text] = yaza_db_concurrent_submit_write_v1(engine, sql, List[YazaSqlValueV1]())
+        if result_is_ok(wr):
+            set ok_cnt = ok_cnt + 1
+        set i = i + 1
+    return ok_cnt
+
+async fn t2c_concurrent_reader_task(engine: YazaDbConcurrentEngineV1, count: Number) -> Number:
+    var ok_cnt: Number = 0
+    var i: Number = 0
+    while i < count:
+        let rr: Result[YazaSqlQueryResultV1, Text] = yaza_db_concurrent_execute_read_v1(engine, "SELECT COUNT(*) FROM ct_items", List[YazaSqlValueV1]())
+        if result_is_ok(rr):
+            set ok_cnt = ok_cnt + 1
+        set i = i + 1
+    return ok_cnt
+
+async fn t2c_http_server_pair_task(eng: YazaDbConcurrentEngineV1, server_sock: Number, auth_secret: Text) -> Boolean:
+    let hc_res: Result[Boolean, Text] = yaza_db_concurrent_handle_http_client_v1(eng, server_sock, auth_secret)
+    let _cl: Result[Boolean, Text] = tcp_close(server_sock)
+    return result_is_ok(hc_res)
+
+async fn t2c_http_client_pair_task(client_sock: Number, token: Text, client_id: Number) -> Boolean:
+    let row_id: Number = 500 + client_id
+    let body: Text = "{\"sql\":\"INSERT INTO ct_items (id, val, tag) VALUES (" + number_text(row_id) + ", 777, 'http')\"}"
+    let req_txt: Text = "POST /api/v1/sql HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer " + token + "\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: " + number_text(text_length(body)) + "\r\n\r\n" + body
+    let wr: Result[Number, Text] = tcp_write(client_sock, bytes_from_text(req_txt), 3000)
+    if not result_is_ok(wr):
+        say "hc write fail: " + result_unwrap_error(wr)
+        let _cl0: Result[Boolean, Text] = tcp_close(client_sock)
+        return false
+    var resp_txt: Text = ""
+    var reads: Number = 0
+    while reads < 8:
+        let resp_res: Result[Bytes, Text] = tcp_read(client_sock, 8192, 5000)
+        if not result_is_ok(resp_res):
+            break
+        let chunk: Bytes = result_unwrap(resp_res)
+        if bytes_length(chunk) == 0:
+            break
+        set resp_txt = resp_txt + bytes_to_text(chunk)
+        if text_find(resp_txt, "\"affected_rows\":1") >= 0:
+            break
+        set reads = reads + 1
+    let _cl1: Result[Boolean, Text] = tcp_close(client_sock)
+    let ok_http: Boolean = text_find(resp_txt, "200 OK") >= 0 and text_find(resp_txt, "\"affected_rows\":1") >= 0
+    if not ok_http:
+        say "hc unexpected resp: " + resp_txt
+    return ok_http
+
+fn t2c_check_ok(r: Result[Boolean, Text]) -> Unit:
+    if not result_is_ok(r):
+        say "yazabase-tier2-concurrent-smoke: FAIL: " + result_unwrap_error(r)
+        exit(1)
+
+fn t2c_unwrap_num(r: Result[Number, Text], label: Text) -> Number:
+    if not result_is_ok(r):
+        say "yazabase-tier2-concurrent-smoke: FAIL at " + label + ": " + result_unwrap_error(r)
+        exit(1)
+    return result_unwrap(r)
+
+fn t2c_unwrap_bool(r: Result[Boolean, Text], label: Text) -> Boolean:
+    if not result_is_ok(r):
+        say "yazabase-tier2-concurrent-smoke: FAIL at " + label + ": " + result_unwrap_error(r)
+        exit(1)
+    return result_unwrap(r)
+
+start:
+    if arg_count() < 1:
+        say "usage: yazabase-tier2-concurrent-smoke <dir>"
+        exit(2)
+    let base_dir: Text = arg(1)
+
+    # 1. WAL Ring Buffer test (4 concurrent producers -> 1 single flush + backpressure)
+    let root_r: Number = result_unwrap(root_open(base_dir + "/ring"))
+    let wal_fd: Number = result_unwrap(create_exclusive(root_r, "ring.yzw"))
+    let ring: YazaDbWalRingBufferV1 = result_unwrap(yaza_db_wal_ring_new_v1(128, 0))
+    let rt1: Task[Number] = spawn t2c_ring_producer_task(ring, 1, 25)
+    let rt2: Task[Number] = spawn t2c_ring_producer_task(ring, 2, 25)
+    let rt3: Task[Number] = spawn t2c_ring_producer_task(ring, 3, 25)
+    let rt4: Task[Number] = spawn t2c_ring_producer_task(ring, 4, 25)
+    let rc1: Number = await rt1
+    let rc2: Number = await rt2
+    let rc3: Number = await rt3
+    let rc4: Number = await rt4
+    t2c_check_ok(t2c_expect(rc1 + rc2 + rc3 + rc4 == 100, "4 ring producers appended 100 records"))
+    let fl: YazaDbWalRingFlushReportV1 = result_unwrap(yaza_db_wal_ring_flush_to_file_v1(ring, wal_fd))
+    t2c_check_ok(t2c_expect(fl.flushed_records == 100 and fl.fsync_count == 1 and fl.flushed_bytes > 1000, "WAL ring swept 100 records in 1 fsync"))
+    say "t2c: step1 ring OK"
+
+    # Backpressure check on small full ring
+    let small_ring: YazaDbWalRingBufferV1 = result_unwrap(yaza_db_wal_ring_new_v1(16, 0))
+    var ri: Number = 0
+    while ri < 16:
+        let _ok_a: YazaDbWalRingAppendResultV1 = result_unwrap(yaza_db_wal_ring_reserve_and_append_v1(small_ring, bytes_from_text("slot")))
+        set ri = ri + 1
+    let bp_res: Result[YazaDbWalRingAppendResultV1, Text] = yaza_db_wal_ring_reserve_and_append_v1(small_ring, bytes_from_text("overflow"))
+    t2c_check_ok(t2c_expect(not result_is_ok(bp_res), "full WAL ring triggers backpressure error"))
+    let _rd1: Boolean = yaza_db_wal_ring_destroy_v1(ring)
+    let _rd2: Boolean = yaza_db_wal_ring_destroy_v1(small_ring)
+    let _fc: Boolean = result_unwrap(close(wal_fd))
+    let _rc: Boolean = result_unwrap(close(root_r))
+
+    # 2. 16-Stripe CLOCK LRU Buffer Pool (4 concurrent reader threads)
+    let uuid: Bytes = bytes_from_text("cbuf-uuid-000001")
+    let cbuf: YazaDbConcurrentBufferPoolV1 = result_unwrap(yaza_db_cbuf_new_v1(7, uuid, 64))
+    var pi: Number = 2
+    while pi <= 17:
+        let raw_p: Bytes = result_unwrap(yaza_db_page_new_v1(pi, 10, 1, 0))
+        let fin_p: Bytes = result_unwrap(yaza_db_page_finalize_v1(raw_p))
+        let hdr_p: YazaDbPageHeaderV1 = result_unwrap(yaza_db_page_header_decode_v1(fin_p, pi))
+        let _put_ok: Boolean = yaza_db_cbuf_put_v1(cbuf, 7, uuid, pi, fin_p, hdr_p)
+        t2c_check_ok(t2c_expect(_put_ok, "striped cbuf put succeeded"))
+        set pi = pi + 1
+    let ct1: Task[Number] = spawn t2c_cbuf_reader_task(cbuf, uuid, 2, 16, 200)
+    let ct2: Task[Number] = spawn t2c_cbuf_reader_task(cbuf, uuid, 2, 16, 200)
+    let ct3: Task[Number] = spawn t2c_cbuf_reader_task(cbuf, uuid, 2, 16, 200)
+    let ct4: Task[Number] = spawn t2c_cbuf_reader_task(cbuf, uuid, 2, 16, 200)
+    let ch1: Number = await ct1
+    let ch2: Number = await ct2
+    let ch3: Number = await ct3
+    let ch4: Number = await ct4
+    let cstats: YazaDbBufferPoolStatsV1 = yaza_db_cbuf_stats_v1(cbuf)
+    t2c_check_ok(t2c_expect(ch1 + ch2 + ch3 + ch4 == 800 and cstats.hits == 800 and cstats.resident_count == 16, "4 concurrent readers hit all 800 striped pages cleanly"))
+    let _inv_ok: Boolean = yaza_db_cbuf_invalidate_page_v1(cbuf, 5)
+    t2c_check_ok(t2c_expect(_inv_ok and not option_is_some(yaza_db_cbuf_get_v1(cbuf, 7, uuid, 5)), "striped cbuf page invalidation took effect"))
+    let _cdest: Boolean = yaza_db_cbuf_destroy_v1(cbuf)
+    say "t2c: step2 cbuf OK"
+
+    # 3. Concurrent Group-Commit Engine (4 writer threads + 2 reader threads + HTTP worker pool)
+    let db_root: Number = result_unwrap(root_open(base_dir + "/db"))
+    let boot: YazaDbCatalogBootstrapV1 = result_unwrap(yaza_db_catalog_create_v1(db_root, "conc.yzdb"))
+    let _bwc: Boolean = result_unwrap(yaza_db_wal_log_close_v1(boot.wal))
+    let _bsc: Boolean = result_unwrap(yaza_db_storage_close_v1(boot.storage))
+    var sess: YazaDbSessionV1 = result_unwrap(yaza_db_session_open_v1(db_root, "conc.yzdb"))
+    let ddl: YazaDbSessionStatementV1 = result_unwrap(yaza_db_session_execute_v1(sess, "CREATE TABLE ct_items (id INTEGER PRIMARY KEY, val INTEGER, tag TEXT)", List[YazaSqlValueV1]()))
+    set sess = ddl.session
+
+    let eng: YazaDbConcurrentEngineV1 = result_unwrap(yaza_db_concurrent_engine_new_v1(sess, yaza_db_concurrent_default_config_v1()))
+    let writer_task: Task[Result[Number, Text]] = spawn yaza_db_concurrent_writer_loop_v1(eng)
+
+    let wt1: Task[Number] = spawn t2c_concurrent_writer_task(eng, 1, 10)
+    let wt2: Task[Number] = spawn t2c_concurrent_writer_task(eng, 2, 10)
+    let wt3: Task[Number] = spawn t2c_concurrent_writer_task(eng, 3, 10)
+    let wt4: Task[Number] = spawn t2c_concurrent_writer_task(eng, 4, 10)
+    let rdr1: Task[Number] = spawn t2c_concurrent_reader_task(eng, 5)
+    let rdr2: Task[Number] = spawn t2c_concurrent_reader_task(eng, 5)
+    let wc1: Number = await wt1
+    let wc2: Number = await wt2
+    let wc3: Number = await wt3
+    let wc4: Number = await wt4
+    let rdc1: Number = await rdr1
+    let rdc2: Number = await rdr2
+    let st_mid: YazaDbConcurrentEngineStatsV1 = yaza_db_concurrent_stats_v1(eng)
+    t2c_check_ok(t2c_expect(wc1 + wc2 + wc3 + wc4 == 40 and st_mid.total_commits == 40, "4 writer threads committed 40 rows"))
+    t2c_check_ok(t2c_expect(rdc1 + rdc2 == 10 and st_mid.total_reads == 10, "2 reader threads served 10 concurrent reads"))
+    t2c_check_ok(t2c_expect(st_mid.total_fsyncs <= 40, "group commit pipeline bounded fsyncs"))
+    say "t2c: step3 writers+readers OK"
+
+    # 4. Multi-worker concurrent HTTP request handler routing writes through the actor pipeline (via tcp_pair_create)
+    let secret: Text = "0123456789abcdef0123456789abcdef_tier2"
+    let now_s: Number = time_now_unix_ms() / 1000
+    let tok: Text = ywt_create("conc-worker", "yazabase", now_s + 3600, secret)
+    let s1_srv: Number = t2c_unwrap_num(tcp_pair_create(), "tcp_pair_create 1")
+    let s1_cli: Number = t2c_unwrap_num(tcp_pair_peer(s1_srv), "tcp_pair_peer 1")
+    let s2_srv: Number = t2c_unwrap_num(tcp_pair_create(), "tcp_pair_create 2")
+    let s2_cli: Number = t2c_unwrap_num(tcp_pair_peer(s2_srv), "tcp_pair_peer 2")
+    let s3_srv: Number = t2c_unwrap_num(tcp_pair_create(), "tcp_pair_create 3")
+    let s3_cli: Number = t2c_unwrap_num(tcp_pair_peer(s3_srv), "tcp_pair_peer 3")
+    let s4_srv: Number = t2c_unwrap_num(tcp_pair_create(), "tcp_pair_create 4")
+    let s4_cli: Number = t2c_unwrap_num(tcp_pair_peer(s4_srv), "tcp_pair_peer 4")
+
+    say "t2c: step4a spawning pairs"
+    let hs1: Task[Boolean] = spawn t2c_http_server_pair_task(eng, s1_srv, secret)
+    let hs2: Task[Boolean] = spawn t2c_http_server_pair_task(eng, s2_srv, secret)
+    let hs3: Task[Boolean] = spawn t2c_http_server_pair_task(eng, s3_srv, secret)
+    let hs4: Task[Boolean] = spawn t2c_http_server_pair_task(eng, s4_srv, secret)
+
+    let hc1: Task[Boolean] = spawn t2c_http_client_pair_task(s1_cli, tok, 1)
+    let hc2: Task[Boolean] = spawn t2c_http_client_pair_task(s2_cli, tok, 2)
+    let hc3: Task[Boolean] = spawn t2c_http_client_pair_task(s3_cli, tok, 3)
+    let hc4: Task[Boolean] = spawn t2c_http_client_pair_task(s4_cli, tok, 4)
+
+    let _hr1: Boolean = await hc1
+    say "t2c: step4b hc1 done"
+    let _hr2: Boolean = await hc2
+    let _hr3: Boolean = await hc3
+    let _hr4: Boolean = await hc4
+    say "t2c: step4c all hc done"
+    let _hs1_ok: Boolean = await hs1
+    let _hs2_ok: Boolean = await hs2
+    let _hs3_ok: Boolean = await hs3
+    let _hs4_ok: Boolean = await hs4
+    t2c_check_ok(t2c_expect(_hr1 and _hr2 and _hr3 and _hr4 and _hs1_ok and _hs2_ok and _hs3_ok and _hs4_ok, "all 4 concurrent HTTP writes succeeded via multi-worker handlers"))
+    say "t2c: step4 http handlers OK"
+
+    let _close_ok: Boolean = t2c_unwrap_bool(yaza_db_concurrent_engine_close_v1(eng), "engine_close")
+    say "t2c: step5 engine closed OK"
+    let _w_res: Result[Number, Text] = await writer_task
+    t2c_check_ok(t2c_expect(result_is_ok(_w_res), "writer loop exited cleanly"))
+    say "t2c: step5 writer joined OK"
+
+    # Reopen and verify all 44 rows durable on disk
+    let db_root2: Number = t2c_unwrap_num(root_open(base_dir + "/db"), "root_open db2")
+    let sess2_r: Result[YazaDbSessionV1, Text] = yaza_db_session_open_v1(db_root2, "conc.yzdb")
+    t2c_check_ok(t2c_expect(result_is_ok(sess2_r), "reopen conc.yzdb"))
+    var sess2: YazaDbSessionV1 = result_unwrap(sess2_r)
+    let cnt_r: Result[YazaDbSessionStatementV1, Text] = yaza_db_session_execute_v1(sess2, "SELECT COUNT(*) FROM ct_items", List[YazaSqlValueV1]())
+    t2c_check_ok(t2c_expect(result_is_ok(cnt_r), "reopen SELECT COUNT"))
+    let cnt_st: YazaDbSessionStatementV1 = result_unwrap(cnt_r)
+    set sess2 = cnt_st.session
+    let total_rows: Number = list_get(list_get(option_unwrap(cnt_st.statement.query_result).rows, 0), 0).integer_value
+    t2c_check_ok(t2c_expect(total_rows == 44, "all 44 concurrent + HTTP rows durable after reopen"))
+    let _cl2: Boolean = t2c_unwrap_bool(yaza_db_session_close_v1(sess2), "session_close db2")
+    say "yazabase-tier2-concurrent-smoke: PASS"
+    exit(0)

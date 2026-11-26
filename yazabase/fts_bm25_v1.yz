@@ -1,0 +1,338 @@
+# Tier 2.2: Full-Text Search (Tokenizer, Inverted Index, Okapi BM25 Ranking,
+# Update/Delete Tombstones, and Durable YDBv1 Session Persistence).
+
+use "std/json"
+use "std/math"
+use "./session_v1"
+use "./sql_executor_v1"
+
+shape YazaDbFtsPostingV1:
+    doc_slot: Number
+    tf: Number
+
+shape YazaDbFtsHitV1:
+    doc_id: Number
+    score: Float64
+
+shape YazaDbFtsIndexV1:
+    total_live_docs: Number
+    total_token_length: Number
+    doc_ids: List[Number]
+    doc_lengths: List[Number]
+    doc_deleted: List[Boolean]
+    doc_texts: List[Text]
+    terms: List[Text]
+    postings: List[List[YazaDbFtsPostingV1]]
+
+fn yaza_db_fts_is_alnum_ascii_v1(b: Number) -> Boolean:
+    return (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or b >= 128
+
+fn yaza_db_fts_fold_ascii_lower_v1(raw: Text) -> Text:
+    let src: Bytes = bytes_from_text(raw)
+    let n: Number = bytes_length(src)
+    var i: Number = 0
+    while i < n:
+        let b: Number = bytes_get(src, i)
+        if b >= 65 and b <= 90:
+            let _s: Boolean = bytes_try_set(src, i, b + 32)
+        set i = i + 1
+    return bytes_to_text(src)
+
+fn yaza_db_fts_is_stopword_v1(tok: Text) -> Boolean:
+    if tok == "the" or tok == "and" or tok == "for" or tok == "with" or tok == "that" or tok == "this" or tok == "from" or tok == "are" or tok == "was":
+        return true
+    if tok == "dan" or tok == "yang" or tok == "untuk" or tok == "dari" or tok == "dengan" or tok == "ini" or tok == "itu" or tok == "pada" or tok == "atau":
+        return true
+    return false
+
+fn yaza_db_fts_tokenize_v1(text: Text, filter_stopwords: Boolean) -> List[Text]:
+    let out_res: Result[List[Text], Text] = list_try_new()
+    if not result_is_ok(out_res):
+        return List[Text]()
+    let out: List[Text] = result_unwrap(out_res)
+    let lower: Text = yaza_db_fts_fold_ascii_lower_v1(text)
+    let n: Number = text_length(lower)
+    var i: Number = 0
+    while i < n:
+        while i < n and not yaza_db_fts_is_alnum_ascii_v1(text_byte(lower, i)):
+            set i = i + 1
+        if i >= n:
+            break
+        let start: Number = i
+        while i < n and yaza_db_fts_is_alnum_ascii_v1(text_byte(lower, i)):
+            set i = i + 1
+        let tlen: Number = i - start
+        if tlen >= 2 and tlen <= 64:
+            let tok: Text = text_slice(lower, start, tlen)
+            if not filter_stopwords or not yaza_db_fts_is_stopword_v1(tok):
+                let _pt: Boolean = list_try_push(out, tok)
+    return out
+
+fn yaza_db_fts_err_text_v1(msg: Text) -> Text:
+    return "" + msg
+
+fn yaza_db_fts_new_v1() -> Result[YazaDbFtsIndexV1, Text]:
+    let ids_res: Result[List[Number], Text] = list_try_new()
+    let len_res: Result[List[Number], Text] = list_try_new()
+    let del_res: Result[List[Boolean], Text] = list_try_new()
+    let txt_res: Result[List[Text], Text] = list_try_new()
+    let trm_res: Result[List[Text], Text] = list_try_new()
+    let pst_res: Result[List[List[YazaDbFtsPostingV1]], Text] = list_try_new()
+    if not result_is_ok(ids_res) or not result_is_ok(len_res) or not result_is_ok(del_res) or not result_is_ok(txt_res) or not result_is_ok(trm_res) or not result_is_ok(pst_res):
+        return err(yaza_db_fts_err_text_v1("YDBv1 FTS index allocation failed"))
+    return ok(YazaDbFtsIndexV1(0, 0, result_unwrap(ids_res), result_unwrap(len_res), result_unwrap(del_res), result_unwrap(txt_res), result_unwrap(trm_res), result_unwrap(pst_res)))
+
+fn yaza_db_fts_find_doc_slot_v1(idx: YazaDbFtsIndexV1, doc_id: Number) -> Number:
+    var i: Number = 0
+    while i < list_count(idx.doc_ids):
+        if list_get(idx.doc_ids, i) == doc_id and not list_get(idx.doc_deleted, i):
+            return i
+        set i = i + 1
+    return -1
+
+fn yaza_db_fts_find_term_slot_v1(idx: YazaDbFtsIndexV1, term: Text) -> Number:
+    var i: Number = 0
+    while i < list_count(idx.terms):
+        if list_get(idx.terms, i) == term:
+            return i
+        set i = i + 1
+    return -1
+
+fn yaza_db_fts_delete_doc_v1(idx: YazaDbFtsIndexV1, doc_id: Number) -> YazaDbFtsIndexV1:
+    let slot: Number = yaza_db_fts_find_doc_slot_v1(idx, doc_id)
+    if slot < 0:
+        return idx
+    let old_len: Number = list_get(idx.doc_lengths, slot)
+    let _sd: Boolean = list_try_set(idx.doc_deleted, slot, true)
+    var next_live: Number = idx.total_live_docs - 1
+    if next_live < 0: set next_live = 0
+    var next_tok: Number = idx.total_token_length - old_len
+    if next_tok < 0: set next_tok = 0
+    return YazaDbFtsIndexV1(next_live, next_tok, idx.doc_ids, idx.doc_lengths, idx.doc_deleted, idx.doc_texts, idx.terms, idx.postings)
+
+fn yaza_db_fts_index_doc_v1(idx: YazaDbFtsIndexV1, doc_id: Number, content: Text) -> Result[YazaDbFtsIndexV1, Text]:
+    let cur: YazaDbFtsIndexV1 = yaza_db_fts_delete_doc_v1(idx, doc_id)
+    let toks: List[Text] = yaza_db_fts_tokenize_v1(content, true)
+    let doc_len: Number = list_count(toks)
+    # Append a fresh slot so tombstoned postings from prior versions of doc_id never match
+    let doc_slot: Number = list_count(cur.doc_ids)
+    let _p1: Boolean = list_try_push(cur.doc_ids, doc_id)
+    let _p2: Boolean = list_try_push(cur.doc_lengths, doc_len)
+    let _p3: Boolean = list_try_push(cur.doc_deleted, false)
+    let _p4: Boolean = list_try_push(cur.doc_texts, content)
+
+    # Count unique terms & TF in this document
+    let uniq_terms: List[Text] = List[Text]()
+    let uniq_tfs: List[Number] = List[Number]()
+    var ti: Number = 0
+    while ti < doc_len:
+        let tok: Text = list_get(toks, ti)
+        var found: Number = -1
+        var ui: Number = 0
+        while ui < list_count(uniq_terms):
+            if list_get(uniq_terms, ui) == tok:
+                set found = ui
+                break
+            set ui = ui + 1
+        if found >= 0:
+            let _st: Boolean = list_try_set(uniq_tfs, found, list_get(uniq_tfs, found) + 1)
+        else:
+            let _ut1: Boolean = list_try_push(uniq_terms, tok)
+            let _ut2: Boolean = list_try_push(uniq_tfs, 1)
+        set ti = ti + 1
+
+    var ui: Number = 0
+    while ui < list_count(uniq_terms):
+        let term: Text = list_get(uniq_terms, ui)
+        let tf: Number = list_get(uniq_tfs, ui)
+        let tslot: Number = yaza_db_fts_find_term_slot_v1(cur, term)
+        if tslot >= 0:
+            let plist: List[YazaDbFtsPostingV1] = list_get(cur.postings, tslot)
+            var pfound: Number = -1
+            var pi: Number = 0
+            while pi < list_count(plist):
+                if list_get(plist, pi).doc_slot == doc_slot:
+                    set pfound = pi
+                    break
+                set pi = pi + 1
+            if pfound >= 0:
+                let _sp: Boolean = list_try_set(plist, pfound, YazaDbFtsPostingV1(doc_slot, tf))
+            else:
+                let _pp: Boolean = list_try_push(plist, YazaDbFtsPostingV1(doc_slot, tf))
+        else:
+            let new_plist_res: Result[List[YazaDbFtsPostingV1], Text] = list_try_new()
+            if not result_is_ok(new_plist_res):
+                return err(yaza_db_fts_err_text_v1(result_unwrap_error(new_plist_res)))
+            let new_plist: List[YazaDbFtsPostingV1] = result_unwrap(new_plist_res)
+            let _pp: Boolean = list_try_push(new_plist, YazaDbFtsPostingV1(doc_slot, tf))
+            let _pt: Boolean = list_try_push(cur.terms, term)
+            let _ppl: Boolean = list_try_push(cur.postings, new_plist)
+        set ui = ui + 1
+
+    return ok(YazaDbFtsIndexV1(cur.total_live_docs + 1, cur.total_token_length + doc_len, cur.doc_ids, cur.doc_lengths, cur.doc_deleted, cur.doc_texts, cur.terms, cur.postings))
+
+fn yaza_db_fts_sort_hits_v1(hits: List[YazaDbFtsHitV1]) -> Unit:
+    let n: Number = list_count(hits)
+    var i: Number = 1
+    while i < n:
+        let cur: YazaDbFtsHitV1 = list_get(hits, i)
+        var j: Number = i - 1
+        while j >= 0:
+            let prev: YazaDbFtsHitV1 = list_get(hits, j)
+            var swap: Boolean = false
+            if prev.score < cur.score:
+                set swap = true
+            elif prev.score == cur.score and prev.doc_id > cur.doc_id:
+                set swap = true
+            if not swap:
+                break
+            let _s1: Boolean = list_try_set(hits, j + 1, prev)
+            set j = j - 1
+        let _s2: Boolean = list_try_set(hits, j + 1, cur)
+        set i = i + 1
+    return
+
+fn yaza_db_fts_search_bm25_v1(idx: YazaDbFtsIndexV1, query_text: Text, top_k: Number, require_all_terms: Boolean) -> Result[List[YazaDbFtsHitV1], Text]:
+    if top_k < 1:
+        return err(yaza_db_fts_err_text_v1("YDBv1 FTS top_k must be positive"))
+    let q_all: List[Text] = yaza_db_fts_tokenize_v1(query_text, true)
+    let q_terms: List[Text] = List[Text]()
+    var qi: Number = 0
+    while qi < list_count(q_all):
+        let qt: Text = list_get(q_all, qi)
+        var seen: Boolean = false
+        var si: Number = 0
+        while si < list_count(q_terms):
+            if list_get(q_terms, si) == qt:
+                set seen = true
+                break
+            set si = si + 1
+        if not seen:
+            let _pq: Boolean = list_try_push(q_terms, qt)
+        set qi = qi + 1
+
+    let out_res: Result[List[YazaDbFtsHitV1], Text] = list_try_new()
+    if not result_is_ok(out_res):
+        return err(yaza_db_fts_err_text_v1("YDBv1 FTS result allocation failed"))
+    let out: List[YazaDbFtsHitV1] = result_unwrap(out_res)
+    if idx.total_live_docs == 0 or list_count(q_terms) == 0:
+        return ok(out)
+
+    let num_slots: Number = list_count(idx.doc_ids)
+    let scores_res: Result[List[Float64], Text] = list_try_new()
+    let matched_res: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(scores_res) or not result_is_ok(matched_res):
+        return err(yaza_db_fts_err_text_v1("YDBv1 FTS score workspace allocation failed"))
+    let scores: List[Float64] = result_unwrap(scores_res)
+    let matched_terms: List[Number] = result_unwrap(matched_res)
+    var di: Number = 0
+    while di < num_slots:
+        let _ps: Boolean = list_try_push(scores, 0.0)
+        let _pm: Boolean = list_try_push(matched_terms, 0)
+        set di = di + 1
+
+    var avgdl: Float64 = float64_from_number(idx.total_token_length) / float64_from_number(idx.total_live_docs)
+    if avgdl <= 0.0:
+        set avgdl = 1.0
+    let k1: Float64 = 1.2
+    let b: Float64 = 0.75
+    let n_docs: Float64 = float64_from_number(idx.total_live_docs)
+
+    set qi = 0
+    while qi < list_count(q_terms):
+        let tslot: Number = yaza_db_fts_find_term_slot_v1(idx, list_get(q_terms, qi))
+        if tslot >= 0:
+            let plist: List[YazaDbFtsPostingV1] = list_get(idx.postings, tslot)
+            var df: Number = 0
+            var pi: Number = 0
+            while pi < list_count(plist):
+                let p: YazaDbFtsPostingV1 = list_get(plist, pi)
+                if not list_get(idx.doc_deleted, p.doc_slot):
+                    set df = df + 1
+                set pi = pi + 1
+            if df > 0:
+                let df_f: Float64 = float64_from_number(df)
+                let idf: Float64 = math_ln_float64(((n_docs - df_f + 0.5) / (df_f + 0.5)) + 1.0)
+                set pi = 0
+                while pi < list_count(plist):
+                    let p: YazaDbFtsPostingV1 = list_get(plist, pi)
+                    if not list_get(idx.doc_deleted, p.doc_slot):
+                        let dl: Float64 = float64_from_number(list_get(idx.doc_lengths, p.doc_slot))
+                        let tf_f: Float64 = float64_from_number(p.tf)
+                        let denom: Float64 = tf_f + k1 * (1.0 - b + b * (dl / avgdl))
+                        let contribution: Float64 = idf * ((tf_f * (k1 + 1.0)) / denom)
+                        let _us: Boolean = list_try_set(scores, p.doc_slot, list_get(scores, p.doc_slot) + contribution)
+                        let _um: Boolean = list_try_set(matched_terms, p.doc_slot, list_get(matched_terms, p.doc_slot) + 1)
+                    set pi = pi + 1
+        set qi = qi + 1
+
+    let req_count: Number = list_count(q_terms)
+    let all_hits: List[YazaDbFtsHitV1] = List[YazaDbFtsHitV1]()
+    set di = 0
+    while di < num_slots:
+        if not list_get(idx.doc_deleted, di):
+            let mcnt: Number = list_get(matched_terms, di)
+            if (require_all_terms and mcnt == req_count) or (not require_all_terms and mcnt > 0):
+                let _ph: Boolean = list_try_push(all_hits, YazaDbFtsHitV1(list_get(idx.doc_ids, di), list_get(scores, di)))
+        set di = di + 1
+    yaza_db_fts_sort_hits_v1(all_hits)
+    var i: Number = 0
+    while i < top_k and i < list_count(all_hits):
+        let _po: Boolean = list_try_push(out, list_get(all_hits, i))
+        set i = i + 1
+    return ok(out)
+
+fn yaza_db_fts_persist_to_session_v1(session: YazaDbSessionV1, index_name: Text, idx: YazaDbFtsIndexV1) -> Result[YazaDbSessionV1, Text]:
+    if not session.is_open or index_name == "":
+        return err(yaza_db_fts_err_text_v1("YDBv1 FTS persist requires open session and index name"))
+    let tbl: Text = "_ydb_fts_" + index_name
+    var cur: YazaDbSessionV1 = session
+    let drp: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(cur, "DROP TABLE IF EXISTS " + tbl, List[YazaSqlValueV1]())?
+    set cur = drp.session
+    let crt: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(cur, "CREATE TABLE " + tbl + " (id BIGINT PRIMARY KEY, content TEXT)", List[YazaSqlValueV1]())?
+    set cur = crt.session
+
+    var i: Number = 0
+    while i < list_count(idx.doc_ids):
+        if not list_get(idx.doc_deleted, i):
+            let p: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+            let v0: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, list_get(idx.doc_ids, i))?
+            let _p1: Boolean = list_try_push(p, v0)
+            let _p2: Boolean = list_try_push(p, yaza_sql_value_text_v1(list_get(idx.doc_texts, i)))
+            let ins: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(cur, "INSERT INTO " + tbl + " (id, content) VALUES ($1, $2)", p)?
+            set cur = ins.session
+        set i = i + 1
+    return ok(cur)
+
+fn yaza_db_fts_build_from_cols_v1(ids: List[Number], texts: List[Text]) -> Result[YazaDbFtsIndexV1, Text]:
+    let idx_res: Result[YazaDbFtsIndexV1, Text] = yaza_db_fts_new_v1()
+    if not result_is_ok(idx_res):
+        return err(yaza_db_fts_err_text_v1(result_unwrap_error(idx_res)))
+    var idx: YazaDbFtsIndexV1 = result_unwrap(idx_res)
+    var i: Number = 0
+    while i < list_count(ids):
+        let idoc_res: Result[YazaDbFtsIndexV1, Text] = yaza_db_fts_index_doc_v1(idx, list_get(ids, i), list_get(texts, i))
+        if not result_is_ok(idoc_res):
+            return err(yaza_db_fts_err_text_v1(result_unwrap_error(idoc_res)))
+        set idx = result_unwrap(idoc_res)
+        set i = i + 1
+    return ok(idx)
+
+fn yaza_db_fts_load_from_session_v1(session: YazaDbSessionV1, index_name: Text) -> Result[YazaDbFtsIndexV1, Text]:
+    if not session.is_open or index_name == "":
+        return err(yaza_db_fts_err_text_v1("YDBv1 FTS load requires open session and index name"))
+    let tbl: Text = "_ydb_fts_" + index_name
+    let sel_res: Result[YazaDbSessionStatementV1, Text] = yaza_db_session_execute_v1(session, "SELECT id, content FROM " + tbl + " ORDER BY id ASC", List[YazaSqlValueV1]())
+    if not result_is_ok(sel_res):
+        return err(yaza_db_fts_err_text_v1(result_unwrap_error(sel_res)))
+    let sel: YazaDbSessionStatementV1 = result_unwrap(sel_res)
+    let qr: YazaSqlQueryResultV1 = option_unwrap(sel.statement.query_result)
+    let ids: List[Number] = List[Number]()
+    let texts: List[Text] = List[Text]()
+    var r: Number = 0
+    while r < list_count(qr.rows):
+        let row: List[YazaSqlValueV1] = list_get(qr.rows, r)
+        let _p1: Boolean = list_try_push(ids, list_get(row, 0).integer_value)
+        let _p2: Boolean = list_try_push(texts, "" + list_get(row, 1).text_value)
+        set r = r + 1
+    return yaza_db_fts_build_from_cols_v1(ids, texts)

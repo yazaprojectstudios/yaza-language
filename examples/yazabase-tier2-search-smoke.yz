@@ -1,0 +1,160 @@
+# Tier 2.2 Search Validation:
+# 1. Native VECTOR binary YDV1 codec (encode/decode/CRC/dimension/NaN checks)
+# 2. Cosine, L2, and Inner-Product distances + Flat exact search
+# 3. HNSW graph search (recall@5 vs Flat, delete tombstone, durable .yzdb persist/reload)
+# 4. Full-Text Search (tokenizer, stopwords, Okapi BM25 ranking, update/delete, durable persist/reload)
+
+use "std/fs"
+use "std/math"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/fts_bm25_v1"
+use "../yazabase/session_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/vector_index_v1"
+use "../yazabase/wal_v1"
+
+fn t2s_expect(cond: Boolean, label: Text) -> Result[Boolean, Text]:
+    if not cond:
+        return err("tier2-search failed: " + label)
+    return ok(true)
+
+fn t2s_make_vec8(a: Float64, b: Float64, c: Float64, d: Float64, e: Float64, f: Float64, g: Float64, h: Float64) -> Result[YazaDbVectorV1, Text]:
+    let vals: List[Float64] = List[Float64]()
+    let _p0: Boolean = list_try_push(vals, a)
+    let _p1: Boolean = list_try_push(vals, b)
+    let _p2: Boolean = list_try_push(vals, c)
+    let _p3: Boolean = list_try_push(vals, d)
+    let _p4: Boolean = list_try_push(vals, e)
+    let _p5: Boolean = list_try_push(vals, f)
+    let _p6: Boolean = list_try_push(vals, g)
+    let _p7: Boolean = list_try_push(vals, h)
+    return yaza_db_vector_new_v1(vals)
+
+fn t2s_run(base_dir: Text) -> Result[Boolean, Text]:
+    # 1. Binary YDV1 codec & distance metrics
+    let v_a: YazaDbVectorV1 = t2s_make_vec8(1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)?
+    let v_b: YazaDbVectorV1 = t2s_make_vec8(0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)?
+    let v_a2: YazaDbVectorV1 = t2s_make_vec8(2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)?
+    let enc_a: Bytes = yaza_db_vector_encode_v1(v_a2)?
+    let dec_a: YazaDbVectorV1 = yaza_db_vector_decode_v1(enc_a)?
+    let _a1: Boolean = t2s_expect(dec_a.dim == 8 and list_get(dec_a.values, 0) == 2.0, "YDV1 encode/decode roundtrip")?
+
+    # Tampered YDV1 CRC must fail closed
+    let bad_enc: Bytes = bytes_try_slice(enc_a, 0, bytes_length(enc_a))?
+    let _tamper: Boolean = bytes_try_set(bad_enc, bytes_length(bad_enc) - 1, (bytes_get(bad_enc, bytes_length(bad_enc) - 1) + 1) % 256)
+    let _a2: Boolean = t2s_expect(not result_is_ok(yaza_db_vector_decode_v1(bad_enc)), "tampered YDV1 rejected by CRC32C")?
+
+    # NaN rejection
+    let nan_vals: List[Float64] = List[Float64]()
+    let _pn1: Boolean = list_try_push(nan_vals, float64_from_bits(9221120237041090560))
+    let _a3: Boolean = t2s_expect(not result_is_ok(yaza_db_vector_new_v1(nan_vals)), "NaN vector rejected")?
+
+    let d_cos_orth: Float64 = yaza_db_vector_distance_v1(v_a, v_b, yaza_db_vector_metric_cosine_v1())?
+    let d_l2_orth: Float64 = yaza_db_vector_distance_v1(v_a, v_b, yaza_db_vector_metric_l2_v1())?
+    let d_ip_a2: Float64 = yaza_db_vector_distance_v1(v_a, v_a2, yaza_db_vector_metric_ip_v1())?
+    let _a4: Boolean = t2s_expect(math_abs_float64(d_cos_orth - 1.0) < 0.0001 and math_abs_float64(d_l2_orth - math_sqrt_float64(2.0)) < 0.0001 and math_abs_float64(d_ip_a2 + 2.0) < 0.0001, "Cosine/L2/IP distances accurate")?
+
+    # 2. Flat vs HNSW recall@5 over 80 deterministic vectors
+    let flat_vecs: List[YazaDbVectorV1] = List[YazaDbVectorV1]()
+    let flat_ids: List[Number] = List[Number]()
+    let flat_del: List[Boolean] = List[Boolean]()
+    var hnsw: YazaDbHnswIndexV1 = yaza_db_hnsw_new_v1(yaza_db_vector_metric_l2_v1(), 12, 64, 48)?
+
+    var i: Number = 0
+    while i < 80:
+        let rid: Number = 1000 + i
+        let x0: Float64 = float64_from_number((i * 17) % 50) / 10.0
+        let x1: Float64 = float64_from_number((i * 31) % 50) / 10.0
+        let x2: Float64 = float64_from_number((i * 7) % 29) / 10.0
+        let x3: Float64 = float64_from_number(i % 13) / 10.0
+        let x4: Float64 = float64_from_number((i * 3) % 19) / 10.0
+        let x5: Float64 = float64_from_number((i * 11) % 23) / 10.0
+        let x6: Float64 = float64_from_number((i * 5) % 11) / 10.0
+        let x7: Float64 = float64_from_number((i * 13) % 17) / 10.0
+        let v: YazaDbVectorV1 = t2s_make_vec8(x0, x1, x2, x3, x4, x5, x6, x7)?
+        let _pf1: Boolean = list_try_push(flat_vecs, v)
+        let _pf2: Boolean = list_try_push(flat_ids, rid)
+        let _pf3: Boolean = list_try_push(flat_del, false)
+        set hnsw = yaza_db_hnsw_insert_v1(hnsw, rid, v)?
+        set i = i + 1
+
+    let query_v: YazaDbVectorV1 = t2s_make_vec8(2.5, 2.5, 1.4, 0.5, 0.8, 1.1, 0.4, 0.7)?
+    let flat_top5: List[YazaDbVectorHitV1] = yaza_db_vector_flat_search_v1(flat_vecs, flat_ids, flat_del, query_v, 5, yaza_db_vector_metric_l2_v1())?
+    let hnsw_top5: List[YazaDbVectorHitV1] = yaza_db_hnsw_search_v1(hnsw, query_v, 5, 48)?
+    let _a5: Boolean = t2s_expect(list_count(flat_top5) == 5 and list_count(hnsw_top5) == 5, "top-5 search returned 5 hits")?
+
+    var overlap: Number = 0
+    var hi: Number = 0
+    while hi < 5:
+        let hid: Number = list_get(hnsw_top5, hi).row_id
+        var fi: Number = 0
+        while fi < 5:
+            if list_get(flat_top5, fi).row_id == hid:
+                set overlap = overlap + 1
+                break
+            set fi = fi + 1
+        set hi = hi + 1
+    let _a6: Boolean = t2s_expect(list_get(hnsw_top5, 0).row_id == list_get(flat_top5, 0).row_id and overlap >= 4, "HNSW matches top-1 and recall@5 >= 0.80")?
+
+    # Delete top-1 row and confirm both Flat and HNSW exclude tombstone
+    let del_id: Number = list_get(flat_top5, 0).row_id
+    let _fd: Boolean = list_try_set(flat_del, del_id - 1000, true)
+    let _hd: Boolean = yaza_db_hnsw_delete_v1(hnsw, del_id)
+    let hnsw_after_del: List[YazaDbVectorHitV1] = yaza_db_hnsw_search_v1(hnsw, query_v, 5, 48)?
+    let flat_after_del: List[YazaDbVectorHitV1] = yaza_db_vector_flat_search_v1(flat_vecs, flat_ids, flat_del, query_v, 5, yaza_db_vector_metric_l2_v1())?
+    let _a7: Boolean = t2s_expect(list_get(hnsw_after_del, 0).row_id == list_get(flat_after_del, 0).row_id and list_get(hnsw_after_del, 0).row_id != del_id, "deleted vector excluded from HNSW and Flat")?
+
+    # 3. Full-Text Search (Tokenizer, Okapi BM25 ranking, Update/Delete)
+    let toks: List[Text] = yaza_db_fts_tokenize_v1("The YazaBase Engine, v1.0! Fast Vector & BM25 Search.", true)
+    let _a8: Boolean = t2s_expect(list_count(toks) == 7 and list_get(toks, 0) == "yazabase" and list_get(toks, 1) == "engine" and list_get(toks, 2) == "v1" and list_get(toks, 6) == "search", "FTS tokenizer folds case, drops stopwords and punctuation")?
+
+    var fts: YazaDbFtsIndexV1 = yaza_db_fts_new_v1()?
+    set fts = yaza_db_fts_index_doc_v1(fts, 1, "distributed database replication raft consensus yazabase")?
+    set fts = yaza_db_fts_index_doc_v1(fts, 2, "yazabase vector search hnsw bm25 fulltext index yazabase")?
+    set fts = yaza_db_fts_index_doc_v1(fts, 3, "frontend ssr templates css assets router")?
+    set fts = yaza_db_fts_index_doc_v1(fts, 4, "yazabase bm25 ranking ranking inverted index search")?
+
+    let fts_hits: List[YazaDbFtsHitV1] = yaza_db_fts_search_bm25_v1(fts, "bm25 ranking search", 3, true)?
+    let _a9: Boolean = t2s_expect(list_count(fts_hits) == 1 and list_get(fts_hits, 0).doc_id == 4, "AND BM25 query matched doc 4 strictly")?
+
+    let fts_or_hits: List[YazaDbFtsHitV1] = yaza_db_fts_search_bm25_v1(fts, "bm25 ranking", 3, false)?
+    let _a10: Boolean = t2s_expect(list_count(fts_or_hits) == 2 and list_get(fts_or_hits, 0).doc_id == 4 and list_get(fts_or_hits, 0).score > list_get(fts_or_hits, 1).score, "OR BM25 ranked multi-match doc 4 above doc 2")?
+
+    set fts = yaza_db_fts_index_doc_v1(fts, 4, "plain archival cold storage snapshot")?
+    let fts_after_upd: List[YazaDbFtsHitV1] = yaza_db_fts_search_bm25_v1(fts, "ranking", 3, false)?
+    let _a11: Boolean = t2s_expect(list_count(fts_after_upd) == 0, "updating doc cleared stale inverted postings")?
+
+    # 4. Durable HNSW & FTS persistence into .yzdb and reopen
+    let db_root: Number = root_open(base_dir)?
+    let boot: YazaDbCatalogBootstrapV1 = yaza_db_catalog_create_v1(db_root, "search.yzdb")?
+    let _bwc: Boolean = yaza_db_wal_log_close_v1(boot.wal)?
+    let _bsc: Boolean = yaza_db_storage_close_v1(boot.storage)?
+    var sess: YazaDbSessionV1 = yaza_db_session_open_v1(db_root, "search.yzdb")?
+    let emb_name: Text = "" + "emb1"
+    let docs_name: Text = "" + "docs1"
+    set sess = yaza_db_hnsw_persist_to_session_v1(sess, emb_name, hnsw)?
+    set sess = yaza_db_fts_persist_to_session_v1(sess, docs_name, fts)?
+    let _cl1: Boolean = yaza_db_session_close_v1(sess)?
+
+    let db_root2: Number = root_open(base_dir)?
+    let sess2: YazaDbSessionV1 = yaza_db_session_open_v1(db_root2, "search.yzdb")?
+    let reloaded_hnsw: YazaDbHnswIndexV1 = yaza_db_hnsw_load_from_session_v1(sess2, emb_name)?
+    let reloaded_fts: YazaDbFtsIndexV1 = yaza_db_fts_load_from_session_v1(sess2, docs_name)?
+    let hnsw_reloaded_hits: List[YazaDbVectorHitV1] = yaza_db_hnsw_search_v1(reloaded_hnsw, query_v, 5, 48)?
+    let fts_reloaded_hits: List[YazaDbFtsHitV1] = yaza_db_fts_search_bm25_v1(reloaded_fts, "yazabase vector hnsw", 3, true)?
+    let _a12: Boolean = t2s_expect(list_get(hnsw_reloaded_hits, 0).row_id == list_get(hnsw_after_del, 0).row_id, "reloaded HNSW preserved exact top-1 hit after reopen")?
+    let _a13: Boolean = t2s_expect(list_count(fts_reloaded_hits) == 1 and list_get(fts_reloaded_hits, 0).doc_id == 2, "reloaded FTS BM25 preserved indexed docs after reopen")?
+    let _cl2: Boolean = yaza_db_session_close_v1(sess2)?
+    return ok(true)
+
+start:
+    if arg_count() < 1:
+        say "usage: yazabase-tier2-search-smoke <dir>"
+        exit(2)
+    let dir: Text = "" + arg(1)
+    let res: Result[Boolean, Text] = t2s_run(dir)
+    if not result_is_ok(res):
+        say "yazabase-tier2-search-smoke: FAIL: " + result_unwrap_error(res)
+        exit(1)
+    say "yazabase-tier2-search-smoke: PASS"
+    exit(0)
