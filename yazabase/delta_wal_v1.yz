@@ -1,0 +1,336 @@
+# Compact logical/physical slot-delta WAL records (rec_type = 17, "YDL1").
+# Stores only changed slot keys and before/after row payloads when the leaf
+# page has already had a full-page image logged in the current checkpoint
+# window, preserving full ARIES redo/undo and streaming replication fidelity.
+use "./page_v1"
+use "./wal_v1"
+use "./storage_v1"
+use "./page_wal_v1"
+
+shape YazaDbWalLeafSlotDeltaEntryV1:
+    key: Bytes
+    new_payload: Bytes
+    old_payload: Bytes
+
+shape YazaDbWalLeafSlotDeltaV1:
+    operation: Number
+    page_id: Number
+    entries: List[YazaDbWalLeafSlotDeltaEntryV1]
+
+fn yaza_db_wal_leaf_slot_delta_magic_v1() -> Number:
+    return 827081817
+
+fn yaza_db_wal_leaf_slot_delta_header_size_v1() -> Number:
+    return 24
+
+fn yaza_db_wal_leaf_slot_delta_encode_v1(operation: Number, page_id: Number, entries: List[YazaDbWalLeafSlotDeltaEntryV1]) -> Result[Bytes, Text]:
+    if operation != yaza_db_wal_type_leaf_insert_v1() and operation != yaza_db_wal_type_leaf_update_v1() and operation != yaza_db_wal_type_leaf_delete_v1():
+        return err("YDBv1 LEAF_SLOT_DELTA operation must be INSERT, UPDATE, or DELETE")
+    if page_id < 2:
+        return err("YDBv1 LEAF_SLOT_DELTA page ID is invalid")
+    let count: Number = list_count(entries)
+    if count < 1 or count > 900:
+        return err("YDBv1 LEAF_SLOT_DELTA entry count is outside its 1..900 bound")
+    let header: Bytes = bytes_try_new_zeroed(yaza_db_wal_leaf_slot_delta_header_size_v1())?
+    if not yaza_db_write_uint_le_v1(header, 0, yaza_db_wal_leaf_slot_delta_magic_v1(), 4):
+        return err("YDBv1 LEAF_SLOT_DELTA magic could not be encoded")
+    if not yaza_db_write_uint_le_v1(header, 4, 1, 2) or not yaza_db_write_uint_le_v1(header, 6, operation, 2):
+        return err("YDBv1 LEAF_SLOT_DELTA version or operation could not be encoded")
+    if not yaza_db_write_uint_le_v1(header, 8, page_id, 8):
+        return err("YDBv1 LEAF_SLOT_DELTA page ID could not be encoded")
+    if not yaza_db_write_uint_le_v1(header, 16, count, 4) or not yaza_db_write_uint_le_v1(header, 20, 0, 4):
+        return err("YDBv1 LEAF_SLOT_DELTA count could not be encoded")
+    let parts_res: Result[List[Bytes], Text] = list_try_new()
+    if not result_is_ok(parts_res):
+        return err("YDBv1 LEAF_SLOT_DELTA parts could not be allocated")
+    let parts: List[Bytes] = result_unwrap(parts_res)
+    if not list_try_reserve(parts, 1 + count * 4) or not list_try_push(parts, header):
+        return err("YDBv1 LEAF_SLOT_DELTA parts could not be staged")
+    var idx: Number = 0
+    var prior_key: Bytes = bytes_empty()
+    while idx < count:
+        let entry: YazaDbWalLeafSlotDeltaEntryV1 = list_get(entries, idx)
+        let klen: Number = bytes_length(entry.key)
+        let nlen: Number = bytes_length(entry.new_payload)
+        let olen: Number = bytes_length(entry.old_payload)
+        if klen < 1 or klen > 2048 or nlen > 16384 or olen > 16384:
+            return err("YDBv1 LEAF_SLOT_DELTA entry field length is outside its bound")
+        if operation == yaza_db_wal_type_leaf_insert_v1() and (nlen < 1 or olen != 0):
+            return err("YDBv1 LEAF_SLOT_DELTA INSERT requires non-empty new payload and empty old payload")
+        if operation == yaza_db_wal_type_leaf_update_v1() and (nlen < 1 or olen < 1):
+            return err("YDBv1 LEAF_SLOT_DELTA UPDATE requires both new and old payloads")
+        if operation == yaza_db_wal_type_leaf_delete_v1() and (nlen != 0 or olen < 1):
+            return err("YDBv1 LEAF_SLOT_DELTA DELETE requires empty new payload and non-empty old payload")
+        if idx > 0 and yaza_db_compare_bytes_v1(prior_key, entry.key) >= 0:
+            return err("YDBv1 LEAF_SLOT_DELTA keys must be strictly increasing")
+        let ehdr: Bytes = bytes_try_new_zeroed(10)?
+        if not yaza_db_write_uint_le_v1(ehdr, 0, klen, 2) or not yaza_db_write_uint_le_v1(ehdr, 2, nlen, 4) or not yaza_db_write_uint_le_v1(ehdr, 6, olen, 4):
+            return err("YDBv1 LEAF_SLOT_DELTA entry header could not be encoded")
+        if not list_try_push(parts, ehdr) or not list_try_push(parts, entry.key):
+            return err("YDBv1 LEAF_SLOT_DELTA entry key could not be staged")
+        if nlen > 0:
+            if not list_try_push(parts, entry.new_payload):
+                return err("YDBv1 LEAF_SLOT_DELTA entry new payload could not be staged")
+        if olen > 0:
+            if not list_try_push(parts, entry.old_payload):
+                return err("YDBv1 LEAF_SLOT_DELTA entry old payload could not be staged")
+        set prior_key = entry.key
+        set idx = idx + 1
+    return bytes_join(parts)
+
+fn yaza_db_wal_leaf_slot_delta_decode_v1(record: YazaDbWalRecordV1) -> Result[YazaDbWalLeafSlotDeltaV1, Text]:
+    if record.rec_type != yaza_db_wal_type_leaf_slot_delta_v1():
+        return err("YDBv1 LEAF_SLOT_DELTA decoder requires record type 17")
+    if record.txn_id < 1 or record.lsn < 1:
+        return err("YDBv1 LEAF_SLOT_DELTA record requires valid transaction ID and LSN")
+    let payload: Bytes = record.payload
+    let total_len: Number = bytes_length(payload)
+    if total_len < yaza_db_wal_leaf_slot_delta_header_size_v1():
+        return err("YDBv1 LEAF_SLOT_DELTA payload is shorter than its header")
+    let magic: Number = yaza_db_read_uint_le_v1(payload, 0, 4)?
+    let version: Number = yaza_db_read_uint_le_v1(payload, 4, 2)?
+    let operation: Number = yaza_db_read_uint_le_v1(payload, 6, 2)?
+    let page_id: Number = yaza_db_read_uint_le_v1(payload, 8, 8)?
+    let count: Number = yaza_db_read_uint_le_v1(payload, 16, 4)?
+    let reserved: Number = yaza_db_read_uint_le_v1(payload, 20, 4)?
+    if magic != yaza_db_wal_leaf_slot_delta_magic_v1() or version != 1 or reserved != 0:
+        return err("YDBv1 LEAF_SLOT_DELTA header magic, version, or reserved field is invalid")
+    if operation != yaza_db_wal_type_leaf_insert_v1() and operation != yaza_db_wal_type_leaf_update_v1() and operation != yaza_db_wal_type_leaf_delete_v1():
+        return err("YDBv1 LEAF_SLOT_DELTA operation is invalid")
+    if page_id < 2 or count < 1 or count > 900:
+        return err("YDBv1 LEAF_SLOT_DELTA page ID or entry count is invalid")
+    let entries_res: Result[List[YazaDbWalLeafSlotDeltaEntryV1], Text] = list_try_new()
+    if not result_is_ok(entries_res):
+        return err("YDBv1 LEAF_SLOT_DELTA entries list could not be allocated")
+    let entries: List[YazaDbWalLeafSlotDeltaEntryV1] = result_unwrap(entries_res)
+    if not list_try_reserve(entries, count):
+        return err("YDBv1 LEAF_SLOT_DELTA entries list could not be reserved")
+    var cursor: Number = yaza_db_wal_leaf_slot_delta_header_size_v1()
+    var idx: Number = 0
+    var prior_key: Bytes = bytes_empty()
+    while idx < count:
+        if cursor + 10 > total_len:
+            return err("YDBv1 LEAF_SLOT_DELTA entry header is truncated")
+        let klen: Number = yaza_db_read_uint_le_v1(payload, cursor, 2)?
+        let nlen: Number = yaza_db_read_uint_le_v1(payload, cursor + 2, 4)?
+        let olen: Number = yaza_db_read_uint_le_v1(payload, cursor + 6, 4)?
+        set cursor = cursor + 10
+        if klen < 1 or klen > 2048 or nlen > 16384 or olen > 16384:
+            return err("YDBv1 LEAF_SLOT_DELTA entry field length is invalid")
+        if cursor + klen + nlen + olen > total_len:
+            return err("YDBv1 LEAF_SLOT_DELTA entry data is truncated")
+        let key: Bytes = bytes_try_slice(payload, cursor, klen)?
+        set cursor = cursor + klen
+        var new_payload: Bytes = bytes_empty()
+        if nlen > 0:
+            set new_payload = bytes_try_slice(payload, cursor, nlen)?
+            set cursor = cursor + nlen
+        var old_payload: Bytes = bytes_empty()
+        if olen > 0:
+            set old_payload = bytes_try_slice(payload, cursor, olen)?
+            set cursor = cursor + olen
+        if operation == yaza_db_wal_type_leaf_insert_v1() and (nlen < 1 or olen != 0):
+            return err("YDBv1 LEAF_SLOT_DELTA INSERT entry shape is invalid")
+        if operation == yaza_db_wal_type_leaf_update_v1() and (nlen < 1 or olen < 1):
+            return err("YDBv1 LEAF_SLOT_DELTA UPDATE entry shape is invalid")
+        if operation == yaza_db_wal_type_leaf_delete_v1() and (nlen != 0 or olen < 1):
+            return err("YDBv1 LEAF_SLOT_DELTA DELETE entry shape is invalid")
+        if idx > 0 and yaza_db_compare_bytes_v1(prior_key, key) >= 0:
+            return err("YDBv1 LEAF_SLOT_DELTA keys are not strictly increasing")
+        if not list_try_push(entries, YazaDbWalLeafSlotDeltaEntryV1(key, new_payload, old_payload)):
+            return err("YDBv1 LEAF_SLOT_DELTA decoded entry could not be stored")
+        set prior_key = key
+        set idx = idx + 1
+    if cursor != total_len:
+        return err("YDBv1 LEAF_SLOT_DELTA payload contains trailing bytes")
+    return ok(YazaDbWalLeafSlotDeltaV1(operation, page_id, entries))
+
+fn yaza_db_delta_wal_delete_slots_v1(source: Bytes, page_lsn: Number, remove_keys: List[Bytes]) -> Result[Bytes, Text]:
+    let header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(source, -1)?
+    let remove_count: Number = list_count(remove_keys)
+    if header.page_type != 1 or header.level != 0:
+        return err("YDBv1 batched leaf slot removal requires a level-zero LEAF page")
+    if page_lsn <= header.page_lsn or remove_count < 1 or remove_count > header.count:
+        return err("YDBv1 batched leaf slot removal metadata is invalid")
+    let created: Bytes = yaza_db_page_new_v1(header.page_id, page_lsn, 1, 0)?
+    if header.prefix_len > 0:
+        let prefix: Bytes = bytes_try_slice(source, yaza_db_page_size_v1() - header.prefix_len, header.prefix_len)?
+        let ignored_prefix: Number = yaza_db_page_set_prefix_v1(created, prefix)?
+    var old_index: Number = 0
+    var remove_index: Number = 0
+    while old_index < header.count:
+        let old_slot: YazaDbPageSlotV1 = yaza_db_page_slot_from_validated_header_v1(source, header, old_index)?
+        let old_key: Bytes = yaza_db_page_slot_key_from_validated_header_v1(source, header, old_slot)?
+        var skip_slot: Boolean = false
+        if remove_index < remove_count:
+            let remove_key: Bytes = list_get(remove_keys, remove_index)
+            let cmp: Number = yaza_db_compare_bytes_v1(remove_key, old_key)
+            if cmp < 0:
+                return err("YDBv1 batched leaf slot removal key is missing or out of order")
+            if cmp == 0:
+                set skip_slot = true
+                set remove_index = remove_index + 1
+        if not skip_slot:
+            let ignored_added: Number = yaza_db_page_add_slot_v1(created, old_key, old_slot.payload)?
+        set old_index = old_index + 1
+    if remove_index != remove_count:
+        return err("YDBv1 batched leaf slot removal referenced a missing key")
+    let packed_page: Bytes = yaza_db_page_finalize_v1(created)?
+    var result_page: Bytes = packed_page
+    if header.low_fence_len > 0 or header.high_fence_len > 0:
+        var low_fence: Bytes = bytes_empty()
+        var high_fence: Bytes = bytes_empty()
+        if header.low_fence_len > 0: set low_fence = bytes_try_slice(source, header.low_fence_offset, header.low_fence_len)?
+        if header.high_fence_len > 0: set high_fence = bytes_try_slice(source, header.high_fence_offset, header.high_fence_len)?
+        set result_page = yaza_db_page_set_fences_v1(packed_page, header.low_fence_len > 0, low_fence, header.high_fence_len > 0, high_fence)?
+    let verified: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(result_page, header.page_id)?
+    if verified.page_type != 1 or verified.level != 0 or verified.page_lsn != page_lsn or verified.count != header.count - remove_count:
+        return err("YDBv1 batched leaf slot removal failed metadata verification")
+    return ok(result_page)
+
+fn yaza_db_delta_wal_apply_to_page_v1(current: Bytes, operation: Number, target_lsn: Number, entries: List[YazaDbWalLeafSlotDeltaEntryV1]) -> Result[Bytes, Text]:
+    let current_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(current, -1)?
+    if current_header.page_type != 1 or current_header.level != 0:
+        return err("YDBv1 LEAF_SLOT_DELTA apply requires a level-zero LEAF page")
+    let keys_res: Result[List[Bytes], Text] = list_try_new()
+    let payloads_res: Result[List[Bytes], Text] = list_try_new()
+    if not result_is_ok(keys_res) or not result_is_ok(payloads_res):
+        return err("YDBv1 LEAF_SLOT_DELTA apply lists could not be allocated")
+    let keys: List[Bytes] = result_unwrap(keys_res)
+    let payloads: List[Bytes] = result_unwrap(payloads_res)
+    let count: Number = list_count(entries)
+    let _rk: Boolean = list_try_reserve(keys, count)
+    let _rp: Boolean = list_try_reserve(payloads, count)
+    var i: Number = 0
+    while i < count:
+        let entry: YazaDbWalLeafSlotDeltaEntryV1 = list_get(entries, i)
+        if operation != yaza_db_wal_type_leaf_insert_v1():
+            let old_payload: Bytes = yaza_db_delta_wal_find_slot_payload_v1(current, current_header, entry.key)?
+            if not bytes_equal(old_payload, entry.old_payload):
+                return err("YDBv1 LEAF_SLOT_DELTA before payload does not match target page")
+        if not list_try_push(keys, entry.key):
+            return err("YDBv1 LEAF_SLOT_DELTA key stage failed")
+        if operation != yaza_db_wal_type_leaf_delete_v1():
+            if not list_try_push(payloads, entry.new_payload):
+                return err("YDBv1 LEAF_SLOT_DELTA payload stage failed")
+        set i = i + 1
+    if operation == yaza_db_wal_type_leaf_insert_v1():
+        var inserted: Bytes = bytes_empty()
+        if count == 1:
+            set inserted = yaza_db_page_insert_sorted_slot_v1(current, list_get(keys, 0), list_get(payloads, 0))?
+        else:
+            set inserted = yaza_db_page_insert_sorted_slots_bulk_v1(current, keys, payloads)?
+        if not yaza_db_write_uint_le_v1(inserted, 0, target_lsn, 8):
+            return err("YDBv1 LEAF_SLOT_DELTA insert page LSN stamp failed")
+        return yaza_db_page_finalize_v1(inserted)
+    if operation == yaza_db_wal_type_leaf_update_v1():
+        if count == 1:
+            return yaza_db_page_replace_leaf_slot_v1(current, target_lsn, list_get(keys, 0), list_get(payloads, 0))
+        return yaza_db_page_replace_leaf_slots_v1(current, target_lsn, keys, payloads)
+    if count == 1:
+        return yaza_db_page_delete_leaf_slot_v1(current, target_lsn, list_get(keys, 0))
+    return yaza_db_delta_wal_delete_slots_v1(current, target_lsn, keys)
+
+fn yaza_db_storage_redo_leaf_slot_delta_v1(storage: YazaDbStorageHandleV1, record: YazaDbWalRecordV1, wal_end_lsn: Number) -> Result[Boolean, Text]:
+    if record.lsn < 1 or record.lsn > 9223372036854775807 - yaza_db_wal_header_size_v1() - bytes_length(record.payload):
+        return err("YDBv1 LEAF_SLOT_DELTA WAL LSN overflows supported range")
+    let record_end: Number = record.lsn + yaza_db_wal_header_size_v1() + bytes_length(record.payload)
+    if record_end > wal_end_lsn:
+        return err("YDBv1 LEAF_SLOT_DELTA extends beyond recovered WAL end")
+    let delta: YazaDbWalLeafSlotDeltaV1 = yaza_db_wal_leaf_slot_delta_decode_v1(record)?
+    let ignored_alloc: Boolean = yaza_db_storage_validate_leaf_page_allocated_v1(storage, delta.page_id)?
+    let current: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, delta.page_id)?
+    let cur_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(current, delta.page_id)?
+    if cur_header.page_type != 1 or cur_header.level != 0:
+        return err("YDBv1 LEAF_SLOT_DELTA target page is not a level-zero LEAF")
+    if cur_header.page_lsn >= record.lsn:
+        return ok(true)
+    let next_image: Bytes = yaza_db_delta_wal_apply_to_page_v1(current, delta.operation, record.lsn, delta.entries)?
+    let written: Number = yaza_db_storage_write_page_sync_v1(storage.file, storage.header, next_image)?
+    if written != yaza_db_page_size_v1():
+        return err("YDBv1 LEAF_SLOT_DELTA redo page write was incomplete")
+    return ok(true)
+
+fn yaza_db_delta_wal_build_undo_image_v1(storage: YazaDbStorageHandleV1, clr_lsn: Number, delta: YazaDbWalLeafSlotDeltaV1) -> Result[Bytes, Text]:
+    let current: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, delta.page_id)?
+    let cur_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(current, delta.page_id)?
+    if cur_header.page_type != 1 or cur_header.level != 0:
+        return err("YDBv1 LEAF_SLOT_DELTA undo target is not a level-zero LEAF")
+    let count: Number = list_count(delta.entries)
+    let keys_res: Result[List[Bytes], Text] = list_try_new()
+    let old_payloads_res: Result[List[Bytes], Text] = list_try_new()
+    if not result_is_ok(keys_res) or not result_is_ok(old_payloads_res):
+        return err("YDBv1 LEAF_SLOT_DELTA undo lists could not be allocated")
+    let keys: List[Bytes] = result_unwrap(keys_res)
+    let old_payloads: List[Bytes] = result_unwrap(old_payloads_res)
+    let _rk: Boolean = list_try_reserve(keys, count)
+    let _ro: Boolean = list_try_reserve(old_payloads, count)
+    var i: Number = 0
+    while i < count:
+        let entry: YazaDbWalLeafSlotDeltaEntryV1 = list_get(delta.entries, i)
+        if delta.operation != yaza_db_wal_type_leaf_delete_v1():
+            let live_payload: Bytes = yaza_db_delta_wal_find_slot_payload_v1(current, cur_header, entry.key)?
+            if not bytes_equal(live_payload, entry.new_payload):
+                return err("YDBv1 LEAF_SLOT_DELTA undo target does not match the logged after payload")
+        if not list_try_push(keys, entry.key):
+            return err("YDBv1 LEAF_SLOT_DELTA undo key stage failed")
+        if delta.operation != yaza_db_wal_type_leaf_insert_v1():
+            if not list_try_push(old_payloads, entry.old_payload):
+                return err("YDBv1 LEAF_SLOT_DELTA undo payload stage failed")
+        set i = i + 1
+    if delta.operation == yaza_db_wal_type_leaf_insert_v1():
+        if count == 1:
+            return yaza_db_page_delete_leaf_slot_v1(current, clr_lsn, list_get(keys, 0))
+        return yaza_db_delta_wal_delete_slots_v1(current, clr_lsn, keys)
+    if delta.operation == yaza_db_wal_type_leaf_update_v1():
+        if count == 1:
+            return yaza_db_page_replace_leaf_slot_v1(current, clr_lsn, list_get(keys, 0), list_get(old_payloads, 0))
+        return yaza_db_page_replace_leaf_slots_v1(current, clr_lsn, keys, old_payloads)
+    var restored: Bytes = bytes_empty()
+    if count == 1:
+        set restored = yaza_db_page_insert_sorted_slot_v1(current, list_get(keys, 0), list_get(old_payloads, 0))?
+    else:
+        set restored = yaza_db_page_insert_sorted_slots_bulk_v1(current, keys, old_payloads)?
+    if not yaza_db_write_uint_le_v1(restored, 0, clr_lsn, 8):
+        return err("YDBv1 LEAF_SLOT_DELTA undo DELETE LSN stamp failed")
+    return yaza_db_page_finalize_v1(restored)
+
+fn yaza_db_delta_wal_validate_clr_image_v1(delta: YazaDbWalLeafSlotDeltaV1, clr_image: Bytes) -> Boolean:
+    let hdr_res: Result[YazaDbPageHeaderV1, Text] = yaza_db_page_header_decode_v1(clr_image, delta.page_id)
+    if not result_is_ok(hdr_res): return false
+    let hdr: YazaDbPageHeaderV1 = result_unwrap(hdr_res)
+    if hdr.page_type != 1 or hdr.level != 0: return false
+    let count: Number = list_count(delta.entries)
+    var i: Number = 0
+    while i < count:
+        let entry: YazaDbWalLeafSlotDeltaEntryV1 = list_get(delta.entries, i)
+        let lb_res: Result[Number, Text] = yaza_db_page_lower_bound_validated_header_v1(clr_image, hdr, entry.key)
+        if not result_is_ok(lb_res): return false
+        let slot_idx: Number = result_unwrap(lb_res)
+        var exact: Boolean = false
+        var slot_payload: Bytes = bytes_empty()
+        if slot_idx < hdr.count:
+            let slot_res: Result[YazaDbPageSlotV1, Text] = yaza_db_page_slot_from_validated_header_v1(clr_image, hdr, slot_idx)
+            if not result_is_ok(slot_res): return false
+            let slot: YazaDbPageSlotV1 = result_unwrap(slot_res)
+            let k_res: Result[Bytes, Text] = yaza_db_page_slot_key_from_validated_header_v1(clr_image, hdr, slot)
+            if not result_is_ok(k_res): return false
+            if yaza_db_compare_bytes_v1(result_unwrap(k_res), entry.key) == 0:
+                set exact = true
+                set slot_payload = slot.payload
+        if delta.operation == yaza_db_wal_type_leaf_insert_v1():
+            if exact: return false
+        else:
+            if not exact or not bytes_equal(slot_payload, entry.old_payload): return false
+        set i = i + 1
+    return true
+
+fn yaza_db_delta_wal_find_slot_payload_v1(page: Bytes, header: YazaDbPageHeaderV1, key: Bytes) -> Result[Bytes, Text]:
+    let slot_idx: Number = yaza_db_page_lower_bound_validated_header_v1(page, header, key)?
+    if slot_idx < 0 or slot_idx >= header.count:
+        return err("YDBv1 LEAF_SLOT_DELTA could not find existing slot payload")
+    let slot: YazaDbPageSlotV1 = yaza_db_page_slot_from_validated_header_v1(page, header, slot_idx)?
+    let slot_key: Bytes = yaza_db_page_slot_key_from_validated_header_v1(page, header, slot)?
+    if yaza_db_compare_bytes_v1(slot_key, key) != 0:
+        return err("YDBv1 LEAF_SLOT_DELTA existing key mismatch")
+    return ok(slot.payload)

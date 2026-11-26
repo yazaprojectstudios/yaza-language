@@ -9,6 +9,7 @@ use "./mvcc_history_v1"
 use "./overflow_v1"
 use "./page_v1"
 use "./page_wal_v1"
+use "./plan_cache_v1"
 use "./query_v1"
 use "./row_v1"
 use "./sql_binder_v1"
@@ -60,6 +61,15 @@ shape YazaDbSqlUpdatePreparedPlanV1:
     reserve_pages: Number
     required_wal_bytes: Number
     groups: List[YazaDbWriteLeafUpdateGroupV1]
+
+shape YazaDbSqlUpdatePreparedWithCacheV1:
+    plan: YazaDbSqlUpdatePreparedPlanV1
+    cache_entry: Option[YazaDbWritePlanCacheEntryV1]
+
+shape YazaDbSqlUpdateCachedCommitV1:
+    commit: YazaDbWriteCommitV1
+    cache_entry: Option[YazaDbWritePlanCacheEntryV1]
+    overlay: Option[YazaDbDirtyPageOverlayV1]
 
 fn yaza_db_sql_update_unique_batch_conflict_v1(prior_targets: List[YazaDbSqlUpdateTargetV1], candidate: YazaDbSecondaryIndexUpdateV1) -> Boolean:
     let index_id: Number = candidate.old_target.index.index_id
@@ -502,37 +512,83 @@ fn yaza_db_sql_update_build_groups_v1(targets: List[YazaDbSqlUpdateTargetV1], co
         set group_start = group_end
     return ok(groups)
 
-fn yaza_db_sql_update_prepare_plan_v1(file: Number, read_header: YazaDbFileHeaderV1, encode_commit_ts: Number, source: Text, parameters: List[YazaSqlValueV1], cached_catalog: Option[YazaDbCatalogSnapshotWithRootsV1], cached_index_rows: Option[List[YazaDbRowV1]]) -> Result[YazaDbSqlUpdatePreparedPlanV1, Text]:
-    let update: YazaSqlUpdateAstV1 = yaza_sql_parse_update_v1(source)?
-    let statement_parameters: List[YazaSqlBoundParameterV1] = yaza_sql_update_bind_statement_parameters_v1(source, parameters)?
-    let predicate_source: YazaSqlUpdatePredicateSourceV1 = yaza_sql_update_normalize_predicate_source_v1(update.predicate_select_source)?
+fn yaza_db_sql_update_prepare_plan_with_cache_v1(file: Number, read_header: YazaDbFileHeaderV1, encode_commit_ts: Number, source: Text, parameters: List[YazaSqlValueV1], cached_catalog: Option[YazaDbCatalogSnapshotWithRootsV1], cached_index_rows: Option[List[YazaDbRowV1]], cached_entry: Option[YazaDbWritePlanCacheEntryV1]) -> Result[YazaDbSqlUpdatePreparedWithCacheV1, Text]:
     var loaded_result: Result[YazaDbCatalogSnapshotWithRootsV1, Text] = err("YDBv1 UPDATE catalog was not loaded")
     if option_is_some(cached_catalog):
         set loaded_result = ok(option_unwrap(cached_catalog))
     else:
         set loaded_result = yaza_db_catalog_snapshot_load_with_roots_v1(file, read_header)
     let loaded: YazaDbCatalogSnapshotWithRootsV1 = loaded_result?
-    var view_index: Number = 0
-    while view_index < list_count(loaded.views):
-        if yaza_sql_bind_v1_identifier_matches(source, update.table_name.first_token, list_get(loaded.views, view_index).name):
-            return err("YDBv1 views are read-only; UPDATE through a view is not supported")
-        set view_index = view_index + 1
-    let parsed: YazaSqlSelectAstV3 = yaza_sql_parse_select_v3(predicate_source.source)?
-    let plan: YazaSqlBoundPlanV1 = yaza_sql_bind_select_v1(predicate_source.source, parsed, loaded.sql_snapshot)?
-    if plan.catalog_version != loaded.sql_snapshot.version: return err("YDBv1 UPDATE predicate was bound against a stale catalog snapshot")
-    if plan.distinct or plan.has_limit or list_count(plan.order_by) != 0: return err("YDBv1 UPDATE predicate plan has unsupported output modifiers")
-    let table_index: Number = yaza_db_catalog_snapshot_table_index_v1(loaded.sql_snapshot.tables, plan.table_id)
-    if table_index < 0 or table_index >= list_count(loaded.root_page_ids) or table_index >= list_count(loaded.table_schema_versions): return err("YDBv1 UPDATE target has no persisted table root or schema version")
-    let table: YazaSqlTableSchemaV1 = list_get(loaded.sql_snapshot.tables, table_index)
-    let table_schema_version: Number = list_get(loaded.table_schema_versions, table_index)
-    let table_root_page_id: Number = list_get(loaded.root_page_ids, table_index)
     var index_rows_result: Result[List[YazaDbRowV1], Text] = err("YDBv1 UPDATE index catalog was not loaded")
     if option_is_some(cached_index_rows):
         set index_rows_result = ok(option_unwrap(cached_index_rows))
     else:
         set index_rows_result = yaza_db_index_catalog_rows_v1(file, read_header, loaded.sql_snapshot.version)
     let index_rows: List[YazaDbRowV1] = index_rows_result?
-    let key_ordinals: List[Number] = yaza_db_query_clustered_key_ordinals_from_rows_v1(index_rows, plan.table_id, table_root_page_id, list_count(table.columns))?
+
+    var used_cache: Boolean = false
+    var update_opt: Option[YazaSqlUpdateAstV1] = none
+    var statement_parameters: List[YazaSqlBoundParameterV1] = List[YazaSqlBoundParameterV1]()
+    var pred_source_text: Text = ""
+    var pred_pos_ordinals: List[Number] = List[Number]()
+    var pred_entry_opt: Option[YazaDbSelectPlanCacheEntryV1] = none
+    var plan_opt: Option[YazaSqlBoundPlanV1] = none
+    var table_index: Number = -1
+    var table_schema_version: Number = 0
+    var table_root_page_id: Number = 0
+    var key_ordinals: List[Number] = List[Number]()
+    var out_cache_entry: Option[YazaDbWritePlanCacheEntryV1] = none
+
+    if option_is_some(cached_entry):
+        let ce: YazaDbWritePlanCacheEntryV1 = option_unwrap(cached_entry)
+        if ce.stmt_kind == 2 and ce.source == source and ce.catalog_root == read_header.catalog_root and option_is_some(ce.update_ast) and option_is_some(ce.pred_select_entry):
+            if ce.table_index >= 0 and ce.table_index < list_count(loaded.sql_snapshot.tables) and ce.table_index < list_count(loaded.root_page_ids) and ce.table_index < list_count(loaded.table_schema_versions):
+                if list_get(loaded.sql_snapshot.tables, ce.table_index).table_id == ce.table_id and list_get(loaded.root_page_ids, ce.table_index) == ce.table_root_page_id and list_get(loaded.table_schema_versions, ce.table_index) == ce.table_schema_version:
+                    if list_count(ce.update_stmt_params) != list_count(parameters): return err("YDBv1 UPDATE parameter count does not match the full statement")
+                    let pe: YazaDbSelectPlanCacheEntryV1 = option_unwrap(ce.pred_select_entry)
+                    set used_cache = true
+                    set update_opt = ce.update_ast
+                    set statement_parameters = ce.update_stmt_params
+                    set pred_source_text = ce.update_pred_source_text
+                    set pred_pos_ordinals = ce.update_pred_pos_ordinals
+                    set pred_entry_opt = ce.pred_select_entry
+                    set plan_opt = some(pe.plan)
+                    set table_index = ce.table_index
+                    set table_schema_version = ce.table_schema_version
+                    set table_root_page_id = ce.table_root_page_id
+                    set key_ordinals = ce.key_ordinals
+
+    if not used_cache:
+        let parsed_update: YazaSqlUpdateAstV1 = yaza_sql_parse_update_v1(source)?
+        set statement_parameters = yaza_sql_update_bind_statement_parameters_v1(source, parameters)?
+        let predicate_source: YazaSqlUpdatePredicateSourceV1 = yaza_sql_update_normalize_predicate_source_v1(parsed_update.predicate_select_source)?
+        var view_index: Number = 0
+        while view_index < list_count(loaded.views):
+            if yaza_sql_bind_v1_identifier_matches(source, parsed_update.table_name.first_token, list_get(loaded.views, view_index).name):
+                return err("YDBv1 views are read-only; UPDATE through a view is not supported")
+            set view_index = view_index + 1
+        let parsed: YazaSqlSelectAstV3 = yaza_sql_parse_select_v3(predicate_source.source)?
+        let bound_plan: YazaSqlBoundPlanV1 = yaza_sql_bind_select_v1(predicate_source.source, parsed, loaded.sql_snapshot)?
+        if bound_plan.catalog_version != loaded.sql_snapshot.version: return err("YDBv1 UPDATE predicate was bound against a stale catalog snapshot")
+        if bound_plan.distinct or bound_plan.has_limit or list_count(bound_plan.order_by) != 0: return err("YDBv1 UPDATE predicate plan has unsupported output modifiers")
+        set table_index = yaza_db_catalog_snapshot_table_index_v1(loaded.sql_snapshot.tables, bound_plan.table_id)
+        if table_index < 0 or table_index >= list_count(loaded.root_page_ids) or table_index >= list_count(loaded.table_schema_versions): return err("YDBv1 UPDATE target has no persisted table root or schema version")
+        let table_chk: YazaSqlTableSchemaV1 = list_get(loaded.sql_snapshot.tables, table_index)
+        set table_schema_version = list_get(loaded.table_schema_versions, table_index)
+        set table_root_page_id = list_get(loaded.root_page_ids, table_index)
+        set key_ordinals = yaza_db_query_clustered_key_ordinals_from_rows_v1(index_rows, bound_plan.table_id, table_root_page_id, list_count(table_chk.columns))?
+        set update_opt = some(parsed_update)
+        set pred_source_text = predicate_source.source
+        set pred_pos_ordinals = predicate_source.positional_source_ordinals
+        set plan_opt = some(bound_plan)
+        if read_header.catalog_root > 0 and bound_plan.right_table_id == 0 and list_count(bound_plan.join_stages) == 0 and list_count(bound_plan.subqueries) == 0:
+            let pe: YazaDbSelectPlanCacheEntryV1 = YazaDbSelectPlanCacheEntryV1(predicate_source.source, read_header.catalog_root, bound_plan.table_id, table_index, table_root_page_id, table_schema_version, key_ordinals, bound_plan)
+            set pred_entry_opt = some(pe)
+            set out_cache_entry = some(yaza_db_write_plan_entry_update_v1(source, read_header.catalog_root, bound_plan.table_id, table_index, table_root_page_id, table_schema_version, key_ordinals, parsed_update, statement_parameters, predicate_source.source, predicate_source.positional_source_ordinals, pe))
+
+    let update: YazaSqlUpdateAstV1 = option_unwrap(update_opt)
+    let plan: YazaSqlBoundPlanV1 = option_unwrap(plan_opt)
+    let table: YazaSqlTableSchemaV1 = list_get(loaded.sql_snapshot.tables, table_index)
     let indexes: List[YazaDbSecondaryIndexV1] = yaza_db_index_maintenance_load_from_rows_v1(loaded, table_index, key_ordinals, index_rows)?
     let assignments: List[YazaDbSqlUpdateAssignmentValueV1] = yaza_db_sql_update_materialize_assignments_v1(source, update, table, key_ordinals, parameters)?
     let predicate_parameters_result: Result[List[YazaSqlValueV1], Text] = list_try_new()
@@ -549,8 +605,8 @@ fn yaza_db_sql_update_prepare_plan_v1(file: Number, read_header: YazaDbFileHeade
         if parameter_style == 1:
             set statement_parameter_index = set_parameter_count + predicate_parameter_index
         elif parameter_style == 2:
-            if predicate_parameter_index >= list_count(predicate_source.positional_source_ordinals): return err("YDBv1 UPDATE positional predicate map is incomplete")
-            set statement_parameter_index = list_get(predicate_source.positional_source_ordinals, predicate_parameter_index)
+            if predicate_parameter_index >= list_count(pred_pos_ordinals): return err("YDBv1 UPDATE positional predicate map is incomplete")
+            set statement_parameter_index = list_get(pred_pos_ordinals, predicate_parameter_index)
         elif parameter_style == 3:
             set statement_parameter_index = yaza_sql_bind_v1_find_parameter(statement_parameters, bound_predicate_parameter.key)
         else:
@@ -558,12 +614,18 @@ fn yaza_db_sql_update_prepare_plan_v1(file: Number, read_header: YazaDbFileHeade
         if statement_parameter_index < 0 or statement_parameter_index >= list_count(parameters): return err("YDBv1 UPDATE WHERE parameter maps outside the supplied statement values")
         if not list_try_push(predicate_parameters, list_get(parameters, statement_parameter_index)): return err("YDBv1 UPDATE could not append a WHERE parameter value")
         set predicate_parameter_index = predicate_parameter_index + 1
-    if parameter_style == 2 and list_count(predicate_source.positional_source_ordinals) != list_count(plan.parameters): return err("YDBv1 UPDATE positional predicate metadata does not match its bound plan")
-    let predicate_tokens: List[YazaSqlTokenV1] = yaza_sql_lex_v1(predicate_source.source)?
-    let query_result: YazaSqlQueryResultV1 = yaza_db_execute_single_select_with_cached_catalog_and_index_rows_profiled_v1(file, read_header, predicate_source.source, predicate_tokens, predicate_parameters, loaded, index_rows, List[Number]())?
+    if parameter_style == 2 and list_count(pred_pos_ordinals) != list_count(plan.parameters): return err("YDBv1 UPDATE positional predicate metadata does not match its bound plan")
+    var query_res: Result[YazaSqlQueryResultV1, Text] = err("YDBv1 UPDATE predicate query did not run")
+    if option_is_some(pred_entry_opt):
+        let pooled: YazaDbQueryPooledSelectResultV1 = yaza_db_execute_cached_select_plan_pooled_profiled_v1(file, read_header, predicate_parameters, loaded, some(index_rows), option_unwrap(pred_entry_opt), none, List[Number]())?
+        set query_res = ok(pooled.query_result)
+    else:
+        let predicate_tokens: List[YazaSqlTokenV1] = yaza_sql_lex_v1(pred_source_text)?
+        set query_res = yaza_db_execute_single_select_with_cached_catalog_and_index_rows_profiled_v1(file, read_header, pred_source_text, predicate_tokens, predicate_parameters, loaded, index_rows, List[Number]())
+    let query_result: YazaSqlQueryResultV1 = query_res?
     let row_count: Number = list_count(query_result.rows)
     if row_count == 0:
-        return ok(YazaDbSqlUpdatePreparedPlanV1(table, table_schema_version, 0, List[YazaDbSqlUpdateTargetV1](), 0, YazaDbSqlUpdateOverflowBudgetV1(0, 0), 0, 0, 0, List[YazaDbWriteLeafUpdateGroupV1]()))
+        return ok(YazaDbSqlUpdatePreparedWithCacheV1(YazaDbSqlUpdatePreparedPlanV1(table, table_schema_version, 0, List[YazaDbSqlUpdateTargetV1](), 0, YazaDbSqlUpdateOverflowBudgetV1(0, 0), 0, 0, 0, List[YazaDbWriteLeafUpdateGroupV1]()), out_cache_entry))
     let column_count: Number = list_count(table.columns)
     if row_count > 900 or row_count * column_count > 1048576: return err("YDBv1 UPDATE result exceeds the bounded 900-row atomic transaction/cell profile")
     let targets_result: Result[List[YazaDbSqlUpdateTargetV1], Text] = list_try_new()
@@ -722,7 +784,11 @@ fn yaza_db_sql_update_prepare_plan_v1(file: Number, read_header: YazaDbFileHeade
     var groups: List[YazaDbWriteLeafUpdateGroupV1] = List[YazaDbWriteLeafUpdateGroupV1]()
     if overflow_budget.page_count == 0 and row_count > 0:
         set groups = yaza_db_sql_update_build_groups_v1(targets, table.columns, encode_commit_ts, table_schema_version)?
-    return ok(YazaDbSqlUpdatePreparedPlanV1(table, table_schema_version, row_count, targets, total_index_writes, overflow_budget, mutation_count, reserve_pages, required_wal_bytes, groups))
+    return ok(YazaDbSqlUpdatePreparedWithCacheV1(YazaDbSqlUpdatePreparedPlanV1(table, table_schema_version, row_count, targets, total_index_writes, overflow_budget, mutation_count, reserve_pages, required_wal_bytes, groups), out_cache_entry))
+
+fn yaza_db_sql_update_prepare_plan_v1(file: Number, read_header: YazaDbFileHeaderV1, encode_commit_ts: Number, source: Text, parameters: List[YazaSqlValueV1], cached_catalog: Option[YazaDbCatalogSnapshotWithRootsV1], cached_index_rows: Option[List[YazaDbRowV1]]) -> Result[YazaDbSqlUpdatePreparedPlanV1, Text]:
+    let res: YazaDbSqlUpdatePreparedWithCacheV1 = yaza_db_sql_update_prepare_plan_with_cache_v1(file, read_header, encode_commit_ts, source, parameters, cached_catalog, cached_index_rows, none)?
+    return ok(res.plan)
 
 fn yaza_db_sql_update_execute_nonstaged_in_tx_v1(initial_tx: YazaDbWriteTransactionV1, plan: YazaDbSqlUpdatePreparedPlanV1) -> Result[YazaDbWriteTransactionV1, Text]:
     var current: YazaDbWriteTransactionV1 = initial_tx
@@ -824,11 +890,12 @@ fn yaza_db_execute_update_in_tx_v1(transaction: YazaDbWriteTransactionV1, source
     let next_tx: YazaDbWriteTransactionV1 = yaza_db_sql_update_execute_nonstaged_in_tx_v1(transaction, plan)?
     return ok(YazaDbTxDmlResultV1(next_tx, plan.row_count))
 
-fn yaza_db_execute_update_with_sync_policy_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], defer_checkpoint: Boolean, sync_commit_wal: Boolean, cached_catalog: Option[YazaDbCatalogSnapshotWithRootsV1], cached_index_rows: Option[List[YazaDbRowV1]]) -> Result[YazaDbWriteCommitV1, Text]:
+fn yaza_db_execute_update_with_overlay_and_cache_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], defer_checkpoint: Boolean, sync_commit_wal: Boolean, cached_catalog: Option[YazaDbCatalogSnapshotWithRootsV1], cached_index_rows: Option[List[YazaDbRowV1]], cached_entry: Option[YazaDbWritePlanCacheEntryV1], overlay: Option[YazaDbDirtyPageOverlayV1]) -> Result[YazaDbSqlUpdateCachedCommitV1, Text]:
     if storage.root != wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid): return err("YDBv1 SQL UPDATE storage and WAL handles belong to different databases")
-    let plan: YazaDbSqlUpdatePreparedPlanV1 = yaza_db_sql_update_prepare_plan_v1(storage.file, storage.header, storage.header.next_commit_ts, source, parameters, cached_catalog, cached_index_rows)?
+    let prepared: YazaDbSqlUpdatePreparedWithCacheV1 = yaza_db_sql_update_prepare_plan_with_cache_v1(storage.file, storage.header, storage.header.next_commit_ts, source, parameters, cached_catalog, cached_index_rows, cached_entry)?
+    let plan: YazaDbSqlUpdatePreparedPlanV1 = prepared.plan
     if plan.row_count == 0:
-        return ok(YazaDbWriteCommitV1(storage, wal, 0, storage.header.next_commit_ts - 1, 0))
+        return ok(YazaDbSqlUpdateCachedCommitV1(YazaDbWriteCommitV1(storage, wal, 0, storage.header.next_commit_ts - 1, 0), prepared.cache_entry, overlay))
     var begun_result: Result[YazaDbWriteTransactionV1, Text] = err("YDBv1 UPDATE transaction begin path was not selected")
     if defer_checkpoint:
         set begun_result = yaza_db_write_transaction_begin_with_reserve_deferred_checkpoint_v1(storage, wal, plan.reserve_pages)
@@ -843,7 +910,7 @@ fn yaza_db_execute_update_with_sync_policy_v1(storage: YazaDbStorageHandleV1, wa
         return err("YDBv1 UPDATE result exceeds the bounded WAL recovery-tail budget; reopen through recovery before reuse")
     var current: YazaDbWriteTransactionV1 = begun
     if plan.overflow_budget.page_count == 0 and plan.row_count > 0 and plan.total_index_writes == 0 and list_count(plan.groups) <= 128:
-        let staged_result: Result[YazaDbStagedLeafBatchV1, Text] = yaza_db_write_transaction_stage_leaf_update_groups_profiled_v1(current, plan.groups, List[Number]())
+        let staged_result: Result[YazaDbStagedLeafBatchV1, Text] = yaza_db_write_transaction_stage_leaf_update_groups_with_overlay_v1(current, plan.groups, overlay, List[Number]())
         if not result_is_ok(staged_result):
             let message: Text = result_unwrap_error(staged_result)
             yaza_db_sql_update_close_after_error_v1(current.storage, current.wal, message)
@@ -855,7 +922,15 @@ fn yaza_db_execute_update_with_sync_policy_v1(storage: YazaDbStorageHandleV1, wa
             yaza_db_sql_update_close_after_error_v1(staged.transaction.storage, staged.transaction.wal, message)
             return err("YDBv1 SQL UPDATE commit failed; reopen through recovery before reuse: " + message)
         let staged_commit: YazaDbWriteCommitV1 = result_unwrap(committed_staged)
-        return ok(YazaDbWriteCommitV1(staged_commit.storage, staged_commit.wal, staged_commit.txn_id, staged_commit.commit_ts, plan.row_count))
+        var out_overlay: Option[YazaDbDirtyPageOverlayV1] = overlay
+        if option_is_some(overlay):
+            if staged_commit.storage.header.checkpoint_lsn != storage.header.checkpoint_lsn:
+                let reset_ov: Result[YazaDbDirtyPageOverlayV1, Text] = yaza_db_dirty_overlay_new_v1()
+                if result_is_ok(reset_ov): set out_overlay = some(result_unwrap(reset_ov))
+            else:
+                let marked_ov: Result[YazaDbDirtyPageOverlayV1, Text] = yaza_db_dirty_overlay_mark_fpi_v1(option_unwrap(overlay), staged.page_ids)
+                if result_is_ok(marked_ov): set out_overlay = some(result_unwrap(marked_ov))
+        return ok(YazaDbSqlUpdateCachedCommitV1(YazaDbWriteCommitV1(staged_commit.storage, staged_commit.wal, staged_commit.txn_id, staged_commit.commit_ts, plan.row_count), prepared.cache_entry, out_overlay))
     set current = yaza_db_sql_update_execute_nonstaged_in_tx_v1(current, plan)?
     let committed: Result[YazaDbWriteCommitV1, Text] = yaza_db_write_transaction_commit_with_sync_policy_v1(current, not defer_checkpoint, 0, sync_commit_wal)
     if not result_is_ok(committed):
@@ -863,7 +938,15 @@ fn yaza_db_execute_update_with_sync_policy_v1(storage: YazaDbStorageHandleV1, wa
         yaza_db_sql_update_close_after_error_v1(current.storage, current.wal, message)
         return err("YDBv1 SQL UPDATE commit failed; reopen through recovery before reuse: " + message)
     let result: YazaDbWriteCommitV1 = result_unwrap(committed)
-    return ok(YazaDbWriteCommitV1(result.storage, result.wal, result.txn_id, result.commit_ts, plan.row_count))
+    var out_overlay_ns: Option[YazaDbDirtyPageOverlayV1] = overlay
+    if option_is_some(overlay) and result.storage.header.checkpoint_lsn != storage.header.checkpoint_lsn:
+        let reset_ov: Result[YazaDbDirtyPageOverlayV1, Text] = yaza_db_dirty_overlay_new_v1()
+        if result_is_ok(reset_ov): set out_overlay_ns = some(result_unwrap(reset_ov))
+    return ok(YazaDbSqlUpdateCachedCommitV1(YazaDbWriteCommitV1(result.storage, result.wal, result.txn_id, result.commit_ts, plan.row_count), prepared.cache_entry, out_overlay_ns))
+
+fn yaza_db_execute_update_with_sync_policy_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], defer_checkpoint: Boolean, sync_commit_wal: Boolean, cached_catalog: Option[YazaDbCatalogSnapshotWithRootsV1], cached_index_rows: Option[List[YazaDbRowV1]]) -> Result[YazaDbWriteCommitV1, Text]:
+    let res: YazaDbSqlUpdateCachedCommitV1 = yaza_db_execute_update_with_overlay_and_cache_v1(storage, wal, source, parameters, defer_checkpoint, sync_commit_wal, cached_catalog, cached_index_rows, none, none)?
+    return ok(res.commit)
 
 fn yaza_db_execute_update_with_policy_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], defer_checkpoint: Boolean, cached_catalog: Option[YazaDbCatalogSnapshotWithRootsV1], cached_index_rows: Option[List[YazaDbRowV1]]) -> Result[YazaDbWriteCommitV1, Text]:
     return yaza_db_execute_update_with_sync_policy_v1(storage, wal, source, parameters, defer_checkpoint, true, cached_catalog, cached_index_rows)

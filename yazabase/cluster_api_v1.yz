@@ -6,6 +6,7 @@ use "./cluster_ha_v1"
 use "./replication_v1"
 use "./router_v1"
 use "./session_v1"
+use "./sync_engine_v1"
 
 shape YazaApiReplicationResponseV1:
     session: YazaDbSessionV1
@@ -59,6 +60,16 @@ fn yaza_api_route_request_cluster_v1(session: YazaDbSessionV1, root_path: Text, 
         if ha_out.state.role != repl_state.role:
             set next_repl = YazaDbReplicationStateV1(ha_out.state.role, repl_state.node_id, repl_state.sync_quorum, repl_state.acks)
         return ok(YazaApiClusterResponseV1(ha_out.session, next_repl, ha_out.state, ha_out.response))
+    if text_starts_with(request.path, "/api/v1/sync/"):
+        if request.method == "OPTIONS":
+            return ok(YazaApiClusterResponseV1(session, repl_state, ha_state, http_response_no_content()))
+        let auth_err: Option[HttpResponse] = yaza_api_verify_auth(request, auth_secret)
+        if option_is_some(auth_err):
+            return ok(YazaApiClusterResponseV1(session, repl_state, ha_state, option_unwrap(auth_err)))
+        if request.path == "/api/v1/sync/push" and request.method == "POST" and (repl_state.role == "replica" or ha_state.role == "replica"):
+            return ok(YazaApiClusterResponseV1(session, repl_state, ha_state, yaza_api_response_conflict_json("READ_ONLY_REPLICA", "cannot apply sync writes on a read-only replica")))
+        let sync_out: YazaDbSyncHttpOutcomeV1 = yaza_db_sync_handle_http_v1(session, request, repl_state.node_id, yaza_db_sync_policy_server_wins_v1())?
+        return ok(YazaApiClusterResponseV1(sync_out.session, repl_state, ha_state, sync_out.response))
     let base: YazaApiSessionResponseV1 = yaza_api_route_request_state_with_role_v1(session, root_path, db_name, request, auth_secret, state, ha_state.role)?
     return ok(YazaApiClusterResponseV1(base.session, repl_state, ha_state, base.response))
 

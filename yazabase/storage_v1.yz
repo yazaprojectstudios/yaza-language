@@ -1,6 +1,7 @@
 use "std/fs"
 use "./disk_quota_v1"
 use "./page_v1"
+use "./page_crypto_v1"
 
 shape YazaDbStorageHandleV1:
     root: Number
@@ -393,3 +394,403 @@ fn yaza_db_storage_close_v1(handle: YazaDbStorageHandleV1) -> Result[Boolean, Te
     if not result_is_ok(lock_result): return err(result_unwrap_error(lock_result))
     if not result_unwrap(file_result) or not result_unwrap(identity_lock_result) or not result_unwrap(lock_result): return err("YDBv1 storage handle close did not release every capability")
     return ok(true)
+
+# Transparent Authenticated Page-Level Encryption Storage Boundary (Tier 1 #3)
+# Uses header.flags == 3 so unencrypted yaza_db_storage_open_v1 fails closed.
+shape YazaDbEncryptedStorageHandleV1:
+    storage: YazaDbStorageHandleV1
+    crypto: YazaDbPageCryptoKeyV1
+    meta_file: Number
+    db_name: Text
+    meta_name: Text
+
+fn yaza_db_storage_file_has_encrypted_header_capacity_v1(size: Number, header: YazaDbFileHeaderV1) -> Boolean:
+    if size < yaza_db_page_size_v1() * 2 or size % yaza_db_page_size_v1() != 0: return false
+    if bytes_length(header.db_uuid) != 16 or header.checkpoint_lsn < 0 or header.next_txn_id < 1 or header.next_commit_ts < 1: return false
+    if header.flags != yaza_db_crypto_header_flag_encrypted_v1() or header.page_count < 3 or header.page_count > yaza_db_storage_max_page_count_v1(): return false
+    if header.catalog_root < 0 or (header.catalog_root != 0 and (header.catalog_root < 2 or header.catalog_root >= header.page_count)): return false
+    return header.page_count <= size / yaza_db_page_size_v1()
+
+fn yaza_db_storage_read_encrypted_header_v1(file: Number) -> Result[YazaDbFileHeaderV1, Text]:
+    let sz: Number = file_size(file)?
+    if sz < yaza_db_page_size_v1() * 2 or sz % yaza_db_page_size_v1() != 0: return err("YDBv1 encrypted file must contain aligned header pages")
+    let first_bytes: Bytes = read_exact(file, 0, yaza_db_page_size_v1())?
+    let second_bytes: Bytes = read_exact(file, yaza_db_page_size_v1(), yaza_db_page_size_v1())?
+    let first_result: Result[YazaDbFileHeaderV1, Text] = yaza_db_read_file_header_v1(first_bytes)
+    let second_result: Result[YazaDbFileHeaderV1, Text] = yaza_db_read_file_header_v1(second_bytes)
+    var first_valid: Boolean = result_is_ok(first_result)
+    var second_valid: Boolean = result_is_ok(second_result)
+    var first_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_empty(), 0, 0, 0, 0, 0, 0)
+    var second_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(bytes_empty(), 0, 0, 0, 0, 0, 0)
+    if first_valid:
+        set first_header = result_unwrap(first_result)
+        if not yaza_db_storage_file_has_encrypted_header_capacity_v1(sz, first_header): set first_valid = false
+    if second_valid:
+        set second_header = result_unwrap(second_result)
+        if not yaza_db_storage_file_has_encrypted_header_capacity_v1(sz, second_header): set second_valid = false
+    if not first_valid and not second_valid: return err("both YDBv1 encrypted file-header copies are invalid or not encrypted (flags != 3)")
+    if first_valid and not second_valid: return yaza_db_storage_header_result_v1(first_header)
+    if second_valid and not first_valid: return yaza_db_storage_header_result_v1(second_header)
+    if not bytes_equal(first_header.db_uuid, second_header.db_uuid): return err("YDBv1 encrypted file-header copies identify different databases")
+    if first_header.checkpoint_lsn > second_header.checkpoint_lsn: return yaza_db_storage_header_result_v1(first_header)
+    if second_header.checkpoint_lsn > first_header.checkpoint_lsn: return yaza_db_storage_header_result_v1(second_header)
+    if not yaza_db_storage_headers_equal_v1(first_header, second_header): return err("YDBv1 encrypted file-header copies disagree at the same checkpoint LSN")
+    return yaza_db_storage_header_result_v1(first_header)
+
+fn yaza_db_storage_read_sidecar_params_v1(root: Number, db_uuid: Bytes) -> Result[YazaDbCryptoSidecarHeaderV1, Text]:
+    let meta_name: Text = yaza_db_crypto_sidecar_name_v1(db_uuid)?
+    let f: Number = open_read(root, meta_name)?
+    let raw_res: Result[Bytes, Text] = read_exact(f, 0, yaza_db_crypto_sidecar_header_size_v1())
+    let _c: Result[Boolean, Text] = close(f)
+    let raw: Bytes = raw_res?
+    return yaza_db_crypto_peek_sidecar_header_v1(raw)
+
+fn yaza_db_storage_meta_read_slot_v1(meta_file: Number, page_id: Number) -> Result[YazaDbPageCipherMetaV1, Text]:
+    let off: Number = yaza_db_crypto_sidecar_slot_offset_v1(page_id)?
+    let sz: Number = file_size(meta_file)?
+    let slot_sz: Number = yaza_db_crypto_sidecar_slot_size_v1()
+    if off + slot_sz > sz:
+        let z_nonce: Bytes = bytes_try_new_zeroed(16)?
+        let z_mac: Bytes = bytes_try_new_zeroed(32)?
+        return ok(YazaDbPageCipherMetaV1(0, z_nonce, z_mac))
+    let raw: Bytes = read_exact(meta_file, off, slot_sz)?
+    return yaza_db_crypto_decode_slot_v1(raw)
+
+fn yaza_db_storage_meta_write_slot_v1(meta_file: Number, page_id: Number, meta: YazaDbPageCipherMetaV1) -> Result[Number, Text]:
+    let off: Number = yaza_db_crypto_sidecar_slot_offset_v1(page_id)?
+    let encoded: Bytes = yaza_db_crypto_encode_slot_v1(meta)?
+    let written: Number = write_exact(meta_file, off, encoded)?
+    if written != yaza_db_crypto_sidecar_slot_size_v1():
+        return err("YDBv1 encrypted sidecar slot write was incomplete")
+    return ok(written)
+
+fn yaza_db_storage_read_page_raw_encrypted_v1(handle: YazaDbEncryptedStorageHandleV1, page_id: Number) -> Result[Bytes, Text]:
+    if page_id < 2 or page_id >= handle.storage.header.page_count:
+        return err("YDBv1 encrypted page ID is outside the logical allocation")
+    let slot: YazaDbPageCipherMetaV1 = yaza_db_storage_meta_read_slot_v1(handle.meta_file, page_id)?
+    if slot.key_epoch == 0:
+        return err("YDBv1 encrypted page has no authenticated sidecar metadata")
+    let offset: Number = yaza_db_storage_page_offset_v1(page_id)?
+    let ciphertext: Bytes = read_exact(handle.storage.file, offset, yaza_db_page_size_v1())?
+    return yaza_db_crypto_decrypt_page_v1(handle.crypto, page_id, ciphertext, slot)
+
+fn yaza_db_storage_validate_page_role_encrypted_v1(handle: YazaDbEncryptedStorageHandleV1, page: Bytes, page_header: YazaDbPageHeaderV1) -> Result[Boolean, Text]:
+    let address: YazaDbBitmapAddressV1 = yaza_db_bitmap_address_v1(page_header.page_id)?
+    if address.is_bitmap_page:
+        if page_header.page_type != 5: return err("YDBv1 BITMAP range start must contain a BITMAP page")
+        if not yaza_db_bitmap_page_bit_unchecked_v1(page, 0): return err("YDBv1 BITMAP page must reserve its own allocation bit")
+    else:
+        if page_header.page_type == 5: return err("YDBv1 BITMAP page must be at the start of its mapped range")
+        if page_header.page_type == 6: return err("YDBv1 FREE page cannot be stored while its allocation bit is set")
+        if address.bitmap_page_id >= handle.storage.header.page_count: return err("YDBv1 data page has no allocated BITMAP range")
+        let bitmap: Bytes = yaza_db_storage_read_page_raw_encrypted_v1(handle, address.bitmap_page_id)?
+        let bitmap_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(bitmap, address.bitmap_page_id)?
+        if bitmap_header.page_type != 5: return err("YDBv1 encrypted page range does not contain its BITMAP page")
+        if not yaza_db_bitmap_page_bit_unchecked_v1(bitmap, 0): return err("YDBv1 encrypted page-range BITMAP does not reserve itself")
+        if not yaza_db_bitmap_page_bit_unchecked_v1(bitmap, address.bit_index): return err("YDBv1 encrypted data page is not marked allocated in its BITMAP")
+    return ok(true)
+
+fn yaza_db_storage_read_page_encrypted_v1(handle: YazaDbEncryptedStorageHandleV1, page_id: Number) -> Result[Bytes, Text]:
+    let plain: Bytes = yaza_db_storage_read_page_raw_encrypted_v1(handle, page_id)?
+    let page_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(plain, page_id)?
+    let _role: Boolean = yaza_db_storage_validate_page_role_encrypted_v1(handle, plain, page_header)?
+    return ok(plain)
+
+fn yaza_db_storage_write_page_encrypted_v1(handle: YazaDbEncryptedStorageHandleV1, page: Bytes) -> Result[Number, Text]:
+    let page_header: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page, -1)?
+    if page_header.page_id < 2 or page_header.page_id >= handle.storage.header.page_count:
+        return err("YDBv1 encrypted page ID is outside the logical allocation")
+    let _role: Boolean = yaza_db_storage_validate_page_role_encrypted_v1(handle, page, page_header)?
+    let enc: YazaDbEncryptedPageResultV1 = yaza_db_crypto_encrypt_page_v1(handle.crypto, page_header.page_id, page)?
+    let offset: Number = yaza_db_storage_page_offset_v1(page_header.page_id)?
+    let written: Number = write_exact(handle.storage.file, offset, enc.ciphertext)?
+    if written != yaza_db_page_size_v1(): return err("YDBv1 encrypted data-page write was incomplete")
+    let _fs: Boolean = sync(handle.storage.file)?
+    let _sw: Number = yaza_db_storage_meta_write_slot_v1(handle.meta_file, page_header.page_id, enc.meta)?
+    let _ms: Boolean = sync(handle.meta_file)?
+    return ok(written)
+
+fn yaza_db_storage_create_encrypted_with_pages_v1(root: Number, name: Text, header: YazaDbFileHeaderV1, key: YazaDbPageCryptoKeyV1, initial_pages: Number) -> Result[YazaDbEncryptedStorageHandleV1, Text]:
+    if header.page_count != 2 or header.catalog_root != 0:
+        return err("YDBv1 initial encrypted database must start with two header pages and zero catalog root")
+    if not bytes_equal(header.db_uuid, key.db_uuid):
+        return err("YDBv1 encrypted database UUID does not match encryption key")
+    if initial_pages < 4 or initial_pages > yaza_db_storage_preallocated_page_count_v1():
+        return err("YDBv1 initial encrypted page count is out of bounds")
+    let meta_name: Text = yaza_db_crypto_sidecar_name_v1(header.db_uuid)?
+    let identity_lock_name: Text = yaza_db_storage_uuid_lock_name_v1(header.db_uuid)?
+    let lock: Number = lock_exclusive(root, name)?
+    let id_lock_res: Result[Number, Text] = lock_exclusive(root, identity_lock_name)
+    if not result_is_ok(id_lock_res):
+        let _cl: Result[Boolean, Text] = close(lock)
+        return err(result_unwrap_error(id_lock_res))
+    let identity_lock: Number = result_unwrap(id_lock_res)
+    let init_header: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(header.db_uuid, header.checkpoint_lsn, header.next_txn_id, header.next_commit_ts, 0, initial_pages, yaza_db_crypto_header_flag_encrypted_v1())
+    let encoded_hdr: Bytes = yaza_db_write_file_header_v1(init_header)?
+    let initial_bitmap: Bytes = yaza_db_bitmap_page_new_mapped_v1(2, 0)?
+    let enc_bitmap: YazaDbEncryptedPageResultV1 = yaza_db_crypto_encrypt_page_v1(key, 2, initial_bitmap)?
+    let db_open: Result[Number, Text] = create_exclusive(root, name)
+    if not result_is_ok(db_open):
+        let _ci: Result[Boolean, Text] = close(identity_lock)
+        let _cl: Result[Boolean, Text] = close(lock)
+        return err(result_unwrap_error(db_open))
+    let file: Number = result_unwrap(db_open)
+    let pre_res: Result[Boolean, Text] = preallocate(file, initial_pages * yaza_db_page_size_v1())
+    if not result_is_ok(pre_res):
+        let _cu: Number = yaza_db_storage_cleanup_failed_create_v1(root, name, file)
+        let _ci: Result[Boolean, Text] = close(identity_lock)
+        let _cl: Result[Boolean, Text] = close(lock)
+        return err(result_unwrap_error(pre_res))
+    let bm_off: Number = yaza_db_storage_page_offset_v1(2)?
+    let w_bm: Result[Number, Text] = write_exact(file, bm_off, enc_bitmap.ciphertext)
+    let w_h0: Result[Number, Text] = write_exact(file, 0, encoded_hdr)
+    let w_h1: Result[Number, Text] = write_exact(file, yaza_db_page_size_v1(), encoded_hdr)
+    let s_db: Result[Boolean, Text] = sync(file)
+    if not result_is_ok(w_bm) or not result_is_ok(w_h0) or not result_is_ok(w_h1) or not result_is_ok(s_db) or not result_unwrap(s_db):
+        let _cu: Number = yaza_db_storage_cleanup_failed_create_v1(root, name, file)
+        let _ci: Result[Boolean, Text] = close(identity_lock)
+        let _cl: Result[Boolean, Text] = close(lock)
+        return err("YDBv1 encrypted database file initialization failed")
+    let meta_open: Result[Number, Text] = create_exclusive(root, meta_name)
+    if not result_is_ok(meta_open):
+        let _cu: Number = yaza_db_storage_cleanup_failed_create_v1(root, name, file)
+        let _ci: Result[Boolean, Text] = close(identity_lock)
+        let _cl: Result[Boolean, Text] = close(lock)
+        return err(result_unwrap_error(meta_open))
+    let meta_file: Number = result_unwrap(meta_open)
+    let sidecar_hdr: Bytes = yaza_db_crypto_encode_sidecar_header_v1(key)?
+    let w_mh: Result[Number, Text] = write_exact(meta_file, 0, sidecar_hdr)
+    let w_ms: Result[Number, Text] = yaza_db_storage_meta_write_slot_v1(meta_file, 2, enc_bitmap.meta)
+    let s_mf: Result[Boolean, Text] = sync(meta_file)
+    if not result_is_ok(w_mh) or not result_is_ok(w_ms) or not result_is_ok(s_mf) or not result_unwrap(s_mf):
+        let _cm: Result[Boolean, Text] = close(meta_file)
+        let _rm: Result[Boolean, Text] = remove(root, meta_name)
+        let _cu: Number = yaza_db_storage_cleanup_failed_create_v1(root, name, file)
+        let _ci: Result[Boolean, Text] = close(identity_lock)
+        let _cl: Result[Boolean, Text] = close(lock)
+        return err("YDBv1 encrypted sidecar initialization failed")
+    let reg: Result[Boolean, Text] = yaza_db_storage_register_uuid_owner_v1(root, name, header.db_uuid)
+    if not result_is_ok(reg):
+        let _cm: Result[Boolean, Text] = close(meta_file)
+        let _rm: Result[Boolean, Text] = remove(root, meta_name)
+        let _cu: Number = yaza_db_storage_cleanup_failed_create_v1(root, name, file)
+        let _ci: Result[Boolean, Text] = close(identity_lock)
+        let _cl: Result[Boolean, Text] = close(lock)
+        return err(result_unwrap_error(reg))
+    let _ds: Result[Boolean, Text] = sync_directory(root)
+    let storage_handle: YazaDbStorageHandleV1 = YazaDbStorageHandleV1(root, file, lock, identity_lock, init_header)
+    return ok(YazaDbEncryptedStorageHandleV1(storage_handle, key, meta_file, name, meta_name))
+
+fn yaza_db_storage_create_encrypted_v1(root: Number, name: Text, header: YazaDbFileHeaderV1, key: YazaDbPageCryptoKeyV1) -> Result[YazaDbEncryptedStorageHandleV1, Text]:
+    return yaza_db_storage_create_encrypted_with_pages_v1(root, name, header, key, 64)
+
+fn yaza_db_storage_file_exists_v1(root: Number, name: Text) -> Boolean:
+    let f: Result[Number, Text] = open_read(root, name)
+    if result_is_ok(f):
+        let _c: Result[Boolean, Text] = close(result_unwrap(f))
+        return true
+    return false
+
+fn yaza_db_storage_open_encrypted_v1(root: Number, name: Text, key: YazaDbPageCryptoKeyV1) -> Result[YazaDbEncryptedStorageHandleV1, Text]:
+    let meta_name: Text = yaza_db_crypto_sidecar_name_v1(key.db_uuid)?
+    let commit_name: Text = yaza_db_crypto_rekey_commit_name_v1(key.db_uuid)?
+    let db_tmp: Text = name + ".rekey.tmp"
+    let meta_tmp: Text = meta_name + ".rekey.tmp"
+    let lock: Number = lock_exclusive(root, name)?
+    # Crash-safe rekey recovery before opening live files.
+    let marker_open: Result[Number, Text] = open_read(root, commit_name)
+    if result_is_ok(marker_open):
+        let mf: Number = result_unwrap(marker_open)
+        let marker_res: Result[Bytes, Text] = read_exact(mf, 0, 36)
+        let _cmf: Result[Boolean, Text] = close(mf)
+        if not result_is_ok(marker_res) or not yaza_db_crypto_verify_rekey_commit_marker_v1(result_unwrap(marker_res), key):
+            let _cl: Result[Boolean, Text] = close(lock)
+            return err("YDBv1 encrypted rekey already committed; open with the rotated key")
+        if yaza_db_storage_file_exists_v1(root, db_tmp):
+            let r1: Result[Boolean, Text] = rename(root, db_tmp, name)
+            if not result_is_ok(r1) or not result_unwrap(r1):
+                let _cl: Result[Boolean, Text] = close(lock)
+                return err("YDBv1 rekey recovery failed renaming database file")
+        if yaza_db_storage_file_exists_v1(root, meta_tmp):
+            let r2: Result[Boolean, Text] = rename(root, meta_tmp, meta_name)
+            if not result_is_ok(r2) or not result_unwrap(r2):
+                let _cl: Result[Boolean, Text] = close(lock)
+                return err("YDBv1 rekey recovery failed renaming sidecar file")
+        let _ds1: Result[Boolean, Text] = sync_directory(root)
+        let _rmc: Result[Boolean, Text] = remove(root, commit_name)
+        let _ds2: Result[Boolean, Text] = sync_directory(root)
+    else:
+        if yaza_db_storage_file_exists_v1(root, db_tmp):
+            let _r1: Result[Boolean, Text] = remove(root, db_tmp)
+        if yaza_db_storage_file_exists_v1(root, meta_tmp):
+            let _r2: Result[Boolean, Text] = remove(root, meta_tmp)
+        let _ds0: Result[Boolean, Text] = sync_directory(root)
+    let opened: Result[Number, Text] = open_rw(root, name)
+    if not result_is_ok(opened):
+        let _cl: Result[Boolean, Text] = close(lock)
+        return err(result_unwrap_error(opened))
+    let file: Number = result_unwrap(opened)
+    let header_res: Result[YazaDbFileHeaderV1, Text] = yaza_db_storage_read_encrypted_header_v1(file)
+    if not result_is_ok(header_res):
+        let _cf: Result[Boolean, Text] = close(file)
+        let _cl: Result[Boolean, Text] = close(lock)
+        return err(result_unwrap_error(header_res))
+    let header: YazaDbFileHeaderV1 = result_unwrap(header_res)
+    if not bytes_equal(header.db_uuid, key.db_uuid):
+        let _cf: Result[Boolean, Text] = close(file)
+        let _cl: Result[Boolean, Text] = close(lock)
+        return err("YDBv1 encrypted database UUID does not match provided key")
+    let id_lock_name_res: Result[Text, Text] = yaza_db_storage_uuid_lock_name_v1(header.db_uuid)
+    if not result_is_ok(id_lock_name_res):
+        let _cf: Result[Boolean, Text] = close(file)
+        let _cl: Result[Boolean, Text] = close(lock)
+        return err(result_unwrap_error(id_lock_name_res))
+    let id_lock_res: Result[Number, Text] = lock_exclusive(root, result_unwrap(id_lock_name_res))
+    if not result_is_ok(id_lock_res):
+        let _cf: Result[Boolean, Text] = close(file)
+        let _cl: Result[Boolean, Text] = close(lock)
+        return err(result_unwrap_error(id_lock_res))
+    let identity_lock: Number = result_unwrap(id_lock_res)
+    let reg: Result[Boolean, Text] = yaza_db_storage_register_uuid_owner_v1(root, name, header.db_uuid)
+    if not result_is_ok(reg):
+        let _cf: Result[Boolean, Text] = close(file)
+        let _ci: Result[Boolean, Text] = close(identity_lock)
+        let _cl: Result[Boolean, Text] = close(lock)
+        return err(result_unwrap_error(reg))
+    let meta_open: Result[Number, Text] = open_rw(root, meta_name)
+    if not result_is_ok(meta_open):
+        let _cf: Result[Boolean, Text] = close(file)
+        let _ci: Result[Boolean, Text] = close(identity_lock)
+        let _cl: Result[Boolean, Text] = close(lock)
+        return err("YDBv1 encrypted database sidecar is missing or unreadable")
+    let meta_file: Number = result_unwrap(meta_open)
+    let raw_hdr_res: Result[Bytes, Text] = read_exact(meta_file, 0, yaza_db_crypto_sidecar_header_size_v1())
+    if not result_is_ok(raw_hdr_res):
+        let _cm: Result[Boolean, Text] = close(meta_file)
+        let _cf: Result[Boolean, Text] = close(file)
+        let _ci: Result[Boolean, Text] = close(identity_lock)
+        let _cl: Result[Boolean, Text] = close(lock)
+        return err("YDBv1 encrypted sidecar header could not be read")
+    let verified_hdr: Result[YazaDbCryptoSidecarHeaderV1, Text] = yaza_db_crypto_verify_sidecar_header_v1(result_unwrap(raw_hdr_res), key)
+    if not result_is_ok(verified_hdr):
+        let _cm: Result[Boolean, Text] = close(meta_file)
+        let _cf: Result[Boolean, Text] = close(file)
+        let _ci: Result[Boolean, Text] = close(identity_lock)
+        let _cl: Result[Boolean, Text] = close(lock)
+        return err(result_unwrap_error(verified_hdr))
+    let storage_handle: YazaDbStorageHandleV1 = YazaDbStorageHandleV1(root, file, lock, identity_lock, header)
+    return ok(YazaDbEncryptedStorageHandleV1(storage_handle, key, meta_file, name, meta_name))
+
+fn yaza_db_storage_close_encrypted_v1(handle: YazaDbEncryptedStorageHandleV1) -> Result[Boolean, Text]:
+    let _z: Number = yaza_db_crypto_zeroize_key_v1(handle.crypto)
+    let mc: Result[Boolean, Text] = close(handle.meta_file)
+    let sc: Result[Boolean, Text] = yaza_db_storage_close_v1(handle.storage)
+    if not result_is_ok(mc): return err(result_unwrap_error(mc))
+    if not result_is_ok(sc): return err(result_unwrap_error(sc))
+    return ok(result_unwrap(mc) and result_unwrap(sc))
+
+fn yaza_db_storage_rekey_with_fault_v1(handle: YazaDbEncryptedStorageHandleV1, new_key: YazaDbPageCryptoKeyV1, fault_mode: Number) -> Result[YazaDbEncryptedStorageHandleV1, Text]:
+    if not bytes_equal(new_key.db_uuid, handle.storage.header.db_uuid):
+        return err("YDBv1 rekey target key UUID does not match database")
+    if new_key.key_epoch <= handle.crypto.key_epoch:
+        return err("YDBv1 rekey target key_epoch must strictly increase")
+    let root: Number = handle.storage.root
+    let db_tmp: Text = handle.db_name + ".rekey.tmp"
+    let meta_tmp: Text = handle.meta_name + ".rekey.tmp"
+    let commit_name: Text = yaza_db_crypto_rekey_commit_name_v1(handle.storage.header.db_uuid)?
+    let _rm1: Result[Boolean, Text] = remove(root, db_tmp)
+    let _rm2: Result[Boolean, Text] = remove(root, meta_tmp)
+    let _rm3: Result[Boolean, Text] = remove(root, commit_name)
+
+    let db_f: Number = create_exclusive(root, db_tmp)?
+    let page_count: Number = handle.storage.header.page_count
+    let pre_res: Result[Boolean, Text] = preallocate(db_f, page_count * yaza_db_page_size_v1())
+    if not result_is_ok(pre_res):
+        let _c: Result[Boolean, Text] = close(db_f)
+        let _r: Result[Boolean, Text] = remove(root, db_tmp)
+        return err(result_unwrap_error(pre_res))
+    let encoded_hdr: Bytes = yaza_db_write_file_header_v1(handle.storage.header)?
+    let wh0: Result[Number, Text] = write_exact(db_f, 0, encoded_hdr)
+    let wh1: Result[Number, Text] = write_exact(db_f, yaza_db_page_size_v1(), encoded_hdr)
+    if not result_is_ok(wh0) or not result_is_ok(wh1):
+        let _c: Result[Boolean, Text] = close(db_f)
+        let _r: Result[Boolean, Text] = remove(root, db_tmp)
+        return err("YDBv1 rekey staging header write failed")
+
+    let meta_f_res: Result[Number, Text] = create_exclusive(root, meta_tmp)
+    if not result_is_ok(meta_f_res):
+        let _c: Result[Boolean, Text] = close(db_f)
+        let _r: Result[Boolean, Text] = remove(root, db_tmp)
+        return err(result_unwrap_error(meta_f_res))
+    let meta_f: Number = result_unwrap(meta_f_res)
+    let new_sidecar_hdr: Bytes = yaza_db_crypto_encode_sidecar_header_v1(new_key)?
+    let wmh: Result[Number, Text] = write_exact(meta_f, 0, new_sidecar_hdr)
+    if not result_is_ok(wmh):
+        let _c1: Result[Boolean, Text] = close(meta_f)
+        let _c2: Result[Boolean, Text] = close(db_f)
+        let _r1: Result[Boolean, Text] = remove(root, meta_tmp)
+        let _r2: Result[Boolean, Text] = remove(root, db_tmp)
+        return err("YDBv1 rekey staging sidecar header write failed")
+
+    var pid: Number = 2
+    while pid < page_count:
+        let slot: YazaDbPageCipherMetaV1 = yaza_db_storage_meta_read_slot_v1(handle.meta_file, pid)?
+        if slot.key_epoch != 0:
+            let plain_res: Result[Bytes, Text] = yaza_db_storage_read_page_raw_encrypted_v1(handle, pid)
+            if not result_is_ok(plain_res):
+                let _c1: Result[Boolean, Text] = close(meta_f)
+                let _c2: Result[Boolean, Text] = close(db_f)
+                let _r1: Result[Boolean, Text] = remove(root, meta_tmp)
+                let _r2: Result[Boolean, Text] = remove(root, db_tmp)
+                return err(result_unwrap_error(plain_res))
+            let re_enc: YazaDbEncryptedPageResultV1 = yaza_db_crypto_encrypt_page_v1(new_key, pid, result_unwrap(plain_res))?
+            let off: Number = yaza_db_storage_page_offset_v1(pid)?
+            let wp: Result[Number, Text] = write_exact(db_f, off, re_enc.ciphertext)
+            let ws: Result[Number, Text] = yaza_db_storage_meta_write_slot_v1(meta_f, pid, re_enc.meta)
+            if not result_is_ok(wp) or not result_is_ok(ws):
+                let _c1: Result[Boolean, Text] = close(meta_f)
+                let _c2: Result[Boolean, Text] = close(db_f)
+                let _r1: Result[Boolean, Text] = remove(root, meta_tmp)
+                let _r2: Result[Boolean, Text] = remove(root, db_tmp)
+                return err("YDBv1 rekey staging page write failed")
+        set pid = pid + 1
+
+    let s1: Result[Boolean, Text] = sync(db_f)
+    let s2: Result[Boolean, Text] = sync(meta_f)
+    let c1: Result[Boolean, Text] = close(db_f)
+    let c2: Result[Boolean, Text] = close(meta_f)
+    if not result_is_ok(s1) or not result_is_ok(s2) or not result_is_ok(c1) or not result_is_ok(c2):
+        let _r1: Result[Boolean, Text] = remove(root, meta_tmp)
+        let _r2: Result[Boolean, Text] = remove(root, db_tmp)
+        return err("YDBv1 rekey staging sync/close failed")
+
+    if fault_mode == 1:
+        let _ce: Result[Boolean, Text] = yaza_db_storage_close_encrypted_v1(handle)
+        return err("YDBv1 simulated crash before rekey commit marker")
+
+    let marker_bytes: Bytes = yaza_db_crypto_rekey_commit_marker_bytes_v1(new_key)?
+    let _wm: Boolean = yaza_db_crypto_write_atomic_file_v1(root, commit_name, marker_bytes)?
+    let _close_old_db: Result[Boolean, Text] = close(handle.storage.file)
+    let _close_old_meta: Result[Boolean, Text] = close(handle.meta_file)
+    let ren1: Result[Boolean, Text] = rename(root, db_tmp, handle.db_name)
+    if not result_is_ok(ren1) or not result_unwrap(ren1):
+        return err("YDBv1 rekey cutover rename of database failed")
+    if fault_mode == 2:
+        let _ci: Result[Boolean, Text] = close(handle.storage.identity_lock)
+        let _cl: Result[Boolean, Text] = close(handle.storage.lock)
+        let _z: Number = yaza_db_crypto_zeroize_key_v1(handle.crypto)
+        return err("YDBv1 simulated crash after rekey commit marker between renames")
+    let ren2: Result[Boolean, Text] = rename(root, meta_tmp, handle.meta_name)
+    if not result_is_ok(ren2) or not result_unwrap(ren2):
+        return err("YDBv1 rekey cutover rename of sidecar failed")
+    let _ds1: Result[Boolean, Text] = sync_directory(root)
+    let _rmc: Result[Boolean, Text] = remove(root, commit_name)
+    let _ds2: Result[Boolean, Text] = sync_directory(root)
+    let _zold: Number = yaza_db_crypto_zeroize_key_v1(handle.crypto)
+    let new_db_file: Number = open_rw(root, handle.db_name)?
+    let new_meta_file: Number = open_rw(root, handle.meta_name)?
+    let new_storage: YazaDbStorageHandleV1 = YazaDbStorageHandleV1(root, new_db_file, handle.storage.lock, handle.storage.identity_lock, handle.storage.header)
+    return ok(YazaDbEncryptedStorageHandleV1(new_storage, new_key, new_meta_file, handle.db_name, handle.meta_name))
+
+fn yaza_db_storage_rekey_v1(handle: YazaDbEncryptedStorageHandleV1, new_key: YazaDbPageCryptoKeyV1) -> Result[YazaDbEncryptedStorageHandleV1, Text]:
+    return yaza_db_storage_rekey_with_fault_v1(handle, new_key, 0)

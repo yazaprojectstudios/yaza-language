@@ -1,0 +1,1470 @@
+# Bidirectional Logical LSN Sync Engine (Mobile <-> Server) — Tier 1
+# Extracts committed logical row changes above the physical WAL commit boundary,
+# persists per-origin watermarks, row versions, delete tombstones, outbox, and
+# echo-prevention sets atomically per database UUID, verifies CRC32C and table
+# schema versions fail-closed, and resolves offline divergence deterministically
+# (SERVER_WINS, CLIENT_WINS, VERSION_LWW without relying on wall clocks).
+
+use "std/fs"
+use "std/http"
+use "std/json"
+use "./catalog_snapshot_v1"
+use "./delta_wal_v1"
+use "./index_catalog_v1"
+use "./overflow_storage_v1"
+use "./page_v1"
+use "./page_wal_v1"
+use "./query_v1"
+use "./replication_v1"
+use "./row_v1"
+use "./session_v1"
+use "./sql_binder_v1"
+use "./sql_decimal_v1"
+use "./sql_executor_v1"
+use "./storage_v1"
+use "./wal_v1"
+
+shape YazaDbSyncWatermarkV1:
+    origin_id: Text
+    last_applied_seq: Number
+    last_extracted_lsn: Number
+
+shape YazaDbSyncRowMetaV1:
+    table_name: Text
+    pk_key_hex: Text
+    row_version: Number
+    last_origin_id: Text
+    last_commit_ts: Number
+    deleted: Boolean
+    tombstone_ts: Number
+    local_dirty: Boolean
+
+shape YazaDbSyncChangeV1:
+    origin_id: Text
+    origin_seq: Number
+    txn_id: Number
+    commit_ts: Number
+    schema_version: Number
+    table_name: Text
+    operation: Number
+    pk_key_hex: Text
+    row_json: Text
+    row_version: Number
+
+shape YazaDbSyncOutboxEntryV1:
+    wal_end_lsn: Number
+    change: YazaDbSyncChangeV1
+
+shape YazaDbSyncBatchV1:
+    origin_id: Text
+    from_lsn: Number
+    to_lsn: Number
+    changes: List[YazaDbSyncChangeV1]
+    batch_crc32c: Number
+
+shape YazaDbSyncConflictV1:
+    table_name: Text
+    pk_key_hex: Text
+    policy: Number
+    winner: Text
+    local_version: Number
+    remote_version: Number
+    reason: Text
+
+shape YazaDbSyncApplyResultV1:
+    session: YazaDbSessionV1
+    applied_count: Number
+    skipped_duplicates: Number
+    conflicts: List[YazaDbSyncConflictV1]
+    new_remote_seq: Number
+
+shape YazaDbSyncStateV1:
+    origin_id: Text
+    next_origin_seq: Number
+    last_extracted_lsn: Number
+    watermarks: List[YazaDbSyncWatermarkV1]
+    row_meta: List[YazaDbSyncRowMetaV1]
+    applied_local_txns: List[Number]
+    outbox: List[YazaDbSyncOutboxEntryV1]
+
+shape YazaDbSyncHttpOutcomeV1:
+    session: YazaDbSessionV1
+    response: HttpResponse
+
+shape YazaDbSyncPageTableMapV1:
+    page_ids: List[Number]
+    table_indices: List[Number]
+
+shape YazaDbSyncCommittedTxnV1:
+    txn_id: Number
+    commit_ts: Number
+
+shape YazaDbSyncExtractedItemV1:
+    wal_end_lsn: Number
+    txn_id: Number
+    commit_ts: Number
+    schema_version: Number
+    table_name: Text
+    operation: Number
+    pk_key_hex: Text
+    row_json: Text
+
+fn yaza_db_sync_policy_server_wins_v1() -> Number:
+    return 1
+
+fn yaza_db_sync_policy_client_wins_v1() -> Number:
+    return 2
+
+fn yaza_db_sync_policy_version_lww_v1() -> Number:
+    return 3
+
+fn yaza_db_sync_op_upsert_v1() -> Number:
+    return 1
+
+fn yaza_db_sync_op_delete_v1() -> Number:
+    return 2
+
+fn yaza_db_sync_default_max_changes_v1() -> Number:
+    return 256
+
+fn yaza_db_sync_hard_max_changes_v1() -> Number:
+    return 4096
+
+fn yaza_db_sync_state_magic_v1() -> Number:
+    return 827540569
+
+fn yaza_db_sync_state_header_size_v1() -> Number:
+    return 16
+
+fn yaza_db_sync_max_state_bytes_v1() -> Number:
+    return 16777216
+
+fn yaza_db_sync_compare_text_v1(a: Text, b: Text) -> Number:
+    let la: Number = text_length(a)
+    let lb: Number = text_length(b)
+    var min_len: Number = la
+    if lb < min_len:
+        set min_len = lb
+    var i: Number = 0
+    while i < min_len:
+        let ba: Number = text_byte(a, i)
+        let bb: Number = text_byte(b, i)
+        if ba < bb: return -1
+        if ba > bb: return 1
+        set i = i + 1
+    if la < lb: return -1
+    if la > lb: return 1
+    return 0
+
+fn yaza_db_sync_state_filename_v1(db_uuid: Bytes) -> Result[Text, Text]:
+    let uuid_hex: Text = yaza_db_storage_uuid_hex_v1(db_uuid)?
+    return ok("ydb-sync-" + uuid_hex + ".state")
+
+fn yaza_db_sync_state_tmp_filename_v1(db_uuid: Bytes) -> Result[Text, Text]:
+    let uuid_hex: Text = yaza_db_storage_uuid_hex_v1(db_uuid)?
+    return ok("ydb-sync-" + uuid_hex + ".state.tmp")
+
+fn yaza_db_sync_file_exists_v1(root: Number, name: Text) -> Result[Boolean, Text]:
+    let names: Bytes = list_names(root)?
+    let total: Number = bytes_length(names)
+    let target_len: Number = text_length(name)
+    var offset: Number = 0
+    while offset < total:
+        var end: Number = offset
+        while end < total and bytes_get(names, end) != 0:
+            set end = end + 1
+        if end - offset == target_len:
+            var eq: Boolean = true
+            var i: Number = 0
+            while i < target_len:
+                if bytes_get(names, offset + i) != text_byte(name, i):
+                    set eq = false
+                    break
+                set i = i + 1
+            if eq:
+                return ok(true)
+        set offset = end + 1
+    return ok(false)
+
+fn yaza_db_sync_empty_state_v1(origin_id: Text) -> Result[YazaDbSyncStateV1, Text]:
+    let w_res: Result[List[YazaDbSyncWatermarkV1], Text] = list_try_new()
+    let m_res: Result[List[YazaDbSyncRowMetaV1], Text] = list_try_new()
+    let t_res: Result[List[Number], Text] = list_try_new()
+    let o_res: Result[List[YazaDbSyncOutboxEntryV1], Text] = list_try_new()
+    if not result_is_ok(w_res) or not result_is_ok(m_res) or not result_is_ok(t_res) or not result_is_ok(o_res):
+        return err("YDBv1 sync state allocation failed")
+    return ok(YazaDbSyncStateV1(origin_id, 1, 0, result_unwrap(w_res), result_unwrap(m_res), result_unwrap(t_res), result_unwrap(o_res)))
+
+fn yaza_db_sync_json_extract_bool_v1(json: Text, key: Text) -> Option[Boolean]:
+    let vpos: Number = json_find_top_level_value_pos(json, key)
+    if vpos < 0: return none
+    let vend: Number = json_skip_value(json, vpos)
+    if vend <= vpos: return none
+    let slice: Text = text_slice(json, vpos, vend - vpos)
+    if slice == "true": return some(true)
+    if slice == "false": return some(false)
+    return none
+
+fn yaza_db_sync_json_split_array_v1(json: Text, key: Text) -> Result[List[Text], Text]:
+    let out_res: Result[List[Text], Text] = list_try_new()
+    if not result_is_ok(out_res):
+        return err("YDBv1 sync JSON array allocation failed")
+    let out: List[Text] = result_unwrap(out_res)
+    let vpos: Number = json_find_top_level_value_pos(json, key)
+    if vpos < 0:
+        return err("YDBv1 sync JSON is missing array field: " + key)
+    let len: Number = text_length(json)
+    if vpos >= len or text_byte(json, vpos) != 91:
+        return err("YDBv1 sync JSON field is not an array: " + key)
+    var i: Number = json_skip_ws(json, vpos + 1)
+    if i >= len:
+        return err("YDBv1 sync JSON array is unterminated: " + key)
+    if text_byte(json, i) == 93:
+        return ok(out)
+    while i < len:
+        set i = json_skip_ws(json, i)
+        if i >= len:
+            return err("YDBv1 sync JSON array element is truncated: " + key)
+        let elem_end: Number = json_skip_value(json, i)
+        if elem_end <= i:
+            return err("YDBv1 sync JSON array element is malformed: " + key)
+        let elem_text: Text = text_slice(json, i, elem_end - i)
+        if not list_try_push(out, elem_text):
+            return err("YDBv1 sync JSON array push failed: " + key)
+        set i = json_skip_ws(json, elem_end)
+        if i >= len:
+            return err("YDBv1 sync JSON array is missing closing bracket: " + key)
+        let sep: Number = text_byte(json, i)
+        if sep == 44:
+            set i = i + 1
+        elif sep == 93:
+            return ok(out)
+        else:
+            return err("YDBv1 sync JSON array has invalid separator: " + key)
+    return err("YDBv1 sync JSON array is unterminated: " + key)
+
+fn yaza_db_sync_change_to_json_v1(c: YazaDbSyncChangeV1) -> Text:
+    let parts: TextList = text_list()
+    list_push(parts, "{\"origin_id\":")
+    list_push(parts, json_string(c.origin_id))
+    list_push(parts, ",\"origin_seq\":")
+    list_push(parts, number_text(c.origin_seq))
+    list_push(parts, ",\"txn_id\":")
+    list_push(parts, number_text(c.txn_id))
+    list_push(parts, ",\"commit_ts\":")
+    list_push(parts, number_text(c.commit_ts))
+    list_push(parts, ",\"schema_version\":")
+    list_push(parts, number_text(c.schema_version))
+    list_push(parts, ",\"table_name\":")
+    list_push(parts, json_string(c.table_name))
+    list_push(parts, ",\"operation\":")
+    list_push(parts, number_text(c.operation))
+    list_push(parts, ",\"pk_key_hex\":")
+    list_push(parts, json_string(c.pk_key_hex))
+    list_push(parts, ",\"row_json\":")
+    list_push(parts, json_string(c.row_json))
+    list_push(parts, ",\"row_version\":")
+    list_push(parts, number_text(c.row_version))
+    list_push(parts, "}")
+    return text_join(parts, "")
+
+fn yaza_db_sync_parse_change_json_v1(obj: Text) -> Result[YazaDbSyncChangeV1, Text]:
+    let o_id: Option[Text] = json_extract_string(obj, "origin_id")
+    let o_seq: Option[Number] = json_extract_number(obj, "origin_seq")
+    let tx: Option[Number] = json_extract_number(obj, "txn_id")
+    let cts: Option[Number] = json_extract_number(obj, "commit_ts")
+    let sv: Option[Number] = json_extract_number(obj, "schema_version")
+    let tbl: Option[Text] = json_extract_string(obj, "table_name")
+    let op: Option[Number] = json_extract_number(obj, "operation")
+    let pk: Option[Text] = json_extract_string(obj, "pk_key_hex")
+    let rj: Option[Text] = json_extract_string(obj, "row_json")
+    let rv: Option[Number] = json_extract_number(obj, "row_version")
+    if not option_is_some(o_id) or not option_is_some(o_seq) or not option_is_some(tx) or not option_is_some(cts) or not option_is_some(sv) or not option_is_some(tbl) or not option_is_some(op) or not option_is_some(pk) or not option_is_some(rj) or not option_is_some(rv):
+        return err("YDBv1 sync change JSON is missing required fields")
+    return ok(YazaDbSyncChangeV1(option_unwrap(o_id), option_unwrap(o_seq), option_unwrap(tx), option_unwrap(cts), option_unwrap(sv), option_unwrap(tbl), option_unwrap(op), option_unwrap(pk), option_unwrap(rj), option_unwrap(rv)))
+
+fn yaza_db_sync_batch_canonical_body_v1(origin_id: Text, from_lsn: Number, to_lsn: Number, changes: List[YazaDbSyncChangeV1]) -> Text:
+    let c_jsons: List[Text] = List[Text]()
+    var i: Number = 0
+    while i < list_count(changes):
+        list_push(c_jsons, yaza_db_sync_change_to_json_v1(list_get(changes, i)))
+        set i = i + 1
+    let parts: TextList = text_list()
+    list_push(parts, "{\"origin_id\":")
+    list_push(parts, json_string(origin_id))
+    list_push(parts, ",\"from_lsn\":")
+    list_push(parts, number_text(from_lsn))
+    list_push(parts, ",\"to_lsn\":")
+    list_push(parts, number_text(to_lsn))
+    list_push(parts, ",\"changes\":")
+    list_push(parts, json_array(c_jsons))
+    list_push(parts, "}")
+    return text_join(parts, "")
+
+fn yaza_db_sync_batch_compute_crc32c_v1(origin_id: Text, from_lsn: Number, to_lsn: Number, changes: List[YazaDbSyncChangeV1]) -> Number:
+    let canonical: Text = yaza_db_sync_batch_canonical_body_v1(origin_id, from_lsn, to_lsn, changes)
+    return bytes_ydbv1_checksum(bytes_from_text(canonical))
+
+fn yaza_db_sync_batch_verify_crc32c_v1(batch: YazaDbSyncBatchV1) -> Boolean:
+    let expected: Number = yaza_db_sync_batch_compute_crc32c_v1(batch.origin_id, batch.from_lsn, batch.to_lsn, batch.changes)
+    return expected == batch.batch_crc32c
+
+fn yaza_db_sync_batch_to_json_v1(batch: YazaDbSyncBatchV1) -> Text:
+    let c_jsons: List[Text] = List[Text]()
+    var i: Number = 0
+    while i < list_count(batch.changes):
+        list_push(c_jsons, yaza_db_sync_change_to_json_v1(list_get(batch.changes, i)))
+        set i = i + 1
+    let parts: TextList = text_list()
+    list_push(parts, "{\"origin_id\":")
+    list_push(parts, json_string(batch.origin_id))
+    list_push(parts, ",\"from_lsn\":")
+    list_push(parts, number_text(batch.from_lsn))
+    list_push(parts, ",\"to_lsn\":")
+    list_push(parts, number_text(batch.to_lsn))
+    list_push(parts, ",\"batch_crc32c\":")
+    list_push(parts, number_text(batch.batch_crc32c))
+    list_push(parts, ",\"changes\":")
+    list_push(parts, json_array(c_jsons))
+    list_push(parts, "}")
+    return text_join(parts, "")
+
+fn yaza_db_sync_parse_batch_json_v1(json_body: Text) -> Result[YazaDbSyncBatchV1, Text]:
+    let o_opt: Option[Text] = json_extract_string(json_body, "origin_id")
+    let f_opt: Option[Number] = json_extract_number(json_body, "from_lsn")
+    let t_opt: Option[Number] = json_extract_number(json_body, "to_lsn")
+    let crc_opt: Option[Number] = json_extract_number(json_body, "batch_crc32c")
+    if not option_is_some(o_opt) or not option_is_some(f_opt) or not option_is_some(t_opt) or not option_is_some(crc_opt):
+        return err("YDBv1 sync batch JSON is missing required header fields")
+    let raw_items: List[Text] = yaza_db_sync_json_split_array_v1(json_body, "changes")?
+    let changes_res: Result[List[YazaDbSyncChangeV1], Text] = list_try_new()
+    if not result_is_ok(changes_res):
+        return err("YDBv1 sync batch changes allocation failed")
+    let changes: List[YazaDbSyncChangeV1] = result_unwrap(changes_res)
+    var i: Number = 0
+    while i < list_count(raw_items):
+        let ch: YazaDbSyncChangeV1 = yaza_db_sync_parse_change_json_v1(list_get(raw_items, i))?
+        if not list_try_push(changes, ch):
+            return err("YDBv1 sync batch change append failed")
+        set i = i + 1
+    return ok(YazaDbSyncBatchV1(option_unwrap(o_opt), option_unwrap(f_opt), option_unwrap(t_opt), changes, option_unwrap(crc_opt)))
+
+fn yaza_db_sync_state_encode_json_v1(state: YazaDbSyncStateV1) -> Text:
+    let w_list: List[Text] = List[Text]()
+    var i: Number = 0
+    while i < list_count(state.watermarks):
+        let w: YazaDbSyncWatermarkV1 = list_get(state.watermarks, i)
+        let wj: Text = "{\"origin_id\":" + json_string(w.origin_id) + ",\"last_applied_seq\":" + number_text(w.last_applied_seq) + ",\"last_extracted_lsn\":" + number_text(w.last_extracted_lsn) + "}"
+        list_push(w_list, wj)
+        set i = i + 1
+
+    let m_list: List[Text] = List[Text]()
+    set i = 0
+    while i < list_count(state.row_meta):
+        let m: YazaDbSyncRowMetaV1 = list_get(state.row_meta, i)
+        let mp: TextList = text_list()
+        list_push(mp, "{\"table_name\":")
+        list_push(mp, json_string(m.table_name))
+        list_push(mp, ",\"pk_key_hex\":")
+        list_push(mp, json_string(m.pk_key_hex))
+        list_push(mp, ",\"row_version\":")
+        list_push(mp, number_text(m.row_version))
+        list_push(mp, ",\"last_origin_id\":")
+        list_push(mp, json_string(m.last_origin_id))
+        list_push(mp, ",\"last_commit_ts\":")
+        list_push(mp, number_text(m.last_commit_ts))
+        list_push(mp, ",\"deleted\":")
+        list_push(mp, json_bool(m.deleted))
+        list_push(mp, ",\"tombstone_ts\":")
+        list_push(mp, number_text(m.tombstone_ts))
+        list_push(mp, ",\"local_dirty\":")
+        list_push(mp, json_bool(m.local_dirty))
+        list_push(mp, "}")
+        list_push(m_list, text_join(mp, ""))
+        set i = i + 1
+
+    let t_list: List[Text] = List[Text]()
+    set i = 0
+    while i < list_count(state.applied_local_txns):
+        list_push(t_list, number_text(list_get(state.applied_local_txns, i)))
+        set i = i + 1
+
+    let o_list: List[Text] = List[Text]()
+    set i = 0
+    while i < list_count(state.outbox):
+        let oe: YazaDbSyncOutboxEntryV1 = list_get(state.outbox, i)
+        let oj: Text = "{\"wal_end_lsn\":" + number_text(oe.wal_end_lsn) + ",\"change\":" + yaza_db_sync_change_to_json_v1(oe.change) + "}"
+        list_push(o_list, oj)
+        set i = i + 1
+
+    let parts: TextList = text_list()
+    list_push(parts, "{\"version\":1,\"origin_id\":")
+    list_push(parts, json_string(state.origin_id))
+    list_push(parts, ",\"next_origin_seq\":")
+    list_push(parts, number_text(state.next_origin_seq))
+    list_push(parts, ",\"last_extracted_lsn\":")
+    list_push(parts, number_text(state.last_extracted_lsn))
+    list_push(parts, ",\"watermarks\":")
+    list_push(parts, json_array(w_list))
+    list_push(parts, ",\"row_meta\":")
+    list_push(parts, json_array(m_list))
+    list_push(parts, ",\"applied_local_txns\":")
+    list_push(parts, json_array(t_list))
+    list_push(parts, ",\"outbox\":")
+    list_push(parts, json_array(o_list))
+    list_push(parts, "}")
+    return text_join(parts, "")
+
+fn yaza_db_sync_state_decode_json_v1(body: Text) -> Result[YazaDbSyncStateV1, Text]:
+    let v_opt: Option[Number] = json_extract_number(body, "version")
+    let o_opt: Option[Text] = json_extract_string(body, "origin_id")
+    let seq_opt: Option[Number] = json_extract_number(body, "next_origin_seq")
+    let lsn_opt: Option[Number] = json_extract_number(body, "last_extracted_lsn")
+    if not option_is_some(v_opt) or option_unwrap(v_opt) != 1 or not option_is_some(o_opt) or not option_is_some(seq_opt) or not option_is_some(lsn_opt):
+        return err("YDBv1 sync state JSON header is invalid")
+
+    let w_raw: List[Text] = yaza_db_sync_json_split_array_v1(body, "watermarks")?
+    let m_raw: List[Text] = yaza_db_sync_json_split_array_v1(body, "row_meta")?
+    let t_raw: List[Text] = yaza_db_sync_json_split_array_v1(body, "applied_local_txns")?
+    let o_raw: List[Text] = yaza_db_sync_json_split_array_v1(body, "outbox")?
+
+    let w_res: Result[List[YazaDbSyncWatermarkV1], Text] = list_try_new()
+    let m_res: Result[List[YazaDbSyncRowMetaV1], Text] = list_try_new()
+    let t_res: Result[List[Number], Text] = list_try_new()
+    let o_res: Result[List[YazaDbSyncOutboxEntryV1], Text] = list_try_new()
+    if not result_is_ok(w_res) or not result_is_ok(m_res) or not result_is_ok(t_res) or not result_is_ok(o_res):
+        return err("YDBv1 sync state decode allocation failed")
+    let watermarks: List[YazaDbSyncWatermarkV1] = result_unwrap(w_res)
+    let row_meta: List[YazaDbSyncRowMetaV1] = result_unwrap(m_res)
+    let applied_txns: List[Number] = result_unwrap(t_res)
+    let outbox: List[YazaDbSyncOutboxEntryV1] = result_unwrap(o_res)
+
+    var i: Number = 0
+    while i < list_count(w_raw):
+        let wj: Text = list_get(w_raw, i)
+        let wo: Option[Text] = json_extract_string(wj, "origin_id")
+        let ws: Option[Number] = json_extract_number(wj, "last_applied_seq")
+        let wl: Option[Number] = json_extract_number(wj, "last_extracted_lsn")
+        if not option_is_some(wo) or not option_is_some(ws) or not option_is_some(wl):
+            return err("YDBv1 sync watermark JSON is malformed")
+        let _pw: Boolean = list_try_push(watermarks, YazaDbSyncWatermarkV1(option_unwrap(wo), option_unwrap(ws), option_unwrap(wl)))
+        set i = i + 1
+
+    set i = 0
+    while i < list_count(m_raw):
+        let mj: Text = list_get(m_raw, i)
+        let mt: Option[Text] = json_extract_string(mj, "table_name")
+        let mp: Option[Text] = json_extract_string(mj, "pk_key_hex")
+        let mv: Option[Number] = json_extract_number(mj, "row_version")
+        let mo: Option[Text] = json_extract_string(mj, "last_origin_id")
+        let mc: Option[Number] = json_extract_number(mj, "last_commit_ts")
+        let md: Option[Boolean] = yaza_db_sync_json_extract_bool_v1(mj, "deleted")
+        let mts: Option[Number] = json_extract_number(mj, "tombstone_ts")
+        let mld: Option[Boolean] = yaza_db_sync_json_extract_bool_v1(mj, "local_dirty")
+        if not option_is_some(mt) or not option_is_some(mp) or not option_is_some(mv) or not option_is_some(mo) or not option_is_some(mc) or not option_is_some(md) or not option_is_some(mts) or not option_is_some(mld):
+            return err("YDBv1 sync row_meta JSON is malformed")
+        let _pm: Boolean = list_try_push(row_meta, YazaDbSyncRowMetaV1(option_unwrap(mt), option_unwrap(mp), option_unwrap(mv), option_unwrap(mo), option_unwrap(mc), option_unwrap(md), option_unwrap(mts), option_unwrap(mld)))
+        set i = i + 1
+
+    set i = 0
+    while i < list_count(t_raw):
+        let parsed_txn: Result[Number, Text] = number_try_parse(text_trim(list_get(t_raw, i)))
+        if not result_is_ok(parsed_txn):
+            return err("YDBv1 sync applied_local_txns entry is not a valid integer")
+        let _pt: Boolean = list_try_push(applied_txns, result_unwrap(parsed_txn))
+        set i = i + 1
+
+    set i = 0
+    while i < list_count(o_raw):
+        let oj: Text = list_get(o_raw, i)
+        let olsn: Option[Number] = json_extract_number(oj, "wal_end_lsn")
+        if not option_is_some(olsn):
+            return err("YDBv1 sync outbox entry is missing wal_end_lsn")
+        let cpos: Number = json_find_top_level_value_pos(oj, "change")
+        if cpos < 0:
+            return err("YDBv1 sync outbox entry is missing change object")
+        let cend: Number = json_skip_value(oj, cpos)
+        if cend <= cpos:
+            return err("YDBv1 sync outbox change object is malformed")
+        let cobj: Text = text_slice(oj, cpos, cend - cpos)
+        let parsed_c: YazaDbSyncChangeV1 = yaza_db_sync_parse_change_json_v1(cobj)?
+        let _po: Boolean = list_try_push(outbox, YazaDbSyncOutboxEntryV1(option_unwrap(olsn), parsed_c))
+        set i = i + 1
+
+    return ok(YazaDbSyncStateV1(option_unwrap(o_opt), option_unwrap(seq_opt), option_unwrap(lsn_opt), watermarks, row_meta, applied_txns, outbox))
+
+fn yaza_db_sync_state_load_v1(root: Number, db_uuid: Bytes, default_origin_id: Text) -> Result[YazaDbSyncStateV1, Text]:
+    let fname: Text = yaza_db_sync_state_filename_v1(db_uuid)?
+    let exists: Boolean = yaza_db_sync_file_exists_v1(root, fname)?
+    if not exists:
+        return yaza_db_sync_empty_state_v1(default_origin_id)
+    let fd: Number = open_read(root, fname)?
+    let fsz_res: Result[Number, Text] = file_size(fd)
+    if not result_is_ok(fsz_res):
+        let _c: Result[Boolean, Text] = close(fd)
+        return err(result_unwrap_error(fsz_res))
+    let fsz: Number = result_unwrap(fsz_res)
+    if fsz < yaza_db_sync_state_header_size_v1() or fsz > yaza_db_sync_max_state_bytes_v1():
+        let _c: Result[Boolean, Text] = close(fd)
+        return err("YDBv1 sync state file size is invalid")
+    let raw_res: Result[Bytes, Text] = read_exact(fd, 0, fsz)
+    let _c: Result[Boolean, Text] = close(fd)
+    if not result_is_ok(raw_res):
+        return err(result_unwrap_error(raw_res))
+    let raw: Bytes = result_unwrap(raw_res)
+    let magic: Number = yaza_db_read_uint_le_v1(raw, 0, 4)?
+    let ver: Number = yaza_db_read_uint_le_v1(raw, 4, 4)?
+    let body_len: Number = yaza_db_read_uint_le_v1(raw, 8, 4)?
+    let stored_crc: Number = yaza_db_read_uint_le_v1(raw, 12, 4)?
+    if magic != yaza_db_sync_state_magic_v1() or ver != 1 or body_len + yaza_db_sync_state_header_size_v1() != fsz:
+        return err("YDBv1 sync state file header is corrupt")
+    let body_bytes: Bytes = bytes_try_slice(raw, yaza_db_sync_state_header_size_v1(), body_len)?
+    if bytes_ydbv1_checksum(body_bytes) != stored_crc:
+        return err("YDBv1 sync state file CRC32C checksum mismatch")
+    let body_txt_res: Result[Text, Text] = bytes_try_to_text(body_bytes)
+    if not result_is_ok(body_txt_res):
+        return err("YDBv1 sync state body is not valid UTF-8")
+    let decoded: YazaDbSyncStateV1 = yaza_db_sync_state_decode_json_v1(result_unwrap(body_txt_res))?
+    if decoded.origin_id == "" and default_origin_id != "":
+        return ok(YazaDbSyncStateV1(default_origin_id, decoded.next_origin_seq, decoded.last_extracted_lsn, decoded.watermarks, decoded.row_meta, decoded.applied_local_txns, decoded.outbox))
+    return ok(decoded)
+
+fn yaza_db_sync_state_save_v1(root: Number, db_uuid: Bytes, state: YazaDbSyncStateV1) -> Result[Boolean, Text]:
+    let fname: Text = yaza_db_sync_state_filename_v1(db_uuid)?
+    let tmp_name: Text = yaza_db_sync_state_tmp_filename_v1(db_uuid)?
+    let body_text: Text = yaza_db_sync_state_encode_json_v1(state)
+    let body_bytes: Bytes = bytes_from_text(body_text)
+    let body_len: Number = bytes_length(body_bytes)
+    if body_len + yaza_db_sync_state_header_size_v1() > yaza_db_sync_max_state_bytes_v1():
+        return err("YDBv1 sync state exceeds 16 MiB bounded limit")
+    let hdr: Bytes = bytes_try_new_zeroed(yaza_db_sync_state_header_size_v1())?
+    let crc: Number = bytes_ydbv1_checksum(body_bytes)
+    if not yaza_db_write_uint_le_v1(hdr, 0, yaza_db_sync_state_magic_v1(), 4) or not yaza_db_write_uint_le_v1(hdr, 4, 1, 4) or not yaza_db_write_uint_le_v1(hdr, 8, body_len, 4) or not yaza_db_write_uint_le_v1(hdr, 12, crc, 4):
+        return err("YDBv1 sync state header encode failed")
+    let payload: Bytes = bytes_concat(hdr, body_bytes)
+    let _rm_stale: Result[Boolean, Text] = remove(root, tmp_name)
+    let fd: Number = create_exclusive(root, tmp_name)?
+    let wr_res: Result[Number, Text] = write_exact(fd, 0, payload)
+    if not result_is_ok(wr_res) or result_unwrap(wr_res) != bytes_length(payload):
+        let _c1: Result[Boolean, Text] = close(fd)
+        let _r1: Result[Boolean, Text] = remove(root, tmp_name)
+        return err("YDBv1 sync state write failed")
+    let sy_res: Result[Boolean, Text] = sync(fd)
+    let cl_res: Result[Boolean, Text] = close(fd)
+    if not result_is_ok(sy_res) or not result_unwrap(sy_res) or not result_is_ok(cl_res) or not result_unwrap(cl_res):
+        let _r2: Result[Boolean, Text] = remove(root, tmp_name)
+        return err("YDBv1 sync state fsync/close failed")
+    let rn_ok: Boolean = rename(root, tmp_name, fname)?
+    if not rn_ok:
+        return err("YDBv1 sync state atomic rename failed")
+    let ds_ok: Boolean = sync_directory(root)?
+    if not ds_ok:
+        return err("YDBv1 sync state directory sync failed")
+    return ok(true)
+
+fn yaza_db_sync_page_map_lookup_v1(pmap: YazaDbSyncPageTableMapV1, page_id: Number) -> Number:
+    var i: Number = 0
+    while i < list_count(pmap.page_ids):
+        if list_get(pmap.page_ids, i) == page_id:
+            return list_get(pmap.table_indices, i)
+        set i = i + 1
+    return -1
+
+fn yaza_db_sync_build_page_table_map_v1(file: Number, header: YazaDbFileHeaderV1, snapshot: YazaDbCatalogSnapshotWithRootsV1) -> Result[YazaDbSyncPageTableMapV1, Text]:
+    let pids_res: Result[List[Number], Text] = list_try_new()
+    let tidxs_res: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(pids_res) or not result_is_ok(tidxs_res):
+        return err("YDBv1 sync page map allocation failed")
+    let page_ids: List[Number] = result_unwrap(pids_res)
+    let table_indices: List[Number] = result_unwrap(tidxs_res)
+
+    var t_idx: Number = 0
+    let t_count: Number = list_count(snapshot.sql_snapshot.tables)
+    while t_idx < t_count:
+        let tbl: YazaSqlTableSchemaV1 = list_get(snapshot.sql_snapshot.tables, t_idx)
+        if tbl.table_id > 4:
+            let root_pid: Number = list_get(snapshot.root_page_ids, t_idx)
+            let stack_res: Result[List[Number], Text] = list_try_new()
+            if not result_is_ok(stack_res):
+                return err("YDBv1 sync B+Tree traversal stack allocation failed")
+            let stack: List[Number] = result_unwrap(stack_res)
+            let _p0: Boolean = list_try_push(stack, root_pid)
+            var cursor: Number = 0
+            while cursor < list_count(stack):
+                let cur_pid: Number = list_get(stack, cursor)
+                set cursor = cursor + 1
+                let _mp1: Boolean = list_try_push(page_ids, cur_pid)
+                let _mp2: Boolean = list_try_push(table_indices, t_idx)
+                let page_bytes: Bytes = yaza_db_storage_read_page_validated_file_v1(file, header, cur_pid)?
+                let page_hdr: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page_bytes, cur_pid)?
+                if page_hdr.page_type == 2:
+                    var s: Number = 0
+                    while s < page_hdr.count:
+                        let slot: YazaDbPageSlotV1 = yaza_db_page_slot_from_validated_header_v1(page_bytes, page_hdr, s)?
+                        let child_pid: Number = yaza_db_page_inner_child_page_id_v1(slot.payload)?
+                        let _pc: Boolean = list_try_push(stack, child_pid)
+                        set s = s + 1
+                    let right_pid: Number = page_hdr.upper / 2
+                    if right_pid >= 2:
+                        let _pr: Boolean = list_try_push(stack, right_pid)
+        set t_idx = t_idx + 1
+    return ok(YazaDbSyncPageTableMapV1(page_ids, table_indices))
+
+fn yaza_db_sync_value_to_json_v1(val: YazaSqlValueV1, is_null: Boolean, type_id: Number) -> Text:
+    if is_null or val.is_null:
+        return "null"
+    if type_id == 1:
+        return json_bool(val.boolean_value)
+    if type_id == 2 or type_id == 3 or type_id == 4 or type_id == 11 or type_id == 13 or type_id == 14 or type_id == 15:
+        return number_text(val.integer_value)
+    if type_id == 6:
+        return float64_text(val.float_value)
+    if type_id == 16:
+        return json_string(yaza_db_repl_bytes_to_hex_v1(val.bytes_value))
+    return json_string(val.text_value)
+
+fn yaza_db_sync_row_to_json_v1(row: YazaDbRowV1, columns: List[YazaSqlColumnSchemaV1]) -> Text:
+    let parts: TextList = text_list()
+    list_push(parts, "{")
+    var i: Number = 0
+    let count: Number = list_count(columns)
+    while i < count:
+        if i > 0:
+            list_push(parts, ",")
+        let col: YazaSqlColumnSchemaV1 = list_get(columns, i)
+        let val: YazaSqlValueV1 = list_get(row.values, i)
+        let is_null: Boolean = list_get(row.nulls, i)
+        list_push(parts, json_string(col.name))
+        list_push(parts, ":")
+        list_push(parts, yaza_db_sync_value_to_json_v1(val, is_null, col.type_id))
+        set i = i + 1
+    list_push(parts, "}")
+    return text_join(parts, "")
+
+fn yaza_db_sync_parse_col_value_from_json_v1(row_json: Text, col: YazaSqlColumnSchemaV1) -> Result[YazaSqlValueV1, Text]:
+    let vpos: Number = json_find_top_level_value_pos(row_json, col.name)
+    if vpos < 0:
+        return err("YDBv1 sync row_json is missing column: " + col.name)
+    let vend: Number = json_skip_value(row_json, vpos)
+    if vend <= vpos:
+        return err("YDBv1 sync row_json value is malformed for column: " + col.name)
+    let raw_slice: Text = text_slice(row_json, vpos, vend - vpos)
+    if raw_slice == "null":
+        return yaza_sql_value_null_v1(col.type_id)
+    if col.type_id == 1:
+        if raw_slice == "true": return ok(yaza_sql_value_boolean_v1(true))
+        if raw_slice == "false": return ok(yaza_sql_value_boolean_v1(false))
+        return err("YDBv1 sync BOOLEAN value is invalid for column: " + col.name)
+    if col.type_id == 2 or col.type_id == 3 or col.type_id == 4 or col.type_id == 11 or col.type_id == 13 or col.type_id == 14 or col.type_id == 15:
+        let num: Number = number_try_parse(raw_slice)?
+        return yaza_sql_value_integer_v1(col.type_id, num)
+    if col.type_id == 6:
+        let fval: Float64 = float64_try_parse(raw_slice)?
+        return ok(yaza_sql_value_double_v1(fval))
+    if text_byte(row_json, vpos) != 34:
+        return err("YDBv1 sync expected JSON string for column: " + col.name)
+    let sq_end: Number = json_scan_string_end(row_json, vpos)
+    if sq_end < 0:
+        return err("YDBv1 sync unterminated JSON string for column: " + col.name)
+    let unesc_opt: Option[Text] = json_unescape_slice(row_json, vpos + 1, sq_end)
+    if not option_is_some(unesc_opt):
+        return err("YDBv1 sync invalid JSON escape for column: " + col.name)
+    let txt: Text = option_unwrap(unesc_opt)
+    if col.type_id == 9:
+        return ok(yaza_sql_value_text_v1(txt))
+    if col.type_id == 10:
+        let dec: YazaSqlDecimalV1 = yaza_sql_decimal_parse_v1(txt, col.precision, col.scale)?
+        return yaza_sql_value_decimal_v1(dec)
+    if col.type_id == 12:
+        return yaza_sql_value_uuid_v1(txt)
+    if col.type_id == 16:
+        let blob: Bytes = yaza_db_repl_hex_to_bytes_v1(txt)?
+        return yaza_sql_value_blob_v1(blob)
+    return err("YDBv1 sync unsupported column type for: " + col.name)
+
+fn yaza_db_sync_parse_row_values_v1(row_json: Text, columns: List[YazaSqlColumnSchemaV1]) -> Result[List[YazaSqlValueV1], Text]:
+    let vals_res: Result[List[YazaSqlValueV1], Text] = list_try_new()
+    if not result_is_ok(vals_res):
+        return err("YDBv1 sync parsed row list allocation failed")
+    let vals: List[YazaSqlValueV1] = result_unwrap(vals_res)
+    var i: Number = 0
+    while i < list_count(columns):
+        let v: YazaSqlValueV1 = yaza_db_sync_parse_col_value_from_json_v1(row_json, list_get(columns, i))?
+        if not list_try_push(vals, v):
+            return err("YDBv1 sync parsed row append failed")
+        set i = i + 1
+    return ok(vals)
+
+fn yaza_db_sync_parse_pk_values_v1(row_json: Text, columns: List[YazaSqlColumnSchemaV1], key_ordinals: List[Number]) -> Result[List[YazaSqlValueV1], Text]:
+    let vals_res: Result[List[YazaSqlValueV1], Text] = list_try_new()
+    if not result_is_ok(vals_res):
+        return err("YDBv1 sync parsed PK list allocation failed")
+    let vals: List[YazaSqlValueV1] = result_unwrap(vals_res)
+    var i: Number = 0
+    while i < list_count(key_ordinals):
+        let ord: Number = list_get(key_ordinals, i)
+        let v: YazaSqlValueV1 = yaza_db_sync_parse_col_value_from_json_v1(row_json, list_get(columns, ord))?
+        if not list_try_push(vals, v):
+            return err("YDBv1 sync parsed PK append failed")
+        set i = i + 1
+    return ok(vals)
+
+fn yaza_db_sync_list_contains_number_v1(items: List[Number], target: Number) -> Boolean:
+    var i: Number = 0
+    while i < list_count(items):
+        if list_get(items, i) == target:
+            return true
+        set i = i + 1
+    return false
+
+fn yaza_db_sync_find_committed_ts_v1(committed: List[YazaDbSyncCommittedTxnV1], txn_id: Number) -> Number:
+    var i: Number = 0
+    while i < list_count(committed):
+        let ct: YazaDbSyncCommittedTxnV1 = list_get(committed, i)
+        if ct.txn_id == txn_id:
+            return ct.commit_ts
+        set i = i + 1
+    return -1
+
+fn yaza_db_sync_find_row_meta_index_v1(metas: List[YazaDbSyncRowMetaV1], table_name: Text, pk_key_hex: Text) -> Number:
+    var i: Number = 0
+    while i < list_count(metas):
+        let m: YazaDbSyncRowMetaV1 = list_get(metas, i)
+        if m.table_name == table_name and m.pk_key_hex == pk_key_hex:
+            return i
+        set i = i + 1
+    return -1
+
+fn yaza_db_sync_find_watermark_index_v1(wms: List[YazaDbSyncWatermarkV1], origin_id: Text) -> Number:
+    var i: Number = 0
+    while i < list_count(wms):
+        if list_get(wms, i).origin_id == origin_id:
+            return i
+        set i = i + 1
+    return -1
+
+fn yaza_db_sync_stage_extracted_item_v1(items: List[YazaDbSyncExtractedItemV1], candidate: YazaDbSyncExtractedItemV1) -> Result[Boolean, Text]:
+    var i: Number = 0
+    while i < list_count(items):
+        let existing: YazaDbSyncExtractedItemV1 = list_get(items, i)
+        if existing.txn_id == candidate.txn_id and existing.table_name == candidate.table_name and existing.pk_key_hex == candidate.pk_key_hex:
+            if not list_try_set(items, i, candidate):
+                return err("YDBv1 sync extracted item update failed")
+            return ok(true)
+        set i = i + 1
+    if not list_try_push(items, candidate):
+        return err("YDBv1 sync extracted item append failed")
+    return ok(true)
+
+fn yaza_db_sync_extract_page_slots_for_commit_v1(session: YazaDbSessionV1, snapshot: YazaDbCatalogSnapshotWithRootsV1, table_index: Number, page_bytes: Bytes, page_id: Number, txn_id: Number, commit_ts: Number, wal_end_lsn: Number, out_items: List[YazaDbSyncExtractedItemV1]) -> Result[Boolean, Text]:
+    let hdr: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(page_bytes, page_id)?
+    if hdr.page_type != 1:
+        return ok(true)
+    let tbl: YazaSqlTableSchemaV1 = list_get(snapshot.sql_snapshot.tables, table_index)
+    let sv: Number = list_get(snapshot.table_schema_versions, table_index)
+    var s: Number = 0
+    while s < hdr.count:
+        let slot: YazaDbPageSlotV1 = yaza_db_page_slot_from_validated_header_v1(page_bytes, hdr, s)?
+        if bytes_length(slot.payload) >= 24:
+            let row_ver_ts: Number = yaza_db_read_int_le_v1(slot.payload, 0, 8)?
+            if row_ver_ts == commit_ts:
+                let key_bytes: Bytes = yaza_db_page_slot_key_from_validated_header_v1(page_bytes, hdr, slot)?
+                let decoded_row: YazaDbRowV1 = yaza_db_row_decode_for_schema_v1(slot.payload, tbl.columns, sv)?
+                let mat_row: YazaDbRowV1 = yaza_db_row_materialize_overflow_text_v1(session.storage.file, session.storage.header, decoded_row, tbl.columns)?
+                var op: Number = yaza_db_sync_op_upsert_v1()
+                if mat_row.deleted:
+                    set op = yaza_db_sync_op_delete_v1()
+                let pk_hex: Text = yaza_db_repl_bytes_to_hex_v1(key_bytes)
+                let rjson: Text = yaza_db_sync_row_to_json_v1(mat_row, tbl.columns)
+                let _st: Boolean = yaza_db_sync_stage_extracted_item_v1(out_items, YazaDbSyncExtractedItemV1(wal_end_lsn, txn_id, commit_ts, sv, tbl.name, op, pk_hex, rjson))?
+        set s = s + 1
+    return ok(true)
+
+fn yaza_db_sync_extract_deleted_slots_v1(session: YazaDbSessionV1, snapshot: YazaDbCatalogSnapshotWithRootsV1, table_index: Number, before_image: Bytes, after_image: Bytes, page_id: Number, txn_id: Number, commit_ts: Number, wal_end_lsn: Number, out_items: List[YazaDbSyncExtractedItemV1]) -> Result[Boolean, Text]:
+    let bhdr: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(before_image, page_id)?
+    let ahdr: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(after_image, page_id)?
+    let tbl: YazaSqlTableSchemaV1 = list_get(snapshot.sql_snapshot.tables, table_index)
+    let sv: Number = list_get(snapshot.table_schema_versions, table_index)
+    var bi: Number = 0
+    var ai: Number = 0
+    while bi < bhdr.count:
+        let bslot: YazaDbPageSlotV1 = yaza_db_page_slot_from_validated_header_v1(before_image, bhdr, bi)?
+        let bkey: Bytes = yaza_db_page_slot_key_from_validated_header_v1(before_image, bhdr, bslot)?
+        var removed: Boolean = true
+        if ai < ahdr.count:
+            let aslot: YazaDbPageSlotV1 = yaza_db_page_slot_from_validated_header_v1(after_image, ahdr, ai)?
+            let akey: Bytes = yaza_db_page_slot_key_from_validated_header_v1(after_image, ahdr, aslot)?
+            if yaza_db_compare_bytes_v1(bkey, akey) == 0:
+                set removed = false
+                set ai = ai + 1
+        if removed:
+            let decoded_row: YazaDbRowV1 = yaza_db_row_decode_for_schema_v1(bslot.payload, tbl.columns, sv)?
+            let pk_hex: Text = yaza_db_repl_bytes_to_hex_v1(bkey)
+            let rjson: Text = yaza_db_sync_row_to_json_v1(decoded_row, tbl.columns)
+            let _st: Boolean = yaza_db_sync_stage_extracted_item_v1(out_items, YazaDbSyncExtractedItemV1(wal_end_lsn, txn_id, commit_ts, sv, tbl.name, yaza_db_sync_op_delete_v1(), pk_hex, rjson))?
+        set bi = bi + 1
+    return ok(true)
+
+fn yaza_db_sync_scan_wal_records_v1(root: Number, db_uuid: Bytes, start_lsn: Number, wal_end_lsn: Number) -> Result[List[YazaDbWalRecordV1], Text]:
+    let recs_res: Result[List[YazaDbWalRecordV1], Text] = list_try_new()
+    if not result_is_ok(recs_res):
+        return err("YDBv1 sync WAL record list allocation failed")
+    let recs: List[YazaDbWalRecordV1] = result_unwrap(recs_res)
+    if start_lsn >= wal_end_lsn:
+        return ok(recs)
+    let seg_size: Number = yaza_db_wal_segment_size_v1()
+    let seg_count: Number = yaza_db_wal_segment_count_for_v1(root, db_uuid)?
+    var cur_lsn: Number = start_lsn
+    var open_idx: Number = -1
+    var open_fd: Number = -1
+    var open_sz: Number = 0
+    while cur_lsn < wal_end_lsn:
+        let seg_idx: Number = cur_lsn / seg_size
+        let seg_off: Number = cur_lsn % seg_size
+        if seg_idx >= seg_count:
+            if open_fd >= 0:
+                let _c: Result[Boolean, Text] = close(open_fd)
+            return err("YDBv1 sync WAL segment missing for LSN")
+        if seg_idx != open_idx:
+            if open_fd >= 0:
+                let _cp: Result[Boolean, Text] = close(open_fd)
+                set open_fd = -1
+            let seg_name: Text = yaza_db_wal_segment_name_for_v1(seg_idx, db_uuid)?
+            let opened: Result[Number, Text] = open_read(root, seg_name)
+            if not result_is_ok(opened):
+                return err(result_unwrap_error(opened))
+            set open_fd = result_unwrap(opened)
+            set open_idx = seg_idx
+            let sz_res: Result[Number, Text] = file_size(open_fd)
+            if not result_is_ok(sz_res):
+                let _c: Result[Boolean, Text] = close(open_fd)
+                return err(result_unwrap_error(sz_res))
+            set open_sz = result_unwrap(sz_res)
+        if seg_off >= open_sz or seg_off + 4 > open_sz:
+            if seg_idx + 1 < seg_count:
+                set cur_lsn = (seg_idx + 1) * seg_size
+                continue
+            break
+        let len_res: Result[Bytes, Text] = read_exact(open_fd, seg_off, 4)
+        if not result_is_ok(len_res):
+            let _c: Result[Boolean, Text] = close(open_fd)
+            return err(result_unwrap_error(len_res))
+        let rec_len: Number = yaza_db_read_uint_le_v1(result_unwrap(len_res), 0, 4)?
+        if rec_len == 0:
+            if seg_idx + 1 < seg_count:
+                set cur_lsn = (seg_idx + 1) * seg_size
+                continue
+            break
+        let rec_res: Result[YazaDbWalRecordV1, Text] = yaza_db_wal_read_segment_record_v1(open_fd, seg_off, cur_lsn)
+        if not result_is_ok(rec_res):
+            let _c: Result[Boolean, Text] = close(open_fd)
+            return err(result_unwrap_error(rec_res))
+        let rec: YazaDbWalRecordV1 = result_unwrap(rec_res)
+        if not list_try_push(recs, rec):
+            let _c: Result[Boolean, Text] = close(open_fd)
+            return err("YDBv1 sync WAL record push failed")
+        set cur_lsn = cur_lsn + yaza_db_wal_header_size_v1() + bytes_length(rec.payload)
+    if open_fd >= 0:
+        let _cl: Result[Boolean, Text] = close(open_fd)
+    return ok(recs)
+
+fn yaza_db_sync_ingest_local_wal_v1(session: YazaDbSessionV1, state: YazaDbSyncStateV1, origin_id: Text) -> Result[YazaDbSyncStateV1, Text]:
+    var eff_origin: Text = origin_id
+    if eff_origin == "":
+        set eff_origin = state.origin_id
+    if eff_origin == "":
+        set eff_origin = "local-node"
+    let wal_end: Number = session.wal.next_lsn
+    if state.last_extracted_lsn >= wal_end:
+        return ok(YazaDbSyncStateV1(eff_origin, state.next_origin_seq, state.last_extracted_lsn, state.watermarks, state.row_meta, state.applied_local_txns, state.outbox))
+
+    let records: List[YazaDbWalRecordV1] = yaza_db_sync_scan_wal_records_v1(session.root, session.storage.header.db_uuid, state.last_extracted_lsn, wal_end)?
+    let committed_res: Result[List[YazaDbSyncCommittedTxnV1], Text] = list_try_new()
+    let ended_res: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(committed_res) or not result_is_ok(ended_res):
+        return err("YDBv1 sync commit tracking allocation failed")
+    let committed: List[YazaDbSyncCommittedTxnV1] = result_unwrap(committed_res)
+    let ended_txns: List[Number] = result_unwrap(ended_res)
+
+    var ri: Number = 0
+    while ri < list_count(records):
+        let rec: YazaDbWalRecordV1 = list_get(records, ri)
+        if rec.rec_type == yaza_db_wal_type_commit_v1():
+            let cts: Number = yaza_db_wal_commit_payload_decode_v1(rec)?
+            let _pe: Boolean = list_try_push(ended_txns, rec.txn_id)
+            if not yaza_db_sync_list_contains_number_v1(state.applied_local_txns, rec.txn_id):
+                let _pc: Boolean = list_try_push(committed, YazaDbSyncCommittedTxnV1(rec.txn_id, cts))
+        elif rec.rec_type == yaza_db_wal_type_abort_v1():
+            let _pe: Boolean = list_try_push(ended_txns, rec.txn_id)
+        set ri = ri + 1
+
+    var next_lsn_cursor: Number = wal_end
+    set ri = 0
+    while ri < list_count(records):
+        let rec: YazaDbWalRecordV1 = list_get(records, ri)
+        if rec.txn_id > 0 and not yaza_db_sync_list_contains_number_v1(ended_txns, rec.txn_id):
+            if rec.lsn < next_lsn_cursor:
+                set next_lsn_cursor = rec.lsn
+        set ri = ri + 1
+
+    let extracted_res: Result[List[YazaDbSyncExtractedItemV1], Text] = list_try_new()
+    if not result_is_ok(extracted_res):
+        return err("YDBv1 sync extracted items allocation failed")
+    let extracted: List[YazaDbSyncExtractedItemV1] = result_unwrap(extracted_res)
+
+    if list_count(committed) > 0 and session.storage.header.catalog_root != 0 and session.storage.header.next_commit_ts >= 2:
+        let snapshot: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(session.storage.file, session.storage.header)?
+        let pmap: YazaDbSyncPageTableMapV1 = yaza_db_sync_build_page_table_map_v1(session.storage.file, session.storage.header, snapshot)?
+        set ri = 0
+        while ri < list_count(records):
+            let rec: YazaDbWalRecordV1 = list_get(records, ri)
+            let cts: Number = yaza_db_sync_find_committed_ts_v1(committed, rec.txn_id)
+            if cts > 0:
+                let rec_end_lsn: Number = rec.lsn + yaza_db_wal_header_size_v1() + bytes_length(rec.payload)
+                if rec.rec_type == yaza_db_wal_type_leaf_slot_delta_v1():
+                    let delta: YazaDbWalLeafSlotDeltaV1 = yaza_db_wal_leaf_slot_delta_decode_v1(rec)?
+                    let tidx: Number = yaza_db_sync_page_map_lookup_v1(pmap, delta.page_id)
+                    if tidx >= 0:
+                        let tbl: YazaSqlTableSchemaV1 = list_get(snapshot.sql_snapshot.tables, tidx)
+                        let sv: Number = list_get(snapshot.table_schema_versions, tidx)
+                        var ei: Number = 0
+                        while ei < list_count(delta.entries):
+                            let ent: YazaDbWalLeafSlotDeltaEntryV1 = list_get(delta.entries, ei)
+                            let pk_hex: Text = yaza_db_repl_bytes_to_hex_v1(ent.key)
+                            if delta.operation == yaza_db_wal_type_leaf_delete_v1():
+                                let dr: YazaDbRowV1 = yaza_db_row_decode_for_schema_v1(ent.old_payload, tbl.columns, sv)?
+                                let rj: Text = yaza_db_sync_row_to_json_v1(dr, tbl.columns)
+                                let _st: Boolean = yaza_db_sync_stage_extracted_item_v1(extracted, YazaDbSyncExtractedItemV1(rec_end_lsn, rec.txn_id, cts, sv, tbl.name, yaza_db_sync_op_delete_v1(), pk_hex, rj))?
+                            else:
+                                let dr: YazaDbRowV1 = yaza_db_row_decode_for_schema_v1(ent.new_payload, tbl.columns, sv)?
+                                let mr: YazaDbRowV1 = yaza_db_row_materialize_overflow_text_v1(session.storage.file, session.storage.header, dr, tbl.columns)?
+                                var op: Number = yaza_db_sync_op_upsert_v1()
+                                if mr.deleted:
+                                    set op = yaza_db_sync_op_delete_v1()
+                                let rj: Text = yaza_db_sync_row_to_json_v1(mr, tbl.columns)
+                                let _st: Boolean = yaza_db_sync_stage_extracted_item_v1(extracted, YazaDbSyncExtractedItemV1(rec_end_lsn, rec.txn_id, cts, sv, tbl.name, op, pk_hex, rj))?
+                            set ei = ei + 1
+                elif rec.rec_type == yaza_db_wal_type_leaf_insert_v1() or rec.rec_type == yaza_db_wal_type_leaf_update_v1():
+                    let mut: YazaDbWalLeafMutationV1 = yaza_db_wal_leaf_mutation_payload_decode_v1(rec)?
+                    let tidx: Number = yaza_db_sync_page_map_lookup_v1(pmap, mut.page_id)
+                    if tidx >= 0:
+                        let _ex: Boolean = yaza_db_sync_extract_page_slots_for_commit_v1(session, snapshot, tidx, mut.after_image, mut.page_id, rec.txn_id, cts, rec_end_lsn, extracted)?
+                elif rec.rec_type == yaza_db_wal_type_leaf_delete_v1():
+                    let mut: YazaDbWalLeafMutationV1 = yaza_db_wal_leaf_mutation_payload_decode_v1(rec)?
+                    let tidx: Number = yaza_db_sync_page_map_lookup_v1(pmap, mut.page_id)
+                    if tidx >= 0:
+                        let _ex: Boolean = yaza_db_sync_extract_deleted_slots_v1(session, snapshot, tidx, mut.before_image, mut.after_image, mut.page_id, rec.txn_id, cts, rec_end_lsn, extracted)?
+                elif rec.rec_type == yaza_db_wal_type_node_split_v1():
+                    let sp: YazaDbWalNodeSplitV1 = yaza_db_wal_node_split_payload_decode_v1(rec)?
+                    var pi: Number = 0
+                    while pi < list_count(sp.pages):
+                        let spp: YazaDbWalNodeSplitPageV1 = list_get(sp.pages, pi)
+                        let tidx: Number = yaza_db_sync_page_map_lookup_v1(pmap, spp.page_id)
+                        if tidx >= 0:
+                            let _ex: Boolean = yaza_db_sync_extract_page_slots_for_commit_v1(session, snapshot, tidx, spp.after_image, spp.page_id, rec.txn_id, cts, rec_end_lsn, extracted)?
+                        set pi = pi + 1
+            set ri = ri + 1
+
+    # Stage changes in fresh lists: a failed extraction must not mutate the
+    # caller's state, and new WAL values belong to this call's arena.
+    let row_meta_res: Result[List[YazaDbSyncRowMetaV1], Text] = list_try_new()
+    let outbox_res: Result[List[YazaDbSyncOutboxEntryV1], Text] = list_try_new()
+    let row_meta: List[YazaDbSyncRowMetaV1] = row_meta_res?
+    let outbox: List[YazaDbSyncOutboxEntryV1] = outbox_res?
+    var copy_index: Number = 0
+    while copy_index < list_count(state.row_meta):
+        if not list_try_push(row_meta, list_get(state.row_meta, copy_index)):
+            return err("YDBv1 sync could not copy row metadata")
+        set copy_index = copy_index + 1
+    set copy_index = 0
+    while copy_index < list_count(state.outbox):
+        if not list_try_push(outbox, list_get(state.outbox, copy_index)):
+            return err("YDBv1 sync could not copy outbox")
+        set copy_index = copy_index + 1
+    var next_seq: Number = state.next_origin_seq
+    var ei: Number = 0
+    while ei < list_count(extracted):
+        let it: YazaDbSyncExtractedItemV1 = list_get(extracted, ei)
+        let midx: Number = yaza_db_sync_find_row_meta_index_v1(row_meta, it.table_name, it.pk_key_hex)
+        var next_ver: Number = 1
+        if midx >= 0:
+            set next_ver = list_get(row_meta, midx).row_version + 1
+        let is_del: Boolean = it.operation == yaza_db_sync_op_delete_v1()
+        var tomb_ts: Number = 0
+        if is_del:
+            set tomb_ts = it.commit_ts
+        let new_meta: YazaDbSyncRowMetaV1 = YazaDbSyncRowMetaV1(it.table_name, it.pk_key_hex, next_ver, eff_origin, it.commit_ts, is_del, tomb_ts, true)
+        if midx >= 0:
+            if not list_try_set(row_meta, midx, new_meta):
+                return err("YDBv1 sync could not update row metadata")
+        else:
+            if not list_try_push(row_meta, new_meta):
+                return err("YDBv1 sync could not append row metadata")
+        let ch: YazaDbSyncChangeV1 = YazaDbSyncChangeV1(eff_origin, next_seq, it.txn_id, it.commit_ts, it.schema_version, it.table_name, it.operation, it.pk_key_hex, it.row_json, next_ver)
+        if not list_try_push(outbox, YazaDbSyncOutboxEntryV1(it.wal_end_lsn, ch)):
+            return err("YDBv1 sync could not append outbox change")
+        set next_seq = next_seq + 1
+        set ei = ei + 1
+
+    return ok(YazaDbSyncStateV1(eff_origin, next_seq, next_lsn_cursor, state.watermarks, row_meta, state.applied_local_txns, outbox))
+
+fn yaza_db_sync_extract_delta_v1(session: YazaDbSessionV1, origin_id: Text, from_lsn: Number, max_changes: Number) -> Result[YazaDbSyncBatchV1, Text]:
+    if not session.is_open:
+        return err("YDBv1 sync extract requires an open session")
+    if option_is_some(session.explicit_tx):
+        return err("YDBv1 sync extract cannot run inside an active explicit transaction")
+    if origin_id == "":
+        return err("YDBv1 sync extract requires a non-empty origin_id")
+    if from_lsn < 0:
+        return err("YDBv1 sync extract requires a non-negative from_lsn")
+    var limit: Number = max_changes
+    if limit < 1: set limit = yaza_db_sync_default_max_changes_v1()
+    if limit > yaza_db_sync_hard_max_changes_v1(): set limit = yaza_db_sync_hard_max_changes_v1()
+
+    let loaded_state: YazaDbSyncStateV1 = yaza_db_sync_state_load_v1(session.root, session.storage.header.db_uuid, origin_id)?
+    let state: YazaDbSyncStateV1 = yaza_db_sync_ingest_local_wal_v1(session, loaded_state, origin_id)?
+
+    let out_res: Result[List[YazaDbSyncChangeV1], Text] = list_try_new()
+    if not result_is_ok(out_res):
+        return err("YDBv1 sync delta batch allocation failed")
+    let out_changes: List[YazaDbSyncChangeV1] = result_unwrap(out_res)
+    let export_meta_res: Result[List[YazaDbSyncRowMetaV1], Text] = list_try_new()
+    let export_meta: List[YazaDbSyncRowMetaV1] = export_meta_res?
+    var export_index: Number = 0
+    while export_index < list_count(state.row_meta):
+        if not list_try_push(export_meta, list_get(state.row_meta, export_index)):
+            return err("YDBv1 sync could not stage export metadata")
+        set export_index = export_index + 1
+
+    var to_lsn: Number = from_lsn
+    var truncated: Boolean = false
+    var last_emitted_lsn: Number = from_lsn
+    var i: Number = 0
+    while i < list_count(state.outbox):
+        let oe: YazaDbSyncOutboxEntryV1 = list_get(state.outbox, i)
+        if oe.wal_end_lsn > from_lsn:
+            if list_count(out_changes) >= limit and oe.wal_end_lsn != last_emitted_lsn:
+                set truncated = true
+                break
+            if not list_try_push(out_changes, oe.change):
+                return err("YDBv1 sync delta batch append failed")
+            let em_idx: Number = yaza_db_sync_find_row_meta_index_v1(export_meta, oe.change.table_name, oe.change.pk_key_hex)
+            if em_idx >= 0:
+                let em: YazaDbSyncRowMetaV1 = list_get(export_meta, em_idx)
+                if em.row_version == oe.change.row_version and em.local_dirty:
+                    if not list_try_set(export_meta, em_idx, YazaDbSyncRowMetaV1(em.table_name, em.pk_key_hex, em.row_version, em.last_origin_id, em.last_commit_ts, em.deleted, em.tombstone_ts, false)):
+                        return err("YDBv1 sync could not update export metadata")
+            set last_emitted_lsn = oe.wal_end_lsn
+            set to_lsn = oe.wal_end_lsn
+        set i = i + 1
+
+    if not truncated and state.last_extracted_lsn > to_lsn:
+        set to_lsn = state.last_extracted_lsn
+
+    let export_state: YazaDbSyncStateV1 = YazaDbSyncStateV1(state.origin_id, state.next_origin_seq, state.last_extracted_lsn, state.watermarks, export_meta, state.applied_local_txns, state.outbox)
+    let _saved: Boolean = yaza_db_sync_state_save_v1(session.root, session.storage.header.db_uuid, export_state)?
+    let crc: Number = yaza_db_sync_batch_compute_crc32c_v1(state.origin_id, from_lsn, to_lsn, out_changes)
+    return ok(YazaDbSyncBatchV1(state.origin_id, from_lsn, to_lsn, out_changes, crc))
+
+fn yaza_db_sync_find_table_index_by_name_v1(snapshot: YazaDbCatalogSnapshotWithRootsV1, table_name: Text) -> Number:
+    var i: Number = 0
+    while i < list_count(snapshot.sql_snapshot.tables):
+        let tbl: YazaSqlTableSchemaV1 = list_get(snapshot.sql_snapshot.tables, i)
+        if tbl.table_id > 4 and tbl.name == table_name:
+            return i
+        set i = i + 1
+    return -1
+
+fn yaza_db_sync_ordinal_is_pk_v1(key_ordinals: List[Number], ordinal: Number) -> Boolean:
+    var i: Number = 0
+    while i < list_count(key_ordinals):
+        if list_get(key_ordinals, i) == ordinal:
+            return true
+        set i = i + 1
+    return false
+
+fn yaza_db_sync_build_pk_where_v1(columns: List[YazaSqlColumnSchemaV1], key_ordinals: List[Number], first_param_idx: Number) -> Text:
+    let parts: TextList = text_list()
+    var i: Number = 0
+    while i < list_count(key_ordinals):
+        if i > 0:
+            list_push(parts, " AND ")
+        let col: YazaSqlColumnSchemaV1 = list_get(columns, list_get(key_ordinals, i))
+        list_push(parts, col.name)
+        list_push(parts, " = $")
+        list_push(parts, number_text(first_param_idx + i))
+        set i = i + 1
+    return text_join(parts, "")
+
+fn yaza_db_sync_execute_remote_upsert_v1(session: YazaDbSessionV1, tbl: YazaSqlTableSchemaV1, key_ordinals: List[Number], row_values: List[YazaSqlValueV1], pk_values: List[YazaSqlValueV1]) -> Result[YazaDbSessionStatementV1, Text]:
+    let first_pk_col: Text = list_get(tbl.columns, list_get(key_ordinals, 0)).name
+    let sel_sql: Text = "SELECT " + first_pk_col + " FROM " + tbl.name + " WHERE " + yaza_db_sync_build_pk_where_v1(tbl.columns, key_ordinals, 1)
+    let sel_res: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, sel_sql, pk_values)?
+    let cur_sess: YazaDbSessionV1 = sel_res.session
+    let qr: YazaSqlQueryResultV1 = option_unwrap(sel_res.statement.query_result)
+    if list_count(qr.rows) == 0:
+        let col_parts: TextList = text_list()
+        let val_parts: TextList = text_list()
+        var ci: Number = 0
+        while ci < list_count(tbl.columns):
+            if ci > 0:
+                list_push(col_parts, ", ")
+                list_push(val_parts, ", ")
+            list_push(col_parts, list_get(tbl.columns, ci).name)
+            list_push(val_parts, "$" + number_text(ci + 1))
+            set ci = ci + 1
+        let ins_sql: Text = "INSERT INTO " + tbl.name + " (" + text_join(col_parts, "") + ") VALUES (" + text_join(val_parts, "") + ")"
+        return yaza_db_session_execute_v1(cur_sess, ins_sql, row_values)
+
+    let set_parts: TextList = text_list()
+    let upd_params_res: Result[List[YazaSqlValueV1], Text] = list_try_new()
+    if not result_is_ok(upd_params_res):
+        return err("YDBv1 sync UPDATE parameter list allocation failed")
+    let upd_params: List[YazaSqlValueV1] = result_unwrap(upd_params_res)
+    var p_idx: Number = 1
+    var ci: Number = 0
+    while ci < list_count(tbl.columns):
+        if not yaza_db_sync_ordinal_is_pk_v1(key_ordinals, ci):
+            if p_idx > 1:
+                list_push(set_parts, ", ")
+            list_push(set_parts, list_get(tbl.columns, ci).name + " = $" + number_text(p_idx))
+            let _pu: Boolean = list_try_push(upd_params, list_get(row_values, ci))
+            set p_idx = p_idx + 1
+        set ci = ci + 1
+    if p_idx == 1:
+        return ok(sel_res)
+    var pi: Number = 0
+    while pi < list_count(pk_values):
+        let _pp: Boolean = list_try_push(upd_params, list_get(pk_values, pi))
+        set pi = pi + 1
+    let upd_sql: Text = "UPDATE " + tbl.name + " SET " + text_join(set_parts, "") + " WHERE " + yaza_db_sync_build_pk_where_v1(tbl.columns, key_ordinals, p_idx)
+    return yaza_db_session_execute_v1(cur_sess, upd_sql, upd_params)
+
+fn yaza_db_sync_execute_remote_delete_v1(session: YazaDbSessionV1, tbl: YazaSqlTableSchemaV1, key_ordinals: List[Number], pk_values: List[YazaSqlValueV1]) -> Result[YazaDbSessionStatementV1, Text]:
+    let del_sql: Text = "DELETE FROM " + tbl.name + " WHERE " + yaza_db_sync_build_pk_where_v1(tbl.columns, key_ordinals, 1)
+    return yaza_db_session_execute_v1(session, del_sql, pk_values)
+
+fn yaza_db_sync_resolve_conflict_v1(policy: Number, local_is_server: Boolean, local_meta: YazaDbSyncRowMetaV1, change: YazaDbSyncChangeV1) -> YazaDbSyncConflictV1:
+    if policy == yaza_db_sync_policy_server_wins_v1():
+        if local_is_server:
+            return YazaDbSyncConflictV1(change.table_name, change.pk_key_hex, policy, "local", local_meta.row_version, change.row_version, "SERVER_WINS: authoritative server retained local row")
+        return YazaDbSyncConflictV1(change.table_name, change.pk_key_hex, policy, "remote", local_meta.row_version, change.row_version, "SERVER_WINS: client accepted authoritative server row")
+    if policy == yaza_db_sync_policy_client_wins_v1():
+        if local_is_server:
+            return YazaDbSyncConflictV1(change.table_name, change.pk_key_hex, policy, "remote", local_meta.row_version, change.row_version, "CLIENT_WINS: server accepted client row")
+        return YazaDbSyncConflictV1(change.table_name, change.pk_key_hex, policy, "local", local_meta.row_version, change.row_version, "CLIENT_WINS: client retained local row")
+    if change.row_version > local_meta.row_version:
+        return YazaDbSyncConflictV1(change.table_name, change.pk_key_hex, policy, "remote", local_meta.row_version, change.row_version, "VERSION_LWW: higher remote row_version won")
+    if local_meta.row_version > change.row_version:
+        return YazaDbSyncConflictV1(change.table_name, change.pk_key_hex, policy, "local", local_meta.row_version, change.row_version, "VERSION_LWW: higher local row_version won")
+    let cmp_origin: Number = yaza_db_sync_compare_text_v1(change.origin_id, local_meta.last_origin_id)
+    if cmp_origin > 0:
+        return YazaDbSyncConflictV1(change.table_name, change.pk_key_hex, policy, "remote", local_meta.row_version, change.row_version, "VERSION_LWW: deterministic origin_id tiebreak chose remote")
+    return YazaDbSyncConflictV1(change.table_name, change.pk_key_hex, policy, "local", local_meta.row_version, change.row_version, "VERSION_LWW: deterministic origin_id tiebreak chose local")
+
+fn yaza_db_sync_apply_delta_with_role_v1(session: YazaDbSessionV1, batch: YazaDbSyncBatchV1, policy: Number, local_is_server: Boolean) -> Result[YazaDbSyncApplyResultV1, Text]:
+    if not session.is_open:
+        return err("YDBv1 sync apply requires an open session")
+    if option_is_some(session.explicit_tx):
+        return err("YDBv1 sync apply cannot run inside an active explicit transaction")
+    if policy != yaza_db_sync_policy_server_wins_v1() and policy != yaza_db_sync_policy_client_wins_v1() and policy != yaza_db_sync_policy_version_lww_v1():
+        return err("YDBv1 sync conflict policy is invalid (use 1=SERVER_WINS, 2=CLIENT_WINS, 3=VERSION_LWW)")
+    if batch.origin_id == "":
+        return err("YDBv1 sync batch requires a non-empty origin_id")
+    if not yaza_db_sync_batch_verify_crc32c_v1(batch):
+        return err("YDBv1 sync batch CRC32C checksum mismatch")
+
+    let loaded_state: YazaDbSyncStateV1 = yaza_db_sync_state_load_v1(session.root, session.storage.header.db_uuid, "")?
+    let ingested: YazaDbSyncStateV1 = yaza_db_sync_ingest_local_wal_v1(session, loaded_state, loaded_state.origin_id)?
+    let wm_res: Result[List[YazaDbSyncWatermarkV1], Text] = list_try_new()
+    let meta_res: Result[List[YazaDbSyncRowMetaV1], Text] = list_try_new()
+    let tx_res: Result[List[Number], Text] = list_try_new()
+    let out_res: Result[List[YazaDbSyncOutboxEntryV1], Text] = list_try_new()
+    let apply_wms: List[YazaDbSyncWatermarkV1] = wm_res?
+    let apply_meta: List[YazaDbSyncRowMetaV1] = meta_res?
+    let apply_txns: List[Number] = tx_res?
+    let apply_outbox: List[YazaDbSyncOutboxEntryV1] = out_res?
+    var copy_index: Number = 0
+    while copy_index < list_count(ingested.watermarks):
+        if not list_try_push(apply_wms, list_get(ingested.watermarks, copy_index)): return err("YDBv1 sync could not stage watermarks")
+        set copy_index = copy_index + 1
+    set copy_index = 0
+    while copy_index < list_count(ingested.row_meta):
+        if not list_try_push(apply_meta, list_get(ingested.row_meta, copy_index)): return err("YDBv1 sync could not stage row metadata")
+        set copy_index = copy_index + 1
+    set copy_index = 0
+    while copy_index < list_count(ingested.applied_local_txns):
+        if not list_try_push(apply_txns, list_get(ingested.applied_local_txns, copy_index)): return err("YDBv1 sync could not stage applied transactions")
+        set copy_index = copy_index + 1
+    set copy_index = 0
+    while copy_index < list_count(ingested.outbox):
+        if not list_try_push(apply_outbox, list_get(ingested.outbox, copy_index)): return err("YDBv1 sync could not stage outbox")
+        set copy_index = copy_index + 1
+    var state: YazaDbSyncStateV1 = YazaDbSyncStateV1(ingested.origin_id, ingested.next_origin_seq, ingested.last_extracted_lsn, apply_wms, apply_meta, apply_txns, apply_outbox)
+
+    let wm_idx: Number = yaza_db_sync_find_watermark_index_v1(state.watermarks, batch.origin_id)
+    var remote_seq: Number = 0
+    if wm_idx >= 0:
+        set remote_seq = list_get(state.watermarks, wm_idx).last_applied_seq
+
+    let snapshot: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(session.storage.file, session.storage.header)?
+    let index_rows: List[YazaDbRowV1] = yaza_db_index_catalog_rows_v1(session.storage.file, session.storage.header, snapshot.sql_snapshot.version)?
+
+    # Fail-closed schema & payload pre-validation before mutating any row.
+    var vi: Number = 0
+    while vi < list_count(batch.changes):
+        let ch: YazaDbSyncChangeV1 = list_get(batch.changes, vi)
+        if ch.origin_id != batch.origin_id:
+            return err("YDBv1 sync change origin_id does not match batch origin_id")
+        if ch.origin_seq > remote_seq and (state.origin_id == "" or ch.origin_id != state.origin_id):
+            if ch.operation != yaza_db_sync_op_upsert_v1() and ch.operation != yaza_db_sync_op_delete_v1():
+                return err("YDBv1 sync change operation is invalid")
+            let tidx: Number = yaza_db_sync_find_table_index_by_name_v1(snapshot, ch.table_name)
+            if tidx < 0:
+                return err("YDBv1 sync schema error: table does not exist: " + ch.table_name)
+            let local_sv: Number = list_get(snapshot.table_schema_versions, tidx)
+            if ch.schema_version != local_sv:
+                return err("YDBv1 sync schema version mismatch for table " + ch.table_name + ": remote=" + number_text(ch.schema_version) + " local=" + number_text(local_sv))
+            let tbl: YazaSqlTableSchemaV1 = list_get(snapshot.sql_snapshot.tables, tidx)
+            let root_pid: Number = list_get(snapshot.root_page_ids, tidx)
+            let kords: List[Number] = yaza_db_query_clustered_key_ordinals_from_rows_v1(index_rows, tbl.table_id, root_pid, list_count(tbl.columns))?
+            if ch.operation == yaza_db_sync_op_upsert_v1():
+                let _rv: List[YazaSqlValueV1] = yaza_db_sync_parse_row_values_v1(ch.row_json, tbl.columns)?
+            else:
+                let _pv: List[YazaSqlValueV1] = yaza_db_sync_parse_pk_values_v1(ch.row_json, tbl.columns, kords)?
+        set vi = vi + 1
+
+    let conflicts_res: Result[List[YazaDbSyncConflictV1], Text] = list_try_new()
+    if not result_is_ok(conflicts_res):
+        return err("YDBv1 sync conflict list allocation failed")
+    let conflicts: List[YazaDbSyncConflictV1] = result_unwrap(conflicts_res)
+
+    var cur_sess: YazaDbSessionV1 = session
+    var applied_count: Number = 0
+    var skipped_duplicates: Number = 0
+    var highest_seq: Number = remote_seq
+
+    var ci: Number = 0
+    while ci < list_count(batch.changes):
+        let ch: YazaDbSyncChangeV1 = list_get(batch.changes, ci)
+        if ch.origin_seq <= remote_seq:
+            set skipped_duplicates = skipped_duplicates + 1
+            set ci = ci + 1
+            continue
+        if state.origin_id != "" and ch.origin_id == state.origin_id:
+            set skipped_duplicates = skipped_duplicates + 1
+            if ch.origin_seq > highest_seq:
+                set highest_seq = ch.origin_seq
+            set ci = ci + 1
+            continue
+
+        let tidx: Number = yaza_db_sync_find_table_index_by_name_v1(snapshot, ch.table_name)
+        let tbl: YazaSqlTableSchemaV1 = list_get(snapshot.sql_snapshot.tables, tidx)
+        let root_pid: Number = list_get(snapshot.root_page_ids, tidx)
+        let kords: List[Number] = yaza_db_query_clustered_key_ordinals_from_rows_v1(index_rows, tbl.table_id, root_pid, list_count(tbl.columns))?
+        let midx: Number = yaza_db_sync_find_row_meta_index_v1(state.row_meta, ch.table_name, ch.pk_key_hex)
+
+        var should_apply: Boolean = true
+        if midx >= 0:
+            let lmeta: YazaDbSyncRowMetaV1 = list_get(state.row_meta, midx)
+            if lmeta.last_origin_id != ch.origin_id and (lmeta.row_version >= ch.row_version or lmeta.local_dirty):
+                let conflict: YazaDbSyncConflictV1 = yaza_db_sync_resolve_conflict_v1(policy, local_is_server, lmeta, ch)
+                let _pc: Boolean = list_try_push(conflicts, conflict)
+                if conflict.winner == "local":
+                    set should_apply = false
+
+        if should_apply:
+            var stmt_res: YazaDbSessionStatementV1 = YazaDbSessionStatementV1(cur_sess, YazaDbSqlStatementResultV1(0, none, none, none, cur_sess.storage, cur_sess.wal))
+            if ch.operation == yaza_db_sync_op_upsert_v1():
+                let rvals: List[YazaSqlValueV1] = yaza_db_sync_parse_row_values_v1(ch.row_json, tbl.columns)?
+                let pvals: List[YazaSqlValueV1] = yaza_db_sync_parse_pk_values_v1(ch.row_json, tbl.columns, kords)?
+                set stmt_res = yaza_db_sync_execute_remote_upsert_v1(cur_sess, tbl, kords, rvals, pvals)?
+            else:
+                let pvals: List[YazaSqlValueV1] = yaza_db_sync_parse_pk_values_v1(ch.row_json, tbl.columns, kords)?
+                set stmt_res = yaza_db_sync_execute_remote_delete_v1(cur_sess, tbl, kords, pvals)?
+            set cur_sess = stmt_res.session
+            if option_is_some(stmt_res.statement.write_commit):
+                let wc: YazaDbWriteCommitV1 = option_unwrap(stmt_res.statement.write_commit)
+                if wc.txn_id > 0 and not yaza_db_sync_list_contains_number_v1(state.applied_local_txns, wc.txn_id):
+                    if not list_try_push(apply_txns, wc.txn_id): return err("YDBv1 sync could not retain applied transaction")
+            let is_del: Boolean = ch.operation == yaza_db_sync_op_delete_v1()
+            var tomb_ts: Number = 0
+            if is_del:
+                set tomb_ts = ch.commit_ts
+            var eff_ver: Number = ch.row_version
+            if midx >= 0:
+                let prev_v: Number = list_get(state.row_meta, midx).row_version
+                if prev_v > eff_ver:
+                    set eff_ver = prev_v
+            let next_meta: YazaDbSyncRowMetaV1 = YazaDbSyncRowMetaV1(ch.table_name, ch.pk_key_hex, eff_ver, ch.origin_id, ch.commit_ts, is_del, tomb_ts, false)
+            if midx >= 0:
+                if not list_try_set(apply_meta, midx, next_meta): return err("YDBv1 sync could not update applied row metadata")
+            else:
+                if not list_try_push(apply_meta, next_meta): return err("YDBv1 sync could not retain applied row metadata")
+            # Prune defeated local outbox entries for this row so they never bounce back.
+            let kept_out_res: Result[List[YazaDbSyncOutboxEntryV1], Text] = list_try_new()
+            if result_is_ok(kept_out_res):
+                let kept_out: List[YazaDbSyncOutboxEntryV1] = result_unwrap(kept_out_res)
+                var oi: Number = 0
+                while oi < list_count(state.outbox):
+                    let oe: YazaDbSyncOutboxEntryV1 = list_get(state.outbox, oi)
+                    if not (oe.change.table_name == ch.table_name and oe.change.pk_key_hex == ch.pk_key_hex and oe.change.row_version <= eff_ver):
+                        let _ko: Boolean = list_try_push(kept_out, oe)
+                    set oi = oi + 1
+                set state = YazaDbSyncStateV1(state.origin_id, state.next_origin_seq, state.last_extracted_lsn, state.watermarks, state.row_meta, state.applied_local_txns, kept_out)
+            set applied_count = applied_count + 1
+
+        if ch.origin_seq > highest_seq:
+            set highest_seq = ch.origin_seq
+        set ci = ci + 1
+
+    let next_wm: YazaDbSyncWatermarkV1 = YazaDbSyncWatermarkV1(batch.origin_id, highest_seq, batch.to_lsn)
+    if wm_idx >= 0:
+        if not list_try_set(apply_wms, wm_idx, next_wm): return err("YDBv1 sync could not update watermark")
+    else:
+        if not list_try_push(apply_wms, next_wm): return err("YDBv1 sync could not retain watermark")
+
+    # Advance last_extracted_lsn past our own applied remote txns so they never echo.
+    let final_state: YazaDbSyncStateV1 = YazaDbSyncStateV1(state.origin_id, state.next_origin_seq, cur_sess.wal.next_lsn, state.watermarks, state.row_meta, state.applied_local_txns, state.outbox)
+    let _saved: Boolean = yaza_db_sync_state_save_v1(cur_sess.root, cur_sess.storage.header.db_uuid, final_state)?
+    return ok(YazaDbSyncApplyResultV1(cur_sess, applied_count, skipped_duplicates, conflicts, highest_seq))
+
+fn yaza_db_sync_apply_delta_v1(session: YazaDbSessionV1, batch: YazaDbSyncBatchV1, policy: Number) -> Result[YazaDbSyncApplyResultV1, Text]:
+    return yaza_db_sync_apply_delta_with_role_v1(session, batch, policy, true)
+
+fn yaza_db_sync_get_watermarks_v1(session: YazaDbSessionV1, origin_id: Text) -> Result[List[YazaDbSyncWatermarkV1], Text]:
+    if not session.is_open:
+        return err("YDBv1 sync watermarks requires an open session")
+    let state: YazaDbSyncStateV1 = yaza_db_sync_state_load_v1(session.root, session.storage.header.db_uuid, origin_id)?
+    return ok(state.watermarks)
+
+fn yaza_db_sync_prune_tombstones_v1(session: YazaDbSessionV1, before_ts: Number) -> Result[Number, Text]:
+    if not session.is_open:
+        return err("YDBv1 sync tombstone pruning requires an open session")
+    let state: YazaDbSyncStateV1 = yaza_db_sync_state_load_v1(session.root, session.storage.header.db_uuid, "")?
+    let kept_res: Result[List[YazaDbSyncRowMetaV1], Text] = list_try_new()
+    if not result_is_ok(kept_res):
+        return err("YDBv1 sync tombstone pruning allocation failed")
+    let kept: List[YazaDbSyncRowMetaV1] = result_unwrap(kept_res)
+    var pruned: Number = 0
+    var i: Number = 0
+    while i < list_count(state.row_meta):
+        let m: YazaDbSyncRowMetaV1 = list_get(state.row_meta, i)
+        if m.deleted and m.tombstone_ts > 0 and m.tombstone_ts < before_ts:
+            set pruned = pruned + 1
+        else:
+            let _pk: Boolean = list_try_push(kept, m)
+        set i = i + 1
+    if pruned > 0:
+        let next_state: YazaDbSyncStateV1 = YazaDbSyncStateV1(state.origin_id, state.next_origin_seq, state.last_extracted_lsn, state.watermarks, kept, state.applied_local_txns, state.outbox)
+        let _saved: Boolean = yaza_db_sync_state_save_v1(session.root, session.storage.header.db_uuid, next_state)?
+    return ok(pruned)
+
+fn yaza_db_sync_status_json_v1(session: YazaDbSessionV1, origin_id: Text, policy: Number) -> Result[Text, Text]:
+    let uuid_hex: Text = yaza_db_storage_uuid_hex_v1(session.storage.header.db_uuid)?
+    let state: YazaDbSyncStateV1 = yaza_db_sync_state_load_v1(session.root, session.storage.header.db_uuid, origin_id)?
+    let wm_jsons: List[Text] = List[Text]()
+    var i: Number = 0
+    while i < list_count(state.watermarks):
+        let w: YazaDbSyncWatermarkV1 = list_get(state.watermarks, i)
+        list_push(wm_jsons, "{\"origin_id\":" + json_string(w.origin_id) + ",\"last_applied_seq\":" + number_text(w.last_applied_seq) + ",\"last_extracted_lsn\":" + number_text(w.last_extracted_lsn) + "}")
+        set i = i + 1
+    var tombstones: Number = 0
+    set i = 0
+    while i < list_count(state.row_meta):
+        if list_get(state.row_meta, i).deleted:
+            set tombstones = tombstones + 1
+        set i = i + 1
+    let parts: TextList = text_list()
+    list_push(parts, "{\"origin_id\":")
+    list_push(parts, json_string(state.origin_id))
+    list_push(parts, ",\"db_uuid\":")
+    list_push(parts, json_string(uuid_hex))
+    list_push(parts, ",\"wal_next_lsn\":")
+    list_push(parts, number_text(session.wal.next_lsn))
+    list_push(parts, ",\"next_origin_seq\":")
+    list_push(parts, number_text(state.next_origin_seq))
+    list_push(parts, ",\"last_extracted_lsn\":")
+    list_push(parts, number_text(state.last_extracted_lsn))
+    list_push(parts, ",\"policy\":")
+    list_push(parts, number_text(policy))
+    list_push(parts, ",\"tombstone_count\":")
+    list_push(parts, number_text(tombstones))
+    list_push(parts, ",\"watermarks\":")
+    list_push(parts, json_array(wm_jsons))
+    list_push(parts, "}")
+    return ok(text_join(parts, ""))
+
+fn yaza_db_sync_apply_result_json_v1(res: YazaDbSyncApplyResultV1) -> Text:
+    let c_jsons: List[Text] = List[Text]()
+    var i: Number = 0
+    while i < list_count(res.conflicts):
+        let c: YazaDbSyncConflictV1 = list_get(res.conflicts, i)
+        let cp: TextList = text_list()
+        list_push(cp, "{\"table_name\":")
+        list_push(cp, json_string(c.table_name))
+        list_push(cp, ",\"pk_key_hex\":")
+        list_push(cp, json_string(c.pk_key_hex))
+        list_push(cp, ",\"policy\":")
+        list_push(cp, number_text(c.policy))
+        list_push(cp, ",\"winner\":")
+        list_push(cp, json_string(c.winner))
+        list_push(cp, ",\"local_version\":")
+        list_push(cp, number_text(c.local_version))
+        list_push(cp, ",\"remote_version\":")
+        list_push(cp, number_text(c.remote_version))
+        list_push(cp, ",\"reason\":")
+        list_push(cp, json_string(c.reason))
+        list_push(cp, "}")
+        list_push(c_jsons, text_join(cp, ""))
+        set i = i + 1
+    let parts: TextList = text_list()
+    list_push(parts, "{\"applied_count\":")
+    list_push(parts, number_text(res.applied_count))
+    list_push(parts, ",\"skipped_duplicates\":")
+    list_push(parts, number_text(res.skipped_duplicates))
+    list_push(parts, ",\"new_remote_seq\":")
+    list_push(parts, number_text(res.new_remote_seq))
+    list_push(parts, ",\"conflicts\":")
+    list_push(parts, json_array(c_jsons))
+    list_push(parts, "}")
+    return text_join(parts, "")
+
+fn yaza_db_sync_handle_http_v1(session: YazaDbSessionV1, request: HttpRequest, origin_id: Text, policy: Number) -> Result[YazaDbSyncHttpOutcomeV1, Text]:
+    if request.path == "/api/v1/sync/status":
+        if request.method != "GET":
+            return ok(YazaDbSyncHttpOutcomeV1(session, http_response_method_not_allowed("use GET for /api/v1/sync/status", true)))
+        let body: Text = yaza_db_sync_status_json_v1(session, origin_id, policy)?
+        return ok(YazaDbSyncHttpOutcomeV1(session, http_response_ok_json(body)))
+
+    if request.path == "/api/v1/sync/pull":
+        if request.method != "GET":
+            return ok(YazaDbSyncHttpOutcomeV1(session, http_response_method_not_allowed("use GET for /api/v1/sync/pull", true)))
+        let from_lsn: Number = http_query_param_number(request.query, "from_lsn", 0)
+        let max_changes: Number = http_query_param_number(request.query, "max_changes", yaza_db_sync_default_max_changes_v1())
+        let batch_res: Result[YazaDbSyncBatchV1, Text] = yaza_db_sync_extract_delta_v1(session, origin_id, from_lsn, max_changes)
+        if not result_is_ok(batch_res):
+            return ok(YazaDbSyncHttpOutcomeV1(session, http_response_bad_request(result_unwrap_error(batch_res), true)))
+        let batch_json: Text = yaza_db_sync_batch_to_json_v1(result_unwrap(batch_res))
+        return ok(YazaDbSyncHttpOutcomeV1(session, http_response_ok_json(batch_json)))
+
+    if request.path == "/api/v1/sync/push":
+        if request.method != "POST":
+            return ok(YazaDbSyncHttpOutcomeV1(session, http_response_method_not_allowed("use POST for /api/v1/sync/push", true)))
+        let parsed_res: Result[YazaDbSyncBatchV1, Text] = yaza_db_sync_parse_batch_json_v1(request.body_text)
+        if not result_is_ok(parsed_res):
+            return ok(YazaDbSyncHttpOutcomeV1(session, http_response_bad_request(result_unwrap_error(parsed_res), true)))
+        let q_policy: Number = http_query_param_number(request.query, "policy", 0)
+        if q_policy != 0 and q_policy != policy:
+            return ok(YazaDbSyncHttpOutcomeV1(session, http_response_forbidden("sync conflict policy is controlled by the server", true)))
+        let applied_res: Result[YazaDbSyncApplyResultV1, Text] = yaza_db_sync_apply_delta_with_role_v1(session, result_unwrap(parsed_res), policy, true)
+        if not result_is_ok(applied_res):
+            let err_msg: Text = result_unwrap_error(applied_res)
+            if text_find(err_msg, "schema") >= 0:
+                let c_json: Text = "{\"error\":{\"code\":\"SCHEMA_MISMATCH\",\"message\":\"" + json_escape_text(err_msg) + "\",\"status\":409}}"
+                return ok(YazaDbSyncHttpOutcomeV1(session, HttpResponse(409, "Conflict", "application/json", bytes_from_text(c_json))))
+            return ok(YazaDbSyncHttpOutcomeV1(session, http_response_bad_request(err_msg, true)))
+        let applied: YazaDbSyncApplyResultV1 = result_unwrap(applied_res)
+        return ok(YazaDbSyncHttpOutcomeV1(applied.session, http_response_ok_json(yaza_db_sync_apply_result_json_v1(applied))))
+
+    return ok(YazaDbSyncHttpOutcomeV1(session, http_response_not_found("unknown sync endpoint", true)))

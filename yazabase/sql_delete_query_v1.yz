@@ -7,6 +7,7 @@ use "./index_catalog_v1"
 use "./key_codec_v1"
 use "./page_v1"
 use "./page_wal_v1"
+use "./plan_cache_v1"
 use "./query_v1"
 use "./row_v1"
 use "./sql_binder_v1"
@@ -31,6 +32,15 @@ shape YazaDbSqlDeletePreparedPlanV1:
     indexes: List[YazaDbSecondaryIndexV1]
     targets: List[YazaDbSqlDeleteTargetV1]
     groups: List[YazaDbWriteLeafUpdateGroupV1]
+
+shape YazaDbSqlDeletePreparedWithCacheV1:
+    plan: YazaDbSqlDeletePreparedPlanV1
+    cache_entry: Option[YazaDbWritePlanCacheEntryV1]
+
+shape YazaDbSqlDeleteCachedCommitV1:
+    commit: YazaDbWriteCommitV1
+    cache_entry: Option[YazaDbWritePlanCacheEntryV1]
+    overlay: Option[YazaDbDirtyPageOverlayV1]
 
 fn yaza_db_sql_delete_key_v1(row: List[YazaSqlValueV1], columns: List[YazaSqlColumnSchemaV1], key_ordinals: List[Number]) -> Result[Bytes, Text]:
     let column_count: Number = list_count(columns)
@@ -224,49 +234,90 @@ fn yaza_db_sql_delete_build_groups_v1(targets: List[YazaDbSqlDeleteTargetV1], pr
         set group_start = group_end
     return ok(groups)
 
-fn yaza_db_sql_delete_prepare_plan_profiled_v1(file: Number, read_header: YazaDbFileHeaderV1, encode_commit_ts: Number, source: Text, parameters: List[YazaSqlValueV1], cached_catalog: Option[YazaDbCatalogSnapshotWithRootsV1], cached_index_rows: Option[List[YazaDbRowV1]], profile_ns: List[Number]) -> Result[YazaDbSqlDeletePreparedPlanV1, Text]:
+fn yaza_db_sql_delete_prepare_plan_with_cache_profiled_v1(file: Number, read_header: YazaDbFileHeaderV1, encode_commit_ts: Number, source: Text, parameters: List[YazaSqlValueV1], cached_catalog: Option[YazaDbCatalogSnapshotWithRootsV1], cached_index_rows: Option[List[YazaDbRowV1]], cached_entry: Option[YazaDbWritePlanCacheEntryV1], profile_ns: List[Number]) -> Result[YazaDbSqlDeletePreparedWithCacheV1, Text]:
     let profile_enabled: Boolean = list_count(profile_ns) >= 34
     var profile_started_ns: Number = 0
     if profile_enabled: set profile_started_ns = monotonic_ns()
-    let select_source: Text = yaza_sql_parse_delete_v1(source)?
     var loaded_result: Result[YazaDbCatalogSnapshotWithRootsV1, Text] = err("YDBv1 DELETE catalog was not loaded")
     if option_is_some(cached_catalog):
         set loaded_result = ok(option_unwrap(cached_catalog))
     else:
         set loaded_result = yaza_db_catalog_snapshot_load_with_roots_v1(file, read_header)
     let loaded: YazaDbCatalogSnapshotWithRootsV1 = loaded_result?
-    let parsed: YazaSqlSelectAstV3 = yaza_sql_parse_select_v3(select_source)?
-    var view_index: Number = 0
-    while view_index < list_count(loaded.views):
-        if yaza_sql_bind_v1_identifier_matches(select_source, parsed.table_name.first_token, list_get(loaded.views, view_index).name):
-            return err("YDBv1 views are read-only; DELETE through a view is not supported")
-        set view_index = view_index + 1
-    let plan: YazaSqlBoundPlanV1 = yaza_sql_bind_select_v1(select_source, parsed, loaded.sql_snapshot)?
-    if plan.catalog_version != loaded.sql_snapshot.version: return err("YDBv1 DELETE predicate was bound against a stale catalog snapshot")
-    if plan.distinct or plan.has_limit or list_count(plan.order_by) != 0 or list_count(plan.projections) < 1: return err("YDBv1 DELETE predicate plan has unsupported output modifiers")
-    let table_index: Number = yaza_db_catalog_snapshot_table_index_v1(loaded.sql_snapshot.tables, plan.table_id)
-    if table_index < 0 or table_index >= list_count(loaded.root_page_ids) or table_index >= list_count(loaded.table_schema_versions): return err("YDBv1 DELETE target has no persisted table root or schema version")
-    let table: YazaSqlTableSchemaV1 = list_get(loaded.sql_snapshot.tables, table_index)
-    let table_schema_version: Number = list_get(loaded.table_schema_versions, table_index)
-    if list_count(plan.projections) != list_count(table.columns): return err("YDBv1 DELETE predicate plan does not return the complete target row")
-    var projection_index: Number = 0
-    while projection_index < list_count(plan.projections):
-        let projection: YazaSqlBoundProjectionV1 = list_get(plan.projections, projection_index)
-        if projection.column_ordinal != projection_index or projection.type_id != list_get(table.columns, projection_index).type_id: return err("YDBv1 DELETE predicate projection does not match the target row layout")
-        set projection_index = projection_index + 1
-    let table_root_page_id: Number = list_get(loaded.root_page_ids, table_index)
     var index_rows_result: Result[List[YazaDbRowV1], Text] = err("YDBv1 DELETE index catalog was not loaded")
     if option_is_some(cached_index_rows):
         set index_rows_result = ok(option_unwrap(cached_index_rows))
     else:
         set index_rows_result = yaza_db_index_catalog_rows_v1(file, read_header, loaded.sql_snapshot.version)
     let index_rows: List[YazaDbRowV1] = index_rows_result?
-    let key_ordinals: List[Number] = yaza_db_query_clustered_key_ordinals_from_rows_v1(index_rows, plan.table_id, table_root_page_id, list_count(table.columns))?
+
+    var used_cache: Boolean = false
+    var select_source: Text = ""
+    var pred_entry_opt: Option[YazaDbSelectPlanCacheEntryV1] = none
+    var plan_opt: Option[YazaSqlBoundPlanV1] = none
+    var table_index: Number = -1
+    var table_schema_version: Number = 0
+    var table_root_page_id: Number = 0
+    var key_ordinals: List[Number] = List[Number]()
+    var out_cache_entry: Option[YazaDbWritePlanCacheEntryV1] = none
+
+    if option_is_some(cached_entry):
+        let ce: YazaDbWritePlanCacheEntryV1 = option_unwrap(cached_entry)
+        if ce.stmt_kind == 3 and ce.source == source and ce.catalog_root == read_header.catalog_root and option_is_some(ce.pred_select_entry):
+            if ce.table_index >= 0 and ce.table_index < list_count(loaded.sql_snapshot.tables) and ce.table_index < list_count(loaded.root_page_ids) and ce.table_index < list_count(loaded.table_schema_versions):
+                if list_get(loaded.sql_snapshot.tables, ce.table_index).table_id == ce.table_id and list_get(loaded.root_page_ids, ce.table_index) == ce.table_root_page_id and list_get(loaded.table_schema_versions, ce.table_index) == ce.table_schema_version:
+                    let pe: YazaDbSelectPlanCacheEntryV1 = option_unwrap(ce.pred_select_entry)
+                    set used_cache = true
+                    set select_source = pe.source
+                    set pred_entry_opt = ce.pred_select_entry
+                    set plan_opt = some(pe.plan)
+                    set table_index = ce.table_index
+                    set table_schema_version = ce.table_schema_version
+                    set table_root_page_id = ce.table_root_page_id
+                    set key_ordinals = ce.key_ordinals
+
+    if not used_cache:
+        set select_source = yaza_sql_parse_delete_v1(source)?
+        let parsed: YazaSqlSelectAstV3 = yaza_sql_parse_select_v3(select_source)?
+        var view_index: Number = 0
+        while view_index < list_count(loaded.views):
+            if yaza_sql_bind_v1_identifier_matches(select_source, parsed.table_name.first_token, list_get(loaded.views, view_index).name):
+                return err("YDBv1 views are read-only; DELETE through a view is not supported")
+            set view_index = view_index + 1
+        let bound_plan: YazaSqlBoundPlanV1 = yaza_sql_bind_select_v1(select_source, parsed, loaded.sql_snapshot)?
+        if bound_plan.catalog_version != loaded.sql_snapshot.version: return err("YDBv1 DELETE predicate was bound against a stale catalog snapshot")
+        if bound_plan.distinct or bound_plan.has_limit or list_count(bound_plan.order_by) != 0 or list_count(bound_plan.projections) < 1: return err("YDBv1 DELETE predicate plan has unsupported output modifiers")
+        set table_index = yaza_db_catalog_snapshot_table_index_v1(loaded.sql_snapshot.tables, bound_plan.table_id)
+        if table_index < 0 or table_index >= list_count(loaded.root_page_ids) or table_index >= list_count(loaded.table_schema_versions): return err("YDBv1 DELETE target has no persisted table root or schema version")
+        let table_chk: YazaSqlTableSchemaV1 = list_get(loaded.sql_snapshot.tables, table_index)
+        set table_schema_version = list_get(loaded.table_schema_versions, table_index)
+        if list_count(bound_plan.projections) != list_count(table_chk.columns): return err("YDBv1 DELETE predicate plan does not return the complete target row")
+        var projection_index: Number = 0
+        while projection_index < list_count(bound_plan.projections):
+            let projection: YazaSqlBoundProjectionV1 = list_get(bound_plan.projections, projection_index)
+            if projection.column_ordinal != projection_index or projection.type_id != list_get(table_chk.columns, projection_index).type_id: return err("YDBv1 DELETE predicate projection does not match the target row layout")
+            set projection_index = projection_index + 1
+        set table_root_page_id = list_get(loaded.root_page_ids, table_index)
+        set key_ordinals = yaza_db_query_clustered_key_ordinals_from_rows_v1(index_rows, bound_plan.table_id, table_root_page_id, list_count(table_chk.columns))?
+        set plan_opt = some(bound_plan)
+        if read_header.catalog_root > 0 and bound_plan.right_table_id == 0 and list_count(bound_plan.join_stages) == 0 and list_count(bound_plan.subqueries) == 0:
+            let pe: YazaDbSelectPlanCacheEntryV1 = YazaDbSelectPlanCacheEntryV1(select_source, read_header.catalog_root, bound_plan.table_id, table_index, table_root_page_id, table_schema_version, key_ordinals, bound_plan)
+            set pred_entry_opt = some(pe)
+            set out_cache_entry = some(yaza_db_write_plan_entry_delete_v1(source, read_header.catalog_root, bound_plan.table_id, table_index, table_root_page_id, table_schema_version, key_ordinals, pe))
+
+    let plan: YazaSqlBoundPlanV1 = option_unwrap(plan_opt)
+    let table: YazaSqlTableSchemaV1 = list_get(loaded.sql_snapshot.tables, table_index)
     let indexes: List[YazaDbSecondaryIndexV1] = yaza_db_index_maintenance_load_from_rows_v1(loaded, table_index, key_ordinals, index_rows)?
-    let select_tokens: List[YazaSqlTokenV1] = yaza_sql_lex_v1(select_source)?
     if profile_enabled: set profile_started_ns = yaza_db_query_profile_record_ns_v1(profile_ns, 22, profile_started_ns, monotonic_ns())
     if profile_enabled: set profile_started_ns = monotonic_ns()
-    let query_result: YazaSqlQueryResultV1 = yaza_db_execute_single_select_with_cached_catalog_and_index_rows_profiled_v1(file, read_header, select_source, select_tokens, parameters, loaded, index_rows, List[Number]())?
+    var query_res: Result[YazaSqlQueryResultV1, Text] = err("YDBv1 DELETE predicate query did not run")
+    if option_is_some(pred_entry_opt):
+        let pooled: YazaDbQueryPooledSelectResultV1 = yaza_db_execute_cached_select_plan_pooled_profiled_v1(file, read_header, parameters, loaded, some(index_rows), option_unwrap(pred_entry_opt), none, List[Number]())?
+        set query_res = ok(pooled.query_result)
+    else:
+        let select_tokens: List[YazaSqlTokenV1] = yaza_sql_lex_v1(select_source)?
+        set query_res = yaza_db_execute_single_select_with_cached_catalog_and_index_rows_profiled_v1(file, read_header, select_source, select_tokens, parameters, loaded, index_rows, List[Number]())
+    let query_result: YazaSqlQueryResultV1 = query_res?
     if profile_enabled: set profile_started_ns = yaza_db_query_profile_record_ns_v1(profile_ns, 23, profile_started_ns, monotonic_ns())
     if profile_enabled: set profile_started_ns = monotonic_ns()
     let row_count: Number = list_count(query_result.rows)
@@ -344,7 +395,11 @@ fn yaza_db_sql_delete_prepare_plan_profiled_v1(file: Number, read_header: YazaDb
     let mutation_count: Number = row_count * (list_count(indexes) + 1)
     if mutation_count > 65536: return err("YDBv1 DELETE secondary-index mutations exceed their bounded write count")
     let groups: List[YazaDbWriteLeafUpdateGroupV1] = yaza_db_sql_delete_build_groups_v1(targets, profile_ns)?
-    return ok(YazaDbSqlDeletePreparedPlanV1(row_count, mutation_count, indexes, targets, groups))
+    return ok(YazaDbSqlDeletePreparedWithCacheV1(YazaDbSqlDeletePreparedPlanV1(row_count, mutation_count, indexes, targets, groups), out_cache_entry))
+
+fn yaza_db_sql_delete_prepare_plan_profiled_v1(file: Number, read_header: YazaDbFileHeaderV1, encode_commit_ts: Number, source: Text, parameters: List[YazaSqlValueV1], cached_catalog: Option[YazaDbCatalogSnapshotWithRootsV1], cached_index_rows: Option[List[YazaDbRowV1]], profile_ns: List[Number]) -> Result[YazaDbSqlDeletePreparedPlanV1, Text]:
+    let res: YazaDbSqlDeletePreparedWithCacheV1 = yaza_db_sql_delete_prepare_plan_with_cache_profiled_v1(file, read_header, encode_commit_ts, source, parameters, cached_catalog, cached_index_rows, none, profile_ns)?
+    return ok(res.plan)
 
 fn yaza_db_sql_delete_apply_nonstaged_profiled_v1(initial_tx: YazaDbWriteTransactionV1, plan: YazaDbSqlDeletePreparedPlanV1, profile_ns: List[Number]) -> Result[YazaDbWriteTransactionV1, Text]:
     var current: YazaDbWriteTransactionV1 = initial_tx
@@ -389,10 +444,11 @@ fn yaza_db_execute_delete_in_tx_v1(transaction: YazaDbWriteTransactionV1, source
     let next_tx: YazaDbWriteTransactionV1 = yaza_db_sql_delete_apply_nonstaged_profiled_v1(transaction, plan, List[Number]())?
     return ok(YazaDbTxDmlResultV1(next_tx, plan.row_count))
 
-fn yaza_db_execute_delete_with_sync_policy_profiled_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], defer_checkpoint: Boolean, sync_commit_wal: Boolean, cached_catalog: Option[YazaDbCatalogSnapshotWithRootsV1], cached_index_rows: Option[List[YazaDbRowV1]], profile_ns: List[Number]) -> Result[YazaDbWriteCommitV1, Text]:
+fn yaza_db_execute_delete_with_overlay_and_cache_profiled_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], defer_checkpoint: Boolean, sync_commit_wal: Boolean, cached_catalog: Option[YazaDbCatalogSnapshotWithRootsV1], cached_index_rows: Option[List[YazaDbRowV1]], cached_entry: Option[YazaDbWritePlanCacheEntryV1], overlay: Option[YazaDbDirtyPageOverlayV1], profile_ns: List[Number]) -> Result[YazaDbSqlDeleteCachedCommitV1, Text]:
     if storage.root != wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid): return err("YDBv1 SQL DELETE storage and WAL handles belong to different databases")
     let profile_enabled: Boolean = list_count(profile_ns) >= 34
-    let plan: YazaDbSqlDeletePreparedPlanV1 = yaza_db_sql_delete_prepare_plan_profiled_v1(storage.file, storage.header, storage.header.next_commit_ts, source, parameters, cached_catalog, cached_index_rows, profile_ns)?
+    let prepared: YazaDbSqlDeletePreparedWithCacheV1 = yaza_db_sql_delete_prepare_plan_with_cache_profiled_v1(storage.file, storage.header, storage.header.next_commit_ts, source, parameters, cached_catalog, cached_index_rows, cached_entry, profile_ns)?
+    let plan: YazaDbSqlDeletePreparedPlanV1 = prepared.plan
     var profile_started_ns: Number = 0
     if profile_enabled: set profile_started_ns = monotonic_ns()
     var begun_result: Result[YazaDbWriteTransactionV1, Text] = err("YDBv1 DELETE transaction begin path was not selected")
@@ -410,7 +466,7 @@ fn yaza_db_execute_delete_with_sync_policy_profiled_v1(storage: YazaDbStorageHan
         return err("YDBv1 DELETE result exceeds the bounded WAL recovery-tail budget; reopen through recovery before reuse")
     var current: YazaDbWriteTransactionV1 = begun
     if plan.row_count > 0 and list_count(plan.indexes) == 0 and list_count(plan.groups) <= 128:
-        let staged_result: Result[YazaDbStagedLeafBatchV1, Text] = yaza_db_write_transaction_stage_leaf_update_groups_profiled_v1(current, plan.groups, profile_ns)
+        let staged_result: Result[YazaDbStagedLeafBatchV1, Text] = yaza_db_write_transaction_stage_leaf_update_groups_with_overlay_v1(current, plan.groups, overlay, profile_ns)
         if not result_is_ok(staged_result):
             let message: Text = result_unwrap_error(staged_result)
             yaza_db_sql_delete_close_after_error_v1(current.storage, current.wal, message)
@@ -425,7 +481,15 @@ fn yaza_db_execute_delete_with_sync_policy_profiled_v1(storage: YazaDbStorageHan
             yaza_db_sql_delete_close_after_error_v1(staged.transaction.storage, staged.transaction.wal, message)
             return err("YDBv1 SQL DELETE commit failed; reopen through recovery before reuse: " + message)
         let staged_result_commit: YazaDbWriteCommitV1 = result_unwrap(committed_staged)
-        return ok(YazaDbWriteCommitV1(staged_result_commit.storage, staged_result_commit.wal, staged_result_commit.txn_id, staged_result_commit.commit_ts, plan.row_count))
+        var out_overlay: Option[YazaDbDirtyPageOverlayV1] = overlay
+        if option_is_some(overlay):
+            if staged_result_commit.storage.header.checkpoint_lsn != storage.header.checkpoint_lsn:
+                let reset_ov: Result[YazaDbDirtyPageOverlayV1, Text] = yaza_db_dirty_overlay_new_v1()
+                if result_is_ok(reset_ov): set out_overlay = some(result_unwrap(reset_ov))
+            else:
+                let marked_ov: Result[YazaDbDirtyPageOverlayV1, Text] = yaza_db_dirty_overlay_mark_fpi_v1(option_unwrap(overlay), staged.page_ids)
+                if result_is_ok(marked_ov): set out_overlay = some(result_unwrap(marked_ov))
+        return ok(YazaDbSqlDeleteCachedCommitV1(YazaDbWriteCommitV1(staged_result_commit.storage, staged_result_commit.wal, staged_result_commit.txn_id, staged_result_commit.commit_ts, plan.row_count), prepared.cache_entry, out_overlay))
     if profile_enabled: set profile_started_ns = monotonic_ns()
     set current = yaza_db_sql_delete_apply_nonstaged_profiled_v1(current, plan, profile_ns)?
     if profile_enabled: set profile_started_ns = yaza_db_query_profile_record_ns_v1(profile_ns, 25, profile_started_ns, monotonic_ns())
@@ -437,7 +501,15 @@ fn yaza_db_execute_delete_with_sync_policy_profiled_v1(storage: YazaDbStorageHan
         yaza_db_sql_delete_close_after_error_v1(current.storage, current.wal, message)
         return err("YDBv1 SQL DELETE commit failed; reopen through recovery before reuse: " + message)
     let result: YazaDbWriteCommitV1 = result_unwrap(committed)
-    return ok(YazaDbWriteCommitV1(result.storage, result.wal, result.txn_id, result.commit_ts, plan.row_count))
+    var out_overlay_ns: Option[YazaDbDirtyPageOverlayV1] = overlay
+    if option_is_some(overlay) and result.storage.header.checkpoint_lsn != storage.header.checkpoint_lsn:
+        let reset_ov: Result[YazaDbDirtyPageOverlayV1, Text] = yaza_db_dirty_overlay_new_v1()
+        if result_is_ok(reset_ov): set out_overlay_ns = some(result_unwrap(reset_ov))
+    return ok(YazaDbSqlDeleteCachedCommitV1(YazaDbWriteCommitV1(result.storage, result.wal, result.txn_id, result.commit_ts, plan.row_count), prepared.cache_entry, out_overlay_ns))
+
+fn yaza_db_execute_delete_with_sync_policy_profiled_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], defer_checkpoint: Boolean, sync_commit_wal: Boolean, cached_catalog: Option[YazaDbCatalogSnapshotWithRootsV1], cached_index_rows: Option[List[YazaDbRowV1]], profile_ns: List[Number]) -> Result[YazaDbWriteCommitV1, Text]:
+    let res: YazaDbSqlDeleteCachedCommitV1 = yaza_db_execute_delete_with_overlay_and_cache_profiled_v1(storage, wal, source, parameters, defer_checkpoint, sync_commit_wal, cached_catalog, cached_index_rows, none, none, profile_ns)?
+    return ok(res.commit)
 
 fn yaza_db_execute_delete_with_cache_and_policy_profiled_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], defer_checkpoint: Boolean, cached_catalog: Option[YazaDbCatalogSnapshotWithRootsV1], cached_index_rows: Option[List[YazaDbRowV1]], profile_ns: List[Number]) -> Result[YazaDbWriteCommitV1, Text]:
     return yaza_db_execute_delete_with_sync_policy_profiled_v1(storage, wal, source, parameters, defer_checkpoint, true, cached_catalog, cached_index_rows, profile_ns)

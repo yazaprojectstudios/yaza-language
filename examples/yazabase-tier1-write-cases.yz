@@ -1,0 +1,183 @@
+# Shared Tier 1 write/recovery fixture cases.
+use "std/fs"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/delta_wal_v1"
+use "../yazabase/group_commit_v1"
+use "../yazabase/page_wal_v1"
+use "../yazabase/plan_cache_v1"
+use "../yazabase/session_v1"
+use "../yazabase/sql_executor_v1"
+use "../yazabase/wal_v1"
+
+fn t1_expect(cond: Boolean, label: Text) -> Result[Boolean, Text]:
+    if not cond:
+        return err("tier1 assertion failed: " + label)
+    return ok(true)
+
+fn t1_init_session(dir_path: Text, db_name: Text) -> Result[YazaDbSessionV1, Text]:
+    let root: Number = root_open(dir_path)?
+    let boot: YazaDbCatalogBootstrapV1 = yaza_db_catalog_create_v1(root, db_name)?
+    let _wc: Boolean = yaza_db_wal_log_close_v1(boot.wal)?
+    let _sc: Boolean = yaza_db_storage_close_v1(boot.storage)?
+    return yaza_db_session_open_v1(root, db_name)
+
+fn t1_exec(sess: YazaDbSessionV1, sql: Text) -> Result[YazaDbSessionV1, Text]:
+    let res: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(sess, sql, List[YazaSqlValueV1]())?
+    return ok(res.session)
+
+fn t1_query_int(sess: YazaDbSessionV1, sql: Text) -> Result[Number, Text]:
+    let res: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(sess, sql, List[YazaSqlValueV1]())?
+    let qr: YazaSqlQueryResultV1 = option_unwrap(res.statement.query_result)
+    if list_count(qr.rows) < 1:
+        return err("expected >= 1 row for: " + sql)
+    return ok(list_get(list_get(qr.rows, 0), 0).integer_value)
+
+fn t1_query_text(sess: YazaDbSessionV1, sql: Text) -> Result[Text, Text]:
+    let res: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(sess, sql, List[YazaSqlValueV1]())?
+    let qr: YazaSqlQueryResultV1 = option_unwrap(res.statement.query_result)
+    if list_count(qr.rows) < 1:
+        return err("expected >= 1 row for: " + sql)
+    return ok(list_get(list_get(qr.rows, 0), 0).text_value)
+
+fn t1_query_count(sess: YazaDbSessionV1, sql: Text) -> Result[Number, Text]:
+    let res: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(sess, sql, List[YazaSqlValueV1]())?
+    let qr: YazaSqlQueryResultV1 = option_unwrap(res.statement.query_result)
+    return ok(list_count(qr.rows))
+
+fn t1_count_delta_records(sess: YazaDbSessionV1, start_lsn: Number, end_lsn: Number, expected_op: Number) -> Result[Number, Text]:
+    var cursor: Number = start_lsn
+    var delta_count: Number = 0
+    let full_pages: List[Number] = List[Number]()
+    while cursor < end_lsn:
+        let rec: YazaDbWalRecordV1 = yaza_db_wal_read_record_at_v1(sess.root, sess.wal.db_uuid, cursor, end_lsn)?
+        var full_pid: Number = -1
+        if rec.rec_type == yaza_db_wal_type_full_page_image_v1():
+            let img: YazaDbWalPageImageV1 = yaza_db_wal_page_image_payload_decode_v1(rec)?
+            set full_pid = img.page_id
+        elif rec.rec_type == yaza_db_wal_type_leaf_insert_v1() or rec.rec_type == yaza_db_wal_type_leaf_update_v1() or rec.rec_type == yaza_db_wal_type_leaf_delete_v1():
+            let mut: YazaDbWalLeafMutationV1 = yaza_db_wal_leaf_mutation_payload_decode_v1(rec)?
+            set full_pid = mut.page_id
+        if full_pid >= 2:
+            list_push(full_pages, full_pid)
+        if rec.rec_type == yaza_db_wal_type_leaf_slot_delta_v1():
+            let d: YazaDbWalLeafSlotDeltaV1 = yaza_db_wal_leaf_slot_delta_decode_v1(rec)?
+            var saw_full: Boolean = false
+            var j: Number = 0
+            while j < list_count(full_pages):
+                if list_get(full_pages, j) == d.page_id:
+                    set saw_full = true
+                set j = j + 1
+            let _ok_full: Boolean = t1_expect(saw_full, "LEAF_SLOT_DELTA preceded by full image in window")?
+            if d.operation == expected_op:
+                set delta_count = delta_count + 1
+        set cursor = cursor + yaza_db_wal_header_size_v1() + bytes_length(rec.payload)
+    let _ok_end: Boolean = t1_expect(cursor == end_lsn, "WAL cursor reached exact end_lsn")?
+    return ok(delta_count)
+
+fn t1_test_delta_wal_and_write_plan_cache(base_dir: Text) -> Result[Boolean, Text]:
+    var sess: YazaDbSessionV1 = t1_init_session(base_dir + "/dw", "delta_plan.yzdb")?
+    set sess = t1_exec(sess, "CREATE TABLE t1_items (id INTEGER PRIMARY KEY, qty INTEGER, name TEXT)")?
+
+    # 1. Write Plan Cache hits across parameterized INSERT, UPDATE, DELETE
+    let ins_sql: Text = "INSERT INTO t1_items (id, qty, name) VALUES ($1, $2, $3)"
+    let upd_sql: Text = "UPDATE t1_items SET qty = $1, name = $2 WHERE id = $3"
+    let del_sql: Text = "DELETE FROM t1_items WHERE id = $1"
+
+    let pc0: YazaDbSelectPlanCacheV1 = yaza_db_session_plan_cache_stats_v1(sess)
+    var i: Number = 1
+    while i <= 5:
+        let p: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+        let v1: YazaSqlValueV1 = yaza_sql_value_integer_v1(3, i)?
+        let v2: YazaSqlValueV1 = yaza_sql_value_integer_v1(3, i * 10)?
+        let _p1: Boolean = list_try_push(p, v1)
+        let _p2: Boolean = list_try_push(p, v2)
+        let _p3: Boolean = list_try_push(p, yaza_sql_value_text_v1("item_" + number_text(i)))
+        let r: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(sess, ins_sql, p)?
+        set sess = r.session
+        set i = i + 1
+    let pc1: YazaDbSelectPlanCacheV1 = yaza_db_session_plan_cache_stats_v1(sess)
+    let _c1: Boolean = t1_expect(pc1.write_hits >= pc0.write_hits + 4, "Write plan cache hit for repeated parameterized INSERT")?
+
+    set i = 1
+    while i <= 4:
+        let p: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+        let v1: YazaSqlValueV1 = yaza_sql_value_integer_v1(3, i * 100)?
+        let v3: YazaSqlValueV1 = yaza_sql_value_integer_v1(3, i)?
+        let _p1: Boolean = list_try_push(p, v1)
+        let _p2: Boolean = list_try_push(p, yaza_sql_value_text_v1("upd_" + number_text(i)))
+        let _p3: Boolean = list_try_push(p, v3)
+        let r: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(sess, upd_sql, p)?
+        set sess = r.session
+        set i = i + 1
+    let pc2: YazaDbSelectPlanCacheV1 = yaza_db_session_plan_cache_stats_v1(sess)
+    let _c2: Boolean = t1_expect(pc2.write_hits >= pc1.write_hits + 3, "Write plan cache hit for repeated parameterized UPDATE")?
+
+    set i = 4
+    while i <= 5:
+        let p: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+        let v1: YazaSqlValueV1 = yaza_sql_value_integer_v1(3, i)?
+        let _p1: Boolean = list_try_push(p, v1)
+        let r: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(sess, del_sql, p)?
+        set sess = r.session
+        set i = i + 1
+    let pc3: YazaDbSelectPlanCacheV1 = yaza_db_session_plan_cache_stats_v1(sess)
+    let _c3: Boolean = t1_expect(pc3.write_hits >= pc2.write_hits + 1, "Write plan cache hit for repeated parameterized DELETE")?
+
+    # DDL invalidation clears write plan cache
+    set sess = t1_exec(sess, "ALTER TABLE t1_items ADD COLUMN tag TEXT DEFAULT 'v2'")?
+    let pc4: YazaDbSelectPlanCacheV1 = yaza_db_session_plan_cache_stats_v1(sess)
+    let _c4: Boolean = t1_expect(pc4.invalidations > pc3.invalidations, "ALTER TABLE invalidated write plan cache")?
+
+    # 2. Group-Commit Delta WAL (rec_type=17) for INSERT, UPDATE, AND DELETE
+    let ins_items: List[YazaDbGroupCommitItemV1] = List[YazaDbGroupCommitItemV1]()
+    set i = 100
+    while i < 120:
+        let sql_i: Text = "INSERT INTO t1_items (id, qty, name, tag) VALUES (" + number_text(i) + ", " + number_text(i) + ", 'g_" + number_text(i) + "', 'batch')"
+        let _pi: Boolean = list_try_push(ins_items, YazaDbGroupCommitItemV1(sql_i, List[YazaSqlValueV1]()))
+        set i = i + 1
+    let lsn_ins0: Number = sess.wal.next_lsn
+    let gc_ins: YazaDbGroupCommitBatchResultV1 = yaza_db_group_commit_execute_v1(sess, ins_items)?
+    set sess = gc_ins.session
+    let _ci1: Boolean = t1_expect(gc_ins.committed_count == 20 and gc_ins.fsync_count == 1, "group commit 20 INSERTs committed in 1 fsync")?
+    let ins_deltas: Number = t1_count_delta_records(sess, lsn_ins0, sess.wal.next_lsn, yaza_db_wal_type_leaf_insert_v1())?
+    let ins_wal_bytes: Number = sess.wal.next_lsn - lsn_ins0
+    let _ci2: Boolean = t1_expect(ins_deltas >= 10, "INSERT group commit emitted >= 10 LEAF_SLOT_DELTA records")?
+    let _ci3: Boolean = t1_expect(ins_wal_bytes < 200000, "INSERT delta WAL compact (< 200 KiB vs > 650 KiB full-page)")?
+
+    let upd_items: List[YazaDbGroupCommitItemV1] = List[YazaDbGroupCommitItemV1]()
+    set i = 100
+    while i < 115:
+        let sql_u: Text = "UPDATE t1_items SET qty = " + number_text(i + 500) + " WHERE id = " + number_text(i)
+        let _pu: Boolean = list_try_push(upd_items, YazaDbGroupCommitItemV1(sql_u, List[YazaSqlValueV1]()))
+        set i = i + 1
+    let lsn_upd0: Number = sess.wal.next_lsn
+    let gc_upd: YazaDbGroupCommitBatchResultV1 = yaza_db_group_commit_execute_v1(sess, upd_items)?
+    set sess = gc_upd.session
+    let _cu1: Boolean = t1_expect(gc_upd.committed_count == 15 and gc_upd.fsync_count == 1, "group commit 15 UPDATEs committed in 1 fsync")?
+    let upd_deltas: Number = t1_count_delta_records(sess, lsn_upd0, sess.wal.next_lsn, yaza_db_wal_type_leaf_update_v1())?
+    let _cu2: Boolean = t1_expect(upd_deltas >= 10, "UPDATE group commit emitted >= 10 LEAF_SLOT_DELTA records")?
+
+    let del_items: List[YazaDbGroupCommitItemV1] = List[YazaDbGroupCommitItemV1]()
+    set i = 110
+    while i < 120:
+        let sql_d: Text = "DELETE FROM t1_items WHERE id = " + number_text(i)
+        let _pd: Boolean = list_try_push(del_items, YazaDbGroupCommitItemV1(sql_d, List[YazaSqlValueV1]()))
+        set i = i + 1
+    let lsn_del0: Number = sess.wal.next_lsn
+    let gc_del: YazaDbGroupCommitBatchResultV1 = yaza_db_group_commit_execute_v1(sess, del_items)?
+    set sess = gc_del.session
+    let _cd1: Boolean = t1_expect(gc_del.committed_count == 10 and gc_del.fsync_count == 1, "group commit 10 DELETEs committed in 1 fsync")?
+    let del_deltas: Number = t1_count_delta_records(sess, lsn_del0, sess.wal.next_lsn, yaza_db_wal_type_leaf_update_v1())?
+    let _cd2: Boolean = t1_expect(del_deltas >= 5, "DELETE group commit emitted >= 5 LEAF_SLOT_DELTA records")?
+
+    # Close and reopen to prove full durability across checkpoint + restart
+    let _cl: Boolean = yaza_db_session_close_v1(sess)?
+    let r2: Number = root_open(base_dir + "/dw")?
+    set sess = yaza_db_session_open_v1(r2, "delta_plan.yzdb")?
+    let cnt: Number = t1_query_int(sess, "SELECT COUNT(*) FROM t1_items")?
+    let q105: Number = t1_query_int(sess, "SELECT qty FROM t1_items WHERE id = 105")?
+    let del_chk: Number = t1_query_count(sess, "SELECT id FROM t1_items WHERE id = 115")?
+    let _cdur: Boolean = t1_expect(cnt == 13 and q105 == 605 and del_chk == 0, "Delta WAL INSERT/UPDATE/DELETE durable after reopen")?
+    let _cl2: Boolean = yaza_db_session_close_v1(sess)?
+    return ok(true)
+

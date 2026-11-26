@@ -1,0 +1,171 @@
+# Tier 1 #3 Verification Smoke: Transparent Authenticated Page Encryption,
+# WAL/Backup Envelopes, Wrong-Key & Tamper Rejection, KMS Raw Keys, and
+# Crash-Safe Key Rotation (both pre-commit rollback & post-commit roll-forward).
+use "std/fs"
+use "../yazabase/page_v1"
+use "../yazabase/page_crypto_v1"
+use "../yazabase/storage_v1"
+
+fn pc_assert(cond: Boolean, msg: Text) -> Result[Boolean, Text]:
+    if not cond:
+        return err("page-crypto smoke FAILED: " + msg)
+    return ok(true)
+
+fn pc_contains_subbytes(haystack: Bytes, needle: Bytes) -> Boolean:
+    let hlen: Number = bytes_length(haystack)
+    let nlen: Number = bytes_length(needle)
+    if nlen == 0 or nlen > hlen: return false
+    var i: Number = 0
+    while i <= hlen - nlen:
+        var j: Number = 0
+        var matched: Boolean = true
+        while j < nlen:
+            if bytes_get(haystack, i + j) != bytes_get(needle, j):
+                set matched = false
+                set j = nlen
+            else:
+                set j = j + 1
+        if matched: return true
+        set i = i + 1
+    return false
+
+fn pc_run(dir_path: Text) -> Result[Boolean, Text]:
+    let root: Number = root_open(dir_path)?
+    let db_name: Text = "secret.yzdb"
+    let db_uuid: Bytes = secure_random_bytes_try(16)?
+    let salt1: Bytes = yaza_db_crypto_generate_salt_v1()?
+    let key1: YazaDbPageCryptoKeyV1 = yaza_db_crypto_derive_from_passphrase_v1("pass-v1", "correct-horse-battery-staple", salt1, 4096, 1, db_uuid)?
+    let init_hdr: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(db_uuid, 0, 1, 1, 0, 2, 3)
+
+    # 1. Create encrypted DB and write an allocated LEAF page with a recognizable secret marker
+    let enc_handle: YazaDbEncryptedStorageHandleV1 = yaza_db_storage_create_encrypted_with_pages_v1(root, db_name, init_hdr, key1, 16)?
+    let bm0: Bytes = yaza_db_storage_read_page_encrypted_v1(enc_handle, 2)?
+    let _bm_set: Boolean = yaza_db_bitmap_page_set_page_allocated_v1(bm0, 3, true, 1, 2)?
+    let _wb: Number = yaza_db_storage_write_page_encrypted_v1(enc_handle, bm0)?
+
+    let secret_marker: Text = "TOP_SECRET_YAZABASE_PAYLOAD_987654321"
+    let leaf0: Bytes = yaza_db_page_new_v1(3, 2, 1, 0)?
+    let key_b: Bytes = bytes_try_from_text("row_key_1")?
+    let val_b: Bytes = bytes_try_from_text(secret_marker)?
+    let _sl: Number = yaza_db_page_add_slot_v1(leaf0, key_b, val_b)?
+    let leaf1: Bytes = yaza_db_page_finalize_v1(leaf0)?
+    let _wl: Number = yaza_db_storage_write_page_encrypted_v1(enc_handle, leaf1)?
+
+    let got_leaf: Bytes = yaza_db_storage_read_page_encrypted_v1(enc_handle, 3)?
+    let _a1: Boolean = pc_assert(bytes_equal(got_leaf, leaf1), "decrypted page 3 matches original plaintext")?
+
+    # 2. Verify ZERO plaintext leakage in raw .yzdb page 3 on disk
+    let raw_off: Number = yaza_db_storage_page_offset_v1(3)?
+    let raw_disk_page: Bytes = read_exact(enc_handle.storage.file, raw_off, yaza_db_page_size_v1())?
+    let marker_bytes: Bytes = bytes_try_from_text(secret_marker)?
+    let _a2: Boolean = pc_assert(not pc_contains_subbytes(raw_disk_page, marker_bytes), "raw .yzdb ciphertext contains zero plaintext marker")?
+    let _c1: Boolean = yaza_db_storage_close_encrypted_v1(enc_handle)?
+
+    # 3. Legacy unencrypted open MUST fail closed on flags == 3
+    let legacy_res: Result[YazaDbStorageHandleV1, Text] = yaza_db_storage_open_v1(root, db_name)
+    let _a3: Boolean = pc_assert(not result_is_ok(legacy_res), "unencrypted storage_open rejects flags==3 DB")?
+
+    # 4. Wrong passphrase MUST fail authentication
+    let params: YazaDbCryptoSidecarHeaderV1 = yaza_db_storage_read_sidecar_params_v1(root, db_uuid)?
+    let wrong_key: YazaDbPageCryptoKeyV1 = yaza_db_crypto_derive_from_passphrase_v1("pass-wrong", "wrong-passphrase", params.salt, params.iterations, params.key_epoch, db_uuid)?
+    let bad_open: Result[YazaDbEncryptedStorageHandleV1, Text] = yaza_db_storage_open_encrypted_v1(root, db_name, wrong_key)
+    let _zw: Number = yaza_db_crypto_zeroize_key_v1(wrong_key)
+    let _a4: Boolean = pc_assert(not result_is_ok(bad_open), "wrong passphrase rejected by sidecar HMAC")?
+
+    # 5. Reopen with right passphrase and test 1-bit ciphertext tamper rejection (before decode)
+    let key1_re: YazaDbPageCryptoKeyV1 = yaza_db_crypto_derive_from_passphrase_v1("pass-v1", "correct-horse-battery-staple", params.salt, params.iterations, params.key_epoch, db_uuid)?
+    let enc2: YazaDbEncryptedStorageHandleV1 = yaza_db_storage_open_encrypted_v1(root, db_name, key1_re)?
+    let re_leaf: Bytes = yaza_db_storage_read_page_encrypted_v1(enc2, 3)?
+    let _a5: Boolean = pc_assert(bytes_equal(re_leaf, leaf1), "reopened encrypted DB reads exact page 3")?
+
+    # Flip 1 bit in ciphertext on disk -> must fail MAC check, then restore byte
+    let orig_ct: Bytes = read_exact(enc2.storage.file, raw_off, yaza_db_page_size_v1())?
+    let tampered_ct: Bytes = bytes_try_slice(orig_ct, 0, yaza_db_page_size_v1())?
+    let _flip1: Boolean = bytes_try_set(tampered_ct, 100, (bytes_get(tampered_ct, 100) + 1) % 256)
+    let _wt1: Number = write_exact(enc2.storage.file, raw_off, tampered_ct)?
+    let tamper_read: Result[Bytes, Text] = yaza_db_storage_read_page_encrypted_v1(enc2, 3)
+    let _a6: Boolean = pc_assert(not result_is_ok(tamper_read), "1-bit ciphertext tamper rejected before decoding")?
+    let _wr1: Number = write_exact(enc2.storage.file, raw_off, orig_ct)?
+
+    # Flip 1 bit in sidecar nonce/MAC -> must fail MAC check, then restore slot
+    let slot_off: Number = yaza_db_crypto_sidecar_slot_offset_v1(3)?
+    let orig_slot: Bytes = read_exact(enc2.meta_file, slot_off, yaza_db_crypto_sidecar_slot_size_v1())?
+    let tampered_slot: Bytes = bytes_try_slice(orig_slot, 0, yaza_db_crypto_sidecar_slot_size_v1())?
+    let _flip2: Boolean = bytes_try_set(tampered_slot, 8, (bytes_get(tampered_slot, 8) + 1) % 256)
+    let _wt2: Number = write_exact(enc2.meta_file, slot_off, tampered_slot)?
+    let tamper_slot_read: Result[Bytes, Text] = yaza_db_storage_read_page_encrypted_v1(enc2, 3)
+    let _a7: Boolean = pc_assert(not result_is_ok(tamper_slot_read), "1-bit sidecar AAD/nonce tamper rejected")?
+    let _wr2: Number = write_exact(enc2.meta_file, slot_off, orig_slot)?
+
+    # 6. Authenticated WAL & Backup Envelopes (zero plaintext, wrong key & tamper rejected)
+    let wal_plain: Bytes = bytes_try_from_text("WAL_RECORD_SECRET_TXN_42_AMOUNT_999000")?
+    let sealed_wal: Bytes = yaza_db_crypto_seal_blob_v1(enc2.crypto, "WAL", 7, wal_plain)?
+    let wal_needle: Bytes = bytes_try_from_text("AMOUNT_999000")?
+    let _a8: Boolean = pc_assert(not pc_contains_subbytes(sealed_wal, wal_needle), "sealed WAL envelope hides plaintext")?
+    let opened_wal: Bytes = yaza_db_crypto_open_blob_v1(enc2.crypto, "WAL", 7, sealed_wal)?
+    let _a9: Boolean = pc_assert(bytes_equal(opened_wal, wal_plain), "sealed WAL envelope round-trips")?
+    let wrong_domain: Result[Bytes, Text] = yaza_db_crypto_open_blob_v1(enc2.crypto, "BACKUP", 7, sealed_wal)
+    let _a10: Boolean = pc_assert(not result_is_ok(wrong_domain), "sealed envelope rejects domain mismatch")?
+    let tampered_wal: Bytes = bytes_try_slice(sealed_wal, 0, bytes_length(sealed_wal))?
+    let _flip3: Boolean = bytes_try_set(tampered_wal, bytes_length(tampered_wal) - 5, (bytes_get(tampered_wal, bytes_length(tampered_wal) - 5) + 1) % 256)
+    let bad_wal: Result[Bytes, Text] = yaza_db_crypto_open_blob_v1(enc2.crypto, "WAL", 7, tampered_wal)
+    let _a11: Boolean = pc_assert(not result_is_ok(bad_wal), "tampered WAL envelope rejected")?
+
+    # File-level Backup seal & open
+    let bk_src: Number = create_exclusive(root, "backup_plain.bin")?
+    let bk_data: Bytes = bytes_try_from_text("BACKUP_SNAPSHOT_SECRET_CUSTOMER_LIST")?
+    let _wbk: Number = write_exact(bk_src, 0, bk_data)?
+    let _cbk: Boolean = close(bk_src)?
+    let _sealed_sz: Number = yaza_db_crypto_seal_file_v1(enc2.crypto, "BACKUP", 101, root, "backup_plain.bin", "backup.yde1")?
+    let bk_disk: Bytes = yaza_db_crypto_open_file_bytes_v1(enc2.crypto, "BACKUP", 101, root, "backup.yde1")?
+    let _a12: Boolean = pc_assert(bytes_equal(bk_disk, bk_data), "file-level encrypted backup round-trips")?
+
+    # 7. Crash-Injection Test A: Rekey crash BEFORE commit marker -> rolls back cleanly to key1!
+    let raw_kms_key2: Bytes = secure_random_bytes_try(32)?
+    let key2_pre: YazaDbPageCryptoKeyV1 = yaza_db_crypto_derive_from_raw_key_v1("kms://epoch-2", raw_kms_key2, 2, db_uuid)?
+    let fault1_res: Result[YazaDbEncryptedStorageHandleV1, Text] = yaza_db_storage_rekey_with_fault_v1(enc2, key2_pre, 1)
+    let _a13: Boolean = pc_assert(not result_is_ok(fault1_res), "rekey fault_mode=1 injected pre-commit crash")?
+    let key1_recover: YazaDbPageCryptoKeyV1 = yaza_db_crypto_derive_from_passphrase_v1("pass-v1", "correct-horse-battery-staple", params.salt, params.iterations, 1, db_uuid)?
+    let enc3: YazaDbEncryptedStorageHandleV1 = yaza_db_storage_open_encrypted_v1(root, db_name, key1_recover)?
+    let after_fault1: Bytes = yaza_db_storage_read_page_encrypted_v1(enc3, 3)?
+    let _a14: Boolean = pc_assert(bytes_equal(after_fault1, leaf1), "pre-commit crash recovered cleanly on old key1")?
+
+    # 8. Crash-Injection Test B: Rekey crash AFTER commit marker & between renames -> rolls forward cleanly to key2!
+    let fault2_res: Result[YazaDbEncryptedStorageHandleV1, Text] = yaza_db_storage_rekey_with_fault_v1(enc3, key2_pre, 2)
+    let _a15: Boolean = pc_assert(not result_is_ok(fault2_res), "rekey fault_mode=2 injected post-commit torn-rename crash")?
+    # Old key MUST be rejected now that commit marker exists!
+    let key1_stale: YazaDbPageCryptoKeyV1 = yaza_db_crypto_derive_from_passphrase_v1("pass-v1", "correct-horse-battery-staple", params.salt, params.iterations, 1, db_uuid)?
+    let stale_open: Result[YazaDbEncryptedStorageHandleV1, Text] = yaza_db_storage_open_encrypted_v1(root, db_name, key1_stale)
+    let _zs: Number = yaza_db_crypto_zeroize_key_v1(key1_stale)
+    let _a16: Boolean = pc_assert(not result_is_ok(stale_open), "old key rejected after rekey commit marker")?
+    # Opening with rotated KMS key2 MUST complete cutover & read intact data!
+    let enc4: YazaDbEncryptedStorageHandleV1 = yaza_db_storage_open_encrypted_v1(root, db_name, key2_pre)?
+    let after_fault2: Bytes = yaza_db_storage_read_page_encrypted_v1(enc4, 3)?
+    let _a17: Boolean = pc_assert(bytes_equal(after_fault2, leaf1), "post-commit torn-rename crash rolled forward cleanly to KMS key2")?
+
+    # 9. Clean live Rekey to epoch 3 (passphrase) -> reopen verification
+    let salt3: Bytes = yaza_db_crypto_generate_salt_v1()?
+    let key3: YazaDbPageCryptoKeyV1 = yaza_db_crypto_derive_from_passphrase_v1("pass-v3", "rotated-new-secret-passphrase", salt3, 4096, 3, db_uuid)?
+    let enc5: YazaDbEncryptedStorageHandleV1 = yaza_db_storage_rekey_v1(enc4, key3)?
+    let after_live_rekey: Bytes = yaza_db_storage_read_page_encrypted_v1(enc5, 3)?
+    let _a18: Boolean = pc_assert(bytes_equal(after_live_rekey, leaf1), "live rekey to epoch 3 preserved page 3")?
+    let _c5: Boolean = yaza_db_storage_close_encrypted_v1(enc5)?
+
+    let key3_re: YazaDbPageCryptoKeyV1 = yaza_db_crypto_derive_from_passphrase_v1("pass-v3", "rotated-new-secret-passphrase", salt3, 4096, 3, db_uuid)?
+    let enc6: YazaDbEncryptedStorageHandleV1 = yaza_db_storage_open_encrypted_v1(root, db_name, key3_re)?
+    let final_leaf: Bytes = yaza_db_storage_read_page_encrypted_v1(enc6, 3)?
+    let _a19: Boolean = pc_assert(bytes_equal(final_leaf, leaf1), "reopened epoch 3 DB reads exact page 3")?
+    let _c6: Boolean = yaza_db_storage_close_encrypted_v1(enc6)?
+    let _cr: Boolean = close(root)?
+    return ok(true)
+
+start:
+    if arg_count() < 1:
+        say "usage: yazabase-page-crypto-v1-smoke <dir>"
+        exit(2)
+    let res: Result[Boolean, Text] = pc_run(arg(1))
+    if not result_is_ok(res):
+        say "FAIL: " + result_unwrap_error(res)
+        exit(1)
+    say "yazabase-page-crypto-v1-smoke: PASS"
+    exit(0)
