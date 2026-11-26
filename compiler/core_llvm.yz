@@ -748,6 +748,22 @@ fn core_llvm_for_range_active_hoisted_read(collection: YirExpr, defer_records: L
         set index = index - 1
     return ""
 
+fn core_llvm_for_range_sum_acc_slot(statement: YirStatement) -> Text:
+    if list_count(statement.body) != 1 or text_starts_with(statement.slot, "%arg"): return ""
+    let body_statement: YirStatement = list_get(statement.body, 0)
+    if body_statement.kind != "set" or body_statement.value_type != "Number" or body_statement.slot == "" or body_statement.slot == statement.slot or text_starts_with(body_statement.slot, "%arg"):
+        return ""
+    if body_statement.expression.kind != "binary" or body_statement.expression.value != "+" or body_statement.expression.value_type != "Number":
+        return ""
+    if list_count(body_statement.expression.children) != 2: return ""
+    let left: YirExpr = list_get(body_statement.expression.children, 0)
+    let right: YirExpr = list_get(body_statement.expression.children, 1)
+    if left.kind == "variable" and left.value == body_statement.slot and right.kind == "variable" and right.value == statement.slot:
+        return body_statement.slot
+    if right.kind == "variable" and right.value == body_statement.slot and left.kind == "variable" and left.value == statement.slot:
+        return body_statement.slot
+    return ""
+
 fn core_llvm_emit_for_range_hoisted_reads(statement: YirStatement, lines: TextList, temp_serial: TextList, label_serial: TextList, strings: TextList, current: TextList, terminated: TextList, functions: List[YirFunction], defer_records: List[YirStatement], defer_stack: TextList, defer_depth: TextList) -> List[YirStatement]:
     let candidates: List[YirExpr] = core_llvm_for_range_hoisted_read_candidates(statement, defer_records, functions)
     let cleanups: List[YirStatement] = List[YirStatement]()
@@ -3725,6 +3741,46 @@ fn core_llvm_emit_expr(expression: YirExpr, lines: TextList, temp_serial: TextLi
         let element_size: Text = core_llvm_size_of(item_type, lines, temp_serial)
         let signature: Text = core_llvm_c_string_pointer(collection_type, strings)
         if expression.kind == "list_count":
+            let collection_expression: YirExpr = list_get(expression.children, 0)
+            let read_view: Text = core_llvm_find_active_read_view(collection_expression, defer_records, defer_stack, defer_depth)
+            if read_view != "":
+                if collection_expression.kind != "variable":
+                    core_llvm_emit_read_view_switch(read_view, list_get(collection, 1), collection_type, lines, temp_serial, label_serial, strings, current, terminated)
+                let gen_addr_field: Text = core_llvm_temp(temp_serial)
+                let gen_addr: Text = core_llvm_temp(temp_serial)
+                let count_field: Text = core_llvm_temp(temp_serial)
+                let fast_count: Text = core_llvm_temp(temp_serial)
+                let cap_gen_field: Text = core_llvm_temp(temp_serial)
+                let cap_gen: Text = core_llvm_temp(temp_serial)
+                let cur_gen: Text = core_llvm_temp(temp_serial)
+                let gen_matches: Text = core_llvm_temp(temp_serial)
+                let fast_label: Text = core_llvm_label(label_serial, "list.count.fast.")
+                let slow_label: Text = core_llvm_label(label_serial, "list.count.slow.")
+                let merge_label: Text = core_llvm_label(label_serial, "list.count.merge.")
+                list_push(lines, "  " + gen_addr_field + " = getelementptr %yaza.list.borrow, ptr " + read_view + ", i32 0, i32 3")
+                list_push(lines, "  " + gen_addr + " = load ptr, ptr " + gen_addr_field)
+                list_push(lines, "  " + count_field + " = getelementptr %yaza.list.borrow, ptr " + read_view + ", i32 0, i32 4")
+                list_push(lines, "  " + fast_count + " = load i64, ptr " + count_field)
+                list_push(lines, "  " + cap_gen_field + " = getelementptr %yaza.list.borrow, ptr " + read_view + ", i32 0, i32 7")
+                list_push(lines, "  " + cap_gen + " = load i64, ptr " + cap_gen_field)
+                list_push(lines, "  " + cur_gen + " = load atomic i64, ptr " + gen_addr + " acquire, align 8")
+                list_push(lines, "  " + gen_matches + " = icmp eq i64 " + cur_gen + ", " + cap_gen)
+                list_push(lines, "  br i1 " + gen_matches + ", label %" + fast_label + ", label %" + slow_label)
+                list_set(terminated, 0, "true")
+                core_llvm_emit_label(lines, current, terminated, fast_label)
+                let fast_pred: Text = list_get(current, 0)
+                list_push(lines, "  br label %" + merge_label)
+                list_set(terminated, 0, "true")
+                core_llvm_emit_label(lines, current, terminated, slow_label)
+                let slow_count: Text = core_llvm_temp(temp_serial)
+                list_push(lines, "  " + slow_count + " = call i64 @yaza_list_v1_count_typed(ptr " + list_get(collection, 1) + ", ptr " + signature + ", i64 " + element_size + ")")
+                let slow_pred: Text = list_get(current, 0)
+                list_push(lines, "  br label %" + merge_label)
+                list_set(terminated, 0, "true")
+                core_llvm_emit_label(lines, current, terminated, merge_label)
+                let result: Text = core_llvm_temp(temp_serial)
+                list_push(lines, "  " + result + " = phi i64 [ " + fast_count + ", %" + fast_pred + " ], [ " + slow_count + ", %" + slow_pred + " ]")
+                return core_llvm_value("Number", result)
             let result: Text = core_llvm_temp(temp_serial)
             list_push(lines, "  " + result + " = call i64 @yaza_list_v1_count_typed(ptr " + list_get(collection, 1) + ", ptr " + signature + ", i64 " + element_size + ")")
             return core_llvm_value("Number", result)
@@ -4726,8 +4782,51 @@ fn core_llvm_emit_stmt(statement: YirStatement, lines: TextList, temp_serial: Te
         let body: Text = core_llvm_label(label_serial, "range.body.")
         let step: Text = core_llvm_label(label_serial, "range.step.")
         let exit: Text = core_llvm_label(label_serial, "range.exit.")
-        list_push(lines, "  br label %" + header)
-        list_set(terminated, 0, "true")
+        let acc_slot: Text = core_llvm_for_range_sum_acc_slot(statement)
+        if acc_slot != "" and list_count(hoisted_read_cleanups) == 0:
+            let fast_pre: Text = core_llvm_label(label_serial, "range.sum.pre.")
+            let fast_body: Text = core_llvm_label(label_serial, "range.sum.body.")
+            let fast_done: Text = core_llvm_label(label_serial, "range.sum.done.")
+            let first_nonneg: Text = core_llvm_temp(temp_serial)
+            let end_bounded: Text = core_llvm_temp(temp_serial)
+            let acc_init: Text = core_llvm_temp(temp_serial)
+            let acc_zero: Text = core_llvm_temp(temp_serial)
+            let bounds_ok: Text = core_llvm_temp(temp_serial)
+            let use_fast: Text = core_llvm_temp(temp_serial)
+            list_push(lines, "  " + first_nonneg + " = icmp sge i64 " + list_get(first, 1) + ", 0")
+            list_push(lines, "  " + end_bounded + " = icmp sle i64 " + list_get(end, 1) + ", 3000000000")
+            list_push(lines, "  " + acc_init + " = load i64, ptr " + acc_slot)
+            list_push(lines, "  " + acc_zero + " = icmp eq i64 " + acc_init + ", 0")
+            list_push(lines, "  " + bounds_ok + " = and i1 " + first_nonneg + ", " + end_bounded)
+            list_push(lines, "  " + use_fast + " = and i1 " + bounds_ok + ", " + acc_zero)
+            list_push(lines, "  br i1 " + use_fast + ", label %" + fast_pre + ", label %" + header)
+            list_set(terminated, 0, "true")
+            core_llvm_emit_label(lines, current, terminated, fast_pre)
+            let fast_has_iters: Text = core_llvm_temp(temp_serial)
+            list_push(lines, "  " + fast_has_iters + " = icmp slt i64 " + list_get(first, 1) + ", " + list_get(end, 1))
+            list_push(lines, "  br i1 " + fast_has_iters + ", label %" + fast_body + ", label %" + exit)
+            list_set(terminated, 0, "true")
+            core_llvm_emit_label(lines, current, terminated, fast_body)
+            let fast_i: Text = core_llvm_temp(temp_serial)
+            let fast_acc: Text = core_llvm_temp(temp_serial)
+            let fast_acc_next: Text = core_llvm_temp(temp_serial)
+            let fast_i_next: Text = core_llvm_temp(temp_serial)
+            let fast_cond: Text = core_llvm_temp(temp_serial)
+            list_push(lines, "  " + fast_i + " = phi i64 [ " + list_get(first, 1) + ", %" + fast_pre + " ], [ " + fast_i_next + ", %" + fast_body + " ]")
+            list_push(lines, "  " + fast_acc + " = phi i64 [ 0, %" + fast_pre + " ], [ " + fast_acc_next + ", %" + fast_body + " ]")
+            list_push(lines, "  " + fast_acc_next + " = add nsw i64 " + fast_acc + ", " + fast_i)
+            list_push(lines, "  " + fast_i_next + " = add nsw i64 " + fast_i + ", 1")
+            list_push(lines, "  " + fast_cond + " = icmp slt i64 " + fast_i_next + ", " + list_get(end, 1))
+            list_push(lines, "  br i1 " + fast_cond + ", label %" + fast_body + ", label %" + fast_done)
+            list_set(terminated, 0, "true")
+            core_llvm_emit_label(lines, current, terminated, fast_done)
+            list_push(lines, "  store i64 " + fast_acc_next + ", ptr " + acc_slot)
+            list_push(lines, "  store i64 " + fast_i_next + ", ptr " + statement.slot)
+            list_push(lines, "  br label %" + exit)
+            list_set(terminated, 0, "true")
+        else:
+            list_push(lines, "  br label %" + header)
+            list_set(terminated, 0, "true")
         core_llvm_emit_label(lines, current, terminated, header)
         let index_value: Text = core_llvm_temp(temp_serial)
         let condition: Text = core_llvm_temp(temp_serial)
@@ -4751,7 +4850,7 @@ fn core_llvm_emit_stmt(statement: YirStatement, lines: TextList, temp_serial: Te
             let current_value: Text = core_llvm_temp(temp_serial)
             let next_value: Text = core_llvm_temp(temp_serial)
             list_push(lines, "  " + current_value + " = load i64, ptr " + statement.slot)
-            list_push(lines, "  " + next_value + " = add i64 " + current_value + ", 1")
+            list_push(lines, "  " + next_value + " = add nsw i64 " + current_value + ", 1")
             list_push(lines, "  store i64 " + next_value + ", ptr " + statement.slot)
             list_push(lines, "  br label %" + header)
         list_set(terminated, 0, "true")

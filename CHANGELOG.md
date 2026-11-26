@@ -4,6 +4,28 @@ All notable changes to the **YAZA Programming Language**, **YazaBase SQL Engine*
 
 ---
 
+## [v1.1.1] — 2026-11-27
+
+### Performance & Runtime Optimizations
+1. **LLVM Guarded `for_range` Vectorization/SCEV & Read-View `list_count` (`compiler/core_llvm.yz`):**
+   - Emitted `add nsw i64` on `for_range` induction steps and added a runtime-guarded (`first >= 0 && end <= 3000000000 && acc == 0`) provably-safe `add nsw i64` SSA accumulator fast path while keeping `@llvm.sadd.with.overflow.i64` trap semantics outside the guard (`4.5B` overflow trapped with exit `1`).
+   - Added a `load atomic i64 acquire` active read-view fast path for `list_count`, falling back cleanly on concurrent mutations.
+   - **Measured impact:** Core **Sum 10M integers** dropped **2.19×** (`4.992 ms` → **`2.279 ms`**), Core 7-workload mean dropped to **`5.459 ms`** (**beating Rust 1.99.1 `6.005 ms` & Nim `6.630 ms`**), and 5M Binary Search improved (`ListView` **`95.259 ms`** vs C `-O2` `102.696 ms`; `List[Number]` `340.4 ms` → **`325.171 ms`**, ahead of Go `1.27.3` `353.291 ms`).
+2. **Arena Runtime Chunk Recycling, Fused Scope & TLS Context Elision (`runtime/src/yaza_runtime_v1.c`):**
+   - Added a 64-shard `YazaRtV1ChunkCacheShard` cache to recycle `64 KiB` arena chunks across `arena_scope` cycles (with exit cleanup, ASan memory poisoning, and `YAZA_RT_V1_TESTING` fault-injection bypass).
+   - Fused inline lexical scope entry/exit (`yaza_rt_v1_scope_enter_inplace` + `yaza_rt_v1_scope_leave`) into single tree-lock acquisitions and added a pure `_Thread_local` `yaza_rt_v1_is_current_context_arena` / `yaza_rt_v1_find_current_context_for_arena` fast path for `yaza_arena_v1_generation` and short-lived paired `yaza_list_v1_begin` / `yaza_list_v1_begin_typed` / `yaza_list_v1_end` (keeping explicit leases on long-lived iterators and mutable views).
+   - **Measured impact:** 200k-scope soak improved **1.52×** (`57.74 ms` → **`38.11 ms`**, **`5.25M scopes/s`**, beating Node.js `v26` `45.45 ms` & Python `68.64 ms`), 1M C runtime cycles improved **+25.6%** (`29.57M/s` → **`37.15M scopes/s`**, `26.92 ns/scope`), and Cloud-Native Microservice Peak RSS dropped **-29.8%** (`12.44 MiB` → **`8.73 MiB`**).
+3. **YazaBase Convex & Boundary Leaf Predicate Elision (`yazabase/btree_scan_v1.yz`):**
+   - Added `yaza_db_btree_where_is_convex_integer_key_predicate_v1` + per-leaf `leaf_all_pk_match` validation and enabled `direct_mode == 1` (`COUNT(*)`) on boundary leaves (`start_after_key` / `end_key`) with strict per-slot fence checks, removing tuple materialization on filtered and narrow-range scans (`!=` and `OR` fall back to exact row evaluation).
+   - **Measured impact:** In-process filtered range `COUNT(*)` (`5,001 / 10k` rows) improved **4.58×** (`0.398 ms` → **`0.0869 ms`**); 3-way `filtered_count` (`>=` / `<=` / `<`) dropped **`0.269/0.245/0.229 → 0.089/0.091/0.088 ms`** (**2.8× faster than PostgreSQL 18**) and `narrow_range` (`50` rows) dropped **`0.057/0.056 → 0.031/0.030 ms`**, allowing YazaBase to beat PostgreSQL 18 across **all 7/7 warm queries**.
+4. **Fullstack Arena-SSR Wire & HTML Escaping (`std/web/response.yz`, `std/html.yz`):**
+   - Switched `web_format_response` header assembly to single-pass `TextList` pushes and length-gated sanitization, and added a zero-allocation `text_byte` ASCII fast scan in `html_escape` returning `ok(value)` without intermediate buffers when no `& < > " '` exists.
+   - **Measured impact:** Full SSR HTML (`c=8`) achieved lowest `p50` latency (**`138 µs`** vs Go `170 µs` & Node `179 µs`, `34,651 req/s`), Hypermedia Fragment **`66,634 req/s`** (**1.82× Go & 1.71× Node**), and Static CSS **`68,673 req/s` (#1)** at **`6.70 MiB` Peak RSS** (`247.5 KB` binary).
+5. **Toolchain & Driver Synchronization (`v1.1.1`):**
+   - Bumped `yaza` / `yaza-llvm` (`YAZA LLVM 1.1.1`), `yazabase-cli` (`yazabase 1.1.1`), `libyazabase` C API, `pg_wire_v1` (`16.0 (YazaBase 1.1.1)`), `yazabase-jdbc-1.1.1.jar`, VS Code extension (`1.1.1`), macOS installers (`yaza-1.1.1-darwin-arm64.tar.gz`, `yaza-1.1.1-macos-arm64.pkg`, `yazabase-1.1.1-darwin-arm64.tar.gz`), and all 10 cross-platform bootstrap IR archives (`bootstrap/*.ll.xz`).
+
+---
+
 ## [v1.1.0] — 2026-11-26
 
 ### Highlights & New Capabilities

@@ -681,10 +681,72 @@ static void yaza_rt_v1_record_allocation_failure(YazaArenaV1 *arena) {
     yaza_rt_v1_tree_unlock(root);
 }
 
+#define YAZA_RT_V1_CHUNK_CACHE_SHARDS 64U
+typedef struct YazaRtV1ChunkCacheShard {
+    _Atomic(YazaRtV1Chunk *) chunk;
+    unsigned char padding[64 - sizeof(_Atomic(YazaRtV1Chunk *))];
+} YazaRtV1ChunkCacheShard;
+_Alignas(64) static YazaRtV1ChunkCacheShard yaza_rt_v1_chunk_cache[YAZA_RT_V1_CHUNK_CACHE_SHARDS];
+static _Atomic uint64_t yaza_rt_v1_next_chunk_shard = 0;
+static _Thread_local uint32_t yaza_rt_v1_chunk_shard_index = UINT32_MAX;
+static _Atomic int yaza_rt_v1_exiting = 0;
+
+static uint32_t yaza_rt_v1_get_chunk_shard(void) {
+    if (yaza_rt_v1_chunk_shard_index == UINT32_MAX) {
+        const uint64_t next = atomic_fetch_add_explicit(&yaza_rt_v1_next_chunk_shard, 1, memory_order_relaxed);
+        yaza_rt_v1_chunk_shard_index = (uint32_t)(next % YAZA_RT_V1_CHUNK_CACHE_SHARDS);
+    }
+    return yaza_rt_v1_chunk_shard_index;
+}
+
+static int yaza_rt_v1_chunk_cache_enabled(void) {
+    if (atomic_load_explicit(&yaza_rt_v1_exiting, memory_order_relaxed) != 0) {
+        return 0;
+    }
+#if defined(YAZA_RT_V1_TESTING)
+    if (atomic_load_explicit(&yaza_rt_v1_test_alloc_countdown, memory_order_relaxed) != UINT64_MAX) {
+        return 0;
+    }
+#endif
+    return 1;
+}
+
+static YazaRtV1Chunk *yaza_rt_v1_try_pop_cached_chunk(uint64_t capacity) {
+    if (!yaza_rt_v1_chunk_cache_enabled() || capacity != yaza_rt_v1_config.preferred_chunk_bytes) {
+        return NULL;
+    }
+    const uint32_t shard = yaza_rt_v1_get_chunk_shard();
+    YazaRtV1Chunk *cached = atomic_exchange_explicit(&yaza_rt_v1_chunk_cache[shard].chunk, NULL, memory_order_acq_rel);
+    if (cached != NULL) {
+        if (cached->capacity == capacity) {
+            cached->next = NULL;
+            cached->used = 0;
+            return cached;
+        }
+        free(cached);
+    }
+    return NULL;
+}
+
 static void yaza_rt_v1_free_chunks(YazaRtV1Chunk *chunk) {
+    int recycled_first = 0;
+    const uint64_t preferred = yaza_rt_v1_config.preferred_chunk_bytes;
+    const int cache_enabled = yaza_rt_v1_chunk_cache_enabled();
     while (chunk != NULL) {
         YazaRtV1Chunk *next = chunk->next;
-        free(chunk);
+        if (!recycled_first && cache_enabled && chunk->capacity == preferred) {
+            recycled_first = 1;
+            chunk->next = NULL;
+            chunk->used = 0;
+            yaza_rt_v1_asan_poison(chunk->data, (size_t)chunk->capacity);
+            const uint32_t shard = yaza_rt_v1_get_chunk_shard();
+            YazaRtV1Chunk *displaced = atomic_exchange_explicit(&yaza_rt_v1_chunk_cache[shard].chunk, chunk, memory_order_acq_rel);
+            if (displaced != NULL) {
+                free(displaced);
+            }
+        } else {
+            free(chunk);
+        }
         chunk = next;
     }
 }
@@ -692,11 +754,18 @@ static void yaza_rt_v1_free_chunks(YazaRtV1Chunk *chunk) {
 static void yaza_rt_v1_cleanup_async_resources(void);
 
 static void yaza_rt_v1_destroy_program_arena(void) {
+    atomic_store_explicit(&yaza_rt_v1_exiting, 1, memory_order_release);
     yaza_rt_v1_cleanup_async_resources();
     const uint64_t reclaimed_reserved = yaza_rt_v1_program_arena.local_reserved;
     const uint64_t reclaimed_used = yaza_rt_v1_program_arena.local_used;
     const uint64_t reclaimed_storage_used = yaza_rt_v1_program_arena.local_storage_used;
     yaza_rt_v1_free_chunks(yaza_rt_v1_program_arena.head);
+    for (uint32_t i = 0; i < YAZA_RT_V1_CHUNK_CACHE_SHARDS; ++i) {
+        YazaRtV1Chunk *cached = atomic_exchange_explicit(&yaza_rt_v1_chunk_cache[i].chunk, NULL, memory_order_acq_rel);
+        if (cached != NULL) {
+            free(cached);
+        }
+    }
     yaza_rt_v1_program_arena.head = NULL;
     yaza_rt_v1_program_arena.tail = NULL;
     yaza_rt_v1_program_arena.local_reserved = 0;
@@ -913,35 +982,6 @@ YazaArenaV1 *yaza_arena_v1_create_child(YazaArenaV1 *parent, uint64_t limit_byte
     return arena;
 }
 
-static YazaArenaV1 *yaza_arena_v1_create_child_inplace(YazaArenaV1 *parent, uint64_t limit_bytes, YazaArenaV1 *arena) {
-    if (parent == NULL || arena == NULL || limit_bytes == 0) {
-        return NULL;
-    }
-    if (!yaza_rt_v1_acquire_scope_slot()) {
-        yaza_rt_v1_record_allocation_failure(parent);
-        return NULL;
-    }
-    YazaArenaV1 *root = parent->root;
-    yaza_rt_v1_tree_lock(root);
-    if (parent->destroyed || limit_bytes > parent->limit || root->descendant_count >= yaza_rt_v1_config.max_live_scopes) {
-        yaza_rt_v1_record_allocation_failure_locked(parent);
-        yaza_rt_v1_tree_unlock(root);
-        atomic_fetch_sub_explicit(&yaza_rt_v1_process_scope_count, 1, memory_order_relaxed);
-        return NULL;
-    }
-    memset(arena, 0, sizeof(*arena));
-    atomic_init(&arena->lock, false);
-    arena->root = root;
-    arena->parent = parent;
-    arena->limit = limit_bytes;
-    arena->generation = 1;
-    arena->heap_owned = 0;
-    parent->child_count += 1;
-    root->descendant_count += 1;
-    yaza_rt_v1_tree_unlock(root);
-    return arena;
-}
-
 void *yaza_arena_v1_alloc(YazaArenaV1 *arena, uint64_t requested_size) {
     if (arena == NULL) {
         yaza_rt_v1_record_allocation_failure(NULL);
@@ -995,16 +1035,19 @@ void *yaza_arena_v1_alloc(YazaArenaV1 *arena, uint64_t requested_size) {
             yaza_rt_v1_tree_unlock(root);
             return NULL;
         }
-        chunk = (YazaRtV1Chunk *)yaza_rt_v1_system_malloc(sizeof(YazaRtV1Chunk) + (size_t)capacity);
+        chunk = yaza_rt_v1_try_pop_cached_chunk(capacity);
         if (chunk == NULL) {
-            atomic_fetch_sub_explicit(&yaza_rt_v1_process_reserved, capacity, memory_order_relaxed);
-            yaza_rt_v1_record_allocation_failure_locked(arena);
-            yaza_rt_v1_tree_unlock(root);
-            return NULL;
+            chunk = (YazaRtV1Chunk *)yaza_rt_v1_system_malloc(sizeof(YazaRtV1Chunk) + (size_t)capacity);
+            if (chunk == NULL) {
+                atomic_fetch_sub_explicit(&yaza_rt_v1_process_reserved, capacity, memory_order_relaxed);
+                yaza_rt_v1_record_allocation_failure_locked(arena);
+                yaza_rt_v1_tree_unlock(root);
+                return NULL;
+            }
+            chunk->next = NULL;
+            chunk->capacity = capacity;
+            chunk->used = 0;
         }
-        chunk->next = NULL;
-        chunk->capacity = capacity;
-        chunk->used = 0;
         if (arena->tail == NULL) {
             arena->head = chunk;
         } else {
@@ -1350,21 +1393,48 @@ YazaArenaScopeV1 *yaza_rt_v1_scope_enter_inplace(uint64_t limit_bytes, void *sto
         return NULL;
     }
     YazaRtV1InlineScopeStorage *inline_scope = (YazaRtV1InlineScopeStorage *)storage;
-    memset(inline_scope, 0, sizeof(*inline_scope));
     YazaArenaScopeV1 *scope = &inline_scope->scope;
-    YazaArenaV1 *parent = yaza_arena_v1_current();
-    scope->arena = yaza_arena_v1_create_child_inplace(parent, limit_bytes, &inline_scope->arena);
-    if (scope->arena == NULL) {
-        return NULL;
-    }
-    if (!yaza_arena_v1_scope_begin(scope->arena, &scope->context)) {
-        if (!yaza_arena_v1_destroy(scope->arena)) {
-            fprintf(stderr, "YAZA runtime v1: failed to clean up an unopened inline arena scope\n");
-            abort();
+    for (YazaArenaContextV1 *active = yaza_rt_v1_current_context; active != NULL; active = active->previous_context) {
+        if (active == &scope->context) {
+            return NULL;
         }
-        scope->arena = NULL;
+    }
+    YazaArenaV1 *parent = yaza_rt_v1_current_arena != NULL ? yaza_rt_v1_current_arena : &yaza_rt_v1_program_arena;
+    if (!yaza_rt_v1_acquire_scope_slot()) {
+        yaza_rt_v1_record_allocation_failure(parent);
         return NULL;
     }
+    YazaArenaV1 *root = parent->root;
+    yaza_rt_v1_tree_lock(root);
+    if (parent->destroyed || limit_bytes > parent->limit || root->descendant_count >= yaza_rt_v1_config.max_live_scopes) {
+        yaza_rt_v1_record_allocation_failure_locked(parent);
+        yaza_rt_v1_tree_unlock(root);
+        atomic_fetch_sub_explicit(&yaza_rt_v1_process_scope_count, 1, memory_order_relaxed);
+        return NULL;
+    }
+    memset(inline_scope, 0, sizeof(*inline_scope));
+    YazaArenaV1 *arena = &inline_scope->arena;
+    atomic_init(&arena->lock, false);
+    arena->root = root;
+    arena->parent = parent;
+    arena->limit = limit_bytes;
+    arena->generation = 2;
+    arena->active_leases = 1;
+    arena->active_contexts = 1;
+    arena->scope_active = 1;
+    arena->scope_context = &scope->context;
+    arena->heap_owned = 0;
+    parent->child_count += 1;
+    root->descendant_count += 1;
+    scope->arena = arena;
+    scope->context.previous = yaza_rt_v1_current_arena;
+    scope->context.previous_context = yaza_rt_v1_current_context;
+    scope->context.entered = arena;
+    scope->context.generation = 2;
+    scope->context.active = 1;
+    yaza_rt_v1_current_arena = arena;
+    yaza_rt_v1_current_context = &scope->context;
+    yaza_rt_v1_tree_unlock(root);
     scope->context_active = 1;
     scope->heap_owned = 0;
     return scope;
@@ -1372,6 +1442,57 @@ YazaArenaScopeV1 *yaza_rt_v1_scope_enter_inplace(uint64_t limit_bytes, void *sto
 
 int32_t yaza_rt_v1_scope_leave(YazaArenaScopeV1 *scope) {
     if (scope == NULL || scope->arena == NULL) return 0;
+    if (!scope->heap_owned && scope->context_active) {
+        YazaArenaContextV1 *ctx = &scope->context;
+        YazaArenaV1 *arena = scope->arena;
+        if (arena == &yaza_rt_v1_program_arena || !ctx->active ||
+            yaza_rt_v1_current_context != ctx || yaza_rt_v1_current_arena != arena) {
+            return 0;
+        }
+        YazaArenaV1 *root = arena->root;
+        yaza_rt_v1_tree_lock(root);
+        if (arena->destroyed || !arena->scope_active || arena->scope_context != ctx ||
+            ctx->generation != arena->generation || arena->child_count != 0 ||
+            arena->active_contexts != 1 || arena->active_leases != 1 || arena->explicit_leases != 0) {
+            yaza_rt_v1_tree_unlock(root);
+            return 0;
+        }
+        arena->destroyed = 1;
+        arena->scope_active = 0;
+        arena->scope_context = NULL;
+        arena->active_leases = 0;
+        arena->active_contexts = 0;
+        YazaRtV1Chunk *chunks = arena->head;
+        const uint64_t reclaimed = arena->local_reserved;
+        const uint64_t reclaimed_used = arena->local_used;
+        const uint64_t reclaimed_storage_used = arena->local_storage_used;
+        YazaArenaV1 *parent = arena->parent;
+        for (YazaArenaV1 *anc = parent; anc != NULL; anc = anc->parent) {
+            anc->subtree_reserved -= reclaimed;
+            anc->subtree_used -= reclaimed_used;
+            anc->subtree_storage_used -= reclaimed_storage_used;
+        }
+        if (parent != NULL) {
+            parent->child_count -= 1;
+            root->descendant_count -= 1;
+        }
+        yaza_rt_v1_current_arena = ctx->previous;
+        yaza_rt_v1_current_context = ctx->previous_context;
+        yaza_rt_v1_tree_unlock(root);
+        ctx->active = 0;
+        ctx->previous = NULL;
+        ctx->previous_context = NULL;
+        ctx->entered = NULL;
+        ctx->generation = 0;
+        yaza_rt_v1_free_chunks(chunks);
+        atomic_fetch_sub_explicit(&yaza_rt_v1_process_reserved, reclaimed, memory_order_relaxed);
+        yaza_rt_v1_reclaim_process_use(root, reclaimed_used);
+        yaza_rt_v1_reclaim_process_storage(root, reclaimed_storage_used);
+        atomic_fetch_sub_explicit(&yaza_rt_v1_process_scope_count, 1, memory_order_relaxed);
+        scope->context_active = 0;
+        scope->arena = NULL;
+        return 1;
+    }
     if (scope->context_active) {
         if (!yaza_arena_v1_scope_end(&scope->context)) return 0;
         scope->context_active = 0;
@@ -1663,9 +1784,32 @@ int yaza_arena_v1_last_cycle_metrics(YazaArenaV1 *arena, YazaArenaCycleMetricsV1
     return 1;
 }
 
+static const YazaArenaContextV1 *yaza_rt_v1_find_current_context_for_arena(const YazaArenaV1 *arena) {
+    if (arena == NULL) {
+        return NULL;
+    }
+    for (const YazaArenaContextV1 *active = yaza_rt_v1_current_context; active != NULL; active = active->previous_context) {
+        if (active->active && active->entered == arena) {
+            return active;
+        }
+    }
+    return NULL;
+}
+
+static int yaza_rt_v1_is_current_context_arena(const YazaArenaV1 *arena) {
+    return yaza_rt_v1_find_current_context_for_arena(arena) != NULL;
+}
+
 uint64_t yaza_arena_v1_generation(YazaArenaV1 *arena) {
     if (arena == NULL) {
         return 0;
+    }
+    if (arena == &yaza_rt_v1_program_arena) {
+        return 1;
+    }
+    const YazaArenaContextV1 *tls_context = yaza_rt_v1_find_current_context_for_arena(arena);
+    if (tls_context != NULL) {
+        return tls_context->generation;
     }
     YazaArenaV1 *root = arena->root;
     yaza_rt_v1_tree_lock(root);
@@ -3750,29 +3894,40 @@ static YazaListV1 *yaza_list_v1_begin(void *opaque, uint64_t expected_type) {
     if (list == NULL || list->owner == NULL) {
         yaza_list_v1_fail("invalid List handle");
     }
-    if (!yaza_rt_v1_retain_for_current_access(list->owner)) {
+    const int tls_owned = yaza_rt_v1_is_current_context_arena(list->owner);
+    if (!tls_owned && !yaza_rt_v1_retain_for_current_access(list->owner)) {
         yaza_list_v1_fail("List owner region is closed");
     }
     yaza_rt_v1_lock(&list->lock);
     if (list->owner_generation != yaza_arena_v1_generation(list->owner)) {
         yaza_rt_v1_unlock(&list->lock);
-        yaza_rt_v1_release_current_access(list->owner);
+        if (!tls_owned) {
+            yaza_rt_v1_release_current_access(list->owner);
+        }
         yaza_list_v1_fail("List used after its arena generation changed");
     }
     if (list->collection_type != NULL || list->element_size != sizeof(uint64_t) || list->element_type_id != expected_type) {
         yaza_rt_v1_unlock(&list->lock);
-        yaza_rt_v1_release_current_access(list->owner);
+        if (!tls_owned) {
+            yaza_rt_v1_release_current_access(list->owner);
+        }
         yaza_list_v1_fail("List element type tag mismatch");
     }
     return list;
 }
 
-static void yaza_list_v1_end(YazaListV1 *list) {
+static void yaza_list_v1_end_with_lease_mode(YazaListV1 *list, int allow_tls_elision) {
     YazaArenaV1 *owner = list->owner;
     yaza_rt_v1_unlock(&list->lock);
-    if (!yaza_rt_v1_release_current_access(owner)) {
-        yaza_list_v1_fail("List owner lease accounting failed");
+    if (!(allow_tls_elision && yaza_rt_v1_is_current_context_arena(owner))) {
+        if (!yaza_rt_v1_release_current_access(owner)) {
+            yaza_list_v1_fail("List owner lease accounting failed");
+        }
     }
+}
+
+static void yaza_list_v1_end(YazaListV1 *list) {
+    yaza_list_v1_end_with_lease_mode(list, 1);
 }
 
 /* Preserve active borrowed List buffers before any typed List mutation. */
@@ -3801,27 +3956,36 @@ static void yaza_list_v1_note_typed_mutation(YazaListV1 *list) {
     (void)atomic_fetch_add_explicit(&list->mutation_generation, 1, memory_order_release);
 }
 
-static YazaListV1 *yaza_list_v1_begin_typed(void *opaque, const char *collection_type, uint64_t element_size) {
+static YazaListV1 *yaza_list_v1_begin_typed_with_lease_mode(void *opaque, const char *collection_type, uint64_t element_size, int allow_tls_elision) {
     YazaListV1 *list = (YazaListV1 *)opaque;
     if (list == NULL || list->owner == NULL || collection_type == NULL || collection_type[0] == '\0' || element_size == 0) {
         yaza_list_v1_fail("invalid typed List descriptor");
     }
-    if (!yaza_rt_v1_retain_for_current_access(list->owner)) {
+    const int tls_owned = allow_tls_elision && yaza_rt_v1_is_current_context_arena(list->owner);
+    if (!tls_owned && !yaza_rt_v1_retain_for_current_access(list->owner)) {
         yaza_list_v1_fail("typed List owner region is closed");
     }
     yaza_rt_v1_lock(&list->lock);
     if (list->owner_generation != yaza_arena_v1_generation(list->owner)) {
         yaza_rt_v1_unlock(&list->lock);
-        yaza_rt_v1_release_current_access(list->owner);
+        if (!tls_owned) {
+            yaza_rt_v1_release_current_access(list->owner);
+        }
         yaza_list_v1_fail("typed List used after its arena generation changed");
     }
     if (list->collection_type == NULL || list->element_size != element_size ||
         (list->collection_type != collection_type && strcmp(list->collection_type, collection_type) != 0)) {
         yaza_rt_v1_unlock(&list->lock);
-        yaza_rt_v1_release_current_access(list->owner);
+        if (!tls_owned) {
+            yaza_rt_v1_release_current_access(list->owner);
+        }
         yaza_list_v1_fail("typed List collection signature mismatch");
     }
     return list;
+}
+
+static YazaListV1 *yaza_list_v1_begin_typed(void *opaque, const char *collection_type, uint64_t element_size) {
+    return yaza_list_v1_begin_typed_with_lease_mode(opaque, collection_type, element_size, 1);
 }
 
 static int32_t yaza_list_v1_try_store_typed_item(YazaListV1 *list, const void *item, unsigned char *destination) {
@@ -3932,7 +4096,7 @@ void yaza_list_v1_iter_begin_typed(void *opaque, const char *collection_type, ui
     if (borrow == NULL || borrow->list != NULL || borrow->owner != NULL || borrow->items != NULL || borrow->mutation_generation_address != NULL || borrow->length != 0 || borrow->element_size != 0 || borrow->storage_generation != 0 || borrow->mutation_generation != 0) {
         yaza_list_v1_fail("invalid typed List iterator state");
     }
-    YazaListV1 *list = yaza_list_v1_begin_typed(opaque, collection_type, element_size);
+    YazaListV1 *list = yaza_list_v1_begin_typed_with_lease_mode(opaque, collection_type, element_size, 0);
     borrow->list = list;
     borrow->owner = list->owner;
     borrow->items = list->items;
@@ -4030,9 +4194,9 @@ void yaza_list_v1_mut_begin_typed(void *opaque, const char *collection_type, uin
     if (borrow == NULL || borrow->list != NULL || borrow->items != NULL || borrow->length != 0) {
         yaza_list_v1_fail("invalid typed List mutable view state");
     }
-    YazaListV1 *list = yaza_list_v1_begin_typed(opaque, collection_type, element_size);
+    YazaListV1 *list = yaza_list_v1_begin_typed_with_lease_mode(opaque, collection_type, element_size, 0);
     if (!yaza_list_v1_prepare_typed_write(list, list->capacity)) {
-        yaza_list_v1_end(list);
+        yaza_list_v1_end_with_lease_mode(list, 0);
         yaza_list_v1_fail("arena limit exceeded preserving typed List read view");
     }
     /* Invalidate any existing lock-free readers before the exclusive writes begin. */
@@ -4055,7 +4219,7 @@ void yaza_list_v1_mut_end(YazaListMutableBorrowV1 *borrow) {
     borrow->list = NULL;
     borrow->items = NULL;
     borrow->length = 0;
-    yaza_list_v1_end(list);
+    yaza_list_v1_end_with_lease_mode(list, 0);
 }
 
 static void yaza_list_v1_iter_end_locked(YazaListBorrowV1 *borrow, YazaListV1 *list) {
@@ -4118,7 +4282,7 @@ int32_t yaza_list_v1_nested_mut_begin_typed(void *opaque, const char *outer_type
         void *target = lock_order[index];
         if (index > 0 && target == lock_order[index - 1]) continue;
         if (target == opaque) {
-            outer = yaza_list_v1_begin_typed(target, outer_type, outer_element_size);
+            outer = yaza_list_v1_begin_typed_with_lease_mode(target, outer_type, outer_element_size, 0);
             borrow->outer.list = outer;
             borrow->outer.items = outer->items;
             borrow->outer.length = outer->length;
@@ -4128,7 +4292,7 @@ int32_t yaza_list_v1_nested_mut_begin_typed(void *opaque, const char *outer_type
                     borrow->child_count -= 1;
                     yaza_list_v1_mut_end(&borrow->children[borrow->child_count]);
                 }
-                yaza_list_v1_end(outer);
+                yaza_list_v1_end_with_lease_mode(outer, 0);
                 memset(borrow, 0, sizeof(*borrow));
                 return 0;
             }
@@ -4137,7 +4301,7 @@ int32_t yaza_list_v1_nested_mut_begin_typed(void *opaque, const char *outer_type
             if (borrow->child_count >= YAZA_LIST_V1_NESTED_MUT_VIEW_MAX) {
                 yaza_list_v1_fail("nested typed List mutable view capacity exceeded");
             }
-            YazaListV1 *child = yaza_list_v1_begin_typed(target, inner_type, inner_element_size);
+            YazaListV1 *child = yaza_list_v1_begin_typed_with_lease_mode(target, inner_type, inner_element_size, 0);
             YazaListMutableBorrowV1 *child_borrow = &borrow->children[borrow->child_count];
             child_borrow->list = child;
             child_borrow->items = child->items;
@@ -4194,7 +4358,7 @@ void yaza_list_v1_nested_mut_end(YazaListNestedMutableBorrowV1 *borrow) {
         borrow->child_count -= 1;
         yaza_list_v1_mut_end(&borrow->children[borrow->child_count]);
     }
-    yaza_list_v1_end((YazaListV1 *)borrow->outer.list);
+    yaza_list_v1_end_with_lease_mode((YazaListV1 *)borrow->outer.list, 0);
     memset(borrow, 0, sizeof(*borrow));
 }
 

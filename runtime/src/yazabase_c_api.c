@@ -8,8 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define YAZABASE_VERSION_STR "1.1.0"
-#define YAZABASE_VERSION_NUM 10100
+#define YAZABASE_VERSION_STR "1.1.1"
+#define YAZABASE_VERSION_NUM 10101
 
 struct yazabase {
     char dir[1024];

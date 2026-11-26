@@ -652,6 +652,15 @@ fn yaza_db_btree_eval_pure_integer_key_predicate_v1(plan: YazaSqlBoundPlanV1, pr
         return yaza_sql_executor_apply_comparison_v1(cmp, node.operator)
     return false
 
+fn yaza_db_btree_where_is_convex_integer_key_predicate_v1(plan: YazaSqlBoundPlanV1, expression_index: Number) -> Boolean:
+    if expression_index < 0 or expression_index >= plan.having_start_index or expression_index >= list_count(plan.expressions): return false
+    let node: YazaSqlBoundExpressionNodeV1 = list_get(plan.expressions, expression_index)
+    if node.kind == 2:
+        return yaza_db_btree_where_is_convex_integer_key_predicate_v1(plan, node.left_index) and yaza_db_btree_where_is_convex_integer_key_predicate_v1(plan, node.right_index)
+    if node.kind == 1:
+        return node.operator >= 1 and node.operator <= 6 and node.operator != 2
+    return false
+
 fn yaza_db_btree_read_signed_le_unchecked_v1(page: Bytes, offset: Number, width: Number) -> Number:
     let b0: Number = bytes_get(page, offset)
     let b1: Number = bytes_get(page, offset + 1)
@@ -990,6 +999,9 @@ fn yaza_db_btree_read_rows_internal_filtered_with_pool_profiled_v1(root: Number,
     let direct_max_text_val_bytes: Number = yaza_sql_executor_max_text_value_bytes_v1()
     let direct_max_input_text_bytes: Number = yaza_sql_executor_max_input_text_bytes_v1()
     let direct_max_work_units: Number = yaza_sql_executor_max_work_units_v1()
+    var direct_convex_pk_pred: Boolean = false
+    if direct_mode > 0 and has_filter and direct_where_root >= 0 and is_pure_integer_key_filter:
+        set direct_convex_pk_pred = yaza_db_btree_where_is_convex_integer_key_predicate_v1(option_unwrap(filter_plan), direct_where_root)
 
     while true:
         if pages_scanned >= yaza_db_btree_max_pages_v1() or pages_scanned >= file_header.page_count - 2: return err("YDBv1 B+Tree scan exceeded its page-visit budget")
@@ -1003,16 +1015,21 @@ fn yaza_db_btree_read_rows_internal_filtered_with_pool_profiled_v1(root: Number,
         let high_fence: Bytes = yaza_db_btree_fence_bytes_v1(page, header, false)?
         if scan_profile_enabled: set scan_stage_started_ns = yaza_db_btree_scan_profile_record_ns_v1(profile_ns, 7, scan_stage_started_ns, monotonic_ns())
         var slot_index: Number = 0
-        if direct_mode > 0 and header.count > 0 and passed_start_after:
+        if direct_mode > 0 and header.count > 0 and (passed_start_after or direct_mode == 1):
             var direct_leaf_ok: Boolean = true
+            let leaf_starts_inside: Boolean = passed_start_after
+            var leaf_ends_inside: Boolean = true
             if has_end_key:
                 if header.high_fence_len == 0:
-                    set direct_leaf_ok = false
+                    set leaf_ends_inside = false
                 else:
                     let end_fence_cmp: Number = yaza_db_compare_bytes_v1(high_fence, end_key)
                     if end_fence_cmp > 0 or (end_fence_cmp == 0 and not end_key_inclusive):
-                        set direct_leaf_ok = false
+                        set leaf_ends_inside = false
+                if not leaf_ends_inside and direct_mode != 1:
+                    set direct_leaf_ok = false
             var leaf_last_key: Bytes = empty_scan_key
+            var leaf_all_pk_match: Boolean = false
             if direct_leaf_ok:
                 let first_span: YazaDbPageSlotSpanV1 = yaza_db_page_slot_span_from_validated_header_v1(page, header, 0)?
                 if header.low_fence_len > 0:
@@ -1021,14 +1038,53 @@ fn yaza_db_btree_read_rows_internal_filtered_with_pool_profiled_v1(root: Number,
                 if has_last_key:
                     let prev_cmp: Number = yaza_db_page_slot_span_compare_key_v1(page, header, first_span, last_key)?
                     if prev_cmp <= 0: return err("YDBv1 B+Tree scan keys are not globally increasing")
+                var last_slot_off: Number = first_span.payload_offset
+                var last_slot_len: Number = first_span.payload_len
                 if header.count == 1:
                     set leaf_last_key = yaza_db_page_slot_key_from_validated_span_v1(page, header, first_span)?
                 else:
                     let last_span: YazaDbPageSlotSpanV1 = yaza_db_page_slot_span_from_validated_header_v1(page, header, header.count - 1)?
+                    set last_slot_off = last_span.payload_offset
+                    set last_slot_len = last_span.payload_len
                     set leaf_last_key = yaza_db_page_slot_key_from_validated_span_v1(page, header, last_span)?
                 if header.high_fence_len > 0:
                     if yaza_db_compare_bytes_v1(leaf_last_key, high_fence) >= 0: return err("YDBv1 B+Tree leaf key is at or above its high fence")
+                if direct_convex_pk_pred and leaf_starts_inside and leaf_ends_inside and first_span.payload_len >= direct_var_data_start and last_slot_len >= direct_var_data_start:
+                    let f_inf: Number = bytes_get(page, first_span.payload_offset + 16) + bytes_get(page, first_span.payload_offset + 17) * 256
+                    let f_cnt: Number = bytes_get(page, first_span.payload_offset + 18) + bytes_get(page, first_span.payload_offset + 19) * 256
+                    let f_fix: Number = bytes_get(page, first_span.payload_offset + 20) + bytes_get(page, first_span.payload_offset + 21) * 256
+                    let f_tag: Number = bytes_get(page, first_span.payload_offset + 22) + bytes_get(page, first_span.payload_offset + 23) * 256
+                    let l_inf: Number = bytes_get(page, last_slot_off + 16) + bytes_get(page, last_slot_off + 17) * 256
+                    let l_cnt: Number = bytes_get(page, last_slot_off + 18) + bytes_get(page, last_slot_off + 19) * 256
+                    let l_fix: Number = bytes_get(page, last_slot_off + 20) + bytes_get(page, last_slot_off + 21) * 256
+                    let l_tag: Number = bytes_get(page, last_slot_off + 22) + bytes_get(page, last_slot_off + 23) * 256
+                    if (f_inf == 0 or f_inf == 4) and f_cnt == column_count and f_fix == direct_expected_fixed_len and f_tag == direct_expected_schema_tag and (l_inf == 0 or l_inf == 4) and l_cnt == column_count and l_fix == direct_expected_fixed_len and l_tag == direct_expected_schema_tag:
+                        let f_null: Boolean = (f_inf == 4) and ((bytes_get(page, first_span.payload_offset + direct_pk_null_byte_off) / direct_pk_null_mask) % 2 != 0)
+                        let l_null: Boolean = (l_inf == 4) and ((bytes_get(page, last_slot_off + direct_pk_null_byte_off) / direct_pk_null_mask) % 2 != 0)
+                        if not f_null and not l_null:
+                            let direct_filter_p: YazaSqlBoundPlanV1 = option_unwrap(filter_plan)
+                            let first_pk: Number = yaza_db_btree_read_signed_le_unchecked_v1(page, first_span.payload_offset + direct_pk_offset, direct_pk_width)
+                            if yaza_db_btree_eval_pure_integer_key_predicate_v1(direct_filter_p, filter_prepared, first_pk, direct_where_root):
+                                if header.count == 1:
+                                    set leaf_all_pk_match = true
+                                else:
+                                    let last_pk: Number = yaza_db_btree_read_signed_le_unchecked_v1(page, last_slot_off + direct_pk_offset, direct_pk_width)
+                                    if yaza_db_btree_eval_pure_integer_key_predicate_v1(direct_filter_p, filter_prepared, last_pk, direct_where_root):
+                                        set leaf_all_pk_match = true
             while direct_leaf_ok and slot_index < header.count:
+                if (has_end_key and not leaf_ends_inside) or not passed_start_after:
+                    let bound_span: YazaDbPageSlotSpanV1 = yaza_db_page_slot_span_from_validated_header_v1(page, header, slot_index)?
+                    if has_end_key and not leaf_ends_inside:
+                        let end_comparison: Number = yaza_db_page_slot_span_compare_key_v1(page, header, bound_span, end_key)?
+                        if (end_key_inclusive and end_comparison > 0) or (not end_key_inclusive and end_comparison >= 0):
+                            let completed_range: YazaDbBtreeScanResultV1 = yaza_db_btree_scan_stream_aggregate_result_v1(rows, total_page_reads, filter_work_units, filter_input_rows, stream_projection_count, filter_plan, stream_aggregate, stream_aggregate_count, stream_integer_sums, stream_double_sums, stream_aggregate_values, stream_aggregate_has_values, stream_average_compensations, stream_average_counts, stream_scalar_sum_active, stream_scalar_sum_integer, stream_scalar_sum_double, stream_scalar_sum_has_value, stream_scalar_extreme_active, stream_scalar_extreme_integer, stream_scalar_extreme_double, stream_scalar_extreme_has_value)?
+                            return ok(yaza_db_btree_scan_result_with_misses_v1(completed_range, scan_missed_pages))
+                    if not passed_start_after:
+                        let start_key_order: Number = yaza_db_page_slot_span_compare_key_v1(page, header, bound_span, start_after_key)?
+                        if start_key_order <= 0:
+                            set slot_index = slot_index + 1
+                            continue
+                        set passed_start_after = true
                 let desc: Number = 48 + slot_index * 12
                 let s_off: Number = bytes_get(page, desc) + bytes_get(page, desc + 1) * 256
                 let k_len: Number = bytes_get(page, desc + 2) + bytes_get(page, desc + 3) * 256
@@ -1081,7 +1137,7 @@ fn yaza_db_btree_read_rows_internal_filtered_with_pool_profiled_v1(root: Number,
                                 set next_text_bytes = next_text_bytes + row_inline_text
                         set next_work_units = next_input_cells + next_input_rows * (where_expression_count + 1) + next_input_rows * subquery_values_per_row + next_input_rows * where_text_filter_count * (2 * filter_max_text_bytes + 1)
                         if next_work_units > direct_max_work_units: return err("SQL executor exceeds the bounded per-query work budget")
-                        if direct_leaf_ok and direct_where_root >= 0:
+                        if direct_leaf_ok and direct_where_root >= 0 and not leaf_all_pk_match:
                             let pk_is_null: Boolean = (bytes_get(page, pay_off + 16) == 4) and ((bytes_get(page, pay_off + direct_pk_null_byte_off) / direct_pk_null_mask) % 2 != 0)
                             if pk_is_null:
                                 set direct_leaf_ok = false

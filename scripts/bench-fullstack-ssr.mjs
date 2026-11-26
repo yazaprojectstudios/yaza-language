@@ -60,7 +60,7 @@ function fetchOnce(agent, port, reqPath, headers = {}) {
 
 async function benchEndpoint(port, reqPath, headers, expectedStatus) {
   const agent = new http.Agent({ keepAlive: true, maxSockets: CONCURRENCY });
-  for (let i = 0; i < 80; i++) {
+  for (let i = 0; i < 200; i++) {
     const w = await fetchOnce(agent, port, reqPath, headers);
     if (w.status !== expectedStatus) throw new Error(`Expected ${expectedStatus}, got ${w.status} on ${reqPath}`);
   }
@@ -173,7 +173,7 @@ try {
   }
 
   console.log(JSON.stringify({
-    date: "2026-11-19",
+    date: new Date().toISOString().slice(0, 10),
     host: `${os.platform()} ${os.arch()} (${os.cpus().length} logical CPUs)`,
     go_version: goVersion,
     node_version: process.version,
