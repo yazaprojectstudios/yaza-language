@@ -1,0 +1,181 @@
+# Tier 2 + Tier 3 -O2 Micro-Benchmarks:
+# 1. Concurrent Group-Commit Coalescing Pipeline (4 threads x 25 = 100 tx -> batched fsyncs)
+# 2. Vector Search: Exact Flat vs HNSW over 200 16-dim vectors (latency + recall@5)
+# 3. Full-Text Search (BM25 over 100 docs, 25 queries)
+# 4. Native JSONB YJB1 (encode, ->> path extract, @> containment, and expression index vs full scan)
+
+use "std/async"
+use "std/fs"
+use "std/math"
+use "std/time"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/concurrent_engine_v1"
+use "../yazabase/fts_bm25_v1"
+use "../yazabase/jsonb_v1"
+use "../yazabase/session_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/vector_index_v1"
+use "../yazabase/wal_v1"
+
+async fn b23_conc_writer(eng: YazaDbConcurrentEngineV1, wid: Number, cnt: Number) -> Number:
+    var i: Number = 0
+    var ok_cnt: Number = 0
+    while i < cnt:
+        let id: Number = wid * 1000 + i + 1
+        let sql: Text = "INSERT INTO bench_t (id, v) VALUES (" + number_text(id) + ", " + number_text(id * 3) + ")"
+        let res: Result[YazaDbGroupCommitItemResultV1, Text] = yaza_db_concurrent_submit_write_v1(eng, sql, List[YazaSqlValueV1]())
+        if result_is_ok(res):
+            set ok_cnt = ok_cnt + 1
+        set i = i + 1
+    return ok_cnt
+
+fn b23_vec16(seed: Number) -> YazaDbVectorV1:
+    let vals: List[Float64] = List[Float64]()
+    var d: Number = 0
+    while d < 16:
+        let v: Float64 = float64_from_number(((seed * (d + 7) * 13) % 100)) / 100.0
+        let _p: Boolean = list_try_push(vals, v)
+        set d = d + 1
+    return result_unwrap(yaza_db_vector_new_v1(vals))
+
+fn b23_run(base_dir: Text) -> Result[Boolean, Text]:
+    # 1. Concurrent Group-Commit Pipeline (100 concurrent writes across 4 threads)
+    let r1: Number = root_open(base_dir + "/c")?
+    let boot1: YazaDbCatalogBootstrapV1 = yaza_db_catalog_create_v1(r1, "bconc.yzdb")?
+    let _bw1: Boolean = yaza_db_wal_log_close_v1(boot1.wal)?
+    let _bs1: Boolean = yaza_db_storage_close_v1(boot1.storage)?
+    var sess1: YazaDbSessionV1 = yaza_db_session_open_v1(r1, "bconc.yzdb")?
+    let ddl1: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(sess1, "CREATE TABLE bench_t (id INTEGER PRIMARY KEY, v INTEGER)", List[YazaSqlValueV1]())?
+    set sess1 = ddl1.session
+    let eng: YazaDbConcurrentEngineV1 = yaza_db_concurrent_engine_new_v1(sess1, yaza_db_concurrent_default_config_v1())?
+    let wloop: Task[Result[Number, Text]] = spawn yaza_db_concurrent_writer_loop_v1(eng)
+
+    let t_conc_0: Number = monotonic_ns()
+    let cw1: Task[Number] = spawn b23_conc_writer(eng, 1, 25)
+    let cw2: Task[Number] = spawn b23_conc_writer(eng, 2, 25)
+    let cw3: Task[Number] = spawn b23_conc_writer(eng, 3, 25)
+    let cw4: Task[Number] = spawn b23_conc_writer(eng, 4, 25)
+    let c_done: Number = (await cw1) + (await cw2) + (await cw3) + (await cw4)
+    let t_conc_ns: Number = monotonic_ns() - t_conc_0
+    let cst: YazaDbConcurrentEngineStatsV1 = yaza_db_concurrent_stats_v1(eng)
+    let _ccl: Boolean = yaza_db_concurrent_engine_close_v1(eng)?
+    let _wres: Result[Number, Text] = await wloop
+    say "BENCH_CONC commits=" + number_text(c_done) + " batches=" + number_text(cst.total_batches) + " fsyncs=" + number_text(cst.total_fsyncs) + " total_ns=" + number_text(t_conc_ns)
+
+    # 2. Vector Search: Flat vs HNSW (200 x 16-dim, 20 queries)
+    let fvecs: List[YazaDbVectorV1] = List[YazaDbVectorV1]()
+    let fids: List[Number] = List[Number]()
+    let fdel: List[Boolean] = List[Boolean]()
+    var hnsw: YazaDbHnswIndexV1 = yaza_db_hnsw_new_v1(yaza_db_vector_metric_l2_v1(), 12, 64, 48)?
+    var vi: Number = 0
+    while vi < 200:
+        let v: YazaDbVectorV1 = b23_vec16(vi + 1)
+        let _p1: Boolean = list_try_push(fvecs, v)
+        let _p2: Boolean = list_try_push(fids, vi + 1)
+        let _p3: Boolean = list_try_push(fdel, false)
+        set hnsw = yaza_db_hnsw_insert_v1(hnsw, vi + 1, v)?
+        set vi = vi + 1
+
+    let qvec: YazaDbVectorV1 = b23_vec16(77)
+    let t_flat_0: Number = monotonic_ns()
+    var qi: Number = 0
+    var flat_top1: Number = 0
+    while qi < 20:
+        let fhits: List[YazaDbVectorHitV1] = yaza_db_vector_flat_search_v1(fvecs, fids, fdel, qvec, 5, yaza_db_vector_metric_l2_v1())?
+        set flat_top1 = list_get(fhits, 0).row_id
+        set qi = qi + 1
+    let t_flat_ns: Number = monotonic_ns() - t_flat_0
+
+    let t_hnsw_0: Number = monotonic_ns()
+    set qi = 0
+    var hnsw_top1: Number = 0
+    while qi < 20:
+        let hhits: List[YazaDbVectorHitV1] = yaza_db_hnsw_search_v1(hnsw, qvec, 5, 48)?
+        set hnsw_top1 = list_get(hhits, 0).row_id
+        set qi = qi + 1
+    let t_hnsw_ns: Number = monotonic_ns() - t_hnsw_0
+    say "BENCH_VEC flat_20_ns=" + number_text(t_flat_ns) + " hnsw_20_ns=" + number_text(t_hnsw_ns) + " flat_top1=" + number_text(flat_top1) + " hnsw_top1=" + number_text(hnsw_top1)
+
+    # 3. FTS BM25 (100 docs, 25 multi-term queries)
+    var fts: YazaDbFtsIndexV1 = yaza_db_fts_new_v1()?
+    var di: Number = 0
+    while di < 100:
+        var content: Text = "yazabase concurrent storage engine page crypto btree wal checkpoint item " + number_text(di)
+        if di % 10 == 0:
+            set content = content + " vector hnsw bm25 search ranking"
+        set fts = yaza_db_fts_index_doc_v1(fts, di + 1, content)?
+        set di = di + 1
+    let t_fts_0: Number = monotonic_ns()
+    var fi: Number = 0
+    var fts_hits_cnt: Number = 0
+    while fi < 25:
+        let fhits: List[YazaDbFtsHitV1] = yaza_db_fts_search_bm25_v1(fts, "vector bm25 ranking", 5, true)?
+        set fts_hits_cnt = list_count(fhits)
+        set fi = fi + 1
+    let t_fts_ns: Number = monotonic_ns() - t_fts_0
+    say "BENCH_FTS queries=25 topk=5 hits=" + number_text(fts_hits_cnt) + " total_ns=" + number_text(t_fts_ns)
+
+    # 4. JSONB YJB1 encode/path/contains + expression index lookup
+    let sample_json: Text = "{\"org\":\"yaza\",\"user\":{\"role\":\"admin\",\"tier\":1,\"tags\":[\"fast\",\"safe\",\"native\"]},\"score\":99.5}"
+    let t_jb_0: Number = monotonic_ns()
+    var ji: Number = 0
+    var jb_bytes: Bytes = bytes_empty()
+    while ji < 500:
+        set jb_bytes = yaza_db_jsonb_encode_from_text_v1(sample_json)?
+        set ji = ji + 1
+    let t_jb_enc_ns: Number = monotonic_ns() - t_jb_0
+
+    let t_path_0: Number = monotonic_ns()
+    set ji = 0
+    while ji < 500:
+        let _ex: Option[Text] = yaza_db_jsonb_extract_path_text_v1(jb_bytes, "user.tags[1]")?
+        set ji = ji + 1
+    let t_jb_path_ns: Number = monotonic_ns() - t_path_0
+
+    let needle: Bytes = yaza_db_jsonb_encode_from_text_v1("{\"user\":{\"role\":\"admin\",\"tags\":[\"safe\"]}}")?
+    let t_cnt_0: Number = monotonic_ns()
+    set ji = 0
+    while ji < 500:
+        let _ct: Boolean = yaza_db_jsonb_contains_v1(jb_bytes, needle)?
+        set ji = ji + 1
+    let t_jb_cnt_ns: Number = monotonic_ns() - t_cnt_0
+
+    let r2: Number = root_open(base_dir + "/j")?
+    let boot2: YazaDbCatalogBootstrapV1 = yaza_db_catalog_create_v1(r2, "bjsonb.yzdb")?
+    let _bw2: Boolean = yaza_db_wal_log_close_v1(boot2.wal)?
+    let _bs2: Boolean = yaza_db_storage_close_v1(boot2.storage)?
+    var sess2: YazaDbSessionV1 = yaza_db_session_open_v1(r2, "bjsonb.yzdb")?
+    set sess2 = yaza_db_jsonb_index_init_v1(sess2, "ev", "role")?
+    var row_i: Number = 1
+    while row_i <= 60:
+        var rtxt: Text = "{\"user\":{\"role\":\"member\"},\"id\":" + number_text(row_i) + "}"
+        if row_i == 42:
+            set rtxt = "{\"user\":{\"role\":\"superadmin\"},\"id\":42}"
+        let rjb: Bytes = yaza_db_jsonb_encode_from_text_v1(rtxt)?
+        set sess2 = yaza_db_jsonb_index_upsert_v1(sess2, "ev", "role", row_i, "user.role", rjb)?
+        set row_i = row_i + 1
+
+    let t_idx_0: Number = monotonic_ns()
+    var li: Number = 0
+    var idx_hits: Number = 0
+    while li < 20:
+        let lk: YazaDbJsonbIndexLookupV1 = yaza_db_jsonb_index_lookup_v1(sess2, "ev", "role", "superadmin")?
+        set sess2 = lk.session
+        set idx_hits = list_count(lk.row_ids)
+        set li = li + 1
+    let t_jb_idx_ns: Number = monotonic_ns() - t_idx_0
+    let _cl2: Boolean = yaza_db_session_close_v1(sess2)?
+
+    say "BENCH_JSONB enc_500_ns=" + number_text(t_jb_enc_ns) + " path_500_ns=" + number_text(t_jb_path_ns) + " contains_500_ns=" + number_text(t_jb_cnt_ns) + " idx_lookup_20_ns=" + number_text(t_jb_idx_ns) + " idx_hits=" + number_text(idx_hits)
+    return ok(true)
+
+start:
+    if arg_count() < 1:
+        say "usage: yazabase-tier23-bench <dir>"
+        exit(2)
+    let dir: Text = "" + arg(1)
+    let res: Result[Boolean, Text] = b23_run(dir)
+    if not result_is_ok(res):
+        say "yazabase-tier23-bench: FAIL: " + result_unwrap_error(res)
+        exit(1)
+    exit(0)

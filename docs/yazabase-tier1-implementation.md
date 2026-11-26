@@ -85,12 +85,14 @@ Measured on Apple M5 (`darwin/arm64`), Clang `-O2`:
 
 ---
 
-## Next Tiers: Repository Inventory
+## Tier Roadmap Status (Updated 26 Nov 2026)
 
-| Roadmap item | Existing foundation | Missing release gate |
+| Roadmap item | Status | Implementation & Verification |
 | --- | --- | --- |
-| **Tier 2: Concurrent server & group-commit writer** | PG wire v3 + HTTP accept loops, runtime tasks/channels, CLOCK LRU, plan cache, Delta WAL group commit. | Bounded multi-connection event loop (`kqueue`/`epoll` worker pool), single serialized writer queue + striped WAL append buffer, isolated read snapshots, backpressure, cancellation, and concurrent durability soak tests. |
-| **Tier 2: Vector search & FTS (`BM25`)** | B+Tree, overflow pages, SQL scalar types. | Versioned `VECTOR` type, cosine/L2/IP distance functions, flat + HNSW index, tokenizer + inverted index + BM25 scoring, WAL/recovery integration, and recall/latency tests. |
-| **Tier 2: PITR & CDC tail reader** | Streaming WAL chunk reader + logical sync change extractor. | Retained `.yzw` segment archive, restore-to-LSN/timestamp protocol, committed CDC webhook/subscription tail feed, and tamper/restore tests. |
-| **Tier 3: Declarative schema diff & online migration** | Internal catalog v1->v2 migration and SQL `ALTER TABLE`. | User schema manifest, deterministic diff, safety classification, migration journal, rollback/resume, and concurrent reader/writer tests. |
-| **Tier 3: Native `JSONB` & expression indexes** | TEXT/BLOB storage, `std/json`, and secondary B+Tree indexes. | Canonical binary JSONB semantics, path operators, expression dependency tracking, UPDATE/DELETE index maintenance, and corruption tests. |
+| **Tier 1: Delta WAL, Sync Engine, Page Crypto** | **COMPLETE** | `yazabase-tier1-smoke-validation-ok` (`normal`, `o2`, `asan`); see sections 1–3 above. |
+| **Tier 2.1: Concurrent server & group-commit writer** | **COMPLETE** | `yazabase-tier2-concurrent-validation-ok` (`normal`, `o2`, `asan`); see [`docs/yazabase-tier2-implementation.md`](./yazabase-tier2-implementation.md). |
+| **Tier 2.2: Vector search & FTS (`BM25`)** | **COMPLETE** | `yazabase-tier2-search-validation-ok` (`normal`, `o2`, `asan`); see [`docs/yazabase-tier2-implementation.md`](./yazabase-tier2-implementation.md). |
+| **Tier 2.3: PITR & CDC tail reader** | **COMPLETE** | `yazabase-tier2-pitr-cdc-validation-ok` (`normal`, `o2`, `asan`); see [`docs/yazabase-tier2-implementation.md`](./yazabase-tier2-implementation.md). |
+| **Tier 3.1: Horizontal Sharding & Scatter-Gather** | **COMPLETE** | `yazabase-tier3-sharding-validation-ok` (`normal`, `o2`, `asan`); see [`docs/yazabase-tier3-implementation.md`](./yazabase-tier3-implementation.md). |
+| **Tier 3.2: Declarative schema diff & online migration** | **COMPLETE** | `yazabase-tier3-migration-validation-ok` (`normal`, `o2`, `asan`); see [`docs/yazabase-tier3-implementation.md`](./yazabase-tier3-implementation.md). |
+| **Tier 3.3: Native `JSONB` & expression indexes** | **COMPLETE** | `yazabase-tier3-jsonb-validation-ok` (`normal`, `o2`, `asan`); see [`docs/yazabase-tier3-implementation.md`](./yazabase-tier3-implementation.md). |

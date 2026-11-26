@@ -1,0 +1,111 @@
+# Tier 3.1 Sharding Router Smoke Validation:
+# 1. Hash & Range partition routing + gap/overlap rejection
+# 2. Per-shard lag-aware R/W routing (Primary vs Replica + stale-replica rejection)
+# 3. Cross-shard Scatter-Gather SQL aggregates (COUNT/SUM/MIN/MAX/ORDER BY/LIMIT)
+# 4. Live Hash Shard Expansion rebalance (2 -> 3 shards) with row conservation
+
+use "std/fs"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/session_v1"
+use "../yazabase/shard_router_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/wal_v1"
+
+fn t3s_expect(cond: Boolean, label: Text) -> Result[Boolean, Text]:
+    if not cond:
+        return err("tier3-sharding failed: " + label)
+    return ok(true)
+
+fn t3s_check(r: Result[Boolean, Text]) -> Unit:
+    if not result_is_ok(r):
+        say "yazabase-tier3-sharding-smoke: FAIL: " + result_unwrap_error(r)
+        exit(1)
+
+fn t3s_open_shard(dir: Text, name: Text) -> Result[YazaDbSessionV1, Text]:
+    let r: Number = root_open(dir)?
+    let boot: YazaDbCatalogBootstrapV1 = yaza_db_catalog_create_v1(r, name)?
+    let _bw: Boolean = yaza_db_wal_log_close_v1(boot.wal)?
+    let _bs: Boolean = yaza_db_storage_close_v1(boot.storage)?
+    let sess: YazaDbSessionV1 = yaza_db_session_open_v1(r, name)?
+    let ddl: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(sess, "CREATE TABLE orders (id INTEGER PRIMARY KEY, amount INTEGER, tag TEXT)", List[YazaSqlValueV1]())?
+    return ok(ddl.session)
+
+fn t3s_run(base_dir: Text) -> Result[Boolean, Text]:
+    # 1. Range routing + gap rejection + lag-aware R/W routing
+    let rmins: List[Number] = List[Number]()
+    let rmaxs: List[Number] = List[Number]()
+    let _rm1: Boolean = list_try_push(rmins, 0)
+    let _rm2: Boolean = list_try_push(rmaxs, 1000)
+    let _rm3: Boolean = list_try_push(rmins, 1000)
+    let _rm4: Boolean = list_try_push(rmaxs, 2000)
+    var rcfg: YazaDbShardClusterConfigV1 = yaza_db_shard_new_range_cluster_v1(1, 50, rmins, rmaxs)?
+    set rcfg = yaza_db_shard_set_replica_v1(rcfg, 0, "r0-rep-fast", "127.0.0.1:9201", true, 10)?
+    set rcfg = yaza_db_shard_set_replica_v1(rcfg, 0, "r0-rep-stale", "127.0.0.1:9202", true, 900)?
+    set rcfg = yaza_db_shard_set_replica_v1(rcfg, 1, "r1-rep-stale", "127.0.0.1:9212", true, 500)?
+
+    let w0: YazaDbShardTargetRouteV1 = yaza_db_shard_route_rw_v1(rcfg, 42, true, true)?
+    let rr0: YazaDbShardTargetRouteV1 = yaza_db_shard_route_rw_v1(rcfg, 42, false, false)?
+    let fb1: YazaDbShardTargetRouteV1 = yaza_db_shard_route_rw_v1(rcfg, 1500, false, true)?
+    let rej1: Result[YazaDbShardTargetRouteV1, Text] = yaza_db_shard_route_rw_v1(rcfg, 1500, false, false)
+    let _a1: Boolean = t3s_expect(w0.shard_id == 0 and w0.role == "primary", "range write routed to shard 0 primary")?
+    let _a2: Boolean = t3s_expect(rr0.shard_id == 0 and rr0.node_id == "r0-rep-fast", "range read routed to lowest-lag healthy replica")?
+    let _a3: Boolean = t3s_expect(fb1.shard_id == 1 and fb1.fell_back_to_primary and not result_is_ok(rej1), "stale replica fell back when allowed and rejected when disallowed")?
+
+    # Range gap check must fail closed
+    let bad_mins: List[Number] = List[Number]()
+    let bad_maxs: List[Number] = List[Number]()
+    let _bm1: Boolean = list_try_push(bad_mins, 0)
+    let _bm2: Boolean = list_try_push(bad_maxs, 500)
+    let _bm3: Boolean = list_try_push(bad_mins, 600)
+    let _bm4: Boolean = list_try_push(bad_maxs, 1000)
+    let _a4: Boolean = t3s_expect(not result_is_ok(yaza_db_shard_new_range_cluster_v1(1, 50, bad_mins, bad_maxs)), "non-contiguous range partitions rejected")?
+
+    # 2. Multi-shard real SQL sessions + Scatter-Gather + Live 2 -> 3 Hash Expansion
+    var hcfg: YazaDbShardClusterConfigV1 = yaza_db_shard_new_hash_cluster_v1(1, 50, 2)?
+    let s0: YazaDbSessionV1 = t3s_open_shard(base_dir + "/s0", "s0.yzdb")?
+    let s1: YazaDbSessionV1 = t3s_open_shard(base_dir + "/s1", "s1.yzdb")?
+    let s2: YazaDbSessionV1 = t3s_open_shard(base_dir + "/s2", "s2.yzdb")?
+
+    let shards: List[YazaDbSessionV1] = List[YazaDbSessionV1]()
+    let _ps0: Boolean = list_try_push(shards, s0)
+    let _ps1: Boolean = list_try_push(shards, s1)
+
+    var expected_sum: Number = 0
+    var kid: Number = 1
+    while kid <= 24:
+        let sid: Number = yaza_db_shard_locate_id_v1(hcfg, kid)?
+        let amt: Number = kid * 10
+        set expected_sum = expected_sum + amt
+        let cs: YazaDbSessionV1 = list_get(shards, sid)
+        let st: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(cs, "INSERT INTO orders (id, amount, tag) VALUES (" + number_text(kid) + ", " + number_text(amt) + ", 'k" + number_text(kid) + "')", List[YazaSqlValueV1]())?
+        let _us: Boolean = list_try_set(shards, sid, st.session)
+        set kid = kid + 1
+
+    let sg: YazaDbScatterResultV1 = yaza_db_shard_scatter_gather_v1(shards, "orders", "amount", true, 5)?
+    let _a5: Boolean = t3s_expect(sg.total_count == 24 and sg.sum_val == expected_sum and sg.min_val == 10 and sg.max_val == 240, "scatter-gather computed exact COUNT/SUM/MIN/MAX across shards")?
+    let _a6: Boolean = t3s_expect(list_count(sg.ordered_values) == 5 and list_get(sg.ordered_values, 0) == 240 and list_get(sg.ordered_values, 4) == 200, "scatter-gather top-5 ORDER BY DESC LIMIT verified")?
+
+    # Live expansion 2 -> 3 shards
+    let reb: YazaDbRebalanceReportV1 = yaza_db_shard_live_expand_hash_v1(hcfg, shards, s2, "orders")?
+    let _a7: Boolean = t3s_expect(reb.new_epoch == 2 and reb.new_shard_count == 3 and reb.moved_keys > 0 and reb.moved_keys + reb.kept_keys == 24 and reb.verified_total_rows == 24, "live hash expansion migrated keys with 100% conservation")?
+
+    let sg_post: YazaDbScatterResultV1 = yaza_db_shard_scatter_gather_v1(shards, "orders", "amount", false, 3)?
+    let _a8: Boolean = t3s_expect(sg_post.shard_count_queried == 3 and sg_post.total_count == 24 and sg_post.sum_val == expected_sum and list_get(sg_post.ordered_values, 0) == 10, "post-rebalance 3-shard scatter-gather matches totals")?
+
+    var si: Number = 0
+    while si < list_count(shards):
+        let _cl: Boolean = yaza_db_session_close_v1(list_get(shards, si))?
+        set si = si + 1
+    return ok(true)
+
+start:
+    if arg_count() < 1:
+        say "usage: yazabase-tier3-sharding-smoke <dir>"
+        exit(2)
+    let dir: Text = "" + arg(1)
+    let res: Result[Boolean, Text] = t3s_run(dir)
+    if not result_is_ok(res):
+        say "yazabase-tier3-sharding-smoke: FAIL: " + result_unwrap_error(res)
+        exit(1)
+    say "yazabase-tier3-sharding-smoke: PASS"
+    exit(0)

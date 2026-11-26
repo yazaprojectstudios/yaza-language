@@ -1,0 +1,84 @@
+# Tier 3.2 Schema Migration Smoke Validation:
+# 1. Declarative JSON manifest parsing + live catalog diff
+# 2. Safety classification (SAFE_ONLINE, REQUIRES_BACKFILL, DESTRUCTIVE_BLOCKED rejection)
+# 3. Atomic CRC32C migration journal + simulated mid-migration crash + idempotent resume
+
+use "std/fs"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/catalog_snapshot_v1"
+use "../yazabase/page_crypto_v1"
+use "../yazabase/schema_migration_v1"
+use "../yazabase/session_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/wal_v1"
+
+fn t3m_expect(cond: Boolean, label: Text) -> Result[Boolean, Text]:
+    if not cond:
+        return err("tier3-migration failed: " + label)
+    return ok(true)
+
+fn t3m_check(r: Result[Boolean, Text]) -> Unit:
+    if not result_is_ok(r):
+        say "yazabase-tier3-migration-smoke: FAIL: " + result_unwrap_error(r)
+        exit(1)
+
+fn t3m_run(base_dir: Text) -> Result[Boolean, Text]:
+    let r: Number = root_open(base_dir)?
+    let boot: YazaDbCatalogBootstrapV1 = yaza_db_catalog_create_v1(r, "mig.yzdb")?
+    let _bw: Boolean = yaza_db_wal_log_close_v1(boot.wal)?
+    let _bs: Boolean = yaza_db_storage_close_v1(boot.storage)?
+    var sess: YazaDbSessionV1 = yaza_db_session_open_v1(r, "mig.yzdb")?
+
+    # Manifest v1: Create accounts table with index
+    let m1: Text = "{\"version\":1,\"tables\":[{\"name\":\"accounts\",\"columns\":[{\"name\":\"id\",\"type\":\"INTEGER\",\"nullable\":false,\"primary_key\":true},{\"name\":\"email\",\"type\":\"TEXT\",\"nullable\":false}],\"indexes\":[{\"name\":\"idx_acc_email\",\"column\":\"email\"}]}]}"
+    let p1: YazaDbMigrationPlanV1 = yaza_db_mig_plan_diff_v1(sess, "plan-v1", m1)?
+    let _a1: Boolean = t3m_expect(not p1.has_blocked and list_count(p1.steps) == 2 and list_get(p1.steps, 0).op_kind == "CREATE_TABLE" and list_get(p1.steps, 1).op_kind == "CREATE_INDEX", "v1 diff planned CREATE_TABLE + CREATE_INDEX")?
+
+    # Simulate crash after step 0 (CREATE_TABLE applied, CREATE_INDEX still PENDING)
+    let crash_rep: YazaDbMigrationReportV1 = yaza_db_mig_apply_plan_v1(sess, p1, false, 0)?
+    set sess = crash_rep.session
+    let _a2: Boolean = t3m_expect(not crash_rep.completed and crash_rep.executed_steps == 1, "simulated crash stopped cleanly after step 0")?
+
+    # Resume v1: must skip step 0 cleanly and apply step 1 only
+    let res_rep: YazaDbMigrationReportV1 = yaza_db_mig_apply_plan_v1(sess, p1, false, -1)?
+    set sess = res_rep.session
+    let _a3: Boolean = t3m_expect(res_rep.completed and res_rep.skipped_already_applied == 1 and res_rep.executed_steps == 1, "crash resume skipped applied step and finished step 1")?
+
+    # Manifest v2: Add safe nullable column + new table audit_logs
+    let m2: Text = "{\"version\":2,\"tables\":[{\"name\":\"accounts\",\"columns\":[{\"name\":\"id\",\"type\":\"INTEGER\",\"nullable\":false,\"primary_key\":true},{\"name\":\"email\",\"type\":\"TEXT\",\"nullable\":false},{\"name\":\"bio\",\"type\":\"TEXT\",\"nullable\":true}],\"indexes\":[{\"name\":\"idx_acc_email\",\"column\":\"email\"}]},{\"name\":\"audit_logs\",\"columns\":[{\"name\":\"id\",\"type\":\"INTEGER\",\"nullable\":false,\"primary_key\":true},{\"name\":\"action\",\"type\":\"TEXT\",\"nullable\":false}],\"indexes\":[]}]}"
+    let p2: YazaDbMigrationPlanV1 = yaza_db_mig_plan_diff_v1(sess, "plan-v2", m2)?
+    let _a4: Boolean = t3m_expect(not p2.has_blocked and list_count(p2.steps) == 2 and list_get(p2.steps, 0).safety_class == "SAFE_ONLINE", "v2 diff planned online ADD COLUMN + CREATE TABLE")?
+    let rep2: YazaDbMigrationReportV1 = yaza_db_mig_apply_plan_v1(sess, p2, false, -1)?
+    set sess = rep2.session
+    let _a5: Boolean = t3m_expect(rep2.completed and rep2.executed_steps == 2, "v2 online migration applied cleanly")?
+
+    # Manifest v3: Dropping email column must be classified DESTRUCTIVE_BLOCKED and rejected
+    let m3_bad: Text = "{\"version\":3,\"tables\":[{\"name\":\"accounts\",\"columns\":[{\"name\":\"id\",\"type\":\"INTEGER\",\"nullable\":false,\"primary_key\":true}],\"indexes\":[]},{\"name\":\"audit_logs\",\"columns\":[{\"name\":\"id\",\"type\":\"INTEGER\",\"nullable\":false,\"primary_key\":true},{\"name\":\"action\",\"type\":\"TEXT\",\"nullable\":false}],\"indexes\":[]}]}"
+    let p3_bad: YazaDbMigrationPlanV1 = yaza_db_mig_plan_diff_v1(sess, "plan-v3-bad", m3_bad)?
+    let _a6: Boolean = t3m_expect(p3_bad.has_blocked, "dropped columns classified DESTRUCTIVE_BLOCKED")?
+    let bad_apply: Result[YazaDbMigrationReportV1, Text] = yaza_db_mig_apply_plan_v1(sess, p3_bad, false, -1)
+    let _a7: Boolean = t3m_expect(not result_is_ok(bad_apply), "destructive migration blocked by default")?
+
+    # Corrupt journal CRC check must fail closed
+    let _corrupt: Boolean = yaza_db_crypto_write_atomic_file_v1(r, "schema-migration.journal", bytes_from_text("YDM1|9999\nbad"))?
+    let j_corrupt: Result[Option[YazaDbMigrationPlanV1], Text] = yaza_db_mig_read_journal_v1(r)
+    let _a8: Boolean = t3m_expect(not result_is_ok(j_corrupt), "corrupted migration journal rejected fail-closed")?
+
+    # Re-plan against live DB should show 0 diff against m2
+    let p_noop: YazaDbMigrationPlanV1 = yaza_db_mig_plan_diff_v1(sess, "plan-noop", m2)?
+    let _a9: Boolean = t3m_expect(list_count(p_noop.steps) == 0, "live catalog matches manifest v2 with zero diff")?
+
+    let _cl: Boolean = yaza_db_session_close_v1(sess)?
+    return ok(true)
+
+start:
+    if arg_count() < 1:
+        say "usage: yazabase-tier3-migration-smoke <dir>"
+        exit(2)
+    let dir: Text = "" + arg(1)
+    let res: Result[Boolean, Text] = t3m_run(dir)
+    if not result_is_ok(res):
+        say "yazabase-tier3-migration-smoke: FAIL: " + result_unwrap_error(res)
+        exit(1)
+    say "yazabase-tier3-migration-smoke: PASS"
+    exit(0)
