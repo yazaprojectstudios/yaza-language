@@ -4,6 +4,7 @@
 use "./catalog_snapshot_v1"
 use "./catalog_storage_v1"
 use "./index_catalog_v1"
+use "./plan_cache_v1"
 use "./query_v1"
 use "./row_v1"
 use "./sql_insert_v1"
@@ -24,33 +25,70 @@ shape YazaDbSqlInsertBoundQueryV1:
     batch: YazaSqlInsertMaterializedV1
     indexes: List[YazaDbSecondaryIndexV1]
 
-fn yaza_db_prepare_insert_query_v1(storage: YazaDbStorageHandleV1, read_header: YazaDbFileHeaderV1, source: Text, parameters: List[YazaSqlValueV1], cached_catalog: Option[YazaDbCatalogSnapshotWithRootsV1], cached_index_rows: Option[List[YazaDbRowV1]]) -> Result[YazaDbSqlInsertBoundQueryV1, Text]:
+shape YazaDbSqlInsertPreparedWithPlanV1:
+    bound: YazaDbSqlInsertBoundQueryV1
+    cache_entry: Option[YazaDbWritePlanCacheEntryV1]
+
+shape YazaDbSqlInsertCachedCommitV1:
+    commit: YazaDbWriteCommitV1
+    cache_entry: Option[YazaDbWritePlanCacheEntryV1]
+
+shape YazaDbSqlInsertOverlayCachedAttemptV1:
+    attempt: YazaDbSqlInsertOverlayAttemptV1
+    cache_entry: Option[YazaDbWritePlanCacheEntryV1]
+
+fn yaza_db_prepare_insert_query_with_plan_cache_v1(storage: YazaDbStorageHandleV1, read_header: YazaDbFileHeaderV1, source: Text, parameters: List[YazaSqlValueV1], cached_catalog: Option[YazaDbCatalogSnapshotWithRootsV1], cached_index_rows: Option[List[YazaDbRowV1]], cached_entry: Option[YazaDbWritePlanCacheEntryV1]) -> Result[YazaDbSqlInsertPreparedWithPlanV1, Text]:
     var loaded_result: Result[YazaDbCatalogSnapshotWithRootsV1, Text] = err("YDBv1 SQL INSERT catalog was not loaded")
     if option_is_some(cached_catalog):
         set loaded_result = ok(option_unwrap(cached_catalog))
     else:
         set loaded_result = yaza_db_catalog_snapshot_load_with_roots_v1(storage.file, read_header)
     let loaded: YazaDbCatalogSnapshotWithRootsV1 = loaded_result?
-    let parsed: YazaSqlInsertAstV1 = yaza_sql_parse_insert_v1(source)?
-    var view_index: Number = 0
-    while view_index < list_count(loaded.views):
-        if yaza_sql_bind_v1_identifier_matches(source, parsed.table_name.first_token, list_get(loaded.views, view_index).name):
-            return err("YDBv1 views are read-only; INSERT through a view is not supported")
-        set view_index = view_index + 1
-    let plan: YazaSqlBoundInsertPlanV1 = yaza_sql_bind_insert_v1(source, parsed, loaded.sql_snapshot)?
-    if plan.catalog_version != loaded.sql_snapshot.version: return err("YDBv1 SQL INSERT plan was bound against a stale catalog snapshot")
-    let table_index: Number = yaza_db_catalog_snapshot_table_index_v1(loaded.sql_snapshot.tables, plan.table_id)
-    if table_index < 0 or table_index >= list_count(loaded.root_page_ids) or table_index >= list_count(loaded.table_schema_versions): return err("YDBv1 SQL INSERT target has no persisted table root or schema version")
-    let table_root_page_id: Number = list_get(loaded.root_page_ids, table_index)
-    let table_schema_version: Number = list_get(loaded.table_schema_versions, table_index)
-    let table: YazaSqlTableSchemaV1 = list_get(loaded.sql_snapshot.tables, table_index)
     var index_rows_result: Result[List[YazaDbRowV1], Text] = err("YDBv1 SQL INSERT index catalog was not loaded")
     if option_is_some(cached_index_rows):
         set index_rows_result = ok(option_unwrap(cached_index_rows))
     else:
         set index_rows_result = yaza_db_index_catalog_rows_v1(storage.file, read_header, loaded.sql_snapshot.version)
     let index_rows: List[YazaDbRowV1] = index_rows_result?
-    let key_ordinals: List[Number] = yaza_db_query_clustered_key_ordinals_from_rows_v1(index_rows, plan.table_id, table_root_page_id, list_count(table.columns))?
+
+    var plan_opt: Option[YazaSqlBoundInsertPlanV1] = none
+    var table_index: Number = -1
+    var table_root_page_id: Number = 0
+    var table_schema_version: Number = 0
+    var key_ordinals: List[Number] = List[Number]()
+    var out_cache_entry: Option[YazaDbWritePlanCacheEntryV1] = none
+
+    if option_is_some(cached_entry):
+        let ce: YazaDbWritePlanCacheEntryV1 = option_unwrap(cached_entry)
+        if ce.stmt_kind == 1 and ce.source == source and ce.catalog_root == read_header.catalog_root and option_is_some(ce.insert_plan):
+            if ce.table_index >= 0 and ce.table_index < list_count(loaded.sql_snapshot.tables) and ce.table_index < list_count(loaded.root_page_ids) and ce.table_index < list_count(loaded.table_schema_versions):
+                if list_get(loaded.sql_snapshot.tables, ce.table_index).table_id == ce.table_id and list_get(loaded.root_page_ids, ce.table_index) == ce.table_root_page_id and list_get(loaded.table_schema_versions, ce.table_index) == ce.table_schema_version:
+                    set plan_opt = ce.insert_plan
+                    set table_index = ce.table_index
+                    set table_root_page_id = ce.table_root_page_id
+                    set table_schema_version = ce.table_schema_version
+                    set key_ordinals = ce.key_ordinals
+
+    if not option_is_some(plan_opt):
+        let parsed: YazaSqlInsertAstV1 = yaza_sql_parse_insert_v1(source)?
+        var view_index: Number = 0
+        while view_index < list_count(loaded.views):
+            if yaza_sql_bind_v1_identifier_matches(source, parsed.table_name.first_token, list_get(loaded.views, view_index).name):
+                return err("YDBv1 views are read-only; INSERT through a view is not supported")
+            set view_index = view_index + 1
+        let bound_plan: YazaSqlBoundInsertPlanV1 = yaza_sql_bind_insert_v1(source, parsed, loaded.sql_snapshot)?
+        if bound_plan.catalog_version != loaded.sql_snapshot.version: return err("YDBv1 SQL INSERT plan was bound against a stale catalog snapshot")
+        set table_index = yaza_db_catalog_snapshot_table_index_v1(loaded.sql_snapshot.tables, bound_plan.table_id)
+        if table_index < 0 or table_index >= list_count(loaded.root_page_ids) or table_index >= list_count(loaded.table_schema_versions): return err("YDBv1 SQL INSERT target has no persisted table root or schema version")
+        set table_root_page_id = list_get(loaded.root_page_ids, table_index)
+        set table_schema_version = list_get(loaded.table_schema_versions, table_index)
+        let table: YazaSqlTableSchemaV1 = list_get(loaded.sql_snapshot.tables, table_index)
+        set key_ordinals = yaza_db_query_clustered_key_ordinals_from_rows_v1(index_rows, bound_plan.table_id, table_root_page_id, list_count(table.columns))?
+        set plan_opt = some(bound_plan)
+        if read_header.catalog_root > 0:
+            set out_cache_entry = some(yaza_db_write_plan_entry_insert_v1(source, read_header.catalog_root, bound_plan.table_id, table_index, table_root_page_id, table_schema_version, key_ordinals, bound_plan))
+
+    let plan: YazaSqlBoundInsertPlanV1 = option_unwrap(plan_opt)
     let indexes: List[YazaDbSecondaryIndexV1] = yaza_db_index_maintenance_load_from_rows_v1(loaded, table_index, key_ordinals, index_rows)?
     let batch: YazaSqlInsertMaterializedV1 = yaza_sql_materialize_insert_v1(plan, parameters)?
     let foreign_rows_created: Result[List[List[YazaSqlValueV1]], Text] = list_try_new()
@@ -65,13 +103,22 @@ fn yaza_db_prepare_insert_query_v1(storage: YazaDbStorageHandleV1, read_header: 
     if not foreign_keys_valid: return err("YDBv1 SQL INSERT foreign-key preflight did not complete")
     let checks_valid: Boolean = yaza_db_sql_check_validate_rows_v1(storage.file, read_header, loaded, plan.table_id, foreign_rows)?
     if not checks_valid: return err("YDBv1 SQL INSERT CHECK preflight did not complete")
-    return ok(YazaDbSqlInsertBoundQueryV1(table_root_page_id, key_ordinals, table_schema_version, batch, indexes))
+    return ok(YazaDbSqlInsertPreparedWithPlanV1(YazaDbSqlInsertBoundQueryV1(table_root_page_id, key_ordinals, table_schema_version, batch, indexes), out_cache_entry))
+
+fn yaza_db_prepare_insert_query_v1(storage: YazaDbStorageHandleV1, read_header: YazaDbFileHeaderV1, source: Text, parameters: List[YazaSqlValueV1], cached_catalog: Option[YazaDbCatalogSnapshotWithRootsV1], cached_index_rows: Option[List[YazaDbRowV1]]) -> Result[YazaDbSqlInsertBoundQueryV1, Text]:
+    let prepared: YazaDbSqlInsertPreparedWithPlanV1 = yaza_db_prepare_insert_query_with_plan_cache_v1(storage, read_header, source, parameters, cached_catalog, cached_index_rows, none)?
+    return ok(prepared.bound)
+
+fn yaza_db_execute_insert_with_plan_cache_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], defer_checkpoint: Boolean, sync_commit_wal: Boolean, cached_catalog: Option[YazaDbCatalogSnapshotWithRootsV1], cached_index_rows: Option[List[YazaDbRowV1]], cached_entry: Option[YazaDbWritePlanCacheEntryV1]) -> Result[YazaDbSqlInsertCachedCommitV1, Text]:
+    if storage.root != wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid): return err("YDBv1 SQL INSERT storage and WAL handles belong to different databases")
+    let prepared: YazaDbSqlInsertPreparedWithPlanV1 = yaza_db_prepare_insert_query_with_plan_cache_v1(storage, storage.header, source, parameters, cached_catalog, cached_index_rows, cached_entry)?
+    let bound: YazaDbSqlInsertBoundQueryV1 = prepared.bound
+    let committed: YazaDbWriteCommitV1 = yaza_db_sql_insert_write_with_indexes_sync_policy_for_schema_v1(storage, wal, bound.table_root_page_id, bound.key_ordinals, bound.table_schema_version, bound.batch, bound.indexes, defer_checkpoint, sync_commit_wal)?
+    return ok(YazaDbSqlInsertCachedCommitV1(YazaDbWriteCommitV1(committed.storage, committed.wal, committed.txn_id, committed.commit_ts, list_count(bound.batch.rows)), prepared.cache_entry))
 
 fn yaza_db_execute_insert_with_sync_policy_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], defer_checkpoint: Boolean, sync_commit_wal: Boolean, cached_catalog: Option[YazaDbCatalogSnapshotWithRootsV1], cached_index_rows: Option[List[YazaDbRowV1]]) -> Result[YazaDbWriteCommitV1, Text]:
-    if storage.root != wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid): return err("YDBv1 SQL INSERT storage and WAL handles belong to different databases")
-    let bound: YazaDbSqlInsertBoundQueryV1 = yaza_db_prepare_insert_query_v1(storage, storage.header, source, parameters, cached_catalog, cached_index_rows)?
-    let committed: YazaDbWriteCommitV1 = yaza_db_sql_insert_write_with_indexes_sync_policy_for_schema_v1(storage, wal, bound.table_root_page_id, bound.key_ordinals, bound.table_schema_version, bound.batch, bound.indexes, defer_checkpoint, sync_commit_wal)?
-    return ok(YazaDbWriteCommitV1(committed.storage, committed.wal, committed.txn_id, committed.commit_ts, list_count(bound.batch.rows)))
+    let res: YazaDbSqlInsertCachedCommitV1 = yaza_db_execute_insert_with_plan_cache_v1(storage, wal, source, parameters, defer_checkpoint, sync_commit_wal, cached_catalog, cached_index_rows, none)?
+    return ok(res.commit)
 
 fn yaza_db_execute_insert_in_tx_v1(transaction: YazaDbWriteTransactionV1, source: Text, parameters: List[YazaSqlValueV1], cached_catalog: Option[YazaDbCatalogSnapshotWithRootsV1], cached_index_rows: Option[List[YazaDbRowV1]]) -> Result[YazaDbTxDmlResultV1, Text]:
     if not transaction.active or transaction.storage.root != transaction.wal.root or not bytes_equal(transaction.storage.header.db_uuid, transaction.wal.db_uuid):
@@ -83,22 +130,27 @@ fn yaza_db_execute_insert_in_tx_v1(transaction: YazaDbWriteTransactionV1, source
 fn yaza_db_execute_insert_with_policy_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], defer_checkpoint: Boolean, cached_catalog: Option[YazaDbCatalogSnapshotWithRootsV1], cached_index_rows: Option[List[YazaDbRowV1]]) -> Result[YazaDbWriteCommitV1, Text]:
     return yaza_db_execute_insert_with_sync_policy_v1(storage, wal, source, parameters, defer_checkpoint, true, cached_catalog, cached_index_rows)
 
-fn yaza_db_execute_insert_try_overlay_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], cached_catalog: Option[YazaDbCatalogSnapshotWithRootsV1], cached_index_rows: Option[List[YazaDbRowV1]], overlay: YazaDbDirtyPageOverlayV1) -> Result[YazaDbSqlInsertOverlayAttemptV1, Text]:
+fn yaza_db_execute_insert_try_overlay_cached_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], cached_catalog: Option[YazaDbCatalogSnapshotWithRootsV1], cached_index_rows: Option[List[YazaDbRowV1]], overlay: YazaDbDirtyPageOverlayV1, cached_entry: Option[YazaDbWritePlanCacheEntryV1]) -> Result[YazaDbSqlInsertOverlayCachedAttemptV1, Text]:
     if storage.root != wal.root or not bytes_equal(storage.header.db_uuid, wal.db_uuid):
         return err("YDBv1 SQL INSERT storage and WAL handles belong to different databases")
-    let bound_res: Result[YazaDbSqlInsertBoundQueryV1, Text] = yaza_db_prepare_insert_query_v1(storage, storage.header, source, parameters, cached_catalog, cached_index_rows)
-    if not result_is_ok(bound_res):
+    let prep_res: Result[YazaDbSqlInsertPreparedWithPlanV1, Text] = yaza_db_prepare_insert_query_with_plan_cache_v1(storage, storage.header, source, parameters, cached_catalog, cached_index_rows, cached_entry)
+    if not result_is_ok(prep_res):
         if list_count(overlay.page_ids) > 0:
-            return ok(YazaDbSqlInsertOverlayAttemptV1(false, none, overlay))
-        return err(result_unwrap_error(bound_res))
-    let bound: YazaDbSqlInsertBoundQueryV1 = result_unwrap(bound_res)
+            return ok(YazaDbSqlInsertOverlayCachedAttemptV1(YazaDbSqlInsertOverlayAttemptV1(false, none, overlay), none))
+        return err(result_unwrap_error(prep_res))
+    let prepared: YazaDbSqlInsertPreparedWithPlanV1 = result_unwrap(prep_res)
+    let bound: YazaDbSqlInsertBoundQueryV1 = prepared.bound
     let exec_res: Result[YazaDbSqlInsertOverlayAttemptV1, Text] = yaza_db_sql_insert_try_execute_overlay_v1(storage, wal, bound.table_root_page_id, bound.key_ordinals, bound.table_schema_version, bound.batch, bound.indexes, overlay)
     if not result_is_ok(exec_res):
         let err_msg: Text = result_unwrap_error(exec_res)
         if not yaza_db_sql_insert_writer_handles_closed_v1(err_msg) and list_count(overlay.page_ids) > 0:
-            return ok(YazaDbSqlInsertOverlayAttemptV1(false, none, overlay))
+            return ok(YazaDbSqlInsertOverlayCachedAttemptV1(YazaDbSqlInsertOverlayAttemptV1(false, none, overlay), prepared.cache_entry))
         return err(err_msg)
-    return exec_res
+    return ok(YazaDbSqlInsertOverlayCachedAttemptV1(result_unwrap(exec_res), prepared.cache_entry))
+
+fn yaza_db_execute_insert_try_overlay_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1], cached_catalog: Option[YazaDbCatalogSnapshotWithRootsV1], cached_index_rows: Option[List[YazaDbRowV1]], overlay: YazaDbDirtyPageOverlayV1) -> Result[YazaDbSqlInsertOverlayAttemptV1, Text]:
+    let res: YazaDbSqlInsertOverlayCachedAttemptV1 = yaza_db_execute_insert_try_overlay_cached_v1(storage, wal, source, parameters, cached_catalog, cached_index_rows, overlay, none)?
+    return ok(res.attempt)
 
 fn yaza_db_execute_insert_v1(storage: YazaDbStorageHandleV1, wal: YazaDbWalLogV1, source: Text, parameters: List[YazaSqlValueV1]) -> Result[YazaDbWriteCommitV1, Text]:
     return yaza_db_execute_insert_with_policy_v1(storage, wal, source, parameters, false, none, none)

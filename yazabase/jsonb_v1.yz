@@ -1,0 +1,729 @@
+# Tier 3.3: Native Canonical Binary JSONB (YJB1) + Path/Containment/Set + Durable Expression Index
+# Format: 12-byte header ("YJB1", ver=1, flags=0, crc32c) + canonical value tree (sorted object keys).
+# Types: 0=Null, 1=Bool, 2=Int64, 3=Float64, 4=Text, 5=Array, 6=Object.
+
+use "std/math"
+use "./page_v1"
+use "./replication_v1"
+use "./session_v1"
+use "./sql_executor_v1"
+
+shape YazaDbJsonbNodeV1:
+    kind: Number # 0=null, 1=bool, 2=int, 3=float, 4=text, 5=array, 6=object
+    bool_val: Boolean
+    int_val: Number
+    float_val: Float64
+    text_val: Text
+    arr_items: List[YazaDbJsonbNodeV1]
+    obj_keys: List[Text]
+    obj_vals: List[YazaDbJsonbNodeV1]
+
+shape YazaDbJsonbParseStepV1:
+    node: YazaDbJsonbNodeV1
+    next_pos: Number
+
+shape YazaDbJsonbDecodeStepV1:
+    node: YazaDbJsonbNodeV1
+    next_off: Number
+
+shape YazaDbJsonbPathSegV1:
+    is_index: Boolean
+    key_name: Text
+    arr_idx: Number
+
+fn yaza_db_jsonb_err_text_v1(msg: Text) -> Text:
+    return "" + msg
+
+fn yaza_db_jsonb_magic_v1() -> Number:
+    return 826427993 # "YJB1" LE
+
+fn yaza_db_jsonb_node_null_v1() -> YazaDbJsonbNodeV1:
+    return YazaDbJsonbNodeV1(0, false, 0, 0.0, yaza_db_jsonb_err_text_v1(""), List[YazaDbJsonbNodeV1](), List[Text](), List[YazaDbJsonbNodeV1]())
+
+fn yaza_db_jsonb_node_bool_v1(b: Boolean) -> YazaDbJsonbNodeV1:
+    return YazaDbJsonbNodeV1(1, b, 0, 0.0, yaza_db_jsonb_err_text_v1(""), List[YazaDbJsonbNodeV1](), List[Text](), List[YazaDbJsonbNodeV1]())
+
+fn yaza_db_jsonb_node_int_v1(n: Number) -> YazaDbJsonbNodeV1:
+    return YazaDbJsonbNodeV1(2, false, n, float64_from_number(n), yaza_db_jsonb_err_text_v1(""), List[YazaDbJsonbNodeV1](), List[Text](), List[YazaDbJsonbNodeV1]())
+
+fn yaza_db_jsonb_node_float_v1(f: Float64) -> YazaDbJsonbNodeV1:
+    return YazaDbJsonbNodeV1(3, false, 0, f, yaza_db_jsonb_err_text_v1(""), List[YazaDbJsonbNodeV1](), List[Text](), List[YazaDbJsonbNodeV1]())
+
+fn yaza_db_jsonb_node_text_v1(s: Text) -> YazaDbJsonbNodeV1:
+    return YazaDbJsonbNodeV1(4, false, 0, 0.0, "" + s, List[YazaDbJsonbNodeV1](), List[Text](), List[YazaDbJsonbNodeV1]())
+
+fn yaza_db_jsonb_node_array_v1(items: List[YazaDbJsonbNodeV1]) -> YazaDbJsonbNodeV1:
+    return YazaDbJsonbNodeV1(5, false, 0, 0.0, yaza_db_jsonb_err_text_v1(""), items, List[Text](), List[YazaDbJsonbNodeV1]())
+
+fn yaza_db_jsonb_sort_kv_v1(keys: List[Text], vals: List[YazaDbJsonbNodeV1]) -> Result[Boolean, Text]:
+    let n: Number = list_count(keys)
+    var i: Number = 1
+    while i < n:
+        let ck: Text = list_get(keys, i)
+        let cv: YazaDbJsonbNodeV1 = list_get(vals, i)
+        var j: Number = i - 1
+        while j >= 0:
+            let pk: Text = list_get(keys, j)
+            if pk == ck:
+                return err(yaza_db_jsonb_err_text_v1("YJB1 object contains duplicate key: " + ck))
+            if pk < ck:
+                break
+            let _s1: Boolean = list_try_set(keys, j + 1, pk)
+            let _s2: Boolean = list_try_set(vals, j + 1, list_get(vals, j))
+            set j = j - 1
+        let _s3: Boolean = list_try_set(keys, j + 1, ck)
+        let _s4: Boolean = list_try_set(vals, j + 1, cv)
+        set i = i + 1
+    # Check duplicate at start edge
+    var k: Number = 1
+    while k < n:
+        if list_get(keys, k - 1) == list_get(keys, k):
+            return err(yaza_db_jsonb_err_text_v1("YJB1 object contains duplicate key: " + list_get(keys, k)))
+        set k = k + 1
+    return ok(true)
+
+fn yaza_db_jsonb_node_object_v1(keys: List[Text], vals: List[YazaDbJsonbNodeV1]) -> Result[YazaDbJsonbNodeV1, Text]:
+    if list_count(keys) != list_count(vals):
+        return err(yaza_db_jsonb_err_text_v1("YJB1 object keys/values length mismatch"))
+    let _ok: Boolean = yaza_db_jsonb_sort_kv_v1(keys, vals)?
+    return ok(YazaDbJsonbNodeV1(6, false, 0, 0.0, yaza_db_jsonb_err_text_v1(""), List[YazaDbJsonbNodeV1](), keys, vals))
+
+fn yaza_db_jsonb_skip_ws_v1(s: Text, pos: Number) -> Number:
+    let n: Number = text_length(s)
+    var p: Number = pos
+    while p < n:
+        let b: Number = text_byte(s, p)
+        if b == 32 or b == 9 or b == 10 or b == 13:
+            set p = p + 1
+        else:
+            break
+    return p
+
+fn yaza_db_jsonb_parse_string_v1(s: Text, pos: Number) -> Result[YazaDbJsonbParseStepV1, Text]:
+    let n: Number = text_length(s)
+    if pos >= n or text_byte(s, pos) != 34:
+        return err(yaza_db_jsonb_err_text_v1("YJB1 expected JSON string opening quote"))
+    var p: Number = pos + 1
+    let parts: TextList = text_list()
+    while p < n:
+        let b: Number = text_byte(s, p)
+        if b == 34:
+            return ok(YazaDbJsonbParseStepV1(yaza_db_jsonb_node_text_v1(text_join(parts, "")), p + 1))
+        if b == 92:
+            set p = p + 1
+            if p >= n:
+                return err(yaza_db_jsonb_err_text_v1("YJB1 truncated JSON string escape"))
+            let esc: Number = text_byte(s, p)
+            if esc == 34: list_push(parts, "\"")
+            elif esc == 92: list_push(parts, "\\")
+            elif esc == 47: list_push(parts, "/")
+            elif esc == 110: list_push(parts, "\n")
+            elif esc == 114: list_push(parts, "\r")
+            elif esc == 116: list_push(parts, "\t")
+            else:
+                return err(yaza_db_jsonb_err_text_v1("YJB1 unsupported JSON string escape sequence"))
+            set p = p + 1
+        else:
+            list_push(parts, text_slice(s, p, 1))
+            set p = p + 1
+    return err(yaza_db_jsonb_err_text_v1("YJB1 unterminated JSON string literal"))
+
+fn yaza_db_jsonb_parse_number_v1(s: Text, pos: Number) -> Result[YazaDbJsonbParseStepV1, Text]:
+    let n: Number = text_length(s)
+    var p: Number = pos
+    var is_float: Boolean = false
+    if p < n and text_byte(s, p) == 45:
+        set p = p + 1
+    let digits_start: Number = p
+    while p < n:
+        let b: Number = text_byte(s, p)
+        if b >= 48 and b <= 57:
+            set p = p + 1
+        elif b == 46 or b == 101 or b == 69:
+            set is_float = true
+            set p = p + 1
+            if (b == 101 or b == 69) and p < n and (text_byte(s, p) == 43 or text_byte(s, p) == 45):
+                set p = p + 1
+        else:
+            break
+    if p <= digits_start:
+        return err(yaza_db_jsonb_err_text_v1("YJB1 invalid JSON number"))
+    let raw: Text = text_slice(s, pos, p - pos)
+    if is_float:
+        let fv: Result[Float64, Text] = float64_try_parse(raw)
+        if not result_is_ok(fv) or not math_is_finite_float64(result_unwrap(fv)):
+            return err(yaza_db_jsonb_err_text_v1("YJB1 invalid or non-finite JSON float"))
+        return ok(YazaDbJsonbParseStepV1(yaza_db_jsonb_node_float_v1(result_unwrap(fv)), p))
+    let iv: Result[Number, Text] = number_try_parse(raw)
+    if not result_is_ok(iv):
+        return err(yaza_db_jsonb_err_text_v1("YJB1 invalid JSON integer"))
+    return ok(YazaDbJsonbParseStepV1(yaza_db_jsonb_node_int_v1(result_unwrap(iv)), p))
+
+fn yaza_db_jsonb_parse_value_v1(s: Text, pos: Number, depth: Number) -> Result[YazaDbJsonbParseStepV1, Text]:
+    if depth > 64:
+        return err(yaza_db_jsonb_err_text_v1("YJB1 max JSON nesting depth (64) exceeded"))
+    let n: Number = text_length(s)
+    var p: Number = yaza_db_jsonb_skip_ws_v1(s, pos)
+    if p >= n:
+        return err(yaza_db_jsonb_err_text_v1("YJB1 unexpected end of JSON input"))
+    let b: Number = text_byte(s, p)
+    if b == 34:
+        return yaza_db_jsonb_parse_string_v1(s, p)
+    if b == 110:
+        if p + 4 <= n and text_slice(s, p, 4) == "null":
+            return ok(YazaDbJsonbParseStepV1(yaza_db_jsonb_node_null_v1(), p + 4))
+        return err(yaza_db_jsonb_err_text_v1("YJB1 invalid JSON literal starting with 'n'"))
+    if b == 116:
+        if p + 4 <= n and text_slice(s, p, 4) == "true":
+            return ok(YazaDbJsonbParseStepV1(yaza_db_jsonb_node_bool_v1(true), p + 4))
+        return err(yaza_db_jsonb_err_text_v1("YJB1 invalid JSON literal starting with 't'"))
+    if b == 102:
+        if p + 5 <= n and text_slice(s, p, 5) == "false":
+            return ok(YazaDbJsonbParseStepV1(yaza_db_jsonb_node_bool_v1(false), p + 5))
+        return err(yaza_db_jsonb_err_text_v1("YJB1 invalid JSON literal starting with 'f'"))
+    if b == 91:
+        set p = yaza_db_jsonb_skip_ws_v1(s, p + 1)
+        let items: List[YazaDbJsonbNodeV1] = List[YazaDbJsonbNodeV1]()
+        if p < n and text_byte(s, p) == 93:
+            return ok(YazaDbJsonbParseStepV1(yaza_db_jsonb_node_array_v1(items), p + 1))
+        while true:
+            let elem: YazaDbJsonbParseStepV1 = yaza_db_jsonb_parse_value_v1(s, p, depth + 1)?
+            let _pi: Boolean = list_try_push(items, elem.node)
+            set p = yaza_db_jsonb_skip_ws_v1(s, elem.next_pos)
+            if p >= n:
+                return err(yaza_db_jsonb_err_text_v1("YJB1 unterminated JSON array"))
+            if text_byte(s, p) == 93:
+                return ok(YazaDbJsonbParseStepV1(yaza_db_jsonb_node_array_v1(items), p + 1))
+            if text_byte(s, p) != 44:
+                return err(yaza_db_jsonb_err_text_v1("YJB1 expected ',' or ']' in JSON array"))
+            set p = p + 1
+    if b == 123:
+        set p = yaza_db_jsonb_skip_ws_v1(s, p + 1)
+        let keys: List[Text] = List[Text]()
+        let vals: List[YazaDbJsonbNodeV1] = List[YazaDbJsonbNodeV1]()
+        if p < n and text_byte(s, p) == 125:
+            let obj_e: YazaDbJsonbNodeV1 = yaza_db_jsonb_node_object_v1(keys, vals)?
+            return ok(YazaDbJsonbParseStepV1(obj_e, p + 1))
+        while true:
+            set p = yaza_db_jsonb_skip_ws_v1(s, p)
+            let ks: YazaDbJsonbParseStepV1 = yaza_db_jsonb_parse_string_v1(s, p)?
+            set p = yaza_db_jsonb_skip_ws_v1(s, ks.next_pos)
+            if p >= n or text_byte(s, p) != 58:
+                return err(yaza_db_jsonb_err_text_v1("YJB1 expected ':' after JSON object key"))
+            let vs: YazaDbJsonbParseStepV1 = yaza_db_jsonb_parse_value_v1(s, p + 1, depth + 1)?
+            let _pk: Boolean = list_try_push(keys, ks.node.text_val)
+            let _pv: Boolean = list_try_push(vals, vs.node)
+            set p = yaza_db_jsonb_skip_ws_v1(s, vs.next_pos)
+            if p >= n:
+                return err(yaza_db_jsonb_err_text_v1("YJB1 unterminated JSON object"))
+            if text_byte(s, p) == 125:
+                let obj: YazaDbJsonbNodeV1 = yaza_db_jsonb_node_object_v1(keys, vals)?
+                return ok(YazaDbJsonbParseStepV1(obj, p + 1))
+            if text_byte(s, p) != 44:
+                return err(yaza_db_jsonb_err_text_v1("YJB1 expected ',' or '}' in JSON object"))
+            set p = p + 1
+    if (b >= 48 and b <= 57) or b == 45:
+        return yaza_db_jsonb_parse_number_v1(s, p)
+    return err(yaza_db_jsonb_err_text_v1("YJB1 unexpected JSON token"))
+
+fn yaza_db_jsonb_parse_json_v1(s: Text) -> Result[YazaDbJsonbNodeV1, Text]:
+    let step: YazaDbJsonbParseStepV1 = yaza_db_jsonb_parse_value_v1(s, 0, 0)?
+    let tail: Number = yaza_db_jsonb_skip_ws_v1(s, step.next_pos)
+    if tail != text_length(s):
+        return err(yaza_db_jsonb_err_text_v1("YJB1 trailing characters after JSON value"))
+    return ok(step.node)
+
+fn yaza_db_jsonb_u32_bytes_v1(val: Number) -> Result[Bytes, Text]:
+    let b: Bytes = bytes_try_new_zeroed(4)?
+    if not yaza_db_write_uint_le_v1(b, 0, val, 4):
+        return err(yaza_db_jsonb_err_text_v1("YJB1 failed writing u32"))
+    return ok(b)
+
+fn yaza_db_jsonb_encode_node_parts_v1(node: YazaDbJsonbNodeV1, parts: List[Bytes]) -> Result[Boolean, Text]:
+    let tag_b: Bytes = bytes_try_new_zeroed(1)?
+    let _st: Boolean = bytes_try_set(tag_b, 0, node.kind)
+    let _pt: Boolean = list_try_push(parts, tag_b)
+    if node.kind == 0:
+        return ok(true)
+    if node.kind == 1:
+        let bb: Bytes = bytes_try_new_zeroed(1)?
+        if node.bool_val:
+            let _sb: Boolean = bytes_try_set(bb, 0, 1)
+        let _pb: Boolean = list_try_push(parts, bb)
+        return ok(true)
+    if node.kind == 2:
+        let ib: Bytes = bytes_try_new_zeroed(8)?
+        if not yaza_db_write_int_le_v1(ib, 0, node.int_val, 8):
+            return err(yaza_db_jsonb_err_text_v1("YJB1 int64 encode failed"))
+        let _pi: Boolean = list_try_push(parts, ib)
+        return ok(true)
+    if node.kind == 3:
+        if not math_is_finite_float64(node.float_val):
+            return err(yaza_db_jsonb_err_text_v1("YJB1 non-finite float64 cannot be encoded"))
+        let fb: Bytes = bytes_try_new_zeroed(8)?
+        if not yaza_db_write_int_le_v1(fb, 0, float64_bits(node.float_val), 8):
+            return err(yaza_db_jsonb_err_text_v1("YJB1 float64 encode failed"))
+        let _pf: Boolean = list_try_push(parts, fb)
+        return ok(true)
+    if node.kind == 4:
+        let tb: Bytes = bytes_from_text(node.text_val)
+        let lb: Bytes = yaza_db_jsonb_u32_bytes_v1(bytes_length(tb))?
+        let _pl: Boolean = list_try_push(parts, lb)
+        let _ptb: Boolean = list_try_push(parts, tb)
+        return ok(true)
+    if node.kind == 5:
+        let cnt: Number = list_count(node.arr_items)
+        let cb: Bytes = yaza_db_jsonb_u32_bytes_v1(cnt)?
+        let _pc: Boolean = list_try_push(parts, cb)
+        var i: Number = 0
+        while i < cnt:
+            let _pe: Boolean = yaza_db_jsonb_encode_node_parts_v1(list_get(node.arr_items, i), parts)?
+            set i = i + 1
+        return ok(true)
+    if node.kind == 6:
+        let cnt: Number = list_count(node.obj_keys)
+        let cb: Bytes = yaza_db_jsonb_u32_bytes_v1(cnt)?
+        let _pc: Boolean = list_try_push(parts, cb)
+        var i: Number = 0
+        while i < cnt:
+            let kb: Bytes = bytes_from_text(list_get(node.obj_keys, i))
+            let klb: Bytes = yaza_db_jsonb_u32_bytes_v1(bytes_length(kb))?
+            let _pkl: Boolean = list_try_push(parts, klb)
+            let _pk: Boolean = list_try_push(parts, kb)
+            let _pv: Boolean = yaza_db_jsonb_encode_node_parts_v1(list_get(node.obj_vals, i), parts)?
+            set i = i + 1
+        return ok(true)
+    return err(yaza_db_jsonb_err_text_v1("YJB1 unknown node kind"))
+
+fn yaza_db_jsonb_encode_node_v1(node: YazaDbJsonbNodeV1) -> Result[Bytes, Text]:
+    let parts: List[Bytes] = List[Bytes]()
+    let _pe: Boolean = yaza_db_jsonb_encode_node_parts_v1(node, parts)?
+    let payload: Bytes = bytes_join(parts)?
+    let crc: Number = bytes_ydbv1_checksum(payload)
+    let hdr: Bytes = bytes_try_new_zeroed(12)?
+    if not yaza_db_write_uint_le_v1(hdr, 0, yaza_db_jsonb_magic_v1(), 4) or not yaza_db_write_uint_le_v1(hdr, 4, 1, 2) or not yaza_db_write_uint_le_v1(hdr, 6, 0, 2) or not yaza_db_write_uint_le_v1(hdr, 8, crc, 4):
+        return err(yaza_db_jsonb_err_text_v1("YJB1 header write failed"))
+    return ok(bytes_concat(hdr, payload))
+
+fn yaza_db_jsonb_encode_from_text_v1(json_text: Text) -> Result[Bytes, Text]:
+    let node: YazaDbJsonbNodeV1 = yaza_db_jsonb_parse_json_v1(json_text)?
+    return yaza_db_jsonb_encode_node_v1(node)
+
+fn yaza_db_jsonb_decode_node_v1(raw: Bytes, off: Number, depth: Number) -> Result[YazaDbJsonbDecodeStepV1, Text]:
+    if depth > 64:
+        return err(yaza_db_jsonb_err_text_v1("YJB1 binary max depth exceeded"))
+    let n: Number = bytes_length(raw)
+    if off >= n:
+        return err(yaza_db_jsonb_err_text_v1("YJB1 binary payload truncated at tag"))
+    let kind: Number = bytes_get(raw, off)
+    var p: Number = off + 1
+    if kind == 0:
+        return ok(YazaDbJsonbDecodeStepV1(yaza_db_jsonb_node_null_v1(), p))
+    if kind == 1:
+        if p >= n:
+            return err(yaza_db_jsonb_err_text_v1("YJB1 binary bool truncated"))
+        let bv: Number = bytes_get(raw, p)
+        if bv != 0 and bv != 1:
+            return err(yaza_db_jsonb_err_text_v1("YJB1 binary bool byte invalid"))
+        return ok(YazaDbJsonbDecodeStepV1(yaza_db_jsonb_node_bool_v1(bv == 1), p + 1))
+    if kind == 2:
+        if p + 8 > n:
+            return err(yaza_db_jsonb_err_text_v1("YJB1 binary int64 truncated"))
+        let iv: Number = yaza_db_read_int_le_v1(raw, p, 8)?
+        return ok(YazaDbJsonbDecodeStepV1(yaza_db_jsonb_node_int_v1(iv), p + 8))
+    if kind == 3:
+        if p + 8 > n:
+            return err(yaza_db_jsonb_err_text_v1("YJB1 binary float64 truncated"))
+        let bits: Number = yaza_db_read_int_le_v1(raw, p, 8)?
+        let fv: Float64 = float64_from_bits(bits)
+        if not math_is_finite_float64(fv):
+            return err(yaza_db_jsonb_err_text_v1("YJB1 binary float64 is non-finite"))
+        return ok(YazaDbJsonbDecodeStepV1(yaza_db_jsonb_node_float_v1(fv), p + 8))
+    if kind == 4:
+        if p + 4 > n:
+            return err(yaza_db_jsonb_err_text_v1("YJB1 binary text length truncated"))
+        let tlen: Number = yaza_db_read_uint_le_v1(raw, p, 4)?
+        set p = p + 4
+        if p + tlen > n:
+            return err(yaza_db_jsonb_err_text_v1("YJB1 binary text bytes out of bounds"))
+        let sl: Bytes = bytes_try_slice(raw, p, tlen)?
+        return ok(YazaDbJsonbDecodeStepV1(yaza_db_jsonb_node_text_v1(bytes_to_text(sl)), p + tlen))
+    if kind == 5:
+        if p + 4 > n:
+            return err(yaza_db_jsonb_err_text_v1("YJB1 binary array count truncated"))
+        let cnt: Number = yaza_db_read_uint_le_v1(raw, p, 4)?
+        set p = p + 4
+        let items: List[YazaDbJsonbNodeV1] = List[YazaDbJsonbNodeV1]()
+        var i: Number = 0
+        while i < cnt:
+            let step: YazaDbJsonbDecodeStepV1 = yaza_db_jsonb_decode_node_v1(raw, p, depth + 1)?
+            let _pi: Boolean = list_try_push(items, step.node)
+            set p = step.next_off
+            set i = i + 1
+        return ok(YazaDbJsonbDecodeStepV1(yaza_db_jsonb_node_array_v1(items), p))
+    if kind == 6:
+        if p + 4 > n:
+            return err(yaza_db_jsonb_err_text_v1("YJB1 binary object count truncated"))
+        let cnt: Number = yaza_db_read_uint_le_v1(raw, p, 4)?
+        set p = p + 4
+        let keys: List[Text] = List[Text]()
+        let vals: List[YazaDbJsonbNodeV1] = List[YazaDbJsonbNodeV1]()
+        var i: Number = 0
+        var prev_key: Text = ""
+        while i < cnt:
+            if p + 4 > n:
+                return err(yaza_db_jsonb_err_text_v1("YJB1 binary key length truncated"))
+            let klen: Number = yaza_db_read_uint_le_v1(raw, p, 4)?
+            set p = p + 4
+            if p + klen > n:
+                return err(yaza_db_jsonb_err_text_v1("YJB1 binary key bytes out of bounds"))
+            let ksl: Bytes = bytes_try_slice(raw, p, klen)?
+            let key: Text = bytes_to_text(ksl)
+            set p = p + klen
+            if i > 0 and prev_key >= key:
+                return err(yaza_db_jsonb_err_text_v1("YJB1 object keys are not strictly sorted canonical order"))
+            set prev_key = key
+            let vstep: YazaDbJsonbDecodeStepV1 = yaza_db_jsonb_decode_node_v1(raw, p, depth + 1)?
+            let _pk: Boolean = list_try_push(keys, key)
+            let _pv: Boolean = list_try_push(vals, vstep.node)
+            set p = vstep.next_off
+            set i = i + 1
+        return ok(YazaDbJsonbDecodeStepV1(YazaDbJsonbNodeV1(6, false, 0, 0.0, yaza_db_jsonb_err_text_v1(""), List[YazaDbJsonbNodeV1](), keys, vals), p))
+    return err(yaza_db_jsonb_err_text_v1("YJB1 binary tag is invalid"))
+
+fn yaza_db_jsonb_decode_v1(raw: Bytes) -> Result[YazaDbJsonbNodeV1, Text]:
+    let n: Number = bytes_length(raw)
+    if n < 13:
+        return err(yaza_db_jsonb_err_text_v1("YJB1 binary payload is truncated"))
+    let magic: Number = yaza_db_read_uint_le_v1(raw, 0, 4)?
+    let ver: Number = yaza_db_read_uint_le_v1(raw, 4, 2)?
+    let flags: Number = yaza_db_read_uint_le_v1(raw, 6, 2)?
+    let stored_crc: Number = yaza_db_read_uint_le_v1(raw, 8, 4)?
+    if magic != yaza_db_jsonb_magic_v1() or ver != 1 or flags != 0:
+        return err(yaza_db_jsonb_err_text_v1("YJB1 invalid binary header"))
+    let payload: Bytes = bytes_try_slice(raw, 12, n - 12)?
+    if bytes_ydbv1_checksum(payload) != stored_crc:
+        return err(yaza_db_jsonb_err_text_v1("YJB1 CRC32C checksum mismatch"))
+    let root: YazaDbJsonbDecodeStepV1 = yaza_db_jsonb_decode_node_v1(raw, 12, 0)?
+    if root.next_off != n:
+        return err(yaza_db_jsonb_err_text_v1("YJB1 trailing unconsumed binary bytes"))
+    return ok(root.node)
+
+fn yaza_db_jsonb_validate_v1(raw: Bytes) -> Result[Boolean, Text]:
+    let _node: YazaDbJsonbNodeV1 = yaza_db_jsonb_decode_v1(raw)?
+    return ok(true)
+
+fn yaza_db_jsonb_escape_string_v1(s: Text) -> Text:
+    let parts: TextList = text_list()
+    list_push(parts, "\"")
+    var i: Number = 0
+    let n: Number = text_length(s)
+    while i < n:
+        let ch: Number = text_byte(s, i)
+        if ch == 34: list_push(parts, "\\\"")
+        elif ch == 92: list_push(parts, "\\\\")
+        elif ch == 10: list_push(parts, "\\n")
+        elif ch == 13: list_push(parts, "\\r")
+        elif ch == 9: list_push(parts, "\\t")
+        else: list_push(parts, text_slice(s, i, 1))
+        set i = i + 1
+    list_push(parts, "\"")
+    return text_join(parts, "")
+
+fn yaza_db_jsonb_render_node_v1(node: YazaDbJsonbNodeV1) -> Text:
+    if node.kind == 0: return "null"
+    if node.kind == 1:
+        if node.bool_val: return "true"
+        return "false"
+    if node.kind == 2: return number_text(node.int_val)
+    if node.kind == 3: return float64_text(node.float_val)
+    if node.kind == 4: return yaza_db_jsonb_escape_string_v1(node.text_val)
+    if node.kind == 5:
+        let parts: TextList = text_list()
+        list_push(parts, "[")
+        var i: Number = 0
+        while i < list_count(node.arr_items):
+            if i > 0: list_push(parts, ",")
+            list_push(parts, yaza_db_jsonb_render_node_v1(list_get(node.arr_items, i)))
+            set i = i + 1
+        list_push(parts, "]")
+        return text_join(parts, "")
+    let parts: TextList = text_list()
+    list_push(parts, "{")
+    var i: Number = 0
+    while i < list_count(node.obj_keys):
+        if i > 0: list_push(parts, ",")
+        list_push(parts, yaza_db_jsonb_escape_string_v1(list_get(node.obj_keys, i)))
+        list_push(parts, ":")
+        list_push(parts, yaza_db_jsonb_render_node_v1(list_get(node.obj_vals, i)))
+        set i = i + 1
+    list_push(parts, "}")
+    return text_join(parts, "")
+
+fn yaza_db_jsonb_to_text_v1(raw: Bytes) -> Result[Text, Text]:
+    let node: YazaDbJsonbNodeV1 = yaza_db_jsonb_decode_v1(raw)?
+    return ok(yaza_db_jsonb_render_node_v1(node))
+
+fn yaza_db_jsonb_parse_path_v1(path: Text) -> Result[List[YazaDbJsonbPathSegV1], Text]:
+    let segs: List[YazaDbJsonbPathSegV1] = List[YazaDbJsonbPathSegV1]()
+    if path == "" or path == "$":
+        return ok(segs)
+    let n: Number = text_length(path)
+    var i: Number = 0
+    if text_starts_with(path, "$."):
+        set i = 2
+    elif text_starts_with(path, "$"):
+        set i = 1
+    while i < n:
+        let b: Number = text_byte(path, i)
+        if b == 46:
+            set i = i + 1
+            continue
+        if b == 91:
+            let start: Number = i + 1
+            var end_pos: Number = start
+            while end_pos < n and text_byte(path, end_pos) != 93:
+                set end_pos = end_pos + 1
+            if end_pos >= n:
+                return err(yaza_db_jsonb_err_text_v1("YJB1 unterminated array index in path"))
+            let idx_res: Result[Number, Text] = number_try_parse(text_slice(path, start, end_pos - start))
+            if not result_is_ok(idx_res) or result_unwrap(idx_res) < 0:
+                return err(yaza_db_jsonb_err_text_v1("YJB1 invalid array index in path"))
+            let _ps: Boolean = list_try_push(segs, YazaDbJsonbPathSegV1(true, yaza_db_jsonb_err_text_v1(""), result_unwrap(idx_res)))
+            set i = end_pos + 1
+            continue
+        let kstart: Number = i
+        while i < n and text_byte(path, i) != 46 and text_byte(path, i) != 91:
+            set i = i + 1
+        if i > kstart:
+            let _pk: Boolean = list_try_push(segs, YazaDbJsonbPathSegV1(false, text_slice(path, kstart, i - kstart), 0))
+    return ok(segs)
+
+fn yaza_db_jsonb_find_obj_key_v1(node: YazaDbJsonbNodeV1, key: Text) -> Number:
+    if node.kind != 6:
+        return -1
+    var lo: Number = 0
+    var hi: Number = list_count(node.obj_keys) - 1
+    while lo <= hi:
+        let mid: Number = (lo + hi) / 2
+        let mk: Text = list_get(node.obj_keys, mid)
+        if mk == key:
+            return mid
+        if mk < key:
+            set lo = mid + 1
+        else:
+            set hi = mid - 1
+    return -1
+
+fn yaza_db_jsonb_extract_node_v1(node: YazaDbJsonbNodeV1, path: Text) -> Result[Option[YazaDbJsonbNodeV1], Text]:
+    let segs: List[YazaDbJsonbPathSegV1] = yaza_db_jsonb_parse_path_v1(path)?
+    var cur: YazaDbJsonbNodeV1 = node
+    var i: Number = 0
+    while i < list_count(segs):
+        let seg: YazaDbJsonbPathSegV1 = list_get(segs, i)
+        if seg.is_index:
+            if cur.kind != 5 or seg.arr_idx < 0 or seg.arr_idx >= list_count(cur.arr_items):
+                return ok(none)
+            set cur = list_get(cur.arr_items, seg.arr_idx)
+        else:
+            if cur.kind != 6:
+                return ok(none)
+            let kidx: Number = yaza_db_jsonb_find_obj_key_v1(cur, seg.key_name)
+            if kidx < 0:
+                return ok(none)
+            set cur = list_get(cur.obj_vals, kidx)
+        set i = i + 1
+    return ok(some(cur))
+
+fn yaza_db_jsonb_extract_path_v1(raw: Bytes, path: Text) -> Result[Option[Bytes], Text]:
+    let root: YazaDbJsonbNodeV1 = yaza_db_jsonb_decode_v1(raw)?
+    let hit: Option[YazaDbJsonbNodeV1] = yaza_db_jsonb_extract_node_v1(root, path)?
+    if not option_is_some(hit):
+        return ok(none)
+    let enc: Bytes = yaza_db_jsonb_encode_node_v1(option_unwrap(hit))?
+    return ok(some(enc))
+
+fn yaza_db_jsonb_extract_path_text_v1(raw: Bytes, path: Text) -> Result[Option[Text], Text]:
+    let root: YazaDbJsonbNodeV1 = yaza_db_jsonb_decode_v1(raw)?
+    let hit: Option[YazaDbJsonbNodeV1] = yaza_db_jsonb_extract_node_v1(root, path)?
+    if not option_is_some(hit):
+        return ok(none)
+    let n: YazaDbJsonbNodeV1 = option_unwrap(hit)
+    if n.kind == 4:
+        return ok(some(n.text_val))
+    return ok(some(yaza_db_jsonb_render_node_v1(n)))
+
+fn yaza_db_jsonb_node_contains_v1(doc: YazaDbJsonbNodeV1, needle: YazaDbJsonbNodeV1) -> Boolean:
+    if doc.kind == 6 and needle.kind == 6:
+        var i: Number = 0
+        while i < list_count(needle.obj_keys):
+            let nk: Text = list_get(needle.obj_keys, i)
+            let nv: YazaDbJsonbNodeV1 = list_get(needle.obj_vals, i)
+            let didx: Number = yaza_db_jsonb_find_obj_key_v1(doc, nk)
+            if didx < 0:
+                return false
+            if not yaza_db_jsonb_node_contains_v1(list_get(doc.obj_vals, didx), nv):
+                return false
+            set i = i + 1
+        return true
+    if doc.kind == 5 and needle.kind == 5:
+        var i: Number = 0
+        while i < list_count(needle.arr_items):
+            let nv: YazaDbJsonbNodeV1 = list_get(needle.arr_items, i)
+            var matched: Boolean = false
+            var j: Number = 0
+            while j < list_count(doc.arr_items):
+                if yaza_db_jsonb_node_contains_v1(list_get(doc.arr_items, j), nv):
+                    set matched = true
+                    break
+                set j = j + 1
+            if not matched:
+                return false
+            set i = i + 1
+        return true
+    if doc.kind != needle.kind:
+        if doc.kind == 2 and needle.kind == 3:
+            return float64_from_number(doc.int_val) == needle.float_val
+        if doc.kind == 3 and needle.kind == 2:
+            return doc.float_val == float64_from_number(needle.int_val)
+        return false
+    if doc.kind == 0: return true
+    if doc.kind == 1: return doc.bool_val == needle.bool_val
+    if doc.kind == 2: return doc.int_val == needle.int_val
+    if doc.kind == 3: return doc.float_val == needle.float_val
+    if doc.kind == 4: return doc.text_val == needle.text_val
+    return false
+
+fn yaza_db_jsonb_contains_v1(doc_raw: Bytes, needle_raw: Bytes) -> Result[Boolean, Text]:
+    let doc: YazaDbJsonbNodeV1 = yaza_db_jsonb_decode_v1(doc_raw)?
+    let needle: YazaDbJsonbNodeV1 = yaza_db_jsonb_decode_v1(needle_raw)?
+    return ok(yaza_db_jsonb_node_contains_v1(doc, needle))
+
+fn yaza_db_jsonb_set_node_at_v1(cur: YazaDbJsonbNodeV1, segs: List[YazaDbJsonbPathSegV1], idx: Number, new_val: YazaDbJsonbNodeV1, create_missing: Boolean) -> Result[YazaDbJsonbNodeV1, Text]:
+    if idx >= list_count(segs):
+        return ok(new_val)
+    let seg: YazaDbJsonbPathSegV1 = list_get(segs, idx)
+    let is_leaf: Boolean = idx == list_count(segs) - 1
+    if seg.is_index:
+        if cur.kind != 5 or seg.arr_idx < 0 or seg.arr_idx >= list_count(cur.arr_items):
+            return err(yaza_db_jsonb_err_text_v1("YJB1 jsonb_set array index out of bounds"))
+        let next_items: List[YazaDbJsonbNodeV1] = List[YazaDbJsonbNodeV1]()
+        var i: Number = 0
+        while i < list_count(cur.arr_items):
+            var item: YazaDbJsonbNodeV1 = list_get(cur.arr_items, i)
+            if i == seg.arr_idx:
+                if is_leaf:
+                    set item = new_val
+                else:
+                    set item = yaza_db_jsonb_set_node_at_v1(item, segs, idx + 1, new_val, create_missing)?
+            let _pi: Boolean = list_try_push(next_items, item)
+            set i = i + 1
+        return ok(yaza_db_jsonb_node_array_v1(next_items))
+
+    if cur.kind != 6:
+        return err(yaza_db_jsonb_err_text_v1("YJB1 jsonb_set target is not an object"))
+    let next_keys: List[Text] = List[Text]()
+    let next_vals: List[YazaDbJsonbNodeV1] = List[YazaDbJsonbNodeV1]()
+    let existing: Number = yaza_db_jsonb_find_obj_key_v1(cur, seg.key_name)
+    if existing < 0 and not create_missing:
+        return err(yaza_db_jsonb_err_text_v1("YJB1 jsonb_set missing key with create_missing=false"))
+    if existing < 0 and not is_leaf:
+        return err(yaza_db_jsonb_err_text_v1("YJB1 jsonb_set intermediate missing object path"))
+    var i: Number = 0
+    while i < list_count(cur.obj_keys):
+        let k: Text = list_get(cur.obj_keys, i)
+        var v: YazaDbJsonbNodeV1 = list_get(cur.obj_vals, i)
+        if i == existing:
+            if is_leaf:
+                set v = new_val
+            else:
+                set v = yaza_db_jsonb_set_node_at_v1(v, segs, idx + 1, new_val, create_missing)?
+        let _pk: Boolean = list_try_push(next_keys, k)
+        let _pv: Boolean = list_try_push(next_vals, v)
+        set i = i + 1
+    if existing < 0:
+        let _pk2: Boolean = list_try_push(next_keys, seg.key_name)
+        let _pv2: Boolean = list_try_push(next_vals, new_val)
+    return yaza_db_jsonb_node_object_v1(next_keys, next_vals)
+
+fn yaza_db_jsonb_set_v1(doc_raw: Bytes, path: Text, new_val_raw: Bytes, create_missing: Boolean) -> Result[Bytes, Text]:
+    let doc: YazaDbJsonbNodeV1 = yaza_db_jsonb_decode_v1(doc_raw)?
+    let nv: YazaDbJsonbNodeV1 = yaza_db_jsonb_decode_v1(new_val_raw)?
+    let segs: List[YazaDbJsonbPathSegV1] = yaza_db_jsonb_parse_path_v1(path)?
+    let updated: YazaDbJsonbNodeV1 = yaza_db_jsonb_set_node_at_v1(doc, segs, 0, nv, create_missing)?
+    return yaza_db_jsonb_encode_node_v1(updated)
+
+# --- Durable Expression/Generated Index over JSONB in .yzdb ---
+
+fn yaza_db_jsonb_index_init_v1(session: YazaDbSessionV1, table_name: Text, index_name: Text) -> Result[YazaDbSessionV1, Text]:
+    if not session.is_open or table_name == "" or index_name == "":
+        return err(yaza_db_jsonb_err_text_v1("YDBv1 JSONB index init requires open session, table_name, and index_name"))
+    let idx_tbl: Text = "_ydb_jb_idx_" + table_name + "_" + index_name
+    var cur: YazaDbSessionV1 = session
+    let crt: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(cur, "CREATE TABLE " + idx_tbl + " (id BIGINT PRIMARY KEY, expr_val TEXT, doc_blob BLOB)", List[YazaSqlValueV1]())?
+    set cur = crt.session
+    let cidx: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(cur, "CREATE INDEX idx_jb_" + index_name + " ON " + idx_tbl + " (expr_val)", List[YazaSqlValueV1]())?
+    return ok(cidx.session)
+
+fn yaza_db_jsonb_index_upsert_v1(session: YazaDbSessionV1, table_name: Text, index_name: Text, row_id: Number, expr_path: Text, doc_raw: Bytes) -> Result[YazaDbSessionV1, Text]:
+    let _v: Boolean = yaza_db_jsonb_validate_v1(doc_raw)?
+    let ext: Option[Text] = yaza_db_jsonb_extract_path_text_v1(doc_raw, expr_path)?
+    var expr_val: Text = ""
+    if option_is_some(ext):
+        set expr_val = option_unwrap(ext)
+    let idx_tbl: Text = "_ydb_jb_idx_" + table_name + "_" + index_name
+    var cur: YazaDbSessionV1 = session
+    let sp: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let sv0: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, row_id)?
+    let _sp0: Boolean = list_try_push(sp, sv0)
+    let chk: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(cur, "SELECT id FROM " + idx_tbl + " WHERE id = $1", sp)?
+    set cur = chk.session
+    let exists_cnt: Number = list_count(option_unwrap(chk.statement.query_result).rows)
+
+    let iv0: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, row_id)?
+    let iv2: YazaSqlValueV1 = yaza_sql_value_blob_v1(doc_raw)?
+    if exists_cnt > 0:
+        let up: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+        let _up0: Boolean = list_try_push(up, yaza_sql_value_text_v1(expr_val))
+        let _up1: Boolean = list_try_push(up, iv2)
+        let _up2: Boolean = list_try_push(up, iv0)
+        let upd: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(cur, "UPDATE " + idx_tbl + " SET expr_val = $1, doc_blob = $2 WHERE id = $3", up)?
+        return ok(upd.session)
+
+    let ip: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let _ip0: Boolean = list_try_push(ip, iv0)
+    let _ip1: Boolean = list_try_push(ip, yaza_sql_value_text_v1(expr_val))
+    let _ip2: Boolean = list_try_push(ip, iv2)
+    let ins: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(cur, "INSERT INTO " + idx_tbl + " (id, expr_val, doc_blob) VALUES ($1, $2, $3)", ip)?
+    return ok(ins.session)
+
+fn yaza_db_jsonb_index_delete_v1(session: YazaDbSessionV1, table_name: Text, index_name: Text, row_id: Number) -> Result[YazaDbSessionV1, Text]:
+    let idx_tbl: Text = "_ydb_jb_idx_" + table_name + "_" + index_name
+    let dp: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let dv0: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, row_id)?
+    let _dp0: Boolean = list_try_push(dp, dv0)
+    let del: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "DELETE FROM " + idx_tbl + " WHERE id = $1", dp)?
+    return ok(del.session)
+
+shape YazaDbJsonbIndexLookupV1:
+    session: YazaDbSessionV1
+    row_ids: List[Number]
+    docs: List[Bytes]
+
+fn yaza_db_jsonb_index_lookup_v1(session: YazaDbSessionV1, table_name: Text, index_name: Text, expected_expr_val: Text) -> Result[YazaDbJsonbIndexLookupV1, Text]:
+    let idx_tbl: Text = "_ydb_jb_idx_" + table_name + "_" + index_name
+    let p: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let _p0: Boolean = list_try_push(p, yaza_sql_value_text_v1(expected_expr_val))
+    let sel: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(session, "SELECT id, doc_blob FROM " + idx_tbl + " WHERE expr_val = $1 ORDER BY id ASC", p)?
+    let qr: YazaSqlQueryResultV1 = option_unwrap(sel.statement.query_result)
+    let ids: List[Number] = List[Number]()
+    let docs: List[Bytes] = List[Bytes]()
+    var r: Number = 0
+    while r < list_count(qr.rows):
+        let row: List[YazaSqlValueV1] = list_get(qr.rows, r)
+        let _pi: Boolean = list_try_push(ids, list_get(row, 0).integer_value)
+        let raw_d: Bytes = list_get(row, 1).bytes_value
+        let copy_d: Bytes = bytes_try_slice(raw_d, 0, bytes_length(raw_d))?
+        let _pd: Boolean = list_try_push(docs, copy_d)
+        set r = r + 1
+    return ok(YazaDbJsonbIndexLookupV1(sel.session, ids, docs))

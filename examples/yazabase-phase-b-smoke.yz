@@ -322,9 +322,42 @@ fn pb_run(base_root: Text) -> Result[Boolean, Text]:
         let sql_ov: Text = "INSERT INTO bulk_t (id, val, note) VALUES (" + number_text(ovi) + ", " + number_text(ovi * 10) + ", 'ov_" + number_text(ovi) + "')"
         let _po: Boolean = list_try_push(ov_items, YazaDbGroupCommitItemV1(sql_ov, List[YazaSqlValueV1]()))
         set ovi = ovi + 1
+    let ov_start_lsn: Number = sess.wal.next_lsn
     let ov_res: YazaDbGroupCommitBatchResultV1 = yaza_db_group_commit_execute_v1(sess, ov_items)?
     set sess = ov_res.session
     let _ab3: Boolean = pb_expect_ok(ov_res.fsync_count == 1 and ov_res.committed_count == 30 and ov_res.failed_count == 0, "overlay group commit executed 30 INSERTs with 1 fsync")?
+    var ov_cursor: Number = ov_start_lsn
+    var ov_delta_count: Number = 0
+    let ov_full_pages: List[Number] = List[Number]()
+    while ov_cursor < sess.wal.next_lsn:
+        let ov_record: YazaDbWalRecordV1 = yaza_db_wal_read_record_at_v1(sess.root, sess.wal.db_uuid, ov_cursor, sess.wal.next_lsn)?
+        var ov_full_page_id: Number = -1
+        if ov_record.rec_type == yaza_db_wal_type_full_page_image_v1():
+            let ov_image: YazaDbWalPageImageV1 = yaza_db_wal_page_image_payload_decode_v1(ov_record)?
+            set ov_full_page_id = ov_image.page_id
+        elif ov_record.rec_type == yaza_db_wal_type_leaf_insert_v1() or ov_record.rec_type == yaza_db_wal_type_leaf_update_v1() or ov_record.rec_type == yaza_db_wal_type_leaf_delete_v1():
+            let ov_mutation: YazaDbWalLeafMutationV1 = yaza_db_wal_leaf_mutation_payload_decode_v1(ov_record)?
+            set ov_full_page_id = ov_mutation.page_id
+        if ov_full_page_id >= 2:
+            list_push(ov_full_pages, ov_full_page_id)
+        if ov_record.rec_type == yaza_db_wal_type_node_split_v1():
+            let ov_split: YazaDbWalNodeSplitV1 = yaza_db_wal_node_split_payload_decode_v1(ov_record)?
+            var ov_split_index: Number = 0
+            while ov_split_index < list_count(ov_split.pages):
+                list_push(ov_full_pages, list_get(ov_split.pages, ov_split_index).page_id)
+                set ov_split_index = ov_split_index + 1
+        if ov_record.rec_type == yaza_db_wal_type_leaf_slot_delta_v1():
+            let ov_delta: YazaDbWalLeafSlotDeltaV1 = yaza_db_wal_leaf_slot_delta_decode_v1(ov_record)?
+            var ov_prior_image: Boolean = false
+            var ov_image_index: Number = 0
+            while ov_image_index < list_count(ov_full_pages):
+                if list_get(ov_full_pages, ov_image_index) == ov_delta.page_id:
+                    set ov_prior_image = true
+                set ov_image_index = ov_image_index + 1
+            let _ab3_image: Boolean = pb_expect_ok(ov_prior_image, "slot delta has a previous full image in this group commit")?
+            set ov_delta_count = ov_delta_count + 1
+        set ov_cursor = ov_cursor + yaza_db_wal_header_size_v1() + bytes_length(ov_record.payload)
+    let _ab3_delta: Boolean = pb_expect_ok(ov_cursor == sess.wal.next_lsn and ov_delta_count > 0, "overlay group commit emitted compact slot deltas")?
 
     let _mc2: Boolean = yaza_db_session_close_v1(sess)?
     let main_root2: Number = root_open(base_root + "/main")?

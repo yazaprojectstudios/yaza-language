@@ -1,8 +1,11 @@
-# Bounded session-local SQL SELECT bound-plan cache for single-table queries.
+# Bounded session-local SQL SELECT and DML write bound-plan cache.
 # Validated against storage.header.catalog_root, table_root_page_id, and
 # table_schema_version so DDL invalidates stale plans automatically while DML
-# continues using current MVCC visibility timestamps.
+# and SELECT continue evaluating bind values, constraints, MVCC visibility, and
+# storage/WAL budgets fresh on every execution.
 use "./sql_binder_v1"
+use "./sql_insert_bind_v1"
+use "./sql_update_v1"
 
 shape YazaDbSelectPlanCacheEntryV1:
     source: Text
@@ -14,53 +17,86 @@ shape YazaDbSelectPlanCacheEntryV1:
     key_ordinals: List[Number]
     plan: YazaSqlBoundPlanV1
 
+shape YazaDbWritePlanCacheEntryV1:
+    stmt_kind: Number
+    source: Text
+    catalog_root: Number
+    table_id: Number
+    table_index: Number
+    table_root_page_id: Number
+    table_schema_version: Number
+    key_ordinals: List[Number]
+    insert_plan: Option[YazaSqlBoundInsertPlanV1]
+    update_ast: Option[YazaSqlUpdateAstV1]
+    update_stmt_params: List[YazaSqlBoundParameterV1]
+    update_pred_source_text: Text
+    update_pred_pos_ordinals: List[Number]
+    pred_select_entry: Option[YazaDbSelectPlanCacheEntryV1]
+
 shape YazaDbSelectPlanCacheV1:
     capacity: Number
     entries: List[YazaDbSelectPlanCacheEntryV1]
     hits: Number
     misses: Number
     invalidations: Number
+    write_entries: List[YazaDbWritePlanCacheEntryV1]
+    write_hits: Number
+    write_misses: Number
 
 shape YazaDbSelectPlanLookupV1:
     hit: Boolean
     entry: Option[YazaDbSelectPlanCacheEntryV1]
     cache: YazaDbSelectPlanCacheV1
 
+shape YazaDbWritePlanLookupV1:
+    hit: Boolean
+    entry: Option[YazaDbWritePlanCacheEntryV1]
+    cache: YazaDbSelectPlanCacheV1
+
 fn yaza_db_select_plan_cache_default_capacity_v1() -> Number:
     return 64
+
+fn yaza_db_select_plan_cache_empty_v1() -> YazaDbSelectPlanCacheV1:
+    return YazaDbSelectPlanCacheV1(0, List[YazaDbSelectPlanCacheEntryV1](), 0, 0, 0, List[YazaDbWritePlanCacheEntryV1](), 0, 0)
 
 fn yaza_db_select_plan_cache_new_v1(capacity: Number) -> Result[YazaDbSelectPlanCacheV1, Text]:
     var cap: Number = capacity
     if cap < 1: set cap = 64
     if cap > 256: set cap = 256
     let entries_res: Result[List[YazaDbSelectPlanCacheEntryV1], Text] = list_try_new()
-    if not result_is_ok(entries_res):
-        return err("YDBv1 SELECT plan cache allocation failed")
+    let write_res: Result[List[YazaDbWritePlanCacheEntryV1], Text] = list_try_new()
+    if not result_is_ok(entries_res) or not result_is_ok(write_res):
+        return err("YDBv1 plan cache allocation failed")
     let entries: List[YazaDbSelectPlanCacheEntryV1] = result_unwrap(entries_res)
+    let write_entries: List[YazaDbWritePlanCacheEntryV1] = result_unwrap(write_res)
     let _r: Boolean = list_try_reserve(entries, cap)
-    return ok(YazaDbSelectPlanCacheV1(cap, entries, 0, 0, 0))
+    let _rw: Boolean = list_try_reserve(write_entries, cap)
+    return ok(YazaDbSelectPlanCacheV1(cap, entries, 0, 0, 0, write_entries, 0, 0))
 
 fn yaza_db_select_plan_cache_invalidate_v1(cache: YazaDbSelectPlanCacheV1) -> YazaDbSelectPlanCacheV1:
     let empty_res: Result[List[YazaDbSelectPlanCacheEntryV1], Text] = list_try_new()
-    if not result_is_ok(empty_res):
-        return YazaDbSelectPlanCacheV1(cache.capacity, cache.entries, cache.hits, cache.misses, cache.invalidations + 1)
+    let empty_w_res: Result[List[YazaDbWritePlanCacheEntryV1], Text] = list_try_new()
+    if not result_is_ok(empty_res) or not result_is_ok(empty_w_res):
+        return YazaDbSelectPlanCacheV1(cache.capacity, cache.entries, cache.hits, cache.misses, cache.invalidations + 1, cache.write_entries, cache.write_hits, cache.write_misses)
     let entries: List[YazaDbSelectPlanCacheEntryV1] = result_unwrap(empty_res)
+    let write_entries: List[YazaDbWritePlanCacheEntryV1] = result_unwrap(empty_w_res)
     let _r: Boolean = list_try_reserve(entries, cache.capacity)
-    return YazaDbSelectPlanCacheV1(cache.capacity, entries, cache.hits, cache.misses, cache.invalidations + 1)
+    let _rw: Boolean = list_try_reserve(write_entries, cache.capacity)
+    return YazaDbSelectPlanCacheV1(cache.capacity, entries, cache.hits, cache.misses, cache.invalidations + 1, write_entries, cache.write_hits, cache.write_misses)
 
 fn yaza_db_select_plan_cache_lookup_v1(cache: YazaDbSelectPlanCacheV1, source: Text, catalog_root: Number) -> YazaDbSelectPlanLookupV1:
     var i: Number = 0
     while i < list_count(cache.entries):
         let entry: YazaDbSelectPlanCacheEntryV1 = list_get(cache.entries, i)
         if entry.source == source and entry.catalog_root == catalog_root:
-            let next_cache: YazaDbSelectPlanCacheV1 = YazaDbSelectPlanCacheV1(cache.capacity, cache.entries, cache.hits + 1, cache.misses, cache.invalidations)
+            let next_cache: YazaDbSelectPlanCacheV1 = YazaDbSelectPlanCacheV1(cache.capacity, cache.entries, cache.hits + 1, cache.misses, cache.invalidations, cache.write_entries, cache.write_hits, cache.write_misses)
             return YazaDbSelectPlanLookupV1(true, some(entry), next_cache)
         set i = i + 1
-    let miss_cache: YazaDbSelectPlanCacheV1 = YazaDbSelectPlanCacheV1(cache.capacity, cache.entries, cache.hits, cache.misses + 1, cache.invalidations)
+    let miss_cache: YazaDbSelectPlanCacheV1 = YazaDbSelectPlanCacheV1(cache.capacity, cache.entries, cache.hits, cache.misses + 1, cache.invalidations, cache.write_entries, cache.write_hits, cache.write_misses)
     return YazaDbSelectPlanLookupV1(false, none, miss_cache)
 
 fn yaza_db_select_plan_cache_record_invalidation_v1(cache: YazaDbSelectPlanCacheV1) -> YazaDbSelectPlanCacheV1:
-    return YazaDbSelectPlanCacheV1(cache.capacity, cache.entries, cache.hits, cache.misses, cache.invalidations + 1)
+    return YazaDbSelectPlanCacheV1(cache.capacity, cache.entries, cache.hits, cache.misses, cache.invalidations + 1, cache.write_entries, cache.write_hits, cache.write_misses)
 
 fn yaza_db_select_plan_cache_put_v1(cache: YazaDbSelectPlanCacheV1, entry: YazaDbSelectPlanCacheEntryV1) -> YazaDbSelectPlanCacheV1:
     let next_res: Result[List[YazaDbSelectPlanCacheEntryV1], Text] = list_try_new()
@@ -85,4 +121,58 @@ fn yaza_db_select_plan_cache_put_v1(cache: YazaDbSelectPlanCacheV1, entry: YazaD
         elif list_count(next_entries) > 0:
             let slot: Number = (cache.hits + cache.misses) % list_count(next_entries)
             let _ok: Boolean = list_try_set(next_entries, slot, entry)
-    return YazaDbSelectPlanCacheV1(cache.capacity, next_entries, cache.hits, cache.misses, cache.invalidations)
+    return YazaDbSelectPlanCacheV1(cache.capacity, next_entries, cache.hits, cache.misses, cache.invalidations, cache.write_entries, cache.write_hits, cache.write_misses)
+
+fn yaza_db_write_plan_cache_lookup_v1(cache: YazaDbSelectPlanCacheV1, source: Text, catalog_root: Number) -> YazaDbWritePlanLookupV1:
+    var i: Number = 0
+    while i < list_count(cache.write_entries):
+        let entry: YazaDbWritePlanCacheEntryV1 = list_get(cache.write_entries, i)
+        if entry.source == source and entry.catalog_root == catalog_root:
+            let next_cache: YazaDbSelectPlanCacheV1 = YazaDbSelectPlanCacheV1(cache.capacity, cache.entries, cache.hits, cache.misses, cache.invalidations, cache.write_entries, cache.write_hits + 1, cache.write_misses)
+            return YazaDbWritePlanLookupV1(true, some(entry), next_cache)
+        set i = i + 1
+    let miss_cache: YazaDbSelectPlanCacheV1 = YazaDbSelectPlanCacheV1(cache.capacity, cache.entries, cache.hits, cache.misses, cache.invalidations, cache.write_entries, cache.write_hits, cache.write_misses + 1)
+    return YazaDbWritePlanLookupV1(false, none, miss_cache)
+
+fn yaza_db_write_plan_cache_peek_v1(cache: YazaDbSelectPlanCacheV1, source: Text, catalog_root: Number) -> Option[YazaDbWritePlanCacheEntryV1]:
+    var i: Number = 0
+    while i < list_count(cache.write_entries):
+        let entry: YazaDbWritePlanCacheEntryV1 = list_get(cache.write_entries, i)
+        if entry.source == source and entry.catalog_root == catalog_root:
+            return some(entry)
+        set i = i + 1
+    return none
+
+fn yaza_db_write_plan_cache_put_v1(cache: YazaDbSelectPlanCacheV1, entry: YazaDbWritePlanCacheEntryV1) -> YazaDbSelectPlanCacheV1:
+    let next_res: Result[List[YazaDbWritePlanCacheEntryV1], Text] = list_try_new()
+    if not result_is_ok(next_res):
+        return cache
+    let next_entries: List[YazaDbWritePlanCacheEntryV1] = result_unwrap(next_res)
+    let old_count: Number = list_count(cache.write_entries)
+    let _r: Boolean = list_try_reserve(next_entries, cache.capacity)
+    var replaced: Boolean = false
+    var i: Number = 0
+    while i < old_count:
+        let existing: YazaDbWritePlanCacheEntryV1 = list_get(cache.write_entries, i)
+        if existing.source == entry.source:
+            let _ok: Boolean = list_try_push(next_entries, entry)
+            set replaced = true
+        else:
+            let _ok: Boolean = list_try_push(next_entries, existing)
+        set i = i + 1
+    if not replaced:
+        if list_count(next_entries) < cache.capacity:
+            let _ok: Boolean = list_try_push(next_entries, entry)
+        elif list_count(next_entries) > 0:
+            let slot: Number = (cache.write_hits + cache.write_misses) % list_count(next_entries)
+            let _ok: Boolean = list_try_set(next_entries, slot, entry)
+    return YazaDbSelectPlanCacheV1(cache.capacity, cache.entries, cache.hits, cache.misses, cache.invalidations, next_entries, cache.write_hits, cache.write_misses)
+
+fn yaza_db_write_plan_entry_insert_v1(source: Text, catalog_root: Number, table_id: Number, table_index: Number, table_root_page_id: Number, table_schema_version: Number, key_ordinals: List[Number], plan: YazaSqlBoundInsertPlanV1) -> YazaDbWritePlanCacheEntryV1:
+    return YazaDbWritePlanCacheEntryV1(1, source, catalog_root, table_id, table_index, table_root_page_id, table_schema_version, key_ordinals, some(plan), none, List[YazaSqlBoundParameterV1](), "", List[Number](), none)
+
+fn yaza_db_write_plan_entry_update_v1(source: Text, catalog_root: Number, table_id: Number, table_index: Number, table_root_page_id: Number, table_schema_version: Number, key_ordinals: List[Number], update_ast: YazaSqlUpdateAstV1, stmt_params: List[YazaSqlBoundParameterV1], pred_source: Text, pred_pos_ordinals: List[Number], pred_select_entry: YazaDbSelectPlanCacheEntryV1) -> YazaDbWritePlanCacheEntryV1:
+    return YazaDbWritePlanCacheEntryV1(2, source, catalog_root, table_id, table_index, table_root_page_id, table_schema_version, key_ordinals, none, some(update_ast), stmt_params, pred_source, pred_pos_ordinals, some(pred_select_entry))
+
+fn yaza_db_write_plan_entry_delete_v1(source: Text, catalog_root: Number, table_id: Number, table_index: Number, table_root_page_id: Number, table_schema_version: Number, key_ordinals: List[Number], pred_select_entry: YazaDbSelectPlanCacheEntryV1) -> YazaDbWritePlanCacheEntryV1:
+    return YazaDbWritePlanCacheEntryV1(3, source, catalog_root, table_id, table_index, table_root_page_id, table_schema_version, key_ordinals, none, none, List[YazaSqlBoundParameterV1](), pred_select_entry.source, List[Number](), some(pred_select_entry))

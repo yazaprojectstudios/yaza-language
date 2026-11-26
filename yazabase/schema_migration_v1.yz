@@ -1,0 +1,440 @@
+# Tier 3.2: Declarative Schema Diff, Safety Classification & Atomic CRC32C Migration Journal
+# Parses desired JSON schema manifests, introspects live .yzdb catalog + index catalog,
+# classifies operations (SAFE_ONLINE | REQUIRES_BACKFILL | DESTRUCTIVE_BLOCKED),
+# and executes/resumes steps atomically via a CRC32C-verified crash-safe journal.
+
+use "std/fs"
+use "std/time"
+use "./catalog_snapshot_v1"
+use "./index_catalog_v1"
+use "./jsonb_v1"
+use "./page_crypto_v1"
+use "./page_v1"
+use "./session_v1"
+use "./sql_binder_v1"
+use "./sql_executor_v1"
+
+shape YazaDbSchemaColSpecV1:
+    name: Text
+    type_name: Text
+    type_id: Number
+    nullable: Boolean
+    default_expr: Text
+    primary_key: Boolean
+
+shape YazaDbSchemaIndexSpecV1:
+    name: Text
+    column_name: Text
+
+shape YazaDbSchemaTableSpecV1:
+    name: Text
+    columns: List[YazaDbSchemaColSpecV1]
+    indexes: List[YazaDbSchemaIndexSpecV1]
+
+shape YazaDbSchemaManifestV1:
+    version: Number
+    tables: List[YazaDbSchemaTableSpecV1]
+
+shape YazaDbMigrationStepV1:
+    step_idx: Number
+    op_kind: Text # CREATE_TABLE | ADD_COLUMN | CREATE_INDEX | DROP_COLUMN | DROP_TABLE | ALTER_TYPE
+    table_name: Text
+    target_name: Text
+    safety_class: Text # SAFE_ONLINE | REQUIRES_BACKFILL | DESTRUCTIVE_BLOCKED
+    sql_stmt: Text
+    status: Text # PENDING | IN_PROGRESS | APPLIED
+
+shape YazaDbMigrationPlanV1:
+    plan_id: Text
+    target_version: Number
+    has_blocked: Boolean
+    requires_backfill_count: Number
+    steps: List[YazaDbMigrationStepV1]
+
+shape YazaDbMigrationReportV1:
+    session: YazaDbSessionV1
+    plan_id: Text
+    total_steps: Number
+    executed_steps: Number
+    skipped_already_applied: Number
+    completed: Boolean
+
+fn yaza_db_mig_err_text_v1(msg: Text) -> Text:
+    return "" + msg
+
+fn yaza_db_mig_type_id_from_name_v1(tname: Text) -> Result[Number, Text]:
+    if tname == "BOOLEAN" or tname == "BOOL": return ok(1)
+    if tname == "SMALLINT": return ok(2)
+    if tname == "INTEGER" or tname == "INT": return ok(3)
+    if tname == "BIGINT": return ok(4)
+    if tname == "DOUBLE": return ok(6)
+    if tname == "TEXT": return ok(9)
+    if tname == "BLOB" or tname == "BYTES": return ok(16)
+    if tname == "DATE": return ok(11)
+    if tname == "UUID": return ok(12)
+    if tname == "TIME": return ok(13)
+    if tname == "TIMESTAMP": return ok(14)
+    if tname == "TIMESTAMPTZ": return ok(15)
+    return err("YDBv1 migration unsupported SQL column type: " + tname)
+
+fn yaza_db_mig_obj_field_v1(obj: YazaDbJsonbNodeV1, key: Text) -> Option[YazaDbJsonbNodeV1]:
+    let idx: Number = yaza_db_jsonb_find_obj_key_v1(obj, key)
+    if idx < 0:
+        return none
+    return some(list_get(obj.obj_vals, idx))
+
+fn yaza_db_mig_parse_manifest_v1(json_text: Text) -> Result[YazaDbSchemaManifestV1, Text]:
+    let root: YazaDbJsonbNodeV1 = yaza_db_jsonb_parse_json_v1(json_text)?
+    if root.kind != 6:
+        return err(yaza_db_mig_err_text_v1("YDBv1 schema manifest root must be a JSON object"))
+    let ver_opt: Option[YazaDbJsonbNodeV1] = yaza_db_mig_obj_field_v1(root, "version")
+    let tbls_opt: Option[YazaDbJsonbNodeV1] = yaza_db_mig_obj_field_v1(root, "tables")
+    if not option_is_some(ver_opt) or not option_is_some(tbls_opt):
+        return err(yaza_db_mig_err_text_v1("YDBv1 schema manifest requires version and tables fields"))
+    let ver_n: YazaDbJsonbNodeV1 = option_unwrap(ver_opt)
+    let tbls_n: YazaDbJsonbNodeV1 = option_unwrap(tbls_opt)
+    if ver_n.kind != 2 or tbls_n.kind != 5:
+        return err(yaza_db_mig_err_text_v1("YDBv1 schema manifest version must be integer and tables must be array"))
+
+    let tables: List[YazaDbSchemaTableSpecV1] = List[YazaDbSchemaTableSpecV1]()
+    var ti: Number = 0
+    while ti < list_count(tbls_n.arr_items):
+        let tn: YazaDbJsonbNodeV1 = list_get(tbls_n.arr_items, ti)
+        if tn.kind != 6:
+            return err(yaza_db_mig_err_text_v1("YDBv1 table entry in manifest must be an object"))
+        let tname_opt: Option[YazaDbJsonbNodeV1] = yaza_db_mig_obj_field_v1(tn, "name")
+        let cols_opt: Option[YazaDbJsonbNodeV1] = yaza_db_mig_obj_field_v1(tn, "columns")
+        if not option_is_some(tname_opt) or not option_is_some(cols_opt):
+            return err(yaza_db_mig_err_text_v1("YDBv1 manifest table requires name and columns"))
+        let tname: Text = option_unwrap(tname_opt).text_val
+        let cols_arr: YazaDbJsonbNodeV1 = option_unwrap(cols_opt)
+        let cols: List[YazaDbSchemaColSpecV1] = List[YazaDbSchemaColSpecV1]()
+        var ci: Number = 0
+        while ci < list_count(cols_arr.arr_items):
+            let cn: YazaDbJsonbNodeV1 = list_get(cols_arr.arr_items, ci)
+            let cname: Text = option_unwrap(yaza_db_mig_obj_field_v1(cn, "name")).text_val
+            let ctype: Text = option_unwrap(yaza_db_mig_obj_field_v1(cn, "type")).text_val
+            let tid: Number = yaza_db_mig_type_id_from_name_v1(ctype)?
+            var nullable: Boolean = true
+            let null_opt: Option[YazaDbJsonbNodeV1] = yaza_db_mig_obj_field_v1(cn, "nullable")
+            if option_is_some(null_opt):
+                set nullable = option_unwrap(null_opt).bool_val
+            var def_expr: Text = ""
+            let def_opt: Option[YazaDbJsonbNodeV1] = yaza_db_mig_obj_field_v1(cn, "default")
+            if option_is_some(def_opt):
+                set def_expr = option_unwrap(def_opt).text_val
+            var is_pk: Boolean = false
+            let pk_opt: Option[YazaDbJsonbNodeV1] = yaza_db_mig_obj_field_v1(cn, "primary_key")
+            if option_is_some(pk_opt):
+                set is_pk = option_unwrap(pk_opt).bool_val
+            let _pc: Boolean = list_try_push(cols, YazaDbSchemaColSpecV1(cname, ctype, tid, nullable, def_expr, is_pk))
+            set ci = ci + 1
+
+        let idxs: List[YazaDbSchemaIndexSpecV1] = List[YazaDbSchemaIndexSpecV1]()
+        let idxs_opt: Option[YazaDbJsonbNodeV1] = yaza_db_mig_obj_field_v1(tn, "indexes")
+        if option_is_some(idxs_opt):
+            let idx_arr: YazaDbJsonbNodeV1 = option_unwrap(idxs_opt)
+            var ii: Number = 0
+            while ii < list_count(idx_arr.arr_items):
+                let ixn: YazaDbJsonbNodeV1 = list_get(idx_arr.arr_items, ii)
+                let ix_name: Text = option_unwrap(yaza_db_mig_obj_field_v1(ixn, "name")).text_val
+                let ix_col: Text = option_unwrap(yaza_db_mig_obj_field_v1(ixn, "column")).text_val
+                let _pix: Boolean = list_try_push(idxs, YazaDbSchemaIndexSpecV1(ix_name, ix_col))
+                set ii = ii + 1
+        let _pt: Boolean = list_try_push(tables, YazaDbSchemaTableSpecV1(tname, cols, idxs))
+        set ti = ti + 1
+    return ok(YazaDbSchemaManifestV1(ver_n.int_val, tables))
+
+fn yaza_db_mig_find_live_table_v1(tables: List[YazaSqlTableSchemaV1], name: Text) -> Number:
+    var i: Number = 0
+    while i < list_count(tables):
+        if list_get(tables, i).name == name:
+            return i
+        set i = i + 1
+    return -1
+
+fn yaza_db_mig_find_live_col_v1(cols: List[YazaSqlColumnSchemaV1], name: Text) -> Number:
+    var i: Number = 0
+    while i < list_count(cols):
+        if list_get(cols, i).name == name:
+            return i
+        set i = i + 1
+    return -1
+
+fn yaza_db_mig_find_spec_table_v1(tables: List[YazaDbSchemaTableSpecV1], name: Text) -> Number:
+    var i: Number = 0
+    while i < list_count(tables):
+        if list_get(tables, i).name == name:
+            return i
+        set i = i + 1
+    return -1
+
+fn yaza_db_mig_find_spec_col_v1(cols: List[YazaDbSchemaColSpecV1], name: Text) -> Number:
+    var i: Number = 0
+    while i < list_count(cols):
+        if list_get(cols, i).name == name:
+            return i
+        set i = i + 1
+    return -1
+
+fn yaza_db_mig_has_index_name_v1(idx_rows: List[YazaDbRowV1], idx_name: Text) -> Boolean:
+    var i: Number = 0
+    while i < list_count(idx_rows):
+        let row: YazaDbRowV1 = list_get(idx_rows, i)
+        if list_count(row.values) > 2:
+            let nval: Text = list_get(row.values, 2).text_value
+            if nval == idx_name:
+                return true
+        set i = i + 1
+    return false
+
+fn yaza_db_mig_build_create_table_sql_v1(spec: YazaDbSchemaTableSpecV1) -> Text:
+    let parts: TextList = text_list()
+    list_push(parts, "CREATE TABLE ")
+    list_push(parts, spec.name)
+    list_push(parts, " (")
+    var i: Number = 0
+    while i < list_count(spec.columns):
+        if i > 0: list_push(parts, ", ")
+        let col: YazaDbSchemaColSpecV1 = list_get(spec.columns, i)
+        list_push(parts, col.name)
+        list_push(parts, " ")
+        list_push(parts, col.type_name)
+        if col.primary_key:
+            list_push(parts, " PRIMARY KEY")
+        elif not col.nullable:
+            list_push(parts, " NOT NULL")
+        if col.default_expr != "":
+            list_push(parts, " DEFAULT ")
+            list_push(parts, col.default_expr)
+        set i = i + 1
+    list_push(parts, ")")
+    return text_join(parts, "")
+
+fn yaza_db_mig_plan_diff_v1(session: YazaDbSessionV1, plan_id: Text, manifest_json: Text) -> Result[YazaDbMigrationPlanV1, Text]:
+    if not session.is_open or plan_id == "":
+        return err(yaza_db_mig_err_text_v1("YDBv1 migration planner requires an open session and plan_id"))
+    let manifest: YazaDbSchemaManifestV1 = yaza_db_mig_parse_manifest_v1(manifest_json)?
+    let snap: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_catalog_snapshot_load_with_roots_v1(session.storage.file, session.storage.header)?
+    let live_tables: List[YazaSqlTableSchemaV1] = snap.sql_snapshot.tables
+    var vis_ts: Number = session.storage.header.next_commit_ts - 1
+    if vis_ts < 1: set vis_ts = 1
+    let live_indexes: List[YazaDbRowV1] = yaza_db_index_catalog_rows_v1(session.storage.file, session.storage.header, vis_ts)?
+
+    let steps: List[YazaDbMigrationStepV1] = List[YazaDbMigrationStepV1]()
+    var has_blocked: Boolean = false
+    var backfill_cnt: Number = 0
+    var step_idx: Number = 0
+
+    # Forward diffs: CREATE TABLE, ADD COLUMN, ALTER TYPE, DROP COLUMN, CREATE INDEX
+    var ti: Number = 0
+    while ti < list_count(manifest.tables):
+        let spec_tbl: YazaDbSchemaTableSpecV1 = list_get(manifest.tables, ti)
+        let lidx: Number = yaza_db_mig_find_live_table_v1(live_tables, spec_tbl.name)
+        if lidx < 0:
+            let sql_ct: Text = yaza_db_mig_build_create_table_sql_v1(spec_tbl)
+            let _ps: Boolean = list_try_push(steps, YazaDbMigrationStepV1(step_idx, "CREATE_TABLE", spec_tbl.name, spec_tbl.name, "SAFE_ONLINE", sql_ct, "PENDING"))
+            set step_idx = step_idx + 1
+            var ii: Number = 0
+            while ii < list_count(spec_tbl.indexes):
+                let ix: YazaDbSchemaIndexSpecV1 = list_get(spec_tbl.indexes, ii)
+                let sql_ix: Text = "CREATE INDEX " + ix.name + " ON " + spec_tbl.name + " (" + ix.column_name + ")"
+                let _pix: Boolean = list_try_push(steps, YazaDbMigrationStepV1(step_idx, "CREATE_INDEX", spec_tbl.name, ix.name, "SAFE_ONLINE", sql_ix, "PENDING"))
+                set step_idx = step_idx + 1
+                set ii = ii + 1
+        else:
+            let live_tbl: YazaSqlTableSchemaV1 = list_get(live_tables, lidx)
+            var ci: Number = 0
+            while ci < list_count(spec_tbl.columns):
+                let sc: YazaDbSchemaColSpecV1 = list_get(spec_tbl.columns, ci)
+                let lc_idx: Number = yaza_db_mig_find_live_col_v1(live_tbl.columns, sc.name)
+                if lc_idx < 0:
+                    var safety: Text = "SAFE_ONLINE"
+                    var col_sql: Text = "ALTER TABLE " + spec_tbl.name + " ADD COLUMN " + sc.name + " " + sc.type_name
+                    if not sc.nullable and sc.default_expr == "":
+                        set safety = "REQUIRES_BACKFILL"
+                        set backfill_cnt = backfill_cnt + 1
+                    else:
+                        if not sc.nullable:
+                            set col_sql = col_sql + " NOT NULL"
+                        if sc.default_expr != "":
+                            set col_sql = col_sql + " DEFAULT " + sc.default_expr
+                    let _pa: Boolean = list_try_push(steps, YazaDbMigrationStepV1(step_idx, "ADD_COLUMN", spec_tbl.name, sc.name, safety, col_sql, "PENDING"))
+                    set step_idx = step_idx + 1
+                else:
+                    let lc: YazaSqlColumnSchemaV1 = list_get(live_tbl.columns, lc_idx)
+                    if lc.type_id != sc.type_id:
+                        var t_safety: Text = "DESTRUCTIVE_BLOCKED"
+                        if (lc.type_id == 2 and (sc.type_id == 3 or sc.type_id == 4)) or (lc.type_id == 3 and sc.type_id == 4):
+                            set t_safety = "REQUIRES_BACKFILL"
+                            set backfill_cnt = backfill_cnt + 1
+                        else:
+                            set has_blocked = true
+                        let _pt: Boolean = list_try_push(steps, YazaDbMigrationStepV1(step_idx, "ALTER_TYPE", spec_tbl.name, sc.name, t_safety, "", "PENDING"))
+                        set step_idx = step_idx + 1
+                set ci = ci + 1
+
+            # Check removed columns
+            var lci: Number = 0
+            while lci < list_count(live_tbl.columns):
+                let lcol: YazaSqlColumnSchemaV1 = list_get(live_tbl.columns, lci)
+                if yaza_db_mig_find_spec_col_v1(spec_tbl.columns, lcol.name) < 0:
+                    set has_blocked = true
+                    let _pd: Boolean = list_try_push(steps, YazaDbMigrationStepV1(step_idx, "DROP_COLUMN", spec_tbl.name, lcol.name, "DESTRUCTIVE_BLOCKED", "", "PENDING"))
+                    set step_idx = step_idx + 1
+                set lci = lci + 1
+
+            # Check indexes
+            var ii: Number = 0
+            while ii < list_count(spec_tbl.indexes):
+                let ix: YazaDbSchemaIndexSpecV1 = list_get(spec_tbl.indexes, ii)
+                if not yaza_db_mig_has_index_name_v1(live_indexes, ix.name):
+                    let sql_ix: Text = "CREATE INDEX " + ix.name + " ON " + spec_tbl.name + " (" + ix.column_name + ")"
+                    let _pix: Boolean = list_try_push(steps, YazaDbMigrationStepV1(step_idx, "CREATE_INDEX", spec_tbl.name, ix.name, "SAFE_ONLINE", sql_ix, "PENDING"))
+                    set step_idx = step_idx + 1
+                set ii = ii + 1
+        set ti = ti + 1
+
+    # Check dropped user tables (ignore internal _ydb_ and sys_ catalog tables)
+    var li: Number = 0
+    while li < list_count(live_tables):
+        let lt: YazaSqlTableSchemaV1 = list_get(live_tables, li)
+        if not text_starts_with(lt.name, "_ydb_") and not text_starts_with(lt.name, "sys_") and yaza_db_mig_find_spec_table_v1(manifest.tables, lt.name) < 0:
+            set has_blocked = true
+            let _pdt: Boolean = list_try_push(steps, YazaDbMigrationStepV1(step_idx, "DROP_TABLE", lt.name, lt.name, "DESTRUCTIVE_BLOCKED", "DROP TABLE " + lt.name, "PENDING"))
+            set step_idx = step_idx + 1
+        set li = li + 1
+
+    return ok(YazaDbMigrationPlanV1(plan_id, manifest.version, has_blocked, backfill_cnt, steps))
+
+fn yaza_db_mig_journal_file_v1() -> Text:
+    return "schema-migration.journal"
+
+fn yaza_db_mig_serialize_journal_v1(plan_id: Text, target_ver: Number, steps: List[YazaDbMigrationStepV1]) -> Text:
+    let parts: TextList = text_list()
+    list_push(parts, plan_id)
+    list_push(parts, "|")
+    list_push(parts, number_text(target_ver))
+    list_push(parts, "|")
+    list_push(parts, number_text(list_count(steps)))
+    list_push(parts, "\n")
+    var i: Number = 0
+    while i < list_count(steps):
+        let st: YazaDbMigrationStepV1 = list_get(steps, i)
+        list_push(parts, number_text(st.step_idx))
+        list_push(parts, "|")
+        list_push(parts, st.op_kind)
+        list_push(parts, "|")
+        list_push(parts, st.table_name)
+        list_push(parts, "|")
+        list_push(parts, st.target_name)
+        list_push(parts, "|")
+        list_push(parts, st.safety_class)
+        list_push(parts, "|")
+        list_push(parts, st.status)
+        list_push(parts, "|")
+        list_push(parts, st.sql_stmt)
+        list_push(parts, "\n")
+        set i = i + 1
+    let body: Text = text_join(parts, "")
+    let crc: Number = bytes_ydbv1_checksum(bytes_from_text(body))
+    return "YDM1|" + number_text(crc) + "\n" + body
+
+fn yaza_db_mig_write_journal_v1(root: Number, plan: YazaDbMigrationPlanV1) -> Result[Boolean, Text]:
+    let txt: Text = yaza_db_mig_serialize_journal_v1(plan.plan_id, plan.target_version, plan.steps)
+    return yaza_db_crypto_write_atomic_file_v1(root, yaza_db_mig_journal_file_v1(), bytes_from_text(txt))
+
+fn yaza_db_mig_read_journal_v1(root: Number) -> Result[Option[YazaDbMigrationPlanV1], Text]:
+    let jname: Text = yaza_db_mig_journal_file_v1()
+    let fd_res: Result[Number, Text] = open_read(root, jname)
+    if not result_is_ok(fd_res):
+        return ok(none)
+    let fd: Number = result_unwrap(fd_res)
+    let sz: Number = file_size(fd)?
+    let raw: Bytes = read_exact(fd, 0, sz)?
+    let _c: Boolean = close(fd)?
+    let txt: Text = bytes_to_text(raw)
+    let first_nl: Number = text_find(txt, "\n")
+    if first_nl < 0:
+        return err(yaza_db_mig_err_text_v1("YDBv1 migration journal header truncated"))
+    let hdr_line: Text = text_slice(txt, 0, first_nl)
+    let hparts: TextList = text_split(hdr_line, "|")
+    if list_count(hparts) != 2 or list_get(hparts, 0) != "YDM1":
+        return err(yaza_db_mig_err_text_v1("YDBv1 migration journal magic invalid"))
+    let expected_crc: Number = number_parse(list_get(hparts, 1))
+    let body: Text = text_slice(txt, first_nl + 1, text_length(txt) - first_nl - 1)
+    if bytes_ydbv1_checksum(bytes_from_text(body)) != expected_crc:
+        return err(yaza_db_mig_err_text_v1("YDBv1 migration journal CRC32C checksum mismatch (corrupted)"))
+
+    let lines: TextList = text_lines(body)
+    if list_count(lines) < 1:
+        return err(yaza_db_mig_err_text_v1("YDBv1 migration journal metadata missing"))
+    let mparts: TextList = text_split(list_get(lines, 0), "|")
+    if list_count(mparts) != 3:
+        return err(yaza_db_mig_err_text_v1("YDBv1 migration journal plan metadata malformed"))
+    let plan_id: Text = list_get(mparts, 0)
+    let target_ver: Number = number_parse(list_get(mparts, 1))
+    let steps: List[YazaDbMigrationStepV1] = List[YazaDbMigrationStepV1]()
+    var has_blocked: Boolean = false
+    var bf_cnt: Number = 0
+    var li: Number = 1
+    while li < list_count(lines):
+        let ln: Text = list_get(lines, li)
+        if ln != "":
+            let sp: TextList = text_split(ln, "|")
+            if list_count(sp) < 7:
+                return err(yaza_db_mig_err_text_v1("YDBv1 migration journal step line malformed"))
+            let safety: Text = list_get(sp, 4)
+            if safety == "DESTRUCTIVE_BLOCKED": set has_blocked = true
+            if safety == "REQUIRES_BACKFILL": set bf_cnt = bf_cnt + 1
+            let _ps: Boolean = list_try_push(steps, YazaDbMigrationStepV1(number_parse(list_get(sp, 0)), list_get(sp, 1), list_get(sp, 2), list_get(sp, 3), safety, list_get(sp, 6), list_get(sp, 5)))
+        set li = li + 1
+    return ok(some(YazaDbMigrationPlanV1(plan_id, target_ver, has_blocked, bf_cnt, steps)))
+
+fn yaza_db_mig_apply_plan_v1(session: YazaDbSessionV1, plan: YazaDbMigrationPlanV1, allow_destructive: Boolean, crash_after_step_idx: Number) -> Result[YazaDbMigrationReportV1, Text]:
+    if not session.is_open:
+        return err(yaza_db_mig_err_text_v1("YDBv1 migration apply requires an open session"))
+    if plan.has_blocked and not allow_destructive:
+        return err(yaza_db_mig_err_text_v1("YDBv1 migration plan contains DESTRUCTIVE_BLOCKED operations (set allow_destructive=true to override)"))
+
+    var src_plan: YazaDbMigrationPlanV1 = plan
+    let existing_opt: Option[YazaDbMigrationPlanV1] = yaza_db_mig_read_journal_v1(session.root)?
+    if option_is_some(existing_opt):
+        let ex: YazaDbMigrationPlanV1 = option_unwrap(existing_opt)
+        if ex.plan_id == plan.plan_id:
+            set src_plan = ex
+
+    let steps_copy: List[YazaDbMigrationStepV1] = List[YazaDbMigrationStepV1]()
+    var si: Number = 0
+    while si < list_count(src_plan.steps):
+        let os: YazaDbMigrationStepV1 = list_get(src_plan.steps, si)
+        let _psc: Boolean = list_try_push(steps_copy, YazaDbMigrationStepV1(os.step_idx, "" + os.op_kind, "" + os.table_name, "" + os.target_name, "" + os.safety_class, "" + os.sql_stmt, "" + os.status))
+        set si = si + 1
+    let active_plan: YazaDbMigrationPlanV1 = YazaDbMigrationPlanV1("" + src_plan.plan_id, src_plan.target_version, src_plan.has_blocked, src_plan.requires_backfill_count, steps_copy)
+
+    let _wj0: Boolean = yaza_db_mig_write_journal_v1(session.root, active_plan)?
+    var cur: YazaDbSessionV1 = session
+    var executed: Number = 0
+    var skipped: Number = 0
+    var i: Number = 0
+    while i < list_count(active_plan.steps):
+        let st: YazaDbMigrationStepV1 = list_get(active_plan.steps, i)
+        if st.status == "APPLIED":
+            set skipped = skipped + 1
+            set i = i + 1
+            continue
+        if st.sql_stmt == "":
+            return err(yaza_db_mig_err_text_v1("YDBv1 migration step requires manual backfill or unsupported DDL: " + st.op_kind + " on " + st.table_name + "." + st.target_name))
+        let _s1: Boolean = list_try_set(active_plan.steps, i, YazaDbMigrationStepV1(st.step_idx, st.op_kind, st.table_name, st.target_name, st.safety_class, st.sql_stmt, "IN_PROGRESS"))
+        let _wj1: Boolean = yaza_db_mig_write_journal_v1(cur.root, active_plan)?
+
+        let exec_res: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(cur, st.sql_stmt, List[YazaSqlValueV1]())?
+        set cur = exec_res.session
+        let _s2: Boolean = list_try_set(active_plan.steps, i, YazaDbMigrationStepV1(st.step_idx, st.op_kind, st.table_name, st.target_name, st.safety_class, st.sql_stmt, "APPLIED"))
+        let _wj2: Boolean = yaza_db_mig_write_journal_v1(cur.root, active_plan)?
+        set executed = executed + 1
+        if crash_after_step_idx >= 0 and st.step_idx == crash_after_step_idx:
+            return ok(YazaDbMigrationReportV1(cur, active_plan.plan_id, list_count(active_plan.steps), executed, skipped, false))
+        set i = i + 1
+
+    return ok(YazaDbMigrationReportV1(cur, active_plan.plan_id, list_count(active_plan.steps), executed, skipped, true))

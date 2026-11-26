@@ -1,0 +1,437 @@
+# Transparent Authenticated Page-Level Encryption-at-Rest & Envelope Crypto (Tier 1 #3)
+# Built strictly on YAZA runtime audited primitives: PBKDF2-SHA256, HMAC-SHA256,
+# SHA-256, CSPRNG secure_random_bytes_try, constant-time compare, and zeroize.
+# Uses Encrypt-then-MAC (HMAC-SHA256 CTR + HMAC-SHA256 tag over AAD || ciphertext)
+# authenticated BEFORE decryption or page decoding, with an authenticated sidecar
+# (ydb-crypt-<uuid>.meta) preserving exact 16,384-byte .yzdb page alignment.
+use "std/fs"
+use "./page_v1"
+
+shape YazaDbPageCryptoKeyV1:
+    key_id: Text
+    enc_key: Bytes
+    mac_key: Bytes
+    verifier: Bytes
+    salt: Bytes
+    iterations: Number
+    key_epoch: Number
+    db_uuid: Bytes
+
+shape YazaDbPageCipherMetaV1:
+    key_epoch: Number
+    nonce: Bytes
+    mac: Bytes
+
+shape YazaDbEncryptedPageResultV1:
+    ciphertext: Bytes
+    meta: YazaDbPageCipherMetaV1
+
+shape YazaDbCryptoSidecarHeaderV1:
+    format_version: Number
+    iterations: Number
+    key_epoch: Number
+    db_uuid: Bytes
+    salt: Bytes
+    verifier: Bytes
+
+fn yaza_db_crypto_format_version_v1() -> Number:
+    return 1
+
+fn yaza_db_crypto_header_flag_encrypted_v1() -> Number:
+    return 3
+
+fn yaza_db_crypto_default_pbkdf2_iterations_v1() -> Number:
+    return 100000
+
+fn yaza_db_crypto_min_pbkdf2_iterations_v1() -> Number:
+    return 4096
+
+fn yaza_db_crypto_sidecar_header_size_v1() -> Number:
+    return 128
+
+fn yaza_db_crypto_sidecar_slot_size_v1() -> Number:
+    return 52
+
+fn yaza_db_crypto_xor_byte_v1(a: Number, b: Number) -> Number:
+    var x: Number = a
+    var y: Number = b
+    var bit: Number = 1
+    var out: Number = 0
+    var k: Number = 0
+    while k < 8:
+        if x % 2 != y % 2:
+            set out = out + bit
+        set x = x / 2
+        set y = y / 2
+        set bit = bit * 2
+        set k = k + 1
+    return out
+
+fn yaza_db_crypto_uuid_hex_v1(db_uuid: Bytes) -> Result[Text, Text]:
+    if bytes_length(db_uuid) != 16:
+        return err("YDBv1 crypto requires a 16-byte database UUID")
+    let digits: Text = "0123456789abcdef"
+    let parts: TextList = text_list()
+    var i: Number = 0
+    while i < 16:
+        let b: Number = bytes_get(db_uuid, i)
+        list_push(parts, text_slice(digits, (b / 16) % 16, 1))
+        list_push(parts, text_slice(digits, b % 16, 1))
+        set i = i + 1
+    return ok(text_join(parts, ""))
+
+fn yaza_db_crypto_sidecar_name_v1(db_uuid: Bytes) -> Result[Text, Text]:
+    let hex: Text = yaza_db_crypto_uuid_hex_v1(db_uuid)?
+    return ok("ydb-crypt-" + hex + ".meta")
+
+fn yaza_db_crypto_rekey_commit_name_v1(db_uuid: Bytes) -> Result[Text, Text]:
+    let sidecar: Text = yaza_db_crypto_sidecar_name_v1(db_uuid)?
+    return ok(sidecar + ".rekey.commit")
+
+fn yaza_db_crypto_zeroize_key_v1(key: YazaDbPageCryptoKeyV1) -> Number:
+    let _z1: Number = bytes_zeroize(key.enc_key)
+    let _z2: Number = bytes_zeroize(key.mac_key)
+    let _z3: Number = bytes_zeroize(key.verifier)
+    return 0
+
+fn yaza_db_crypto_derive_subkeys_v1(key_id: Text, master_key: Bytes, salt: Bytes, iterations: Number, key_epoch: Number, db_uuid: Bytes) -> Result[YazaDbPageCryptoKeyV1, Text]:
+    if text_length(key_id) < 1 or text_length(key_id) > 128:
+        return err("YDBv1 crypto key_id must be between 1 and 128 bytes")
+    if bytes_length(master_key) != 32:
+        return err("YDBv1 crypto master key must be exactly 32 bytes")
+    if bytes_length(salt) != 16:
+        return err("YDBv1 crypto salt must be exactly 16 bytes")
+    if bytes_length(db_uuid) != 16:
+        return err("YDBv1 crypto database UUID must be exactly 16 bytes")
+    if key_epoch < 1 or key_epoch > 2147483647:
+        return err("YDBv1 crypto key_epoch must be >= 1")
+    let ctx: Bytes = bytes_try_new_zeroed(24)?
+    if not yaza_db_write_bytes_v1(ctx, 0, db_uuid): return err("YDBv1 crypto context uuid write failed")
+    if not yaza_db_write_uint_le_v1(ctx, 16, yaza_db_crypto_format_version_v1(), 4): return err("YDBv1 crypto context version write failed")
+    if not yaza_db_write_uint_le_v1(ctx, 20, key_epoch, 4): return err("YDBv1 crypto context epoch write failed")
+    let enc_prefix: Bytes = bytes_try_from_text("YDB1-ENC-KEY:")?
+    let mac_prefix: Bytes = bytes_try_from_text("YDB1-MAC-KEY:")?
+    let ver_prefix: Bytes = bytes_try_from_text("YDB1-KEY-VER:")?
+    let enc_label: Bytes = bytes_concat(enc_prefix, ctx)
+    let mac_label: Bytes = bytes_concat(mac_prefix, ctx)
+    let enc_key: Bytes = crypto_hmac_sha256(master_key, enc_label)
+    let mac_key: Bytes = crypto_hmac_sha256(master_key, mac_label)
+    let ver_label: Bytes = bytes_concat(ver_prefix, ctx)
+    let verifier: Bytes = crypto_hmac_sha256(mac_key, ver_label)
+    return ok(YazaDbPageCryptoKeyV1(key_id, enc_key, mac_key, verifier, salt, iterations, key_epoch, db_uuid))
+
+fn yaza_db_crypto_derive_from_passphrase_v1(key_id: Text, passphrase: Text, salt: Bytes, iterations: Number, key_epoch: Number, db_uuid: Bytes) -> Result[YazaDbPageCryptoKeyV1, Text]:
+    if text_length(passphrase) < 1 or text_length(passphrase) > 1024:
+        return err("YDBv1 crypto passphrase must be between 1 and 1024 bytes")
+    if iterations < yaza_db_crypto_min_pbkdf2_iterations_v1() or iterations > 2000000:
+        return err("YDBv1 crypto PBKDF2 iterations must be between 4096 and 2000000")
+    if bytes_length(salt) != 16:
+        return err("YDBv1 crypto PBKDF2 salt must be 16 bytes")
+    let pass_bytes: Bytes = bytes_try_from_text(passphrase)?
+    let master_res: Result[Bytes, Text] = crypto_pbkdf2_sha256(pass_bytes, salt, iterations, 32)
+    let _zp: Number = bytes_zeroize(pass_bytes)
+    if not result_is_ok(master_res):
+        return err("YDBv1 crypto PBKDF2 key derivation failed: " + result_unwrap_error(master_res))
+    let master: Bytes = result_unwrap(master_res)
+    let derived: Result[YazaDbPageCryptoKeyV1, Text] = yaza_db_crypto_derive_subkeys_v1(key_id, master, salt, iterations, key_epoch, db_uuid)
+    let _zm: Number = bytes_zeroize(master)
+    return derived
+
+fn yaza_db_crypto_derive_from_raw_key_v1(key_id: Text, raw_key_32b: Bytes, key_epoch: Number, db_uuid: Bytes) -> Result[YazaDbPageCryptoKeyV1, Text]:
+    if bytes_length(raw_key_32b) != 32:
+        return err("YDBv1 KMS/Keystore raw key must be exactly 32 bytes")
+    let zero_salt: Bytes = bytes_try_new_zeroed(16)?
+    let key_id_bytes: Bytes = bytes_try_from_text(key_id)?
+    let kms_prefix: Bytes = bytes_try_from_text("YDB1-KMS-MASTER:")?
+    let bound_master: Bytes = crypto_hmac_sha256(raw_key_32b, bytes_concat(kms_prefix, key_id_bytes))
+    let derived: Result[YazaDbPageCryptoKeyV1, Text] = yaza_db_crypto_derive_subkeys_v1(key_id, bound_master, zero_salt, 0, key_epoch, db_uuid)
+    let _zm: Number = bytes_zeroize(bound_master)
+    return derived
+
+fn yaza_db_crypto_generate_salt_v1() -> Result[Bytes, Text]:
+    return secure_random_bytes_try(16)
+
+fn yaza_db_crypto_page_aad_v1(db_uuid: Bytes, page_id: Number, key_epoch: Number, nonce: Bytes) -> Result[Bytes, Text]:
+    if bytes_length(db_uuid) != 16 or bytes_length(nonce) != 16:
+        return err("YDBv1 page AAD requires 16-byte db_uuid and 16-byte nonce")
+    let aad: Bytes = bytes_try_new_zeroed(56)?
+    let tag: Bytes = bytes_try_from_text("YDB1-PAG")?
+    if not yaza_db_write_bytes_v1(aad, 0, tag): return err("YDBv1 page AAD tag failed")
+    if not yaza_db_write_uint_le_v1(aad, 8, yaza_db_crypto_format_version_v1(), 4): return err("YDBv1 page AAD ver failed")
+    if not yaza_db_write_bytes_v1(aad, 12, db_uuid): return err("YDBv1 page AAD uuid failed")
+    if not yaza_db_write_uint_le_v1(aad, 28, page_id, 8): return err("YDBv1 page AAD page_id failed")
+    if not yaza_db_write_uint_le_v1(aad, 36, key_epoch, 4): return err("YDBv1 page AAD epoch failed")
+    if not yaza_db_write_bytes_v1(aad, 40, nonce): return err("YDBv1 page AAD nonce failed")
+    return ok(aad)
+
+fn yaza_db_crypto_ctr_transform_v1(enc_key: Bytes, ctr_prefix: Bytes, input: Bytes) -> Result[Bytes, Text]:
+    let n: Number = bytes_length(input)
+    let out: Bytes = bytes_try_new_zeroed(n)?
+    if n == 0:
+        return ok(out)
+    let prefix_len: Number = bytes_length(ctr_prefix)
+    let ctr_buf: Bytes = bytes_try_new_zeroed(prefix_len + 4)?
+    if not yaza_db_write_bytes_v1(ctr_buf, 0, ctr_prefix):
+        return err("YDBv1 CTR prefix copy failed")
+    var offset: Number = 0
+    var block_idx: Number = 0
+    while offset < n:
+        if not yaza_db_write_uint_le_v1(ctr_buf, prefix_len, block_idx, 4):
+            return err("YDBv1 CTR block counter overflow")
+        let ks: Bytes = crypto_hmac_sha256(enc_key, ctr_buf)
+        var j: Number = 0
+        while j < 32 and offset + j < n:
+            let xb: Number = yaza_db_crypto_xor_byte_v1(bytes_get(input, offset + j), bytes_get(ks, j))
+            if not bytes_try_set(out, offset + j, xb):
+                return err("YDBv1 CTR output byte write failed")
+            set j = j + 1
+        set offset = offset + 32
+        set block_idx = block_idx + 1
+    return ok(out)
+
+fn yaza_db_crypto_encrypt_page_v1(key: YazaDbPageCryptoKeyV1, page_id: Number, plaintext: Bytes) -> Result[YazaDbEncryptedPageResultV1, Text]:
+    if page_id < 2:
+        return err("YDBv1 page encryption applies to data pages >= 2")
+    if bytes_length(plaintext) != yaza_db_page_size_v1():
+        return err("YDBv1 encrypted page plaintext must be exactly 16384 bytes")
+    let nonce: Bytes = secure_random_bytes_try(16)?
+    let aad: Bytes = yaza_db_crypto_page_aad_v1(key.db_uuid, page_id, key.key_epoch, nonce)?
+    let ctr_tag: Bytes = bytes_try_from_text("YDB1-CTR")?
+    let ctr_prefix: Bytes = bytes_concat(ctr_tag, aad)
+    let ciphertext: Bytes = yaza_db_crypto_ctr_transform_v1(key.enc_key, ctr_prefix, plaintext)?
+    let mac_input: Bytes = bytes_concat(aad, ciphertext)
+    let mac: Bytes = crypto_hmac_sha256(key.mac_key, mac_input)
+    let meta: YazaDbPageCipherMetaV1 = YazaDbPageCipherMetaV1(key.key_epoch, nonce, mac)
+    return ok(YazaDbEncryptedPageResultV1(ciphertext, meta))
+
+fn yaza_db_crypto_decrypt_page_v1(key: YazaDbPageCryptoKeyV1, page_id: Number, ciphertext: Bytes, meta: YazaDbPageCipherMetaV1) -> Result[Bytes, Text]:
+    if page_id < 2:
+        return err("YDBv1 page decryption applies to data pages >= 2")
+    if bytes_length(ciphertext) != yaza_db_page_size_v1():
+        return err("YDBv1 encrypted page ciphertext must be exactly 16384 bytes")
+    if meta.key_epoch < 1 or meta.key_epoch != key.key_epoch:
+        return err("YDBv1 encrypted page key_epoch does not match active key")
+    if bytes_length(meta.nonce) != 16 or bytes_length(meta.mac) != 32:
+        return err("YDBv1 encrypted page sidecar metadata is malformed")
+    let aad: Bytes = yaza_db_crypto_page_aad_v1(key.db_uuid, page_id, meta.key_epoch, meta.nonce)?
+    let mac_input: Bytes = bytes_concat(aad, ciphertext)
+    let expected_mac: Bytes = crypto_hmac_sha256(key.mac_key, mac_input)
+    if not bytes_equal_constant_time(expected_mac, meta.mac):
+        return err("YDBv1 encrypted page authentication failed (wrong key or tampered ciphertext/sidecar)")
+    let ctr_tag: Bytes = bytes_try_from_text("YDB1-CTR")?
+    let ctr_prefix: Bytes = bytes_concat(ctr_tag, aad)
+    return yaza_db_crypto_ctr_transform_v1(key.enc_key, ctr_prefix, ciphertext)
+
+fn yaza_db_crypto_encode_sidecar_header_v1(key: YazaDbPageCryptoKeyV1) -> Result[Bytes, Text]:
+    let buf: Bytes = bytes_try_new_zeroed(yaza_db_crypto_sidecar_header_size_v1())?
+    let magic: Bytes = bytes_try_from_text("YDC1")?
+    if not yaza_db_write_bytes_v1(buf, 0, magic): return err("YDBv1 sidecar magic write failed")
+    if not yaza_db_write_uint_le_v1(buf, 4, yaza_db_crypto_format_version_v1(), 4): return err("YDBv1 sidecar version write failed")
+    if not yaza_db_write_uint_le_v1(buf, 8, key.iterations, 4): return err("YDBv1 sidecar iterations write failed")
+    if not yaza_db_write_uint_le_v1(buf, 12, key.key_epoch, 4): return err("YDBv1 sidecar epoch write failed")
+    if not yaza_db_write_bytes_v1(buf, 16, key.db_uuid): return err("YDBv1 sidecar uuid write failed")
+    if not yaza_db_write_bytes_v1(buf, 32, key.salt): return err("YDBv1 sidecar salt write failed")
+    if not yaza_db_write_bytes_v1(buf, 48, key.verifier): return err("YDBv1 sidecar verifier write failed")
+    let body: Bytes = bytes_try_slice(buf, 0, 96)?
+    let hdr_mac: Bytes = crypto_hmac_sha256(key.mac_key, body)
+    if not yaza_db_write_bytes_v1(buf, 96, hdr_mac): return err("YDBv1 sidecar header MAC write failed")
+    return ok(buf)
+
+fn yaza_db_crypto_peek_sidecar_header_v1(raw: Bytes) -> Result[YazaDbCryptoSidecarHeaderV1, Text]:
+    if bytes_length(raw) != yaza_db_crypto_sidecar_header_size_v1():
+        return err("YDBv1 sidecar header must be 128 bytes")
+    let magic: Bytes = bytes_try_slice(raw, 0, 4)?
+    let expected_ydc1: Bytes = bytes_try_from_text("YDC1")?
+    if not bytes_equal(magic, expected_ydc1):
+        return err("YDBv1 sidecar header magic is invalid")
+    let ver: Number = yaza_db_read_uint_le_v1(raw, 4, 4)?
+    if ver != yaza_db_crypto_format_version_v1():
+        return err("YDBv1 sidecar format version is unsupported")
+    let iters: Number = yaza_db_read_uint_le_v1(raw, 8, 4)?
+    let epoch: Number = yaza_db_read_uint_le_v1(raw, 12, 4)?
+    if epoch < 1:
+        return err("YDBv1 sidecar key_epoch must be >= 1")
+    let uuid: Bytes = bytes_try_slice(raw, 16, 16)?
+    let salt: Bytes = bytes_try_slice(raw, 32, 16)?
+    let verifier: Bytes = bytes_try_slice(raw, 48, 32)?
+    return ok(YazaDbCryptoSidecarHeaderV1(ver, iters, epoch, uuid, salt, verifier))
+
+fn yaza_db_crypto_verify_sidecar_header_v1(raw: Bytes, key: YazaDbPageCryptoKeyV1) -> Result[YazaDbCryptoSidecarHeaderV1, Text]:
+    let parsed: YazaDbCryptoSidecarHeaderV1 = yaza_db_crypto_peek_sidecar_header_v1(raw)?
+    if not bytes_equal(parsed.db_uuid, key.db_uuid):
+        return err("YDBv1 sidecar database UUID does not match key")
+    if parsed.key_epoch != key.key_epoch:
+        return err("YDBv1 sidecar key_epoch does not match key")
+    let body: Bytes = bytes_try_slice(raw, 0, 96)?
+    let stored_mac: Bytes = bytes_try_slice(raw, 96, 32)?
+    let expected_mac: Bytes = crypto_hmac_sha256(key.mac_key, body)
+    if not bytes_equal_constant_time(expected_mac, stored_mac):
+        return err("YDBv1 sidecar header authentication failed (wrong key or tampered sidecar)")
+    if not bytes_equal_constant_time(parsed.verifier, key.verifier):
+        return err("YDBv1 sidecar key verifier mismatch")
+    return ok(parsed)
+
+fn yaza_db_crypto_sidecar_slot_offset_v1(page_id: Number) -> Result[Number, Text]:
+    if page_id < 2:
+        return err("YDBv1 sidecar slot page_id must be >= 2")
+    return ok(yaza_db_crypto_sidecar_header_size_v1() + (page_id - 2) * yaza_db_crypto_sidecar_slot_size_v1())
+
+fn yaza_db_crypto_encode_slot_v1(meta: YazaDbPageCipherMetaV1) -> Result[Bytes, Text]:
+    if bytes_length(meta.nonce) != 16 or bytes_length(meta.mac) != 32:
+        return err("YDBv1 sidecar slot metadata has invalid lengths")
+    let slot: Bytes = bytes_try_new_zeroed(yaza_db_crypto_sidecar_slot_size_v1())?
+    if not yaza_db_write_uint_le_v1(slot, 0, meta.key_epoch, 4): return err("YDBv1 sidecar slot epoch write failed")
+    if not yaza_db_write_bytes_v1(slot, 4, meta.nonce): return err("YDBv1 sidecar slot nonce write failed")
+    if not yaza_db_write_bytes_v1(slot, 20, meta.mac): return err("YDBv1 sidecar slot mac write failed")
+    return ok(slot)
+
+fn yaza_db_crypto_decode_slot_v1(raw: Bytes) -> Result[YazaDbPageCipherMetaV1, Text]:
+    if bytes_length(raw) != yaza_db_crypto_sidecar_slot_size_v1():
+        return err("YDBv1 sidecar slot must be 52 bytes")
+    let epoch: Number = yaza_db_read_uint_le_v1(raw, 0, 4)?
+    let nonce: Bytes = bytes_try_slice(raw, 4, 16)?
+    let mac: Bytes = bytes_try_slice(raw, 20, 32)?
+    return ok(YazaDbPageCipherMetaV1(epoch, nonce, mac))
+
+fn yaza_db_crypto_rekey_commit_marker_bytes_v1(new_key: YazaDbPageCryptoKeyV1) -> Result[Bytes, Text]:
+    let msg: Bytes = bytes_try_new_zeroed(37)?
+    let tag: Bytes = bytes_try_from_text("YDB1-REKEY-COMMIT")?
+    if not yaza_db_write_bytes_v1(msg, 0, tag): return err("YDBv1 rekey marker tag failed")
+    if not yaza_db_write_bytes_v1(msg, 17, new_key.db_uuid): return err("YDBv1 rekey marker uuid failed")
+    if not yaza_db_write_uint_le_v1(msg, 33, new_key.key_epoch, 4): return err("YDBv1 rekey marker epoch failed")
+    let mac: Bytes = crypto_hmac_sha256(new_key.mac_key, msg)
+    let marker: Bytes = bytes_try_new_zeroed(36)?
+    if not yaza_db_write_uint_le_v1(marker, 0, new_key.key_epoch, 4): return err("YDBv1 rekey marker header failed")
+    if not yaza_db_write_bytes_v1(marker, 4, mac): return err("YDBv1 rekey marker mac failed")
+    return ok(marker)
+
+fn yaza_db_crypto_verify_rekey_commit_marker_v1(marker: Bytes, candidate_key: YazaDbPageCryptoKeyV1) -> Boolean:
+    if bytes_length(marker) != 36:
+        return false
+    let expected_res: Result[Bytes, Text] = yaza_db_crypto_rekey_commit_marker_bytes_v1(candidate_key)
+    if not result_is_ok(expected_res):
+        return false
+    return bytes_equal_constant_time(marker, result_unwrap(expected_res))
+
+# Authenticated Blob & File Envelopes for WAL, Checkpoints, Backups, and Temp Files (YDE1)
+fn yaza_db_crypto_seal_blob_v1(key: YazaDbPageCryptoKeyV1, domain_tag: Text, record_id: Number, plaintext: Bytes) -> Result[Bytes, Text]:
+    let tag_bytes: Bytes = bytes_try_from_text(domain_tag)?
+    let tag_len: Number = bytes_length(tag_bytes)
+    if tag_len < 1 or tag_len > 64:
+        return err("YDBv1 envelope domain_tag must be 1..64 bytes")
+    if record_id < 0:
+        return err("YDBv1 envelope record_id must be non-negative")
+    let nonce: Bytes = secure_random_bytes_try(16)?
+    let plain_len: Number = bytes_length(plaintext)
+    let hdr_len: Number = 64 + tag_len
+    let hdr: Bytes = bytes_try_new_zeroed(hdr_len)?
+    let magic: Bytes = bytes_try_from_text("YDE1")?
+    if not yaza_db_write_bytes_v1(hdr, 0, magic): return err("YDBv1 envelope magic failed")
+    if not yaza_db_write_uint_le_v1(hdr, 4, yaza_db_crypto_format_version_v1(), 4): return err("YDBv1 envelope version failed")
+    if not yaza_db_write_uint_le_v1(hdr, 8, key.key_epoch, 4): return err("YDBv1 envelope epoch failed")
+    if not yaza_db_write_uint_le_v1(hdr, 12, record_id, 8): return err("YDBv1 envelope record_id failed")
+    if not yaza_db_write_bytes_v1(hdr, 20, key.db_uuid): return err("YDBv1 envelope uuid failed")
+    if not yaza_db_write_bytes_v1(hdr, 36, nonce): return err("YDBv1 envelope nonce failed")
+    if not yaza_db_write_uint_le_v1(hdr, 52, plain_len, 8): return err("YDBv1 envelope len failed")
+    if not yaza_db_write_uint_le_v1(hdr, 60, tag_len, 4): return err("YDBv1 envelope tag_len failed")
+    if not yaza_db_write_bytes_v1(hdr, 64, tag_bytes): return err("YDBv1 envelope tag write failed")
+    let env_tag: Bytes = bytes_try_from_text("YDB1-ENV")?
+    let ctr_prefix: Bytes = bytes_concat(env_tag, hdr)
+    let ciphertext: Bytes = yaza_db_crypto_ctr_transform_v1(key.enc_key, ctr_prefix, plaintext)?
+    let body: Bytes = bytes_concat(hdr, ciphertext)
+    let mac: Bytes = crypto_hmac_sha256(key.mac_key, body)
+    return ok(bytes_concat(body, mac))
+
+fn yaza_db_crypto_open_blob_v1(key: YazaDbPageCryptoKeyV1, expected_domain_tag: Text, expected_record_id: Number, sealed: Bytes) -> Result[Bytes, Text]:
+    let total_len: Number = bytes_length(sealed)
+    if total_len < 96:
+        return err("YDBv1 sealed envelope is truncated")
+    let magic: Bytes = bytes_try_slice(sealed, 0, 4)?
+    let expected_yde1: Bytes = bytes_try_from_text("YDE1")?
+    if not bytes_equal(magic, expected_yde1):
+        return err("YDBv1 sealed envelope magic is invalid")
+    let ver: Number = yaza_db_read_uint_le_v1(sealed, 4, 4)?
+    if ver != yaza_db_crypto_format_version_v1():
+        return err("YDBv1 sealed envelope format version is unsupported")
+    let epoch: Number = yaza_db_read_uint_le_v1(sealed, 8, 4)?
+    if epoch != key.key_epoch:
+        return err("YDBv1 sealed envelope key_epoch does not match key")
+    let rec_id: Number = yaza_db_read_uint_le_v1(sealed, 12, 8)?
+    if rec_id != expected_record_id:
+        return err("YDBv1 sealed envelope record_id mismatch")
+    let uuid: Bytes = bytes_try_slice(sealed, 20, 16)?
+    if not bytes_equal(uuid, key.db_uuid):
+        return err("YDBv1 sealed envelope database UUID mismatch")
+    let plain_len: Number = yaza_db_read_uint_le_v1(sealed, 52, 8)?
+    let tag_len: Number = yaza_db_read_uint_le_v1(sealed, 60, 4)?
+    let hdr_len: Number = 64 + tag_len
+    if tag_len < 1 or tag_len > 64 or total_len != hdr_len + plain_len + 32:
+        return err("YDBv1 sealed envelope length is malformed")
+    let got_tag: Bytes = bytes_try_slice(sealed, 64, tag_len)?
+    let exp_tag: Bytes = bytes_try_from_text(expected_domain_tag)?
+    if not bytes_equal(got_tag, exp_tag):
+        return err("YDBv1 sealed envelope domain_tag mismatch")
+    let body: Bytes = bytes_try_slice(sealed, 0, hdr_len + plain_len)?
+    let stored_mac: Bytes = bytes_try_slice(sealed, hdr_len + plain_len, 32)?
+    let expected_mac: Bytes = crypto_hmac_sha256(key.mac_key, body)
+    if not bytes_equal_constant_time(expected_mac, stored_mac):
+        return err("YDBv1 sealed envelope authentication failed (wrong key or tampered data)")
+    let hdr: Bytes = bytes_try_slice(sealed, 0, hdr_len)?
+    let ciphertext: Bytes = bytes_try_slice(sealed, hdr_len, plain_len)?
+    let env_tag: Bytes = bytes_try_from_text("YDB1-ENV")?
+    let ctr_prefix: Bytes = bytes_concat(env_tag, hdr)
+    return yaza_db_crypto_ctr_transform_v1(key.enc_key, ctr_prefix, ciphertext)
+
+fn yaza_db_crypto_write_atomic_file_v1(root: Number, dst_name: Text, data: Bytes) -> Result[Boolean, Text]:
+    let tmp_name: Text = dst_name + ".enc.tmp"
+    let _rm: Result[Boolean, Text] = remove(root, tmp_name)
+    let f: Number = create_exclusive(root, tmp_name)?
+    let w_res: Result[Number, Text] = write_exact(f, 0, data)
+    if not result_is_ok(w_res) or result_unwrap(w_res) != bytes_length(data):
+        let _c: Result[Boolean, Text] = close(f)
+        let _r: Result[Boolean, Text] = remove(root, tmp_name)
+        return err("YDBv1 atomic encrypted file write failed")
+    let s_res: Result[Boolean, Text] = sync(f)
+    let c_res: Result[Boolean, Text] = close(f)
+    if not result_is_ok(s_res) or not result_unwrap(s_res) or not result_is_ok(c_res) or not result_unwrap(c_res):
+        let _r: Result[Boolean, Text] = remove(root, tmp_name)
+        return err("YDBv1 atomic encrypted file sync/close failed")
+    let ren: Result[Boolean, Text] = rename(root, tmp_name, dst_name)
+    if not result_is_ok(ren) or not result_unwrap(ren):
+        let _r: Result[Boolean, Text] = remove(root, tmp_name)
+        return err("YDBv1 atomic encrypted file rename failed")
+    let ds: Result[Boolean, Text] = sync_directory(root)
+    if not result_is_ok(ds) or not result_unwrap(ds):
+        return err("YDBv1 atomic encrypted file directory sync failed")
+    return ok(true)
+
+fn yaza_db_crypto_seal_file_v1(key: YazaDbPageCryptoKeyV1, domain_tag: Text, record_id: Number, root: Number, src_name: Text, dst_name: Text) -> Result[Number, Text]:
+    let src: Number = open_read(root, src_name)?
+    let sz_res: Result[Number, Text] = file_size(src)
+    if not result_is_ok(sz_res):
+        let _c: Result[Boolean, Text] = close(src)
+        return err(result_unwrap_error(sz_res))
+    let sz: Number = result_unwrap(sz_res)
+    let plain_res: Result[Bytes, Text] = read_exact(src, 0, sz)
+    let _c: Result[Boolean, Text] = close(src)
+    let plain: Bytes = plain_res?
+    let sealed: Bytes = yaza_db_crypto_seal_blob_v1(key, domain_tag, record_id, plain)?
+    let _w: Boolean = yaza_db_crypto_write_atomic_file_v1(root, dst_name, sealed)?
+    return ok(bytes_length(sealed))
+
+fn yaza_db_crypto_open_file_bytes_v1(key: YazaDbPageCryptoKeyV1, domain_tag: Text, record_id: Number, root: Number, src_name: Text) -> Result[Bytes, Text]:
+    let src: Number = open_read(root, src_name)?
+    let sz_res: Result[Number, Text] = file_size(src)
+    if not result_is_ok(sz_res):
+        let _c: Result[Boolean, Text] = close(src)
+        return err(result_unwrap_error(sz_res))
+    let sz: Number = result_unwrap(sz_res)
+    let sealed_res: Result[Bytes, Text] = read_exact(src, 0, sz)
+    let _c: Result[Boolean, Text] = close(src)
+    let sealed: Bytes = sealed_res?
+    return yaza_db_crypto_open_blob_v1(key, domain_tag, record_id, sealed)
+
+fn yaza_db_crypto_open_file_v1(key: YazaDbPageCryptoKeyV1, domain_tag: Text, record_id: Number, root: Number, src_name: Text, dst_name: Text) -> Result[Number, Text]:
+    let plain: Bytes = yaza_db_crypto_open_file_bytes_v1(key, domain_tag, record_id, root, src_name)?
+    let _w: Boolean = yaza_db_crypto_write_atomic_file_v1(root, dst_name, plain)?
+    return ok(bytes_length(plain))

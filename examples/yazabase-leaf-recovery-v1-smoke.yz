@@ -1,6 +1,7 @@
 use "std/fs"
 use "../yazabase/allocator_v1"
 use "../yazabase/checkpoint_v1"
+use "../yazabase/delta_wal_v1"
 use "../yazabase/page_v1"
 use "../yazabase/page_wal_v1"
 use "../yazabase/storage_v1"
@@ -178,13 +179,74 @@ fn yazabase_leaf_recovery_check_v1(root_path: Text) -> Result[Number, Text]:
     let resume_again_storage_closed: Boolean = yaza_db_storage_close_v1(resume_again.storage)?
     if not resume_again_wal_closed or not resume_again_storage_closed: return err("YDBv1 CLR idempotence handles could not close")
 
+    # A committed delta is replayed after an older page image reaches disk.
+    let delta_seed: YazaBaseLeafRecoverySeedV1 = yazabase_leaf_recovery_seed_v1(root, "leaf-delta-smoke.ydb", bytes_from_text("leafdelta-uuid01"))?
+    let delta_key: Bytes = bytes_from_text("delta-key")
+    let delta_base: Bytes = bytes_from_text("delta-base")
+    let delta_insert: YazaDbWalLeafMutationAppendV1 = yaza_db_storage_append_leaf_mutation_v1(delta_seed.storage, delta_seed.wal, 1, delta_seed.allocation_lsn, yaza_db_wal_type_leaf_insert_v1(), delta_seed.page_id, delta_key, delta_base)?
+    let delta_commit_one_payload: Bytes = yaza_db_wal_commit_payload_encode_v1(1)?
+    let delta_commit_one: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(delta_insert.append.log, YazaDbWalRecordV1(0, delta_insert.append.record.lsn, 1, yaza_db_wal_type_commit_v1(), 0, delta_commit_one_payload))?
+    let delta_begin_two: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(delta_commit_one.log, YazaDbWalRecordV1(0, 0, 2, yaza_db_wal_type_mtr_end_v1(), 0, bytes_from_text("")))?
+    let delta_entries: List[YazaDbWalLeafSlotDeltaEntryV1] = [YazaDbWalLeafSlotDeltaEntryV1(delta_key, bytes_from_text("delta-new"), delta_base)]
+    let delta_payload: Bytes = yaza_db_wal_leaf_slot_delta_encode_v1(yaza_db_wal_type_leaf_update_v1(), delta_seed.page_id, delta_entries)?
+    let delta_lsn: Number = yaza_db_wal_record_lsn_for_append_v1(delta_begin_two.log, yaza_db_wal_header_size_v1() + bytes_length(delta_payload))?
+    let delta_update: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(delta_begin_two.log, YazaDbWalRecordV1(0, delta_begin_two.record.lsn, 2, yaza_db_wal_type_leaf_slot_delta_v1(), 0, delta_payload))?
+    if delta_update.record.lsn != delta_lsn: return err("YDBv1 delta recovery fixture LSN prediction changed")
+    let delta_commit_two_payload: Bytes = yaza_db_wal_commit_payload_encode_v1(2)?
+    let delta_commit_two: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(delta_update.log, YazaDbWalRecordV1(0, delta_update.record.lsn, 2, yaza_db_wal_type_commit_v1(), 0, delta_commit_two_payload))?
+    let delta_wal_closed: Boolean = yaza_db_wal_log_close_v1(delta_commit_two.log)?
+    let delta_storage_closed: Boolean = yaza_db_storage_close_v1(delta_seed.storage)?
+    if not delta_wal_closed or not delta_storage_closed: return err("YDBv1 delta fixture could not close before simulated crash")
+    let delta_recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "leaf-delta-smoke.ydb")?
+    let delta_page: Bytes = yaza_db_storage_read_page_v1(delta_recovered.storage.file, delta_recovered.storage.header, delta_seed.page_id)?
+    let delta_value_ok: Boolean = yazabase_leaf_page_value_equals_v1(delta_page, delta_seed.page_id, delta_key, bytes_from_text("delta-new"))?
+    if not delta_value_ok or delta_recovered.storage.header.next_commit_ts != 3 or delta_recovered.storage.header.next_txn_id != 3: return err("YDBv1 startup recovery did not replay committed delta")
+    let delta_checkpoint_lsn: Number = delta_recovered.storage.header.checkpoint_lsn
+    let delta_wal_end: Number = delta_recovered.wal.next_lsn
+    let delta_recovered_wal_closed: Boolean = yaza_db_wal_log_close_v1(delta_recovered.wal)?
+    let delta_recovered_storage_closed: Boolean = yaza_db_storage_close_v1(delta_recovered.storage)?
+    if not delta_recovered_wal_closed or not delta_recovered_storage_closed: return err("YDBv1 delta recovery handles could not close")
+    let delta_again: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "leaf-delta-smoke.ydb")?
+    let delta_again_page: Bytes = yaza_db_storage_read_page_v1(delta_again.storage.file, delta_again.storage.header, delta_seed.page_id)?
+    let delta_again_ok: Boolean = yazabase_leaf_page_value_equals_v1(delta_again_page, delta_seed.page_id, delta_key, bytes_from_text("delta-new"))?
+    if not delta_again_ok or delta_again.applied_checkpoint_count != 0 or delta_again.storage.header.checkpoint_lsn != delta_checkpoint_lsn or delta_again.wal.next_lsn != delta_wal_end: return err("YDBv1 committed delta recovery was not idempotent")
+    let delta_again_wal_closed: Boolean = yaza_db_wal_log_close_v1(delta_again.wal)?
+    let delta_again_storage_closed: Boolean = yaza_db_storage_close_v1(delta_again.storage)?
+    if not delta_again_wal_closed or not delta_again_storage_closed: return err("YDBv1 delta idempotence handles could not close")
+
+    # A loser delta must be redone, compensated, and then remain stable on reopen.
+    let delta_loser_open: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "leaf-delta-smoke.ydb")?
+    let delta_loser_begin: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(delta_loser_open.wal, YazaDbWalRecordV1(0, 0, 3, yaza_db_wal_type_mtr_end_v1(), 0, bytes_from_text("")))?
+    let delta_loser_entries: List[YazaDbWalLeafSlotDeltaEntryV1] = [YazaDbWalLeafSlotDeltaEntryV1(delta_key, bytes_from_text("delta-loser"), bytes_from_text("delta-new"))]
+    let delta_loser_payload: Bytes = yaza_db_wal_leaf_slot_delta_encode_v1(yaza_db_wal_type_leaf_update_v1(), delta_seed.page_id, delta_loser_entries)?
+    let delta_loser_update: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(delta_loser_begin.log, YazaDbWalRecordV1(0, delta_loser_begin.record.lsn, 3, yaza_db_wal_type_leaf_slot_delta_v1(), 0, delta_loser_payload))?
+    let delta_loser_wal_closed: Boolean = yaza_db_wal_log_close_v1(delta_loser_update.log)?
+    let delta_loser_storage_closed: Boolean = yaza_db_storage_close_v1(delta_loser_open.storage)?
+    if not delta_loser_wal_closed or not delta_loser_storage_closed: return err("YDBv1 loser delta fixture could not close before simulated crash")
+    let delta_loser_recovered: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "leaf-delta-smoke.ydb")?
+    let delta_loser_page: Bytes = yaza_db_storage_read_page_v1(delta_loser_recovered.storage.file, delta_loser_recovered.storage.header, delta_seed.page_id)?
+    let delta_loser_restored: Boolean = yazabase_leaf_page_value_equals_v1(delta_loser_page, delta_seed.page_id, delta_key, bytes_from_text("delta-new"))?
+    if not delta_loser_restored or delta_loser_recovered.storage.header.next_commit_ts != 3 or delta_loser_recovered.storage.header.next_txn_id != 4: return err("YDBv1 loser delta was not undone after redo")
+    let delta_loser_checkpoint_lsn: Number = delta_loser_recovered.storage.header.checkpoint_lsn
+    let delta_loser_wal_end: Number = delta_loser_recovered.wal.next_lsn
+    let delta_loser_recovered_wal_closed: Boolean = yaza_db_wal_log_close_v1(delta_loser_recovered.wal)?
+    let delta_loser_recovered_storage_closed: Boolean = yaza_db_storage_close_v1(delta_loser_recovered.storage)?
+    if not delta_loser_recovered_wal_closed or not delta_loser_recovered_storage_closed: return err("YDBv1 loser delta recovery handles could not close")
+    let delta_loser_again: YazaDbCheckpointRecoveryV1 = yaza_db_open_recovered_v1(root, "leaf-delta-smoke.ydb")?
+    let delta_loser_again_page: Bytes = yaza_db_storage_read_page_v1(delta_loser_again.storage.file, delta_loser_again.storage.header, delta_seed.page_id)?
+    let delta_loser_again_ok: Boolean = yazabase_leaf_page_value_equals_v1(delta_loser_again_page, delta_seed.page_id, delta_key, bytes_from_text("delta-new"))?
+    if not delta_loser_again_ok or delta_loser_again.applied_checkpoint_count != 0 or delta_loser_again.storage.header.checkpoint_lsn != delta_loser_checkpoint_lsn or delta_loser_again.wal.next_lsn != delta_loser_wal_end: return err("YDBv1 loser delta recovery was not idempotent")
+    let delta_loser_again_wal_closed: Boolean = yaza_db_wal_log_close_v1(delta_loser_again.wal)?
+    let delta_loser_again_storage_closed: Boolean = yaza_db_storage_close_v1(delta_loser_again.storage)?
+    if not delta_loser_again_wal_closed or not delta_loser_again_storage_closed: return err("YDBv1 loser delta idempotence handles could not close")
+
     let ignored_root_close: Boolean = close(root)?
     if not ignored_root_close: return err("YDBv1 leaf-recovery fixture root close failed")
-    return ok(4)
+    return ok(6)
 
 start:
     let outcome: Result[Number, Text] = yazabase_leaf_recovery_check_v1(arg(1))
     if result_is_ok(outcome):
         say "yazabase-leaf-recovery-v1-ok cases=" + number_text(result_unwrap(outcome))
     else:
-        say result_unwrap_error(outcome)
+        fail(result_unwrap_error(outcome))

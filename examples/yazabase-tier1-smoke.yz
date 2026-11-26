@@ -1,0 +1,229 @@
+# Tier 1 Integration Smoke Test:
+# 1. Delta WAL (rec_type=17) across INSERT, UPDATE, DELETE + Write Plan Cache + DDL invalidation
+# 2. Bidirectional Logical LSN Sync Engine (Mobile <-> Server):
+#    offline divergence, duplicate delivery, restart watermark persistence,
+#    echo prevention, delete tombstones + pruning, schema-version mismatch rejection,
+#    CRC32C tamper rejection, SERVER_WINS / CLIENT_WINS / VERSION_LWW policies,
+#    and authenticated /api/v1/sync/* HTTP routing via cluster_api_v1.
+
+use "std/fs"
+use "std/http"
+use "std/json"
+use "std/time"
+use "std/ywt"
+use "std/db/yazabase_embedded"
+use "../yazabase/api_v1"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/cluster_api_v1"
+use "../yazabase/cluster_ha_v1"
+use "../yazabase/delta_wal_v1"
+use "../yazabase/group_commit_v1"
+use "../yazabase/page_wal_v1"
+use "../yazabase/plan_cache_v1"
+use "../yazabase/replication_v1"
+use "../yazabase/session_v1"
+use "../yazabase/sql_executor_v1"
+use "../yazabase/sync_engine_v1"
+use "../yazabase/wal_v1"
+
+use "./yazabase-tier1-write-cases"
+
+fn t1_test_bidirectional_sync(base_dir: Text) -> Result[Boolean, Text]:
+    # Server node
+    var srv: YazaDbSessionV1 = t1_init_session(base_dir + "/srv", "server.yzdb")?
+    set srv = t1_exec(srv, "CREATE TABLE notes (id INTEGER PRIMARY KEY, title TEXT, score INTEGER)")?
+
+    # Mobile node via std/db/yazabase_embedded
+    var mob: YazaBaseEmbeddedSessionV1 = yaza_db_embedded_open_or_create_v1(base_dir + "/mob", "mobile.yzdb")?
+    let m_ddl: YazaBaseEmbeddedStatementV1 = yaza_db_embedded_execute_v1(mob, "CREATE TABLE notes (id INTEGER PRIMARY KEY, title TEXT, score INTEGER)", List[YazaSqlValueV1]())?
+    set mob = m_ddl.database
+
+    # Seed baseline rows on server
+    set srv = t1_exec(srv, "INSERT INTO notes (id, title, score) VALUES (1, 'alpha', 10)")?
+    set srv = t1_exec(srv, "INSERT INTO notes (id, title, score) VALUES (2, 'beta', 20)")?
+
+    # 1. Server -> Mobile pull + apply
+    let srv_b1: YazaDbSyncBatchV1 = yaza_db_sync_extract_delta_v1(srv, "server-1", 0, 256)?
+    let _s1: Boolean = t1_expect(list_count(srv_b1.changes) == 2, "server extracted 2 baseline rows")?
+    let srv_cursor_1: Number = srv_b1.to_lsn
+
+    # CRC32C tamper check BEFORE apply
+    let bad_batch: YazaDbSyncBatchV1 = YazaDbSyncBatchV1(srv_b1.origin_id, srv_b1.from_lsn, srv_b1.to_lsn, srv_b1.changes, srv_b1.batch_crc32c + 1)
+    let bad_res: Result[YazaBaseEmbeddedSyncApplyV1, Text] = yaza_db_embedded_sync_push_v1(mob, bad_batch, yaza_db_sync_policy_server_wins_v1())
+    let _s_crc: Boolean = t1_expect(not result_is_ok(bad_res), "tampered sync batch rejected by CRC32C")?
+
+    let mob_a1: YazaBaseEmbeddedSyncApplyV1 = yaza_db_embedded_sync_push_v1(mob, srv_b1, yaza_db_sync_policy_server_wins_v1())?
+    set mob = mob_a1.database
+    let _s2: Boolean = t1_expect(mob_a1.applied_count == 2 and mob_a1.skipped_duplicates == 0 and list_count(mob_a1.conflicts) == 0, "mobile applied 2 baseline rows")?
+
+    # 2. Duplicate delivery idempotency (in-process + after restart)
+    let mob_dup1: YazaBaseEmbeddedSyncApplyV1 = yaza_db_embedded_sync_push_v1(mob, srv_b1, yaza_db_sync_policy_server_wins_v1())?
+    set mob = mob_dup1.database
+    let _s3: Boolean = t1_expect(mob_dup1.applied_count == 0 and mob_dup1.skipped_duplicates == 2, "duplicate batch skipped idempotently")?
+
+    let _mcl: Boolean = yaza_db_embedded_close_v1(mob)?
+    set mob = yaza_db_embedded_open_v1(base_dir + "/mob", "mobile.yzdb")?
+    let mob_dup2: YazaBaseEmbeddedSyncApplyV1 = yaza_db_embedded_sync_push_v1(mob, srv_b1, yaza_db_sync_policy_server_wins_v1())?
+    set mob = mob_dup2.database
+    let _s4: Boolean = t1_expect(mob_dup2.applied_count == 0 and mob_dup2.skipped_duplicates == 2, "duplicate batch still skipped after restart")?
+
+    # 3. Echo prevention: mobile extracts 0 changes after applying server's batch
+    let mob_echo: YazaDbSyncBatchV1 = yaza_db_embedded_sync_pull_v1(mob, "mobile-1", 0, 256)?
+    let _s5: Boolean = t1_expect(list_count(mob_echo.changes) == 0, "no echo after applying remote changes")?
+    let mob_cursor_1: Number = mob_echo.to_lsn
+
+    # 4. Offline divergence + SERVER_WINS convergence
+    set srv = t1_exec(srv, "UPDATE notes SET title = 'srv-v2', score = 110 WHERE id = 1")?
+    set srv = t1_exec(srv, "INSERT INTO notes (id, title, score) VALUES (4, 'delta-srv', 40)")?
+
+    let m_u1: YazaBaseEmbeddedStatementV1 = yaza_db_embedded_execute_v1(mob, "UPDATE notes SET title = 'mob-v2', score = 99 WHERE id = 1", List[YazaSqlValueV1]())?
+    set mob = m_u1.database
+    let m_i3: YazaBaseEmbeddedStatementV1 = yaza_db_embedded_execute_v1(mob, "INSERT INTO notes (id, title, score) VALUES (3, 'gamma-mob', 30)", List[YazaSqlValueV1]())?
+    set mob = m_i3.database
+
+    # Mobile pushes offline edits to Server under SERVER_WINS
+    let mob_b2: YazaDbSyncBatchV1 = yaza_db_embedded_sync_pull_v1(mob, "mobile-1", mob_cursor_1, 256)?
+    let _s6: Boolean = t1_expect(list_count(mob_b2.changes) == 2, "mobile extracted 2 offline changes")?
+    let mob_cursor_2: Number = mob_b2.to_lsn
+
+    let srv_a2: YazaDbSyncApplyResultV1 = yaza_db_sync_apply_delta_with_role_v1(srv, mob_b2, yaza_db_sync_policy_server_wins_v1(), true)?
+    set srv = srv_a2.session
+    let _s7: Boolean = t1_expect(srv_a2.applied_count == 1 and list_count(srv_a2.conflicts) == 1 and list_get(srv_a2.conflicts, 0).winner == "local", "SERVER_WINS: server kept id=1 and applied id=3")?
+
+    # Server sends its offline edits to Mobile under SERVER_WINS
+    let srv_b2: YazaDbSyncBatchV1 = yaza_db_sync_extract_delta_v1(srv, "server-1", srv_cursor_1, 256)?
+    let _s8: Boolean = t1_expect(list_count(srv_b2.changes) == 2, "server extracted 2 offline changes without echoing id=3")?
+    let srv_cursor_2: Number = srv_b2.to_lsn
+
+    let mob_a2: YazaBaseEmbeddedSyncApplyV1 = yaza_db_embedded_sync_push_v1(mob, srv_b2, yaza_db_sync_policy_server_wins_v1())?
+    set mob = mob_a2.database
+    let _s9: Boolean = t1_expect(mob_a2.applied_count == 2 and list_count(mob_a2.conflicts) == 1 and list_get(mob_a2.conflicts, 0).winner == "remote", "SERVER_WINS: mobile accepted server id=1 and id=4")?
+
+    # Verify convergence: both peers have identical 4 rows
+    let srv_t1: Text = t1_query_text(srv, "SELECT title FROM notes WHERE id = 1")?
+    let mob_t1: Text = t1_query_text(mob.session, "SELECT title FROM notes WHERE id = 1")?
+    let srv_cnt: Number = t1_query_int(srv, "SELECT COUNT(*) FROM notes")?
+    let mob_cnt: Number = t1_query_int(mob.session, "SELECT COUNT(*) FROM notes")?
+    let _s10: Boolean = t1_expect(srv_t1 == "srv-v2" and mob_t1 == "srv-v2" and srv_cnt == 4 and mob_cnt == 4, "SERVER_WINS converged identically on both peers")?
+
+    # 5. Offline divergence + CLIENT_WINS
+    set srv = t1_exec(srv, "UPDATE notes SET title = 'srv-cw' WHERE id = 2")?
+    let m_cw: YazaBaseEmbeddedStatementV1 = yaza_db_embedded_execute_v1(mob, "UPDATE notes SET title = 'mob-cw' WHERE id = 2", List[YazaSqlValueV1]())?
+    set mob = m_cw.database
+    let mob_b3: YazaDbSyncBatchV1 = yaza_db_embedded_sync_pull_v1(mob, "mobile-1", mob_cursor_2, 256)?
+    let mob_cursor_3: Number = mob_b3.to_lsn
+    let srv_a3: YazaDbSyncApplyResultV1 = yaza_db_sync_apply_delta_with_role_v1(srv, mob_b3, yaza_db_sync_policy_client_wins_v1(), true)?
+    set srv = srv_a3.session
+    let srv_t2: Text = t1_query_text(srv, "SELECT title FROM notes WHERE id = 2")?
+    let _s11: Boolean = t1_expect(list_count(srv_a3.conflicts) == 1 and list_get(srv_a3.conflicts, 0).winner == "remote" and srv_t2 == "mob-cw", "CLIENT_WINS accepted mobile edit on server")?
+    let srv_b3_skip: YazaDbSyncBatchV1 = yaza_db_sync_extract_delta_v1(srv, "server-1", srv_cursor_2, 256)?
+    let srv_cursor_3: Number = srv_b3_skip.to_lsn
+
+    # 6. Offline divergence + VERSION_LWW (higher version wins, equal version uses deterministic origin_id tiebreak)
+    set srv = t1_exec(srv, "UPDATE notes SET title = 'srv-v-once', score = 31 WHERE id = 3")?
+    let m_v1: YazaBaseEmbeddedStatementV1 = yaza_db_embedded_execute_v1(mob, "UPDATE notes SET title = 'mob-v-1', score = 32 WHERE id = 3", List[YazaSqlValueV1]())?
+    set mob = m_v1.database
+    let m_v2: YazaBaseEmbeddedStatementV1 = yaza_db_embedded_execute_v1(mob, "UPDATE notes SET title = 'mob-v-2', score = 33 WHERE id = 3", List[YazaSqlValueV1]())?
+    set mob = m_v2.database
+    # Also edit id=4 once on each side -> equal row_version -> origin_id tiebreak ("server-1" > "mobile-1")
+    set srv = t1_exec(srv, "UPDATE notes SET title = 'srv-tie' WHERE id = 4")?
+    let m_t4: YazaBaseEmbeddedStatementV1 = yaza_db_embedded_execute_v1(mob, "UPDATE notes SET title = 'mob-tie' WHERE id = 4", List[YazaSqlValueV1]())?
+    set mob = m_t4.database
+
+    let mob_b4: YazaDbSyncBatchV1 = yaza_db_embedded_sync_pull_v1(mob, "mobile-1", mob_cursor_3, 256)?
+    let mob_cursor_4: Number = mob_b4.to_lsn
+    let srv_a4: YazaDbSyncApplyResultV1 = yaza_db_sync_apply_delta_with_role_v1(srv, mob_b4, yaza_db_sync_policy_version_lww_v1(), true)?
+    set srv = srv_a4.session
+    let srv_t3: Text = t1_query_text(srv, "SELECT title FROM notes WHERE id = 3")?
+    let srv_t4: Text = t1_query_text(srv, "SELECT title FROM notes WHERE id = 4")?
+    let _s12: Boolean = t1_expect(srv_t3 == "mob-v-2" and srv_t4 == "srv-tie", "VERSION_LWW: higher version won id=3 and origin_id tiebreak kept server-1 on id=4")?
+
+    # 7. Delete tombstone propagation + bounded tombstone pruning
+    let m_del: YazaBaseEmbeddedStatementV1 = yaza_db_embedded_execute_v1(mob, "DELETE FROM notes WHERE id = 3", List[YazaSqlValueV1]())?
+    set mob = m_del.database
+    let mob_b5: YazaDbSyncBatchV1 = yaza_db_embedded_sync_pull_v1(mob, "mobile-1", mob_cursor_4, 256)?
+    let mob_cursor_5: Number = mob_b5.to_lsn
+    let srv_a5: YazaDbSyncApplyResultV1 = yaza_db_sync_apply_delta_with_role_v1(srv, mob_b5, yaza_db_sync_policy_server_wins_v1(), true)?
+    set srv = srv_a5.session
+    let srv_c3: Number = t1_query_count(srv, "SELECT id FROM notes WHERE id = 3")?
+    let _s13: Boolean = t1_expect(srv_c3 == 0, "DELETE tombstone propagated from mobile to server")?
+    let pruned: Number = yaza_db_sync_prune_tombstones_v1(srv, 999999999)?
+    let _s14: Boolean = t1_expect(pruned >= 1, "tombstone pruning reclaimed expired tombstone")?
+
+    # 8. Authenticated HTTP /api/v1/sync/* via cluster_api_v1
+    let secret: Text = "0123456789abcdef0123456789abcdef_tier1"
+    let now_s: Number = time_now_unix_ms() / 1000
+    let tok: Text = ywt_create("sync-bot", "yazabase", now_s + 3600, secret)
+    let api_state: YazaApiServerStateV1 = yaza_api_server_state_default("server.yzdb")
+    let repl_st: YazaDbReplicationStateV1 = yaza_db_replication_default_state_v1("primary", "server-1", 0)
+    let ha_st: YazaDbHaStateV1 = yaza_db_ha_default_state_v1("server-1", "primary", 1, srv.wal.next_lsn, 5000)
+
+    # Unauthenticated request must fail with 401
+    let unauth_req: HttpRequest = HttpRequest("GET", "/api/v1/sync/status", "", "application/json", "", "", "", 0, bytes_empty(), "")
+    let unauth_res: YazaApiClusterResponseV1 = yaza_api_route_request_cluster_v1(srv, base_dir + "/srv", "server.yzdb", unauth_req, secret, api_state, repl_st, ha_st)?
+    set srv = unauth_res.session
+    let _s15: Boolean = t1_expect(unauth_res.response.status_code == 401, "unauthenticated /api/v1/sync/status rejected with 401")?
+
+    # Authenticated GET /api/v1/sync/status
+    let auth_hdr: Text = "Bearer " + tok
+    let st_req: HttpRequest = HttpRequest("GET", "/api/v1/sync/status", "", "application/json", "", auth_hdr, "", 0, bytes_empty(), "")
+    let st_res: YazaApiClusterResponseV1 = yaza_api_route_request_cluster_v1(srv, base_dir + "/srv", "server.yzdb", st_req, secret, api_state, repl_st, ha_st)?
+    set srv = st_res.session
+    let _s16: Boolean = t1_expect(st_res.response.status_code == 200 and text_find(bytes_to_text(st_res.response.body), "\"origin_id\":\"server-1\"") >= 0, "authenticated /api/v1/sync/status returned 200 JSON")?
+
+    # Authenticated GET /api/v1/sync/pull + JSON round-trip
+    let pull_req: HttpRequest = HttpRequest("GET", "/api/v1/sync/pull", "from_lsn=0&max_changes=64", "application/json", "", auth_hdr, "", 0, bytes_empty(), "")
+    let pull_res: YazaApiClusterResponseV1 = yaza_api_route_request_cluster_v1(srv, base_dir + "/srv", "server.yzdb", pull_req, secret, api_state, repl_st, ha_st)?
+    set srv = pull_res.session
+    let _s17: Boolean = t1_expect(pull_res.response.status_code == 200, "authenticated /api/v1/sync/pull returned 200")?
+    let parsed_pull: YazaDbSyncBatchV1 = yaza_db_sync_parse_batch_json_v1(bytes_to_text(pull_res.response.body))?
+    let _s18: Boolean = t1_expect(yaza_db_sync_batch_verify_crc32c_v1(parsed_pull), "HTTP /api/v1/sync/pull batch passed CRC32C verification")?
+
+    let policy_body: Text = yaza_db_sync_batch_to_json_v1(parsed_pull)
+    let policy_req: HttpRequest = HttpRequest("POST", "/api/v1/sync/push", "policy=2", "application/json", "application/json", auth_hdr, "", text_length(policy_body), bytes_from_text(policy_body), policy_body)
+    let before_denied_lsn: Number = srv.wal.next_lsn
+    let policy_res: YazaApiClusterResponseV1 = yaza_api_route_request_cluster_v1(srv, base_dir + "/srv", "server.yzdb", policy_req, secret, api_state, repl_st, ha_st)?
+    let _policy_denied: Boolean = t1_expect(policy_res.response.status_code == 403 and policy_res.session.wal.next_lsn == before_denied_lsn, "client cannot override server conflict policy")?
+    let replica_repl: YazaDbReplicationStateV1 = yaza_db_replication_default_state_v1("replica", "server-1", 0)
+    let replica_res: YazaApiClusterResponseV1 = yaza_api_route_request_cluster_v1(srv, base_dir + "/srv", "server.yzdb", policy_req, secret, api_state, replica_repl, ha_st)?
+    let _replica_denied: Boolean = t1_expect(replica_res.response.status_code == 409 and replica_res.session.wal.next_lsn == before_denied_lsn, "sync push cannot write to replica")?
+
+    # 9. Schema-version mismatch rejection (fail-closed on ALTER TABLE) + HTTP 409 Conflict
+    set srv = t1_exec(srv, "ALTER TABLE notes ADD COLUMN extra TEXT DEFAULT 'ok'")?
+    let m_stale: YazaBaseEmbeddedStatementV1 = yaza_db_embedded_execute_v1(mob, "UPDATE notes SET title = 'stale-v1' WHERE id = 1", List[YazaSqlValueV1]())?
+    set mob = m_stale.database
+    let mob_b6: YazaDbSyncBatchV1 = yaza_db_embedded_sync_pull_v1(mob, "mobile-1", mob_cursor_5, 256)?
+    let mismatch_res: Result[YazaDbSyncApplyResultV1, Text] = yaza_db_sync_apply_delta_with_role_v1(srv, mob_b6, yaza_db_sync_policy_server_wins_v1(), true)
+    let _s19: Boolean = t1_expect(not result_is_ok(mismatch_res) and text_find(result_unwrap_error(mismatch_res), "schema version mismatch") >= 0, "schema-version mismatch rejected fail-closed")?
+
+    let push_body: Text = yaza_db_sync_batch_to_json_v1(mob_b6)
+    let push_req: HttpRequest = HttpRequest("POST", "/api/v1/sync/push", "", "application/json", "application/json", auth_hdr, "", text_length(push_body), bytes_from_text(push_body), push_body)
+    let push_res: YazaApiClusterResponseV1 = yaza_api_route_request_cluster_v1(srv, base_dir + "/srv", "server.yzdb", push_req, secret, api_state, repl_st, ha_st)?
+    set srv = push_res.session
+    let _s20: Boolean = t1_expect(push_res.response.status_code == 409, "HTTP /api/v1/sync/push returned 409 Conflict on schema mismatch")?
+    let srv_after_mm: Text = t1_query_text(srv, "SELECT title FROM notes WHERE id = 1")?
+    let _s21: Boolean = t1_expect(srv_after_mm == "srv-v2", "server data untouched after schema mismatch rejection")?
+
+    # Verify embedded watermarks helper
+    let mob_wms: List[YazaDbSyncWatermarkV1] = yaza_db_embedded_sync_watermarks_v1(mob, "mobile-1")?
+    let _s22: Boolean = t1_expect(list_count(mob_wms) >= 1 and list_get(mob_wms, 0).origin_id == "server-1", "embedded sync watermarks persisted")?
+
+    let _cl_m: Boolean = yaza_db_embedded_close_v1(mob)?
+    let _cl_s: Boolean = yaza_db_session_close_v1(srv)?
+    return ok(true)
+
+fn t1_run(base_dir: Text) -> Result[Boolean, Text]:
+    let _r1: Boolean = t1_test_delta_wal_and_write_plan_cache(base_dir)?
+    let _r2: Boolean = t1_test_bidirectional_sync(base_dir)?
+    return ok(true)
+
+start:
+    if arg_count() < 1:
+        say "usage: yazabase-tier1-smoke <root-dir>"
+        exit(2)
+    let res: Result[Boolean, Text] = t1_run(arg(1))
+    if not result_is_ok(res):
+        say "yazabase-tier1-smoke: FAIL: " + result_unwrap_error(res)
+        exit(1)
+    say "yazabase-tier1-smoke: PASS"
+    exit(0)

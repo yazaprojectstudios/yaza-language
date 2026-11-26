@@ -1,0 +1,100 @@
+# Tier 3.3 JSONB Smoke Validation:
+# 1. Canonical binary YJB1 codec (7 types, deterministic sorted keys, fail-closed CRC & validator)
+# 2. Path extraction (-> JSONB, ->> Text), Containment (@>), Functional update (jsonb_set)
+# 3. Durable Expression/Generated Index in .yzdb (INSERT/UPDATE/DELETE hooks + reopen persistence)
+
+use "std/fs"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/jsonb_v1"
+use "../yazabase/session_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/wal_v1"
+
+fn t3j_expect(cond: Boolean, label: Text) -> Result[Boolean, Text]:
+    if not cond:
+        return err("tier3-jsonb failed: " + label)
+    return ok(true)
+
+fn t3j_check(r: Result[Boolean, Text]) -> Unit:
+    if not result_is_ok(r):
+        say "yazabase-tier3-jsonb-smoke: FAIL: " + result_unwrap_error(r)
+        exit(1)
+
+fn t3j_run(base_dir: Text) -> Result[Boolean, Text]:
+    # 1. Canonical YJB1 encoding & byte-for-byte key order equivalence
+    let j1: Bytes = yaza_db_jsonb_encode_from_text_v1("{\"z\":true,\"a\":null,\"user\":{\"role\":\"admin\",\"roles\":[\"dev\",\"ops\"],\"id\":42},\"score\":98.5}")?
+    let j2: Bytes = yaza_db_jsonb_encode_from_text_v1("{\"score\":98.5,\"user\":{\"roles\":[\"dev\",\"ops\"],\"id\":42,\"role\":\"admin\"},\"a\":null,\"z\":true}")?
+    let _a1: Boolean = t3j_expect(bytes_equal(j1, j2), "canonical YJB1 sorted keys produce identical bytes")?
+    let _v1: Boolean = yaza_db_jsonb_validate_v1(j1)?
+    let _a2: Boolean = t3j_expect(_v1, "YJB1 validator accepts canonical doc")?
+
+    # Corrupted byte & malformed syntax must fail closed
+    let bad_j: Bytes = bytes_try_slice(j1, 0, bytes_length(j1))?
+    let _tamper: Boolean = bytes_try_set(bad_j, bytes_length(bad_j) - 1, (bytes_get(bad_j, bytes_length(bad_j) - 1) + 7) % 256)
+    let _a3: Boolean = t3j_expect(not result_is_ok(yaza_db_jsonb_validate_v1(bad_j)), "corrupted YJB1 rejected by CRC32C")?
+    let _a4: Boolean = t3j_expect(not result_is_ok(yaza_db_jsonb_encode_from_text_v1("{\"dup\":1,\"dup\":2}")), "duplicate object key rejected")?
+    let _a5: Boolean = t3j_expect(not result_is_ok(yaza_db_jsonb_encode_from_text_v1("{\"unclosed\": [1, 2")), "malformed JSON rejected")?
+
+    # 2. Path extraction (-> / ->>), Containment (@>), and jsonb_set
+    let p_role: Option[Text] = yaza_db_jsonb_extract_path_text_v1(j1, "user.roles[1]")?
+    let p_id_raw: Option[Bytes] = yaza_db_jsonb_extract_path_v1(j1, "user.id")?
+    let _a6: Boolean = t3j_expect(option_is_some(p_role) and option_unwrap(p_role) == "ops", "->> extracted nested array element")?
+    let p_id_txt: Text = yaza_db_jsonb_to_text_v1(option_unwrap(p_id_raw))?
+    let _a7: Boolean = t3j_expect(option_is_some(p_id_raw) and p_id_txt == "42", "-> extracted canonical JSONB int")?
+    let p_miss: Option[Text] = yaza_db_jsonb_extract_path_text_v1(j1, "user.missing")?
+    let _a8: Boolean = t3j_expect(not option_is_some(p_miss), "missing path returns none")?
+
+    let needle_hit: Bytes = yaza_db_jsonb_encode_from_text_v1("{\"user\":{\"role\":\"admin\",\"roles\":[\"ops\"]}}")?
+    let needle_miss: Bytes = yaza_db_jsonb_encode_from_text_v1("{\"user\":{\"role\":\"guest\"}}")?
+    let ch1: Boolean = yaza_db_jsonb_contains_v1(j1, needle_hit)?
+    let ch2: Boolean = yaza_db_jsonb_contains_v1(j1, needle_miss)?
+    let _a9: Boolean = t3j_expect(ch1, "@> containment matched object+array subset")?
+    let _a10: Boolean = t3j_expect(not ch2, "@> containment rejected mismatched value")?
+
+    let new_role: Bytes = yaza_db_jsonb_encode_from_text_v1("\"owner\"")?
+    let updated_j: Bytes = yaza_db_jsonb_set_v1(j1, "user.role", new_role, true)?
+    let upd_role_txt: Option[Text] = yaza_db_jsonb_extract_path_text_v1(updated_j, "user.role")?
+    let _a11: Boolean = t3j_expect(option_is_some(upd_role_txt) and option_unwrap(upd_role_txt) == "owner", "jsonb_set updated nested field cleanly")?
+
+    # 3. Durable Expression Index in .yzdb + INSERT/UPDATE/DELETE + Reopen
+    let r: Number = root_open(base_dir)?
+    let boot: YazaDbCatalogBootstrapV1 = yaza_db_catalog_create_v1(r, "jsonb.yzdb")?
+    let _bw: Boolean = yaza_db_wal_log_close_v1(boot.wal)?
+    let _bs: Boolean = yaza_db_storage_close_v1(boot.storage)?
+    var sess: YazaDbSessionV1 = yaza_db_session_open_v1(r, "jsonb.yzdb")?
+
+    set sess = yaza_db_jsonb_index_init_v1(sess, "events", "by_role")?
+    let doc1: Bytes = yaza_db_jsonb_encode_from_text_v1("{\"user\":{\"role\":\"admin\",\"tier\":1}}")?
+    let doc2: Bytes = yaza_db_jsonb_encode_from_text_v1("{\"user\":{\"role\":\"member\",\"tier\":2}}")?
+    let doc3: Bytes = yaza_db_jsonb_encode_from_text_v1("{\"user\":{\"role\":\"admin\",\"tier\":3}}")?
+    set sess = yaza_db_jsonb_index_upsert_v1(sess, "events", "by_role", 101, "user.role", doc1)?
+    set sess = yaza_db_jsonb_index_upsert_v1(sess, "events", "by_role", 102, "user.role", doc2)?
+    set sess = yaza_db_jsonb_index_upsert_v1(sess, "events", "by_role", 103, "user.role", doc3)?
+
+    # Update row 102 to admin, delete row 101
+    let doc2_upd: Bytes = yaza_db_jsonb_encode_from_text_v1("{\"user\":{\"role\":\"admin\",\"tier\":2}}")?
+    set sess = yaza_db_jsonb_index_upsert_v1(sess, "events", "by_role", 102, "user.role", doc2_upd)?
+    set sess = yaza_db_jsonb_index_delete_v1(sess, "events", "by_role", 101)?
+    let _cl1: Boolean = yaza_db_session_close_v1(sess)?
+
+    # Reopen and query expression index directly
+    let r2: Number = root_open(base_dir)?
+    let sess2: YazaDbSessionV1 = yaza_db_session_open_v1(r2, "jsonb.yzdb")?
+    let lkup: YazaDbJsonbIndexLookupV1 = yaza_db_jsonb_index_lookup_v1(sess2, "events", "by_role", "admin")?
+    let _a12: Boolean = t3j_expect(list_count(lkup.row_ids) == 2 and list_get(lkup.row_ids, 0) == 102 and list_get(lkup.row_ids, 1) == 103, "expression index reflects update/delete and survives reopen")?
+    let _v2: Boolean = yaza_db_jsonb_validate_v1(list_get(lkup.docs, 0))?
+    let _a13: Boolean = t3j_expect(_v2, "indexed JSONB doc decoded cleanly after reopen")?
+    let _cl2: Boolean = yaza_db_session_close_v1(lkup.session)?
+    return ok(true)
+
+start:
+    if arg_count() < 1:
+        say "usage: yazabase-tier3-jsonb-smoke <dir>"
+        exit(2)
+    let dir: Text = "" + arg(1)
+    let res: Result[Boolean, Text] = t3j_run(dir)
+    if not result_is_ok(res):
+        say "yazabase-tier3-jsonb-smoke: FAIL: " + result_unwrap_error(res)
+        exit(1)
+    say "yazabase-tier3-jsonb-smoke: PASS"
+    exit(0)

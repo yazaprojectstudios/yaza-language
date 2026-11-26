@@ -1,0 +1,678 @@
+# Tier 2.3: Point-in-Time Recovery (PITR) Archiving/Restore & Committed Logical CDC Tail Reader
+# Supports encrypted (YDE1) & plaintext PITR base snapshots and WAL chunks with fail-closed CRC32C,
+# two-pass commit-aware restore to target_lsn or target_commit_ts, durable CDC consumer cursors,
+# and /api/v1/cdc/poll + /api/v1/cdc/ack HTTP endpoints.
+
+use "std/fs"
+use "std/http"
+use "std/json"
+use "std/time"
+use "./backup_v1"
+use "./checkpoint_v1"
+use "./page_crypto_v1"
+use "./page_v1"
+use "./replication_v1"
+use "./session_v1"
+use "./storage_v1"
+use "./sync_engine_v1"
+use "./wal_v1"
+
+shape YazaDbPitrBaseReportV1:
+    session: YazaDbSessionV1
+    base_lsn: Number
+    db_uuid_hex: Text
+    encrypted: Boolean
+    base_bytes: Number
+    crc32c: Number
+
+shape YazaDbPitrChunkReportV1:
+    from_lsn: Number
+    to_lsn: Number
+    record_count: Number
+    encrypted: Boolean
+    chunk_file: Text
+    crc32c: Number
+
+shape YazaDbPitrRestoreReportV1:
+    restored_lsn: Number
+    applied_records: Number
+    skipped_uncommitted: Number
+    max_commit_ts: Number
+
+shape YazaDbCdcEventV1:
+    lsn: Number
+    txn_id: Number
+    commit_ts: Number
+    table_name: Text
+    op: Text
+    pk_key_hex: Text
+    row_json: Text
+    row_version: Number
+
+shape YazaDbCdcPollResultV1:
+    consumer_id: Text
+    from_lsn: Number
+    next_lsn: Number
+    events: List[YazaDbCdcEventV1]
+
+shape YazaDbCdcCursorV1:
+    consumer_id: Text
+    acked_lsn: Number
+    last_poll_ts_ms: Number
+
+fn yaza_db_pitr_err_text_v1(msg: Text) -> Text:
+    return "" + msg
+
+fn yaza_db_pitr_read_file_bytes_v1(root: Number, file_name: Text) -> Result[Bytes, Text]:
+    let fd: Number = open_read(root, file_name)?
+    let sz_res: Result[Number, Text] = file_size(fd)
+    if not result_is_ok(sz_res):
+        let _c: Result[Boolean, Text] = close(fd)
+        return err(result_unwrap_error(sz_res))
+    let sz: Number = result_unwrap(sz_res)
+    let data_res: Result[Bytes, Text] = read_exact(fd, 0, sz)
+    let _c2: Result[Boolean, Text] = close(fd)
+    return data_res
+
+fn yaza_db_pitr_number_list_contains_v1(items: List[Number], val: Number) -> Boolean:
+    var i: Number = 0
+    while i < list_count(items):
+        if list_get(items, i) == val:
+            return true
+        set i = i + 1
+    return false
+
+fn yaza_db_pitr_is_txn_scoped_record_v1(rt: Number) -> Boolean:
+    if rt == yaza_db_wal_type_commit_v1() or rt == yaza_db_wal_type_abort_v1() or rt == yaza_db_wal_type_catalog_root_commit_v1():
+        return false
+    if rt == yaza_db_wal_type_checkpoint_begin_v1() or rt == yaza_db_wal_type_checkpoint_end_v1() or rt == yaza_db_wal_type_skip_v1():
+        return false
+    return true
+
+fn yaza_db_pitr_is_zero_bytes_v1(b: Bytes) -> Boolean:
+    let n: Number = bytes_length(b)
+    var i: Number = 0
+    while i < n:
+        if bytes_get(b, i) != 0:
+            return false
+        set i = i + 1
+    return true
+
+fn yaza_db_pitr_archive_chunk_in_scope_v1(src_fd: Number, offset: Number, clen: Number, archive_root: Number, part_name: Text, aad: Text, chunk_idx: Number, opt_key: Option[YazaDbPageCryptoKeyV1], out_crcs: List[Number]) -> Number:
+    var code: Number = 0
+    arena_scope 20971520:
+        let r_res: Result[Bytes, Text] = read_exact(src_fd, offset, clen)
+        if not result_is_ok(r_res):
+            set code = 1
+        else:
+            let chunk: Bytes = result_unwrap(r_res)
+            if yaza_db_pitr_is_zero_bytes_v1(chunk):
+                let _s0: Boolean = list_try_set(out_crcs, 0, 0)
+                let _s1: Boolean = list_try_set(out_crcs, 1, -1)
+            else:
+                let pcrc: Number = bytes_ydbv1_checksum(chunk)
+                var stored: Bytes = chunk
+                if option_is_some(opt_key):
+                    let s_res: Result[Bytes, Text] = yaza_db_crypto_seal_blob_v1(option_unwrap(opt_key), aad, chunk_idx, chunk)
+                    if not result_is_ok(s_res):
+                        set code = 2
+                    else:
+                        set stored = result_unwrap(s_res)
+                if code == 0:
+                    let fcrc: Number = bytes_ydbv1_checksum(stored)
+                    let w_res: Result[Boolean, Text] = yaza_db_crypto_write_atomic_file_v1(archive_root, part_name, stored)
+                    if not result_is_ok(w_res) or not result_unwrap(w_res):
+                        set code = 3
+                    else:
+                        let _s0: Boolean = list_try_set(out_crcs, 0, pcrc)
+                        let _s1: Boolean = list_try_set(out_crcs, 1, fcrc)
+    return code
+
+fn yaza_db_pitr_archive_fd_chunked_v1(src_fd: Number, archive_root: Number, part_prefix: Text, aad: Text, opt_key: Option[YazaDbPageCryptoKeyV1]) -> Result[Text, Text]:
+    let total_len: Number = file_size(src_fd)?
+    let max_c: Number = 262144
+    let crcs: List[Number] = List[Number]()
+    let _p0: Boolean = list_try_push(crcs, 0)
+    let _p1: Boolean = list_try_push(crcs, 0)
+    let lparts: TextList = text_list()
+    var offset: Number = 0
+    var cidx: Number = 0
+    let encrypted: Boolean = option_is_some(opt_key)
+    while offset < total_len:
+        var clen: Number = max_c
+        if clen > total_len - offset:
+            set clen = total_len - offset
+        var ext: Text = ".bin"
+        if encrypted:
+            set ext = ".enc"
+        let part_name: Text = part_prefix + "." + number_text(cidx) + ext
+        let rc: Number = yaza_db_pitr_archive_chunk_in_scope_v1(src_fd, offset, clen, archive_root, part_name, aad, cidx, opt_key, crcs)
+        if rc != 0:
+            return err(yaza_db_pitr_err_text_v1("YDBv1 PITR chunked archive failed at part " + part_name + " (code " + number_text(rc) + ")"))
+        let fcrc: Number = list_get(crcs, 1)
+        if fcrc == -1:
+            list_push(lparts, "Z|" + number_text(offset) + "|" + number_text(clen) + "|0|0\n")
+        else:
+            list_push(lparts, part_name + "|" + number_text(offset) + "|" + number_text(clen) + "|" + number_text(list_get(crcs, 0)) + "|" + number_text(fcrc) + "\n")
+        set offset = offset + clen
+        set cidx = cidx + 1
+    return ok(text_join(lparts, ""))
+
+fn yaza_db_pitr_restore_chunk_in_scope_v1(archive_root: Number, part_name: Text, dst_fd: Number, offset: Number, expected_pcrc: Number, expected_fcrc: Number, aad: Text, chunk_idx: Number, encrypted: Boolean, opt_key: Option[YazaDbPageCryptoKeyV1], write_to_dst: Boolean) -> Number:
+    var code: Number = 0
+    arena_scope 20971520:
+        let s_res: Result[Bytes, Text] = yaza_db_pitr_read_file_bytes_v1(archive_root, part_name)
+        if not result_is_ok(s_res):
+            set code = 1
+        else:
+            let stored: Bytes = result_unwrap(s_res)
+            if bytes_ydbv1_checksum(stored) != expected_fcrc:
+                set code = 2
+            else:
+                var plain: Bytes = stored
+                if encrypted:
+                    if not option_is_some(opt_key):
+                        set code = 3
+                    else:
+                        let o_res: Result[Bytes, Text] = yaza_db_crypto_open_blob_v1(option_unwrap(opt_key), aad, chunk_idx, stored)
+                        if not result_is_ok(o_res):
+                            set code = 4
+                        else:
+                            set plain = result_unwrap(o_res)
+                if code == 0:
+                    if bytes_ydbv1_checksum(plain) != expected_pcrc:
+                        set code = 5
+                    elif write_to_dst:
+                        let w_res: Result[Number, Text] = write_exact(dst_fd, offset, plain)
+                        if not result_is_ok(w_res) or result_unwrap(w_res) != bytes_length(plain):
+                            set code = 6
+    return code
+
+fn yaza_db_pitr_process_parts_v1(archive_root: Number, parts_txt: Text, aad: Text, encrypted: Boolean, opt_key: Option[YazaDbPageCryptoKeyV1], dst_fd: Number, write_to_dst: Boolean) -> Result[Boolean, Text]:
+    if encrypted and not option_is_some(opt_key):
+        return err(yaza_db_pitr_err_text_v1("YDBv1 PITR encrypted archive requires decryption key"))
+    let lines: TextList = text_lines(parts_txt)
+    var i: Number = 0
+    var cidx: Number = 0
+    while i < list_count(lines):
+        let ln: Text = list_get(lines, i)
+        if ln != "":
+            let ps: TextList = text_split(ln, "|")
+            if list_count(ps) != 5:
+                return err(yaza_db_pitr_err_text_v1("YDBv1 PITR malformed part ledger line"))
+            let p_name: Text = list_get(ps, 0)
+            let p_off: Number = number_parse(list_get(ps, 1))
+            let p_len: Number = number_parse(list_get(ps, 2))
+            let p_pcrc: Number = number_parse(list_get(ps, 3))
+            let p_fcrc: Number = number_parse(list_get(ps, 4))
+            if p_name == "Z":
+                if write_to_dst:
+                    let _pz: Boolean = preallocate(dst_fd, p_off + p_len)?
+            else:
+                let rc: Number = yaza_db_pitr_restore_chunk_in_scope_v1(archive_root, p_name, dst_fd, p_off, p_pcrc, p_fcrc, aad, cidx, encrypted, opt_key, write_to_dst)
+                if rc != 0:
+                    return err(yaza_db_pitr_err_text_v1("YDBv1 PITR chunk verification/stage failed on " + p_name + " (code " + number_text(rc) + ")"))
+            set cidx = cidx + 1
+        set i = i + 1
+    return ok(true)
+
+fn yaza_db_pitr_archive_base_v1(session: YazaDbSessionV1, archive_root: Number, archive_prefix: Text, opt_key: Option[YazaDbPageCryptoKeyV1]) -> Result[YazaDbPitrBaseReportV1, Text]:
+    if not session.is_open or archive_prefix == "":
+        return err(yaza_db_pitr_err_text_v1("YDBv1 PITR base archive requires an open session and non-empty archive prefix"))
+    if option_is_some(session.explicit_tx):
+        return err(yaza_db_pitr_err_text_v1("YDBv1 PITR base archive cannot run inside an active explicit transaction"))
+    let ckpt: YazaDbCheckpointResultV1 = yaza_db_checkpoint_clean_v1(session.storage, session.wal, 0)?
+    let plain_len: Number = file_size(ckpt.storage.file)?
+    let encrypted: Boolean = option_is_some(opt_key)
+
+    let parts_txt: Text = yaza_db_pitr_archive_fd_chunked_v1(ckpt.storage.file, archive_root, archive_prefix + ".base.part", "YDB1-PITR-BASE", opt_key)?
+    let parts_bytes: Bytes = bytes_from_text(parts_txt)
+    let parts_crc: Number = bytes_ydbv1_checksum(parts_bytes)
+    let _wp: Boolean = yaza_db_crypto_write_atomic_file_v1(archive_root, archive_prefix + ".base.parts", parts_bytes)?
+
+    # Archive initial WAL segments required to open the base checkpoint cleanly (also chunked)
+    let wal_count: Number = (ckpt.wal.next_lsn / yaza_db_wal_segment_size_v1()) + 1
+    let wparts: TextList = text_list()
+    var si: Number = 0
+    while si < wal_count:
+        let src_wname: Text = yaza_db_wal_segment_name_for_v1(si, ckpt.storage.header.db_uuid)?
+        let wfd: Number = open_read(session.root, src_wname)?
+        let w_parts_txt: Text = yaza_db_pitr_archive_fd_chunked_v1(wfd, archive_root, archive_prefix + ".base.wal." + number_text(si), "YDB1-PITR-BWAL", opt_key)?
+        let _cw: Boolean = close(wfd)?
+        let w_parts_file: Text = archive_prefix + ".base.wal." + number_text(si) + ".parts"
+        let w_parts_bytes: Bytes = bytes_from_text(w_parts_txt)
+        let w_parts_crc: Number = bytes_ydbv1_checksum(w_parts_bytes)
+        let _wwp: Boolean = yaza_db_crypto_write_atomic_file_v1(archive_root, w_parts_file, w_parts_bytes)?
+        list_push(wparts, number_text(si) + "|" + w_parts_file + "|" + src_wname + "|" + number_text(w_parts_crc) + "\n")
+        set si = si + 1
+    let wals_bytes: Bytes = bytes_from_text(text_join(wparts, ""))
+    let wals_crc: Number = bytes_ydbv1_checksum(wals_bytes)
+    let _wwl: Boolean = yaza_db_crypto_write_atomic_file_v1(archive_root, archive_prefix + ".base.wals", wals_bytes)?
+
+    let uuid_hex: Text = yaza_db_crypto_uuid_hex_v1(ckpt.storage.header.db_uuid)?
+    var enc_txt: Text = "false"
+    if encrypted:
+        set enc_txt = "true"
+    let meta_json: Text = "{\"base_lsn\":" + number_text(ckpt.wal.next_lsn) + ",\"db_uuid\":\"" + uuid_hex + "\",\"encrypted\":" + enc_txt + ",\"parts_crc\":" + number_text(parts_crc) + ",\"wals_crc\":" + number_text(wals_crc) + ",\"base_bytes\":" + number_text(plain_len) + ",\"created_ts_ms\":" + number_text(time_now_unix_ms()) + "}"
+    let _wm: Boolean = yaza_db_crypto_write_atomic_file_v1(archive_root, archive_prefix + ".base.meta", bytes_from_text(meta_json))?
+
+    # Initialize empty signed chunks ledger
+    let chunks_file: Text = archive_prefix + ".chunks"
+    let empty_chunks: Bytes = bytes_from_text("")
+    let _wc: Boolean = yaza_db_crypto_write_atomic_file_v1(archive_root, chunks_file, empty_chunks)?
+    let sig_crc: Number = bytes_ydbv1_checksum(empty_chunks)
+    let _ws: Boolean = yaza_db_crypto_write_atomic_file_v1(archive_root, archive_prefix + ".chunks.sig", bytes_from_text(number_text(sig_crc)))?
+
+    let updated_sess: YazaDbSessionV1 = YazaDbSessionV1(session.root, ckpt.storage, ckpt.wal, session.catalog_cache, session.index_rows_cache, session.buffer_pool, none, true, session.plan_cache)
+    return ok(YazaDbPitrBaseReportV1(updated_sess, ckpt.wal.next_lsn, uuid_hex, encrypted, plain_len, parts_crc))
+
+fn yaza_db_pitr_archive_wal_chunk_v1(session: YazaDbSessionV1, archive_root: Number, archive_prefix: Text, from_lsn: Number, opt_key: Option[YazaDbPageCryptoKeyV1]) -> Result[YazaDbPitrChunkReportV1, Text]:
+    if not session.is_open or archive_prefix == "":
+        return err("YDBv1 PITR WAL archive requires an open session and non-empty archive prefix")
+    let chunk: YazaDbWalChunkV1 = yaza_db_replication_read_wal_chunk_v1(session.root, session.storage.header.db_uuid, from_lsn, 16777216, session.wal.next_lsn)?
+    if chunk.record_count == 0 or bytes_length(chunk.raw_bytes) == 0:
+        return ok(YazaDbPitrChunkReportV1(from_lsn, from_lsn, 0, option_is_some(opt_key), "", 0))
+
+    let plain_bytes: Bytes = chunk.raw_bytes
+    let plain_crc: Number = chunk.chunk_crc32c
+    let encrypted: Boolean = option_is_some(opt_key)
+    var chunk_name: Text = archive_prefix + ".wal." + number_text(chunk.from_lsn) + ".bin"
+    var stored_bytes: Bytes = plain_bytes
+    if encrypted:
+        set chunk_name = archive_prefix + ".wal." + number_text(chunk.from_lsn) + ".enc"
+        set stored_bytes = yaza_db_crypto_seal_blob_v1(option_unwrap(opt_key), "YDB1-PITR-WAL", chunk.from_lsn, plain_bytes)?
+    let file_crc: Number = bytes_ydbv1_checksum(stored_bytes)
+    let _wch: Boolean = yaza_db_crypto_write_atomic_file_v1(archive_root, chunk_name, stored_bytes)?
+
+    # Verify and extend signed chunks ledger
+    let chunks_file: Text = archive_prefix + ".chunks"
+    let sig_file: Text = archive_prefix + ".chunks.sig"
+    var prev_txt: Text = ""
+    let existing_res: Result[Bytes, Text] = yaza_db_pitr_read_file_bytes_v1(archive_root, chunks_file)
+    if result_is_ok(existing_res):
+        let existing_bytes: Bytes = result_unwrap(existing_res)
+        let sig_bytes: Bytes = yaza_db_pitr_read_file_bytes_v1(archive_root, sig_file)?
+        let expected_sig: Number = number_parse(bytes_to_text(sig_bytes))
+        if bytes_ydbv1_checksum(existing_bytes) != expected_sig:
+            return err("YDBv1 PITR chunks ledger checksum mismatch before append")
+        set prev_txt = bytes_to_text(existing_bytes)
+
+    var enc_flag: Text = "0"
+    if encrypted:
+        set enc_flag = "1"
+    let entry: Text = number_text(chunk.from_lsn) + "|" + number_text(chunk.to_lsn) + "|" + number_text(plain_crc) + "|" + number_text(file_crc) + "|" + enc_flag + "|" + chunk_name + "\n"
+    let next_bytes: Bytes = bytes_from_text(prev_txt + entry)
+    let _wn: Boolean = yaza_db_crypto_write_atomic_file_v1(archive_root, chunks_file, next_bytes)?
+    let _ws: Boolean = yaza_db_crypto_write_atomic_file_v1(archive_root, sig_file, bytes_from_text(number_text(bytes_ydbv1_checksum(next_bytes))))?
+
+    return ok(YazaDbPitrChunkReportV1(chunk.from_lsn, chunk.to_lsn, chunk.record_count, encrypted, chunk_name, plain_crc))
+
+fn yaza_db_pitr_decode_all_records_v1(chunk_raw: Bytes, from_lsn: Number) -> Result[List[YazaDbWalRecordV1], Text]:
+    let out_res: Result[List[YazaDbWalRecordV1], Text] = list_try_new()
+    if not result_is_ok(out_res):
+        return err(yaza_db_pitr_err_text_v1("YDBv1 PITR record list allocation failed"))
+    let out: List[YazaDbWalRecordV1] = result_unwrap(out_res)
+    let raw_len: Number = bytes_length(chunk_raw)
+    let segment_size: Number = yaza_db_wal_segment_size_v1()
+    let header_size: Number = yaza_db_wal_header_size_v1()
+    var offset: Number = 0
+    var scan_lsn: Number = from_lsn
+    while offset < raw_len:
+        if offset + 4 > raw_len:
+            return err(yaza_db_pitr_err_text_v1("YDBv1 PITR WAL record header is truncated"))
+        let len_slice: Bytes = bytes_try_slice(chunk_raw, offset, 4)?
+        let total_len: Number = yaza_db_read_uint_le_v1(len_slice, 0, 4)?
+        if total_len < header_size or offset + total_len > raw_len:
+            return err(yaza_db_pitr_err_text_v1("YDBv1 PITR WAL record length is invalid"))
+        let seg_off: Number = scan_lsn % segment_size
+        if seg_off != 0 and total_len > segment_size - seg_off:
+            set scan_lsn = ((scan_lsn / segment_size) + 1) * segment_size
+        let encoded: Bytes = bytes_try_slice(chunk_raw, offset, total_len)?
+        let rec: YazaDbWalRecordV1 = yaza_db_wal_decode_v1(encoded, scan_lsn)?
+        let _pr: Boolean = list_try_push(out, rec)
+        set offset = offset + total_len
+        set scan_lsn = rec.lsn + total_len
+    return ok(out)
+
+fn yaza_db_pitr_restore_v1(archive_root: Number, archive_prefix: Text, target_root: Number, target_db_name: Text, target_lsn: Number, target_commit_ts: Number, opt_key: Option[YazaDbPageCryptoKeyV1]) -> Result[YazaDbPitrRestoreReportV1, Text]:
+    if archive_prefix == "" or target_db_name == "":
+        return err(yaza_db_pitr_err_text_v1("YDBv1 PITR restore requires non-empty archive prefix and target database name"))
+    let meta_bytes: Bytes = yaza_db_pitr_read_file_bytes_v1(archive_root, archive_prefix + ".base.meta")?
+    let meta_json: Text = bytes_to_text(meta_bytes)
+    let encrypted: Boolean = text_find(meta_json, "\"encrypted\":true") >= 0
+    let parts_crc: Number = option_unwrap(json_extract_number(meta_json, "parts_crc"))
+    let wals_crc: Number = option_unwrap(json_extract_number(meta_json, "wals_crc"))
+
+    let parts_bytes: Bytes = yaza_db_pitr_read_file_bytes_v1(archive_root, archive_prefix + ".base.parts")?
+    if bytes_ydbv1_checksum(parts_bytes) != parts_crc:
+        return err(yaza_db_pitr_err_text_v1("YDBv1 PITR base snapshot parts ledger checksum mismatch"))
+    let base_parts_txt: Text = bytes_to_text(parts_bytes)
+    let _vbase: Boolean = yaza_db_pitr_process_parts_v1(archive_root, base_parts_txt, "YDB1-PITR-BASE", encrypted, opt_key, -1, false)?
+
+    # Verify and decrypt base WAL segments ledger before touching target_root
+    let wals_bytes: Bytes = yaza_db_pitr_read_file_bytes_v1(archive_root, archive_prefix + ".base.wals")?
+    if bytes_ydbv1_checksum(wals_bytes) != wals_crc:
+        return err(yaza_db_pitr_err_text_v1("YDBv1 PITR base WAL ledger checksum mismatch"))
+    let bw_names: List[Text] = List[Text]()
+    let bw_parts_txts: List[Text] = List[Text]()
+    let wlines: TextList = text_lines(bytes_to_text(wals_bytes))
+    var wi: Number = 0
+    while wi < list_count(wlines):
+        let wl: Text = list_get(wlines, wi)
+        if wl != "":
+            let wp: TextList = text_split(wl, "|")
+            if list_count(wp) != 4:
+                return err(yaza_db_pitr_err_text_v1("YDBv1 PITR malformed base WAL ledger line"))
+            let w_parts_file: Text = list_get(wp, 1)
+            let w_target_name: Text = list_get(wp, 2)
+            let w_parts_crc: Number = number_parse(list_get(wp, 3))
+            let wp_bytes: Bytes = yaza_db_pitr_read_file_bytes_v1(archive_root, w_parts_file)?
+            if bytes_ydbv1_checksum(wp_bytes) != w_parts_crc:
+                return err(yaza_db_pitr_err_text_v1("YDBv1 PITR base WAL parts checksum mismatch: " + w_parts_file))
+            let wp_txt: Text = bytes_to_text(wp_bytes)
+            let _vw: Boolean = yaza_db_pitr_process_parts_v1(archive_root, wp_txt, "YDB1-PITR-BWAL", encrypted, opt_key, -1, false)?
+            let _pn: Boolean = list_try_push(bw_names, w_target_name)
+            let _pt: Boolean = list_try_push(bw_parts_txts, wp_txt)
+        set wi = wi + 1
+
+    # Load, verify CRC, and decrypt all WAL chunks before modifying target_root
+    let chunks_bytes: Bytes = yaza_db_pitr_read_file_bytes_v1(archive_root, archive_prefix + ".chunks")?
+    let sig_bytes: Bytes = yaza_db_pitr_read_file_bytes_v1(archive_root, archive_prefix + ".chunks.sig")?
+    let expected_sig: Number = number_parse(bytes_to_text(sig_bytes))
+    if bytes_ydbv1_checksum(chunks_bytes) != expected_sig:
+        return err(yaza_db_pitr_err_text_v1("YDBv1 PITR chunks ledger checksum mismatch"))
+
+    let all_recs_res: Result[List[YazaDbWalRecordV1], Text] = list_try_new()
+    if not result_is_ok(all_recs_res):
+        return err(yaza_db_pitr_err_text_v1("YDBv1 PITR restore record buffer allocation failed"))
+    let all_recs: List[YazaDbWalRecordV1] = result_unwrap(all_recs_res)
+
+    let lines: TextList = text_lines(bytes_to_text(chunks_bytes))
+    var li: Number = 0
+    while li < list_count(lines):
+        let line: Text = list_get(lines, li)
+        if line != "":
+            let parts: TextList = text_split(line, "|")
+            if list_count(parts) != 6:
+                return err(yaza_db_pitr_err_text_v1("YDBv1 PITR malformed chunk ledger line"))
+            let c_from: Number = number_parse(list_get(parts, 0))
+            let c_plain_crc: Number = number_parse(list_get(parts, 2))
+            let c_file_crc: Number = number_parse(list_get(parts, 3))
+            let c_enc: Number = number_parse(list_get(parts, 4))
+            let c_file: Text = list_get(parts, 5)
+            let chunk_stored: Bytes = yaza_db_pitr_read_file_bytes_v1(archive_root, c_file)?
+            if bytes_ydbv1_checksum(chunk_stored) != c_file_crc:
+                return err(yaza_db_pitr_err_text_v1("YDBv1 PITR WAL chunk checksum mismatch: " + c_file))
+            var chunk_plain: Bytes = chunk_stored
+            if c_enc == 1:
+                if not option_is_some(opt_key):
+                    return err(yaza_db_pitr_err_text_v1("YDBv1 PITR encrypted WAL chunk requires decryption key"))
+                set chunk_plain = yaza_db_crypto_open_blob_v1(option_unwrap(opt_key), "YDB1-PITR-WAL", c_from, chunk_stored)?
+            if bytes_ydbv1_checksum(chunk_plain) != c_plain_crc:
+                return err(yaza_db_pitr_err_text_v1("YDBv1 PITR WAL chunk plaintext checksum mismatch"))
+            let dec_recs: List[YazaDbWalRecordV1] = yaza_db_pitr_decode_all_records_v1(chunk_plain, c_from)?
+            var ri: Number = 0
+            while ri < list_count(dec_recs):
+                let _pr: Boolean = list_try_push(all_recs, list_get(dec_recs, ri))
+                set ri = ri + 1
+        set li = li + 1
+
+    # Stage base WAL segments and chunked base database image into target_root
+    var bi: Number = 0
+    while bi < list_count(bw_names):
+        let wfd: Number = create_exclusive(target_root, list_get(bw_names, bi))?
+        let _sw: Boolean = yaza_db_pitr_process_parts_v1(archive_root, list_get(bw_parts_txts, bi), "YDB1-PITR-BWAL", encrypted, opt_key, wfd, true)?
+        let _sws: Boolean = sync(wfd)?
+        let _swc: Boolean = close(wfd)?
+        set bi = bi + 1
+    let db_fd: Number = create_exclusive(target_root, target_db_name)?
+    let _sdb: Boolean = yaza_db_pitr_process_parts_v1(archive_root, base_parts_txt, "YDB1-PITR-BASE", encrypted, opt_key, db_fd, true)?
+    let _sdbs: Boolean = sync(db_fd)?
+    let _sdbc: Boolean = close(db_fd)?
+    let _ds: Boolean = sync_directory(target_root)?
+    var sess: YazaDbSessionV1 = yaza_db_session_open_v1(target_root, target_db_name)?
+
+    # Pass 1: Determine committed transactions strictly within [base_lsn .. target_lsn) and commit_ts <= target_commit_ts
+    let committed_txns: List[Number] = List[Number]()
+    var last_commit_end_lsn: Number = 0
+    var max_cts: Number = 0
+    var ri: Number = 0
+    while ri < list_count(all_recs):
+        let rec: YazaDbWalRecordV1 = list_get(all_recs, ri)
+        if rec.lsn >= sess.wal.next_lsn:
+            let in_lsn: Boolean = target_lsn <= 0 or rec.lsn < target_lsn
+            if in_lsn:
+                if rec.rec_type == yaza_db_wal_type_commit_v1():
+                    let cts: Number = yaza_db_wal_commit_payload_decode_v1(rec)?
+                    if target_commit_ts <= 0 or cts <= target_commit_ts:
+                        let _pc: Boolean = list_try_push(committed_txns, rec.txn_id)
+                        if cts > max_cts: set max_cts = cts
+                        set last_commit_end_lsn = rec.lsn + bytes_length(rec.payload) + yaza_db_wal_header_size_v1()
+                elif rec.rec_type == yaza_db_wal_type_catalog_root_commit_v1():
+                    let crc: YazaDbWalCatalogRootCommitV1 = yaza_db_wal_catalog_root_commit_payload_decode_v1(rec)?
+                    if target_commit_ts <= 0 or crc.commit_ts <= target_commit_ts:
+                        let _pc: Boolean = list_try_push(committed_txns, rec.txn_id)
+                        if crc.commit_ts > max_cts: set max_cts = crc.commit_ts
+                        set last_commit_end_lsn = rec.lsn + bytes_length(rec.payload) + yaza_db_wal_header_size_v1()
+        set ri = ri + 1
+
+    var effective_end_lsn: Number = 0
+    if target_commit_ts > 0:
+        if last_commit_end_lsn > 0:
+            set effective_end_lsn = last_commit_end_lsn
+        else:
+            set effective_end_lsn = sess.wal.next_lsn
+    elif target_lsn > 0:
+        set effective_end_lsn = target_lsn
+
+    var skipped_count: Number = 0
+    set ri = 0
+    while ri < list_count(all_recs):
+        let rec: YazaDbWalRecordV1 = list_get(all_recs, ri)
+        if rec.lsn >= sess.wal.next_lsn:
+            if (effective_end_lsn > 0 and rec.lsn >= effective_end_lsn) or (rec.txn_id > 0 and not yaza_db_pitr_number_list_contains_v1(committed_txns, rec.txn_id)):
+                set skipped_count = skipped_count + 1
+        set ri = ri + 1
+
+    # Pass 2: True LSN-continuous ARIES WAL replay up to effective_end_lsn
+    var cur_storage: YazaDbStorageHandleV1 = sess.storage
+    var cur_wal: YazaDbWalLogV1 = sess.wal
+    var applied_count: Number = 0
+
+    set ri = 0
+    while ri < list_count(all_recs):
+        let rec: YazaDbWalRecordV1 = list_get(all_recs, ri)
+        if rec.lsn >= cur_wal.next_lsn:
+            if effective_end_lsn > 0 and rec.lsn >= effective_end_lsn:
+                break
+            let appended: YazaDbWalAppendV1 = yaza_db_wal_log_append_unflushed_v1(cur_wal, rec)?
+            set cur_wal = appended.log
+            let applied_rec: YazaDbWalRecordV1 = appended.record
+            let redo_code: Number = yaza_db_replication_redo_record_in_scope_v1(cur_storage, applied_rec, cur_wal.next_lsn)
+            if redo_code != 0:
+                return err(yaza_db_pitr_err_text_v1("YDBv1 PITR redo failed at LSN " + number_text(applied_rec.lsn) + " (code " + number_text(redo_code) + ")"))
+            if applied_rec.rec_type == yaza_db_wal_type_commit_v1():
+                let commit_ts: Number = yaza_db_wal_commit_payload_decode_v1(applied_rec)?
+                if commit_ts > max_cts: set max_cts = commit_ts
+                var next_txn: Number = cur_storage.header.next_txn_id
+                if applied_rec.txn_id + 1 > next_txn: set next_txn = applied_rec.txn_id + 1
+                var next_ts: Number = cur_storage.header.next_commit_ts
+                if commit_ts + 1 > next_ts: set next_ts = commit_ts + 1
+                let nh: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(cur_storage.header.db_uuid, cur_storage.header.checkpoint_lsn, next_txn, next_ts, cur_storage.header.catalog_root, cur_storage.header.page_count, cur_storage.header.flags)
+                set cur_storage = YazaDbStorageHandleV1(cur_storage.root, cur_storage.file, cur_storage.lock, cur_storage.identity_lock, nh)
+            elif applied_rec.rec_type == yaza_db_wal_type_catalog_root_commit_v1():
+                let crc: YazaDbWalCatalogRootCommitV1 = yaza_db_wal_catalog_root_commit_payload_decode_v1(applied_rec)?
+                if crc.commit_ts > max_cts: set max_cts = crc.commit_ts
+                var next_txn: Number = cur_storage.header.next_txn_id
+                if applied_rec.txn_id + 1 > next_txn: set next_txn = applied_rec.txn_id + 1
+                var next_ts: Number = cur_storage.header.next_commit_ts
+                if crc.commit_ts + 1 > next_ts: set next_ts = crc.commit_ts + 1
+                let nh: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(cur_storage.header.db_uuid, cur_storage.header.checkpoint_lsn, next_txn, next_ts, crc.new_catalog_root, cur_storage.header.page_count, cur_storage.header.flags)
+                set cur_storage = YazaDbStorageHandleV1(cur_storage.root, cur_storage.file, cur_storage.lock, cur_storage.identity_lock, nh)
+            elif applied_rec.rec_type == yaza_db_wal_type_abort_v1():
+                var next_txn: Number = cur_storage.header.next_txn_id
+                if applied_rec.txn_id + 1 > next_txn: set next_txn = applied_rec.txn_id + 1
+                let nh: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(cur_storage.header.db_uuid, cur_storage.header.checkpoint_lsn, next_txn, cur_storage.header.next_commit_ts, cur_storage.header.catalog_root, cur_storage.header.page_count, cur_storage.header.flags)
+                set cur_storage = YazaDbStorageHandleV1(cur_storage.root, cur_storage.file, cur_storage.lock, cur_storage.identity_lock, nh)
+            elif applied_rec.rec_type == yaza_db_wal_type_checkpoint_end_v1():
+                let snap: YazaDbCheckpointSnapshotV1 = yaza_db_checkpoint_end_payload_decode_v1(applied_rec)?
+                if snap.page_count > cur_storage.header.page_count:
+                    set cur_storage = yaza_db_replication_extend_replica_pages_v1(cur_storage, snap.page_count, snap.begin_lsn)?
+                let nh: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(cur_storage.header.db_uuid, applied_rec.lsn, snap.next_txn_id, snap.next_commit_ts, snap.catalog_root, snap.page_count, cur_storage.header.flags)
+                let w_sync: Boolean = sync(cur_wal.file)?
+                let s_sync: Boolean = sync(cur_storage.file)?
+                if not w_sync or not s_sync:
+                    return err(yaza_db_pitr_err_text_v1("YDBv1 PITR sync failed prior to publishing CHECKPOINT_END header"))
+                let _hw4: Number = yaza_db_storage_write_header_v1(cur_storage.file, nh)?
+                let _hs: Boolean = sync(cur_storage.file)?
+                set cur_storage = YazaDbStorageHandleV1(cur_storage.root, cur_storage.file, cur_storage.lock, cur_storage.identity_lock, nh)
+            if applied_rec.txn_id <= 0 or yaza_db_pitr_number_list_contains_v1(committed_txns, applied_rec.txn_id):
+                set applied_count = applied_count + 1
+        set ri = ri + 1
+
+    let _ws: Boolean = sync(cur_wal.file)?
+    let _ss: Boolean = sync(cur_storage.file)?
+    let restored_lsn: Number = cur_wal.next_lsn
+    let _cwal: Boolean = yaza_db_wal_log_close_v1(cur_wal)?
+    let _cstg: Boolean = yaza_db_storage_close_v1(cur_storage)?
+    let rec_sess: YazaDbSessionV1 = yaza_db_session_open_v1(target_root, target_db_name)?
+    let _cl_fin: Boolean = yaza_db_session_close_v1(rec_sess)?
+    return ok(YazaDbPitrRestoreReportV1(restored_lsn, applied_count, skipped_count, max_cts))
+
+# --- Logical CDC Tail Reader + HTTP Handlers ---
+
+fn yaza_db_cdc_op_name_v1(op: Number) -> Text:
+    if op == yaza_db_sync_op_upsert_v1():
+        return "UPSERT"
+    if op == yaza_db_sync_op_delete_v1():
+        return "DELETE"
+    return "UNKNOWN"
+
+fn yaza_db_cdc_cursor_file_v1(consumer_id: Text) -> Text:
+    return "cdc-cursor-" + consumer_id + ".json"
+
+fn yaza_db_cdc_load_cursor_v1(root: Number, consumer_id: Text) -> Result[YazaDbCdcCursorV1, Text]:
+    if consumer_id == "":
+        return err("YDBv1 CDC consumer_id cannot be empty")
+    let fname: Text = yaza_db_cdc_cursor_file_v1(consumer_id)
+    let exists_b: Boolean = yaza_db_sync_file_exists_v1(root, fname)?
+    if not exists_b:
+        return ok(YazaDbCdcCursorV1(consumer_id, 0, 0))
+    let raw: Bytes = yaza_db_pitr_read_file_bytes_v1(root, fname)?
+    let txt: Text = bytes_to_text(raw)
+    let acked: Number = option_unwrap(json_extract_number(txt, "acked_lsn"))
+    let ts: Number = option_unwrap(json_extract_number(txt, "last_poll_ts_ms"))
+    return ok(YazaDbCdcCursorV1(consumer_id, acked, ts))
+
+fn yaza_db_cdc_save_cursor_v1(root: Number, cursor: YazaDbCdcCursorV1) -> Result[Boolean, Text]:
+    if cursor.consumer_id == "":
+        return err("YDBv1 CDC consumer_id cannot be empty")
+    let json_txt: Text = "{\"consumer_id\":\"" + cursor.consumer_id + "\",\"acked_lsn\":" + number_text(cursor.acked_lsn) + ",\"last_poll_ts_ms\":" + number_text(cursor.last_poll_ts_ms) + "}"
+    return yaza_db_crypto_write_atomic_file_v1(root, yaza_db_cdc_cursor_file_v1(cursor.consumer_id), bytes_from_text(json_txt))
+
+fn yaza_db_cdc_poll_v1(session: YazaDbSessionV1, consumer_id: Text, origin_id: Text, from_lsn: Number, max_events: Number) -> Result[YazaDbCdcPollResultV1, Text]:
+    if not session.is_open or consumer_id == "":
+        return err(yaza_db_pitr_err_text_v1("YDBv1 CDC poll requires an open session and consumer_id"))
+    var start_lsn: Number = from_lsn
+    if start_lsn < 0:
+        let cur: YazaDbCdcCursorV1 = yaza_db_cdc_load_cursor_v1(session.root, consumer_id)?
+        set start_lsn = cur.acked_lsn
+    var lim: Number = max_events
+    if lim < 1: set lim = 100
+    let batch: YazaDbSyncBatchV1 = yaza_db_sync_extract_delta_v1(session, origin_id, start_lsn, lim)?
+    let evs_res: Result[List[YazaDbCdcEventV1], Text] = list_try_new()
+    if not result_is_ok(evs_res):
+        return err(yaza_db_pitr_err_text_v1("YDBv1 CDC event allocation failed"))
+    let evs: List[YazaDbCdcEventV1] = result_unwrap(evs_res)
+    var i: Number = 0
+    while i < list_count(batch.changes):
+        let ch: YazaDbSyncChangeV1 = list_get(batch.changes, i)
+        let _pe: Boolean = list_try_push(evs, YazaDbCdcEventV1(ch.origin_seq, ch.txn_id, ch.commit_ts, ch.table_name, yaza_db_cdc_op_name_v1(ch.operation), ch.pk_key_hex, ch.row_json, ch.row_version))
+        set i = i + 1
+    return ok(YazaDbCdcPollResultV1("" + consumer_id, batch.from_lsn, batch.to_lsn, evs))
+
+fn yaza_db_cdc_poll_to_json_v1(res: YazaDbCdcPollResultV1) -> Text:
+    let parts: TextList = text_list()
+    list_push(parts, "{\"consumer_id\":\"")
+    list_push(parts, res.consumer_id)
+    list_push(parts, "\",\"from_lsn\":")
+    list_push(parts, number_text(res.from_lsn))
+    list_push(parts, ",\"next_lsn\":")
+    list_push(parts, number_text(res.next_lsn))
+    list_push(parts, ",\"events\":[")
+    var i: Number = 0
+    while i < list_count(res.events):
+        if i > 0:
+            list_push(parts, ",")
+        let e: YazaDbCdcEventV1 = list_get(res.events, i)
+        list_push(parts, "{\"lsn\":")
+        list_push(parts, number_text(e.lsn))
+        list_push(parts, ",\"txn_id\":")
+        list_push(parts, number_text(e.txn_id))
+        list_push(parts, ",\"commit_ts\":")
+        list_push(parts, number_text(e.commit_ts))
+        list_push(parts, ",\"table\":\"")
+        list_push(parts, e.table_name)
+        list_push(parts, "\",\"op\":\"")
+        list_push(parts, e.op)
+        list_push(parts, "\",\"pk_hex\":\"")
+        list_push(parts, e.pk_key_hex)
+        list_push(parts, "\",\"row_version\":")
+        list_push(parts, number_text(e.row_version))
+        list_push(parts, ",\"row\":")
+        list_push(parts, e.row_json)
+        list_push(parts, "}")
+        set i = i + 1
+    list_push(parts, "]}")
+    return text_join(parts, "")
+
+fn yaza_db_cdc_query_param_v1(query_text: Text, key: Text) -> Option[Text]:
+    if query_text == "":
+        return none
+    let pairs: TextList = text_split(query_text, "&")
+    var i: Number = 0
+    let prefix: Text = key + "="
+    while i < list_count(pairs):
+        let kv: Text = list_get(pairs, i)
+        if text_starts_with(kv, prefix):
+            return some(text_slice(kv, text_length(prefix), text_length(kv) - text_length(prefix)))
+        set i = i + 1
+    return none
+
+fn yaza_db_cdc_handle_http_v1(session: YazaDbSessionV1, request: HttpRequest, origin_id: Text) -> Result[HttpResponse, Text]:
+    if request.path == "/api/v1/cdc/poll" and (request.method == "GET" or request.method == "POST"):
+        var consumer_id: Text = "default"
+        var from_lsn: Number = -1
+        var limit: Number = 100
+        if request.method == "GET":
+            let co: Option[Text] = yaza_db_cdc_query_param_v1(request.query, "consumer")
+            if option_is_some(co): set consumer_id = option_unwrap(co)
+            let fo: Option[Text] = yaza_db_cdc_query_param_v1(request.query, "from_lsn")
+            if option_is_some(fo): set from_lsn = number_parse(option_unwrap(fo))
+            let lo: Option[Text] = yaza_db_cdc_query_param_v1(request.query, "limit")
+            if option_is_some(lo): set limit = number_parse(option_unwrap(lo))
+        else:
+            let co2: Option[Text] = json_extract_string(request.body_text, "consumer_id")
+            if option_is_some(co2): set consumer_id = option_unwrap(co2)
+            let fo2: Option[Number] = json_extract_number(request.body_text, "from_lsn")
+            if option_is_some(fo2): set from_lsn = option_unwrap(fo2)
+            let lo2: Option[Number] = json_extract_number(request.body_text, "limit")
+            if option_is_some(lo2): set limit = option_unwrap(lo2)
+        let poll_res: Result[YazaDbCdcPollResultV1, Text] = yaza_db_cdc_poll_v1(session, consumer_id, origin_id, from_lsn, limit)
+        if not result_is_ok(poll_res):
+            return ok(http_response_bad_request(result_unwrap_error(poll_res), true))
+        return ok(http_response_ok_json(yaza_db_cdc_poll_to_json_v1(result_unwrap(poll_res))))
+
+    if request.path == "/api/v1/cdc/ack" and request.method == "POST":
+        let co3: Option[Text] = json_extract_string(request.body_text, "consumer_id")
+        let ao3: Option[Number] = json_extract_number(request.body_text, "acked_lsn")
+        if not option_is_some(co3) or not option_is_some(ao3):
+            return ok(http_response_bad_request("missing consumer_id or acked_lsn", true))
+        let cid: Text = option_unwrap(co3)
+        let ack_lsn: Number = option_unwrap(ao3)
+        let saved: Boolean = yaza_db_cdc_save_cursor_v1(session.root, YazaDbCdcCursorV1(cid, ack_lsn, time_now_unix_ms()))?
+        if not saved:
+            return ok(http_response_bad_request("failed to persist CDC cursor", true))
+        return ok(http_response_ok_json("{\"status\":\"ok\",\"consumer_id\":\"" + cid + "\",\"acked_lsn\":" + number_text(ack_lsn) + "}"))
+
+    return ok(http_response_not_found("unknown CDC endpoint", true))

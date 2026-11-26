@@ -3,6 +3,7 @@ use "./allocator_v1"
 use "./page_v1"
 use "./page_image_v1"
 use "./page_wal_v1"
+use "./delta_wal_v1"
 use "./catalog_storage_v1"
 use "./storage_v1"
 use "./wal_v1"
@@ -413,6 +414,12 @@ fn yaza_db_checkpoint_read_undo_record_v1(root: Number, db_uuid: Bytes, record_l
             let payload: YazaDbWalLeafMutationV1 = result_unwrap(decoded)
             set operation = payload.operation
             set page_id = payload.page_id
+        elif record.rec_type == yaza_db_wal_type_leaf_slot_delta_v1():
+            let decoded: Result[YazaDbWalLeafSlotDeltaV1, Text] = yaza_db_wal_leaf_slot_delta_decode_v1(record)
+            if not result_is_ok(decoded): return output
+            let payload: YazaDbWalLeafSlotDeltaV1 = result_unwrap(decoded)
+            set operation = payload.operation
+            set page_id = payload.page_id
         elif record.rec_type == yaza_db_wal_type_node_split_v1():
             let decoded: Result[YazaDbWalNodeSplitV1, Text] = yaza_db_wal_node_split_payload_decode_v1(record)
             if not result_is_ok(decoded): return output
@@ -493,6 +500,20 @@ fn yaza_db_checkpoint_validate_compensation_v1(root: Number, db_uuid: Bytes, com
         let finalized_expected: Result[Bytes, Text] = yaza_db_page_finalize_v1(expected_image)
         if not result_is_ok(finalized_expected): return 3
         if not bytes_equal(result_unwrap(finalized_expected), leaf_clr.image): return 3
+    elif original.rec_type == yaza_db_wal_type_leaf_slot_delta_v1():
+        if original.page_id != compensation.page_id or original.operation != compensation.operation: return 2
+        let original_step_result: Result[YazaDbCheckpointWalStepV1, Text] = yaza_db_checkpoint_read_wal_step_v1(root, db_uuid, original.lsn, segment_count, log_end_lsn)
+        let compensation_step_result: Result[YazaDbCheckpointWalStepV1, Text] = yaza_db_checkpoint_read_wal_step_v1(root, db_uuid, compensation.lsn, segment_count, log_end_lsn)
+        if not result_is_ok(original_step_result) or not result_is_ok(compensation_step_result): return 3
+        let original_step: YazaDbCheckpointWalStepV1 = result_unwrap(original_step_result)
+        let compensation_step: YazaDbCheckpointWalStepV1 = result_unwrap(compensation_step_result)
+        if not original_step.has_record or not compensation_step.has_record: return 3
+        let delta_result: Result[YazaDbWalLeafSlotDeltaV1, Text] = yaza_db_wal_leaf_slot_delta_decode_v1(original_step.record)
+        let leaf_clr_result: Result[YazaDbWalLeafCompensationV1, Text] = yaza_db_wal_leaf_compensation_payload_decode_v1(compensation_step.record)
+        if not result_is_ok(delta_result) or not result_is_ok(leaf_clr_result): return 3
+        let delta: YazaDbWalLeafSlotDeltaV1 = result_unwrap(delta_result)
+        let leaf_clr: YazaDbWalLeafCompensationV1 = result_unwrap(leaf_clr_result)
+        if not yaza_db_delta_wal_validate_clr_image_v1(delta, leaf_clr.image): return 3
     elif original.rec_type == yaza_db_wal_type_node_split_v1():
         if compensation.operation != yaza_db_wal_type_node_split_v1(): return 2
         let original_step_result: Result[YazaDbCheckpointWalStepV1, Text] = yaza_db_checkpoint_read_wal_step_v1(root, db_uuid, original.lsn, segment_count, log_end_lsn)
@@ -774,6 +795,19 @@ fn yaza_db_checkpoint_scan_transaction_tail_v1(storage: YazaDbStorageHandleV1, w
                                                 else:
                                                     let allocated_result: Result[Boolean, Text] = yaza_db_storage_validate_leaf_page_allocated_v1(storage, payload.page_id)
                                                     if not result_is_ok(allocated_result) or not result_unwrap(allocated_result): set step_code = 16
+                                    elif step_code == 0 and record.rec_type == yaza_db_wal_type_leaf_slot_delta_v1():
+                                        let delta_res: Result[YazaDbWalLeafSlotDeltaV1, Text] = yaza_db_wal_leaf_slot_delta_decode_v1(record)
+                                        if not result_is_ok(delta_res): set step_code = 13
+                                        else:
+                                            let delta: YazaDbWalLeafSlotDeltaV1 = result_unwrap(delta_res)
+                                            let address_result: Result[YazaDbBitmapAddressV1, Text] = yaza_db_bitmap_address_v1(delta.page_id)
+                                            if not result_is_ok(address_result): set step_code = 16
+                                            else:
+                                                let address: YazaDbBitmapAddressV1 = result_unwrap(address_result)
+                                                if delta.page_id >= storage.header.page_count or address.is_bitmap_page or address.bitmap_page_id >= storage.header.page_count: set step_code = 16
+                                                else:
+                                                    let allocated_result: Result[Boolean, Text] = yaza_db_storage_validate_leaf_page_allocated_v1(storage, delta.page_id)
+                                                    if not result_is_ok(allocated_result) or not result_unwrap(allocated_result): set step_code = 16
                                     elif step_code == 0 and record.rec_type == yaza_db_wal_type_node_split_v1():
                                         let split_result: Result[Boolean, Text] = yaza_db_checkpoint_validate_node_split_allocations_v1(storage, record, segment_count, wal.next_lsn)
                                         if not result_is_ok(split_result): set step_code = 13
@@ -866,6 +900,9 @@ fn yaza_db_checkpoint_redo_transaction_tail_v1(storage: YazaDbStorageHandleV1, w
                         elif record.rec_type == yaza_db_wal_type_leaf_insert_v1() or record.rec_type == yaza_db_wal_type_leaf_update_v1() or record.rec_type == yaza_db_wal_type_leaf_delete_v1():
                             let applied: Result[Boolean, Text] = yaza_db_storage_redo_leaf_mutation_v1(storage, record, original_log_end)
                             if not result_is_ok(applied): set step_code = 7
+                        elif record.rec_type == yaza_db_wal_type_leaf_slot_delta_v1():
+                            let applied: Result[Boolean, Text] = yaza_db_storage_redo_leaf_slot_delta_v1(storage, record, original_log_end)
+                            if not result_is_ok(applied): set step_code = 7
                         elif record.rec_type == yaza_db_wal_type_node_split_v1():
                             let applied: Result[Boolean, Text] = yaza_db_storage_redo_node_split_v1(storage, record, original_log_end)
                             if not result_is_ok(applied): set step_code = 8
@@ -887,7 +924,7 @@ fn yaza_db_checkpoint_validate_aborted_chain_v1(root: Number, db_uuid: Bytes, tx
         if steps >= 65536: return 2
         let record: YazaDbCheckpointUndoRecordV1 = yaza_db_checkpoint_read_undo_record_v1(root, db_uuid, cursor_lsn, segment_count, log_end_lsn)
         if record.lsn != cursor_lsn or record.txn_id != txn_id: return 1
-        if record.rec_type == yaza_db_wal_type_page_alloc_v1() or record.rec_type == yaza_db_wal_type_page_free_v1() or record.rec_type == yaza_db_wal_type_leaf_insert_v1() or record.rec_type == yaza_db_wal_type_leaf_update_v1() or record.rec_type == yaza_db_wal_type_leaf_delete_v1() or record.rec_type == yaza_db_wal_type_node_split_v1(): return 3
+        if record.rec_type == yaza_db_wal_type_page_alloc_v1() or record.rec_type == yaza_db_wal_type_page_free_v1() or record.rec_type == yaza_db_wal_type_leaf_insert_v1() or record.rec_type == yaza_db_wal_type_leaf_update_v1() or record.rec_type == yaza_db_wal_type_leaf_delete_v1() or record.rec_type == yaza_db_wal_type_leaf_slot_delta_v1() or record.rec_type == yaza_db_wal_type_node_split_v1(): return 3
         elif record.rec_type == yaza_db_wal_type_compensation_v1(): set cursor_lsn = record.undo_next_lsn
         elif record.rec_type == yaza_db_wal_type_mtr_end_v1(): set cursor_lsn = record.prev_lsn
         else: return 4
@@ -933,13 +970,24 @@ fn yaza_db_checkpoint_append_leaf_undo_clr_v1(storage: YazaDbStorageHandleV1, wa
     let step: YazaDbCheckpointWalStepV1 = yaza_db_checkpoint_read_wal_step_v1(storage.root, storage.header.db_uuid, original_lsn, segment_count, wal.next_lsn)?
     if not step.has_record or step.record.lsn != original_lsn or step.record.txn_id != txn_id: return err("YDBv1 leaf undo could not read its original transaction record")
     let original: YazaDbWalRecordV1 = step.record
-    let mutation: YazaDbWalLeafMutationV1 = yaza_db_wal_leaf_mutation_payload_decode_v1(original)?
     let clr_length: Number = yaza_db_wal_header_size_v1() + yaza_db_wal_leaf_compensation_payload_size_v1()
     let clr_lsn: Number = yaza_db_wal_record_lsn_for_append_v1(wal, clr_length)?
-    let image: Bytes = bytes_try_slice(mutation.before_image, 0, yaza_db_page_size_v1())?
-    if not yaza_db_write_uint_le_v1(image, 0, clr_lsn, 8): return err("YDBv1 leaf undo image LSN could not be stamped")
-    let stamped_image: Bytes = yaza_db_page_finalize_v1(image)?
-    let payload: Bytes = yaza_db_wal_leaf_compensation_payload_encode_v1(mutation.operation, mutation.page_id, original.prev_lsn, original.lsn, clr_lsn, transaction_head_lsn, stamped_image)?
+    var undo_op: Number = 0
+    var undo_page_id: Number = 0
+    var stamped_image: Bytes = bytes_empty()
+    if original.rec_type == yaza_db_wal_type_leaf_slot_delta_v1():
+        let delta: YazaDbWalLeafSlotDeltaV1 = yaza_db_wal_leaf_slot_delta_decode_v1(original)?
+        set undo_op = delta.operation
+        set undo_page_id = delta.page_id
+        set stamped_image = yaza_db_delta_wal_build_undo_image_v1(storage, clr_lsn, delta)?
+    else:
+        let mutation: YazaDbWalLeafMutationV1 = yaza_db_wal_leaf_mutation_payload_decode_v1(original)?
+        set undo_op = mutation.operation
+        set undo_page_id = mutation.page_id
+        let image: Bytes = bytes_try_slice(mutation.before_image, 0, yaza_db_page_size_v1())?
+        if not yaza_db_write_uint_le_v1(image, 0, clr_lsn, 8): return err("YDBv1 leaf undo image LSN could not be stamped")
+        set stamped_image = yaza_db_page_finalize_v1(image)?
+    let payload: Bytes = yaza_db_wal_leaf_compensation_payload_encode_v1(undo_op, undo_page_id, original.prev_lsn, original.lsn, clr_lsn, transaction_head_lsn, stamped_image)?
     let input_record: YazaDbWalRecordV1 = YazaDbWalRecordV1(0, transaction_head_lsn, txn_id, yaza_db_wal_type_compensation_v1(), 0, payload)
     let appended: YazaDbWalAppendV1 = yaza_db_wal_log_append_v1(wal, input_record)?
     if appended.record.lsn != clr_lsn:
@@ -1058,7 +1106,7 @@ fn yaza_db_checkpoint_undo_losers_v1(storage: YazaDbStorageHandleV1, initial_wal
                     if not list_try_set(transaction_heads, selected_slot, appended.record.lsn) or not list_try_set(cursors, selected_slot, record.prev_lsn):
                         let ignored_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(current_wal)
                         return err("YDBv1 loser undo could not advance its transaction cursor")
-                elif record.rec_type == yaza_db_wal_type_leaf_insert_v1() or record.rec_type == yaza_db_wal_type_leaf_update_v1() or record.rec_type == yaza_db_wal_type_leaf_delete_v1():
+                elif record.rec_type == yaza_db_wal_type_leaf_insert_v1() or record.rec_type == yaza_db_wal_type_leaf_update_v1() or record.rec_type == yaza_db_wal_type_leaf_delete_v1() or record.rec_type == yaza_db_wal_type_leaf_slot_delta_v1():
                     let appended_result: Result[YazaDbWalAppendV1, Text] = yaza_db_checkpoint_append_leaf_undo_clr_v1(storage, current_wal, txn_id, transaction_head_lsn, record.lsn, segment_count)
                     if not result_is_ok(appended_result):
                         let ignored_close: Result[Boolean, Text] = yaza_db_wal_log_close_v1(current_wal)

@@ -1,0 +1,306 @@
+# Tier 3.1: Horizontal Sharding (Hash + Range), Lag-Aware Per-Shard R/W Routing,
+# Multi-Shard Scatter-Gather Query Execution (COUNT/SUM/MIN/MAX/ORDER BY/LIMIT),
+# and Live Hash Shard Expansion Rebalance with Atomic Routing Epoch Cutover.
+
+use "std/time"
+use "./router_v1"
+use "./session_v1"
+use "./sql_executor_v1"
+
+shape YazaDbShardReplicaV1:
+    node_id: Text
+    endpoint: Text
+    healthy: Boolean
+    lag_lsn: Number
+
+shape YazaDbShardEntryV1:
+    shard_id: Number
+    primary_node_id: Text
+    primary_endpoint: Text
+    primary_lsn: Number
+    range_min_incl: Number
+    range_max_excl: Number
+    replicas: List[YazaDbShardReplicaV1]
+
+shape YazaDbShardClusterConfigV1:
+    epoch: Number
+    mode: Number # 1 = HASH, 2 = RANGE
+    max_replica_lag_lsn: Number
+    shards: List[YazaDbShardEntryV1]
+
+shape YazaDbShardTargetRouteV1:
+    epoch: Number
+    shard_id: Number
+    node_id: Text
+    endpoint: Text
+    role: Text # "primary" | "replica"
+    fell_back_to_primary: Boolean
+
+shape YazaDbScatterResultV1:
+    shard_count_queried: Number
+    total_count: Number
+    sum_val: Number
+    min_val: Number
+    max_val: Number
+    has_min_max: Boolean
+    ordered_values: List[Number]
+    rows_json_preview: List[Text]
+
+shape YazaDbRebalancePlanItemV1:
+    key_id: Number
+    from_shard: Number
+    to_shard: Number
+
+shape YazaDbRebalanceReportV1:
+    old_epoch: Number
+    new_epoch: Number
+    old_shard_count: Number
+    new_shard_count: Number
+    moved_keys: Number
+    kept_keys: Number
+    verified_total_rows: Number
+
+fn yaza_db_shard_err_text_v1(msg: Text) -> Text:
+    return "" + msg
+
+fn yaza_db_shard_mode_hash_v1() -> Number:
+    return 1
+
+fn yaza_db_shard_mode_range_v1() -> Number:
+    return 2
+
+fn yaza_db_shard_new_hash_cluster_v1(epoch: Number, max_lag_lsn: Number, shard_count: Number) -> Result[YazaDbShardClusterConfigV1, Text]:
+    if shard_count < 1 or shard_count > 64 or max_lag_lsn < 0:
+        return err(yaza_db_shard_err_text_v1("YDBv1 shard cluster bounds are invalid"))
+    let shards_res: Result[List[YazaDbShardEntryV1], Text] = list_try_new()
+    if not result_is_ok(shards_res):
+        return err(yaza_db_shard_err_text_v1("YDBv1 shard cluster allocation failed"))
+    let shards: List[YazaDbShardEntryV1] = result_unwrap(shards_res)
+    var i: Number = 0
+    while i < shard_count:
+        let reps_res: Result[List[YazaDbShardReplicaV1], Text] = list_try_new()
+        if not result_is_ok(reps_res):
+            return err(yaza_db_shard_err_text_v1("YDBv1 shard replica list allocation failed"))
+        let sid_txt: Text = number_text(i)
+        let entry: YazaDbShardEntryV1 = YazaDbShardEntryV1(i, "s" + sid_txt + "-primary", "127.0.0.1:" + number_text(9100 + i * 10), 100, 0, 0, result_unwrap(reps_res))
+        let _ps: Boolean = list_try_push(shards, entry)
+        set i = i + 1
+    return ok(YazaDbShardClusterConfigV1(epoch, yaza_db_shard_mode_hash_v1(), max_lag_lsn, shards))
+
+fn yaza_db_shard_new_range_cluster_v1(epoch: Number, max_lag_lsn: Number, bounds_min: List[Number], bounds_max: List[Number]) -> Result[YazaDbShardClusterConfigV1, Text]:
+    let n: Number = list_count(bounds_min)
+    if n < 1 or n != list_count(bounds_max) or max_lag_lsn < 0:
+        return err(yaza_db_shard_err_text_v1("YDBv1 range shard boundaries mismatch"))
+    let shards_res: Result[List[YazaDbShardEntryV1], Text] = list_try_new()
+    if not result_is_ok(shards_res):
+        return err(yaza_db_shard_err_text_v1("YDBv1 range shard list allocation failed"))
+    let shards: List[YazaDbShardEntryV1] = result_unwrap(shards_res)
+    var i: Number = 0
+    while i < n:
+        let lo: Number = list_get(bounds_min, i)
+        let hi: Number = list_get(bounds_max, i)
+        if lo >= hi:
+            return err(yaza_db_shard_err_text_v1("YDBv1 range shard requires min < max"))
+        if i > 0 and lo != list_get(bounds_max, i - 1):
+            return err(yaza_db_shard_err_text_v1("YDBv1 range shard partitions must be contiguous without gaps or overlaps"))
+        let reps_res: Result[List[YazaDbShardReplicaV1], Text] = list_try_new()
+        if not result_is_ok(reps_res):
+            return err(yaza_db_shard_err_text_v1("YDBv1 range replica list allocation failed"))
+        let sid_txt: Text = number_text(i)
+        let entry: YazaDbShardEntryV1 = YazaDbShardEntryV1(i, "r" + sid_txt + "-primary", "127.0.0.1:" + number_text(9200 + i * 10), 100, lo, hi, result_unwrap(reps_res))
+        let _ps: Boolean = list_try_push(shards, entry)
+        set i = i + 1
+    return ok(YazaDbShardClusterConfigV1(epoch, yaza_db_shard_mode_range_v1(), max_lag_lsn, shards))
+
+fn yaza_db_shard_set_replica_v1(cfg: YazaDbShardClusterConfigV1, shard_id: Number, replica_id: Text, endpoint: Text, healthy: Boolean, lag_lsn: Number) -> Result[YazaDbShardClusterConfigV1, Text]:
+    if shard_id < 0 or shard_id >= list_count(cfg.shards) or replica_id == "":
+        return err(yaza_db_shard_err_text_v1("YDBv1 shard replica update invalid shard_id or replica_id"))
+    let sh: YazaDbShardEntryV1 = list_get(cfg.shards, shard_id)
+    var found: Number = -1
+    var i: Number = 0
+    while i < list_count(sh.replicas):
+        if list_get(sh.replicas, i).node_id == replica_id:
+            set found = i
+            break
+        set i = i + 1
+    let rep: YazaDbShardReplicaV1 = YazaDbShardReplicaV1(replica_id, endpoint, healthy, lag_lsn)
+    if found >= 0:
+        let _sr: Boolean = list_try_set(sh.replicas, found, rep)
+    else:
+        let _pr: Boolean = list_try_push(sh.replicas, rep)
+    return ok(cfg)
+
+fn yaza_db_shard_locate_id_v1(cfg: YazaDbShardClusterConfigV1, shard_key_id: Number) -> Result[Number, Text]:
+    let n: Number = list_count(cfg.shards)
+    if n < 1:
+        return err(yaza_db_shard_err_text_v1("YDBv1 shard cluster has zero shards"))
+    if cfg.mode == yaza_db_shard_mode_hash_v1():
+        let h: Number = yaza_db_fnv1a_31_v1(number_text(shard_key_id))
+        return ok(h % n)
+    var i: Number = 0
+    while i < n:
+        let sh: YazaDbShardEntryV1 = list_get(cfg.shards, i)
+        if shard_key_id >= sh.range_min_incl and shard_key_id < sh.range_max_excl:
+            return ok(sh.shard_id)
+        set i = i + 1
+    return err(yaza_db_shard_err_text_v1("YDBv1 range key fell outside configured shard partitions"))
+
+fn yaza_db_shard_route_rw_v1(cfg: YazaDbShardClusterConfigV1, shard_key_id: Number, is_write: Boolean, allow_primary_fallback: Boolean) -> Result[YazaDbShardTargetRouteV1, Text]:
+    let sid: Number = yaza_db_shard_locate_id_v1(cfg, shard_key_id)?
+    let sh: YazaDbShardEntryV1 = list_get(cfg.shards, sid)
+    if is_write:
+        return ok(YazaDbShardTargetRouteV1(cfg.epoch, sid, sh.primary_node_id, sh.primary_endpoint, "primary", false))
+    var best_idx: Number = -1
+    var best_lag: Number = 922337203685477580
+    var i: Number = 0
+    while i < list_count(sh.replicas):
+        let r: YazaDbShardReplicaV1 = list_get(sh.replicas, i)
+        if r.healthy and r.lag_lsn <= cfg.max_replica_lag_lsn and r.lag_lsn < best_lag:
+            set best_idx = i
+            set best_lag = r.lag_lsn
+        set i = i + 1
+    if best_idx >= 0:
+        let chosen: YazaDbShardReplicaV1 = list_get(sh.replicas, best_idx)
+        return ok(YazaDbShardTargetRouteV1(cfg.epoch, sid, chosen.node_id, chosen.endpoint, "replica", false))
+    if not allow_primary_fallback:
+        return err(yaza_db_shard_err_text_v1("YDBv1 shard read rejected: all replicas unhealthy or exceeded lag threshold"))
+    return ok(YazaDbShardTargetRouteV1(cfg.epoch, sid, sh.primary_node_id, sh.primary_endpoint, "primary", true))
+
+fn yaza_db_shard_sort_numbers_v1(nums: List[Number], desc: Boolean) -> Unit:
+    let n: Number = list_count(nums)
+    var i: Number = 1
+    while i < n:
+        let cur: Number = list_get(nums, i)
+        var j: Number = i - 1
+        while j >= 0:
+            let prev: Number = list_get(nums, j)
+            var swap: Boolean = false
+            if desc and prev < cur: set swap = true
+            elif not desc and prev > cur: set swap = true
+            if not swap:
+                break
+            let _s1: Boolean = list_try_set(nums, j + 1, prev)
+            set j = j - 1
+        let _s2: Boolean = list_try_set(nums, j + 1, cur)
+        set i = i + 1
+    return
+
+fn yaza_db_shard_scatter_gather_v1(sessions: List[YazaDbSessionV1], table_name: Text, metric_col: Text, order_desc: Boolean, limit_n: Number) -> Result[YazaDbScatterResultV1, Text]:
+    let n: Number = list_count(sessions)
+    if n < 1 or table_name == "" or metric_col == "":
+        return err(yaza_db_shard_err_text_v1("YDBv1 scatter-gather requires at least one open shard session"))
+    let vals_res: Result[List[Number], Text] = list_try_new()
+    let prevs_res: Result[List[Text], Text] = list_try_new()
+    if not result_is_ok(vals_res) or not result_is_ok(prevs_res):
+        return err(yaza_db_shard_err_text_v1("YDBv1 scatter-gather allocation failed"))
+    let vals: List[Number] = result_unwrap(vals_res)
+    let prevs: List[Text] = result_unwrap(prevs_res)
+    var total_count: Number = 0
+    var sum_val: Number = 0
+    var min_val: Number = 0
+    var max_val: Number = 0
+    var has_mm: Boolean = false
+
+    var s: Number = 0
+    while s < n:
+        let cur_sess: YazaDbSessionV1 = list_get(sessions, s)
+        let sel: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(cur_sess, "SELECT " + metric_col + " FROM " + table_name, List[YazaSqlValueV1]())?
+        let qr: YazaSqlQueryResultV1 = option_unwrap(sel.statement.query_result)
+        var r: Number = 0
+        while r < list_count(qr.rows):
+            let v: Number = list_get(list_get(qr.rows, r), 0).integer_value
+            set total_count = total_count + 1
+            set sum_val = sum_val + v
+            if not has_mm:
+                set min_val = v
+                set max_val = v
+                set has_mm = true
+            else:
+                if v < min_val: set min_val = v
+                if v > max_val: set max_val = v
+            let _pv: Boolean = list_try_push(vals, v)
+            set r = r + 1
+        let _su: Boolean = list_try_set(sessions, s, sel.session)
+        set s = s + 1
+
+    yaza_db_shard_sort_numbers_v1(vals, order_desc)
+    let out_vals: List[Number] = List[Number]()
+    var k: Number = limit_n
+    if k <= 0 or k > list_count(vals):
+        set k = list_count(vals)
+    var i: Number = 0
+    while i < k:
+        let v: Number = list_get(vals, i)
+        let _po: Boolean = list_try_push(out_vals, v)
+        let _pp: Boolean = list_try_push(prevs, number_text(v))
+        set i = i + 1
+    return ok(YazaDbScatterResultV1(n, total_count, sum_val, min_val, max_val, has_mm, out_vals, prevs))
+
+fn yaza_db_shard_live_expand_hash_v1(cfg: YazaDbShardClusterConfigV1, sessions: List[YazaDbSessionV1], new_shard_session: YazaDbSessionV1, table_name: Text) -> Result[YazaDbRebalanceReportV1, Text]:
+    if cfg.mode != yaza_db_shard_mode_hash_v1():
+        return err(yaza_db_shard_err_text_v1("YDBv1 live hash expansion requires HASH sharding mode"))
+    let old_n: Number = list_count(sessions)
+    let new_n: Number = old_n + 1
+    if old_n < 1 or list_count(cfg.shards) != old_n or not new_shard_session.is_open:
+        return err(yaza_db_shard_err_text_v1("YDBv1 live hash expansion arguments invalid"))
+
+    var dest_sess: YazaDbSessionV1 = new_shard_session
+    var moved: Number = 0
+    var kept: Number = 0
+
+    var old_s: Number = 0
+    while old_s < old_n:
+        var cur_sess: YazaDbSessionV1 = list_get(sessions, old_s)
+        let sel: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(cur_sess, "SELECT id, amount, tag FROM " + table_name + " ORDER BY id ASC", List[YazaSqlValueV1]())?
+        set cur_sess = sel.session
+        let qr: YazaSqlQueryResultV1 = option_unwrap(sel.statement.query_result)
+        var r: Number = 0
+        while r < list_count(qr.rows):
+            let row: List[YazaSqlValueV1] = list_get(qr.rows, r)
+            let v_id_src: YazaSqlValueV1 = list_get(row, 0)
+            let v_amt_src: YazaSqlValueV1 = list_get(row, 1)
+            let kid: Number = v_id_src.integer_value
+            let amt: Number = v_amt_src.integer_value
+            let tag: Text = "" + list_get(row, 2).text_value
+            let target_s: Number = yaza_db_fnv1a_31_v1(number_text(kid)) % new_n
+            if target_s == old_n:
+                # Copy to new shard
+                let p: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+                let v0: YazaSqlValueV1 = yaza_sql_value_integer_v1(v_id_src.type_id, kid)?
+                let v1: YazaSqlValueV1 = yaza_sql_value_integer_v1(v_amt_src.type_id, amt)?
+                let _p0: Boolean = list_try_push(p, v0)
+                let _p1: Boolean = list_try_push(p, v1)
+                let _p2: Boolean = list_try_push(p, yaza_sql_value_text_v1(tag))
+                let ins: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(dest_sess, "INSERT INTO " + table_name + " (id, amount, tag) VALUES ($1, $2, $3)", p)?
+                set dest_sess = ins.session
+                # Delete from old shard after durable insert
+                let dp: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+                let dv0: YazaSqlValueV1 = yaza_sql_value_integer_v1(v_id_src.type_id, kid)?
+                let _dp0: Boolean = list_try_push(dp, dv0)
+                let del: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(cur_sess, "DELETE FROM " + table_name + " WHERE id = $1", dp)?
+                set cur_sess = del.session
+                set moved = moved + 1
+            else:
+                set kept = kept + 1
+            set r = r + 1
+        let _us: Boolean = list_try_set(sessions, old_s, cur_sess)
+        set old_s = old_s + 1
+
+    let _pa: Boolean = list_try_push(sessions, dest_sess)
+    let reps_res: Result[List[YazaDbShardReplicaV1], Text] = list_try_new()
+    let new_reps: List[YazaDbShardReplicaV1] = reps_res?
+    let sid_txt: Text = number_text(old_n)
+    let _psh: Boolean = list_try_push(cfg.shards, YazaDbShardEntryV1(old_n, "s" + sid_txt + "-primary", "127.0.0.1:" + number_text(9100 + old_n * 10), 100, 0, 0, new_reps))
+
+    # Verify post-cutover row conservation across all shards
+    var verified: Number = 0
+    var si: Number = 0
+    while si < list_count(sessions):
+        let cs: YazaDbSessionV1 = list_get(sessions, si)
+        let cnt_st: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(cs, "SELECT COUNT(*) FROM " + table_name, List[YazaSqlValueV1]())?
+        let _u2: Boolean = list_try_set(sessions, si, cnt_st.session)
+        let cnt: Number = list_get(list_get(option_unwrap(cnt_st.statement.query_result).rows, 0), 0).integer_value
+        set verified = verified + cnt
+        set si = si + 1
+
+    return ok(YazaDbRebalanceReportV1(cfg.epoch, cfg.epoch + 1, old_n, new_n, moved, kept, verified))

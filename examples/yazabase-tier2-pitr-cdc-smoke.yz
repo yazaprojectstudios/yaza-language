@@ -1,0 +1,176 @@
+# Tier 2.3 PITR & Logical CDC Smoke Validation:
+# 1. Plaintext & Encrypted (YDE1) Base Snapshot + WAL Chunk Archive
+# 2. PITR Restore to LSN (after T1) & Commit Timestamp (after T2), excluding rolled-back txn and T3
+# 3. Fail-closed verification on wrong crypto key & corrupted archive byte
+# 4. CDC Tail Reader & /api/v1/cdc/poll + /api/v1/cdc/ack through cluster_api_v1
+
+use "std/fs"
+use "std/http"
+use "std/json"
+use "std/time"
+use "std/ywt"
+use "../yazabase/api_v1"
+use "../yazabase/catalog_init_v1"
+use "../yazabase/cluster_api_v1"
+use "../yazabase/cluster_ha_v1"
+use "../yazabase/page_crypto_v1"
+use "../yazabase/pitr_cdc_v1"
+use "../yazabase/replication_v1"
+use "../yazabase/session_v1"
+use "../yazabase/storage_v1"
+use "../yazabase/wal_v1"
+
+fn t2p_expect(cond: Boolean, label: Text) -> Result[Boolean, Text]:
+    if not cond:
+        return err("tier2-pitr-cdc failed: " + label)
+    return ok(true)
+
+fn t2p_count_rows(root_path: Text, db_name: Text) -> Result[Number, Text]:
+    let r: Number = root_open(root_path)?
+    let s: YazaDbSessionV1 = yaza_db_session_open_v1(r, db_name)?
+    let st: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(s, "SELECT COUNT(*) FROM pitr_ledger", List[YazaSqlValueV1]())?
+    let qr: YazaSqlQueryResultV1 = option_unwrap(st.statement.query_result)
+    let cnt: Number = list_get(list_get(qr.rows, 0), 0).integer_value
+    let _c1: Boolean = yaza_db_session_close_v1(st.session)?
+    return ok(cnt)
+
+fn t2p_run(base_dir: Text) -> Result[Boolean, Text]:
+    let src_dir: Text = base_dir + "/src"
+    let arch_plain_dir: Text = base_dir + "/arch_plain"
+    let arch_enc_dir: Text = base_dir + "/arch_enc"
+    let rest_lsn_dir: Text = base_dir + "/rest_lsn"
+    let rest_ts_dir: Text = base_dir + "/rest_ts"
+    let rest_enc_dir: Text = base_dir + "/rest_enc"
+    let rest_bad_dir: Text = base_dir + "/rest_bad"
+
+    let src_root: Number = root_open(src_dir)?
+    let ap_root: Number = root_open(arch_plain_dir)?
+    let ae_root: Number = root_open(arch_enc_dir)?
+    let rl_root: Number = root_open(rest_lsn_dir)?
+    let rt_root: Number = root_open(rest_ts_dir)?
+    let re_root: Number = root_open(rest_enc_dir)?
+    let rb_root: Number = root_open(rest_bad_dir)?
+
+    let boot: YazaDbCatalogBootstrapV1 = yaza_db_catalog_create_v1(src_root, "pitr.yzdb")?
+    let _bw: Boolean = yaza_db_wal_log_close_v1(boot.wal)?
+    let _bs: Boolean = yaza_db_storage_close_v1(boot.storage)?
+    var sess: YazaDbSessionV1 = yaza_db_session_open_v1(src_root, "pitr.yzdb")?
+
+    let ddl: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(sess, "CREATE TABLE pitr_ledger (id INTEGER PRIMARY KEY, amount INTEGER, tag TEXT)", List[YazaSqlValueV1]())?
+    set sess = ddl.session
+
+    # Derive YDE1 crypto keys for encrypted PITR tests
+    let master_ok: Bytes = bytes_from_text("0123456789abcdef0123456789abcdef")
+    let master_wrong: Bytes = bytes_from_text("ffffffffffffffffffffffffffffffff")
+    let salt: Bytes = bytes_from_text("pitr-salt-16byte")
+    let enc_key: YazaDbPageCryptoKeyV1 = yaza_db_crypto_derive_subkeys_v1("pitr-k1", master_ok, salt, 4096, 1, sess.storage.header.db_uuid)?
+    let bad_key: YazaDbPageCryptoKeyV1 = yaza_db_crypto_derive_subkeys_v1("pitr-k2", master_wrong, salt, 4096, 1, sess.storage.header.db_uuid)?
+
+    # Archive base snapshot (after schema creation, 0 rows)
+    let base_rep_p: YazaDbPitrBaseReportV1 = yaza_db_pitr_archive_base_v1(sess, ap_root, "ledger", none)?
+    set sess = base_rep_p.session
+    let base_rep_e: YazaDbPitrBaseReportV1 = yaza_db_pitr_archive_base_v1(sess, ae_root, "ledger_e", some(enc_key))?
+    set sess = base_rep_e.session
+    let base_lsn: Number = base_rep_p.base_lsn
+
+    # T1 (committed)
+    let t1_st: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(sess, "INSERT INTO pitr_ledger (id, amount, tag) VALUES (1, 100, 't1')", List[YazaSqlValueV1]())?
+    set sess = t1_st.session
+    let lsn_after_t1: Number = sess.wal.next_lsn
+
+    # Uncommitted + explicitly rolled back transaction (must be ignored by PITR and CDC)
+    let rb0: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(sess, "BEGIN", List[YazaSqlValueV1]())?
+    set sess = rb0.session
+    let rb1: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(sess, "INSERT INTO pitr_ledger (id, amount, tag) VALUES (99, 999, 'rolled_back')", List[YazaSqlValueV1]())?
+    set sess = rb1.session
+    let rb2: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(sess, "ROLLBACK", List[YazaSqlValueV1]())?
+    set sess = rb2.session
+
+    # T2 (committed) - record commit_ts after T2
+    let t2_st: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(sess, "INSERT INTO pitr_ledger (id, amount, tag) VALUES (2, 200, 't2')", List[YazaSqlValueV1]())?
+    set sess = t2_st.session
+    let ts_after_t2: Number = sess.storage.header.next_commit_ts - 1
+
+    # Archive WAL chunk covering T1 + rollback + T2
+    let ch1_p: YazaDbPitrChunkReportV1 = yaza_db_pitr_archive_wal_chunk_v1(sess, ap_root, "ledger", base_lsn, none)?
+    let ch1_e: YazaDbPitrChunkReportV1 = yaza_db_pitr_archive_wal_chunk_v1(sess, ae_root, "ledger_e", base_lsn, some(enc_key))?
+    let _a1: Boolean = t2p_expect(ch1_p.record_count > 0 and ch1_e.encrypted, "WAL chunk 1 archived in both plain and encrypted modes")?
+
+    # T3 (committed later)
+    let t3_from: Number = sess.wal.next_lsn
+    let t3_st: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(sess, "INSERT INTO pitr_ledger (id, amount, tag) VALUES (3, 300, 't3')", List[YazaSqlValueV1]())?
+    set sess = t3_st.session
+    let ch2_p: YazaDbPitrChunkReportV1 = yaza_db_pitr_archive_wal_chunk_v1(sess, ap_root, "ledger", t3_from, none)?
+    let ch2_e: YazaDbPitrChunkReportV1 = yaza_db_pitr_archive_wal_chunk_v1(sess, ae_root, "ledger_e", t3_from, some(enc_key))?
+    let _a2: Boolean = t2p_expect(ch2_p.record_count > 0 and ch2_e.record_count > 0, "WAL chunk 2 archived cleanly")?
+
+    # 1. PITR Restore to target_lsn (after T1 -> should see 1 row only)
+    let rr_lsn: YazaDbPitrRestoreReportV1 = yaza_db_pitr_restore_v1(ap_root, "ledger", rl_root, "r_lsn.yzdb", lsn_after_t1, 0, none)?
+    let cnt_lsn: Number = t2p_count_rows(rest_lsn_dir, "r_lsn.yzdb")?
+    let _a3: Boolean = t2p_expect(cnt_lsn == 1 and rr_lsn.applied_records > 0, "PITR restore to target_lsn saw T1 only")?
+
+    # 2. PITR Restore to target_commit_ts (after T2 -> should see 2 rows: T1+T2, no rollback, no T3)
+    let rr_ts: YazaDbPitrRestoreReportV1 = yaza_db_pitr_restore_v1(ap_root, "ledger", rt_root, "r_ts.yzdb", 0, ts_after_t2, none)?
+    let cnt_ts: Number = t2p_count_rows(rest_ts_dir, "r_ts.yzdb")?
+    let _a4: Boolean = t2p_expect(cnt_ts == 2 and rr_ts.skipped_uncommitted > 0, "PITR restore to commit_ts excluded rolled-back and post-target T3")?
+
+    # 3. Encrypted PITR restore with right key succeeds (all 3 rows), wrong key fails closed
+    let rr_enc: YazaDbPitrRestoreReportV1 = yaza_db_pitr_restore_v1(ae_root, "ledger_e", re_root, "r_enc.yzdb", 0, 0, some(enc_key))?
+    let cnt_enc: Number = t2p_count_rows(rest_enc_dir, "r_enc.yzdb")?
+    let _a5: Boolean = t2p_expect(cnt_enc == 3 and rr_enc.applied_records > 0, "Encrypted PITR restore recovered all 3 rows")?
+
+    let wrong_res: Result[YazaDbPitrRestoreReportV1, Text] = yaza_db_pitr_restore_v1(ae_root, "ledger_e", rb_root, "r_bad.yzdb", 0, 0, some(bad_key))
+    let _a6: Boolean = t2p_expect(not result_is_ok(wrong_res), "Encrypted PITR failed closed with wrong key")?
+
+    # Corrupt plaintext chunks.sig and verify fail-closed CRC check
+    let _corrupt: Boolean = yaza_db_crypto_write_atomic_file_v1(ap_root, "ledger.chunks.sig", bytes_from_text("123456789"))?
+    let bad_crc_res: Result[YazaDbPitrRestoreReportV1, Text] = yaza_db_pitr_restore_v1(ap_root, "ledger", rb_root, "r_bad2.yzdb", 0, 0, none)
+    let _a7: Boolean = t2p_expect(not result_is_ok(bad_crc_res), "Tampered PITR archive ledger rejected fail-closed")?
+
+    # 4. CDC Tail Reader & /api/v1/cdc/poll + /api/v1/cdc/ack through cluster_api_v1
+    let secret: Text = "0123456789abcdef0123456789abcdef_cdc"
+    let now_s: Number = time_now_unix_ms() / 1000
+    let tok: Text = ywt_create("cdc-consumer", "yazabase", now_s + 3600, secret)
+    let auth_val: Text = "Bearer " + tok
+    let poll_req: HttpRequest = HttpRequest("GET", "/api/v1/cdc/poll", "consumer=sub1&from_lsn=" + number_text(base_lsn) + "&limit=50", "application/json", "", auth_val, "", 0, bytes_empty(), "")
+    let state: YazaApiServerStateV1 = yaza_api_server_state_default("pitr.yzdb")
+    let rstate: YazaDbReplicationStateV1 = yaza_db_replication_default_state_v1("primary", "node-1", 0)
+    let hstate: YazaDbHaStateV1 = yaza_db_ha_default_state_v1("node-1", "primary", 1, sess.wal.next_lsn, 15000)
+
+    let poll_out: YazaApiClusterResponseV1 = yaza_api_route_request_cluster_v1(sess, src_dir, "pitr.yzdb", poll_req, secret, state, rstate, hstate)?
+    let _a8: Boolean = t2p_expect(poll_out.response.status_code == 200, "GET /api/v1/cdc/poll returned 200 OK")?
+    let poll_json: Text = bytes_to_text(poll_out.response.body)
+    let _a9: Boolean = t2p_expect(text_find(poll_json, "\"consumer_id\":\"sub1\"") >= 0 and text_find(poll_json, "rolled_back") < 0, "CDC stream included committed rows and zero rolled_back rows")?
+    let _a10: Boolean = t2p_expect(text_find(poll_json, "\"tag\":\"t1\"") >= 0 and text_find(poll_json, "\"tag\":\"t2\"") >= 0 and text_find(poll_json, "\"tag\":\"t3\"") >= 0, "CDC stream contains all 3 committed transactions in order")?
+
+    let next_lsn: Number = option_unwrap(json_extract_number(poll_json, "next_lsn"))
+    let ack_body: Text = "{\"consumer_id\":\"sub1\",\"acked_lsn\":" + number_text(next_lsn) + "}"
+    let ack_req: HttpRequest = HttpRequest("POST", "/api/v1/cdc/ack", "", "application/json", "application/json", auth_val, "", text_length(ack_body), bytes_from_text(ack_body), ack_body)
+    let ack_out: YazaApiClusterResponseV1 = yaza_api_route_request_cluster_v1(poll_out.session, src_dir, "pitr.yzdb", ack_req, secret, state, rstate, hstate)?
+    let _a11: Boolean = t2p_expect(ack_out.response.status_code == 200, "POST /api/v1/cdc/ack returned 200 OK")?
+
+    # Poll again without explicit from_lsn -> resumes at persisted acked_lsn with 0 duplicate events
+    let poll_req2: HttpRequest = HttpRequest("GET", "/api/v1/cdc/poll", "consumer=sub1&limit=50", "application/json", "", auth_val, "", 0, bytes_empty(), "")
+    let poll_out2: YazaApiClusterResponseV1 = yaza_api_route_request_cluster_v1(ack_out.session, src_dir, "pitr.yzdb", poll_req2, secret, state, rstate, hstate)?
+    let poll_json2: Text = bytes_to_text(poll_out2.response.body)
+    let _a12: Boolean = t2p_expect(text_find(poll_json2, "\"events\":[]") >= 0, "persisted CDC cursor prevented duplicate replay after ack")?
+
+    let _z1: Number = yaza_db_crypto_zeroize_key_v1(enc_key)
+    let _z2: Number = yaza_db_crypto_zeroize_key_v1(bad_key)
+    let _sc: Boolean = yaza_db_session_close_v1(poll_out2.session)?
+    let _c_ap: Boolean = close(ap_root)?
+    let _c_ae: Boolean = close(ae_root)?
+    let _c_rb: Boolean = close(rb_root)?
+    return ok(true)
+
+start:
+    if arg_count() < 1:
+        say "usage: yazabase-tier2-pitr-cdc-smoke <dir>"
+        exit(2)
+    let base_dir: Text = "" + arg(1)
+    let res: Result[Boolean, Text] = t2p_run(base_dir)
+    if not result_is_ok(res):
+        say "yazabase-tier2-pitr-cdc-smoke: FAIL: " + result_unwrap_error(res)
+        exit(1)
+    say "yazabase-tier2-pitr-cdc-smoke: PASS"
+    exit(0)

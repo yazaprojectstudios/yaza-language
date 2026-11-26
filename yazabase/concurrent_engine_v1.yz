@@ -1,0 +1,718 @@
+# Tier 2.1: Concurrent Server Event Loop, Coalescing Group-Commit Writer Pipeline,
+# Striped Atomic WAL Ring Buffer, and Lock-Striped CLOCK LRU Buffer Pool.
+
+use "std/async"
+use "std/fs"
+use "std/http"
+use "std/json"
+use "std/net"
+use "std/sync"
+use "std/time"
+use "./api_v1"
+use "./buffer_pool_v1"
+use "./group_commit_v1"
+use "./page_v1"
+use "./plan_cache_v1"
+use "./server_v1"
+use "./session_v1"
+use "./sql_executor_v1"
+use "./sql_lexer_v1"
+use "./sql_parser_v2"
+use "./storage_v1"
+use "./transaction_v1"
+use "./wal_v1"
+
+shape YazaDbWalRingBufferV1:
+    capacity: Number
+    lock: Mutex
+    write_seq: AtomicNumber
+    flushed_seq: AtomicNumber
+    next_lsn: AtomicNumber
+    total_bytes_flushed: AtomicNumber
+    flush_count: AtomicNumber
+    slot_occupied: List[Boolean]
+    slot_lsns: List[Number]
+    slot_payloads: List[Text]
+    slot_crcs: List[Number]
+
+shape YazaDbWalRingAppendResultV1:
+    slot_seq: Number
+    assigned_lsn: Number
+    crc32c: Number
+
+shape YazaDbWalRingFlushReportV1:
+    flushed_records: Number
+    flushed_bytes: Number
+    fsync_count: Number
+    new_flushed_seq: Number
+
+shape YazaDbConcurrentBufferPoolV1:
+    file: Number
+    db_uuid: Bytes
+    capacity: Number
+    num_sets: Number
+    stripe_count: Number
+    stripe_locks: List[Mutex]
+    page_ids: List[Number]
+    pages: List[Bytes]
+    headers: List[YazaDbPageHeaderV1]
+    ref_bits: List[Number]
+    set_hands: List[Number]
+    hits: AtomicNumber
+    misses: AtomicNumber
+    evictions: AtomicNumber
+    resident_count: AtomicNumber
+
+shape YazaDbConcurrentEngineConfigV1:
+    max_queue_depth: Number
+    max_batch_size: Number
+    writer_linger_ms: Number
+    num_http_workers: Number
+
+shape YazaDbConcurrentEngineV1:
+    config: YazaDbConcurrentEngineConfigV1
+    session_box: List[YazaDbSessionV1]
+    queue_mutex: Mutex
+    wakeup_chan: AsyncChannel
+    close_done_chan: AsyncChannel
+    close_ok: AtomicNumber
+    shutdown_flag: AtomicNumber
+    snapshot_epoch: AtomicNumber
+    in_flight_readers: AtomicNumber
+    total_commits: AtomicNumber
+    total_batches: AtomicNumber
+    total_fsyncs: AtomicNumber
+    total_reads: AtomicNumber
+    backpressure_rejects: AtomicNumber
+    pending_sqls: List[Text]
+    pending_is_write: List[Boolean]
+    pending_done_chans: List[AsyncChannel]
+    queue_cursors: List[Number]
+    result_ok: List[Boolean]
+    result_affected: List[Number]
+    result_commit_ts: List[Number]
+    result_text: List[Text]
+    next_slot_seq: AtomicNumber
+
+shape YazaDbConcurrentEngineStatsV1:
+    snapshot_epoch: Number
+    in_flight_readers: Number
+    total_commits: Number
+    total_batches: Number
+    total_fsyncs: Number
+    total_reads: Number
+    backpressure_rejects: Number
+
+fn yaza_db_c_err_text_v1(msg: Text) -> Text:
+    return "" + msg
+
+fn yaza_db_wal_ring_bytes_to_hex_v1(b: Bytes) -> Text:
+    let digits: Text = "0123456789abcdef"
+    let parts: TextList = text_list()
+    var i: Number = 0
+    let n: Number = bytes_length(b)
+    while i < n:
+        let v: Number = bytes_get(b, i)
+        list_push(parts, text_slice(digits, (v / 16) % 16, 1))
+        list_push(parts, text_slice(digits, v % 16, 1))
+        set i = i + 1
+    return text_join(parts, "")
+
+fn yaza_db_wal_ring_hex_nibble_v1(ch: Number) -> Number:
+    if ch >= 48 and ch <= 57: return ch - 48
+    if ch >= 97 and ch <= 102: return ch - 87
+    if ch >= 65 and ch <= 70: return ch - 55
+    return -1
+
+fn yaza_db_wal_ring_hex_to_bytes_v1(hex: Text) -> Result[Bytes, Text]:
+    let n: Number = text_length(hex)
+    if n % 2 != 0:
+        return err("YDBv1 WAL ring hex payload length is odd")
+    let out: Bytes = bytes_try_new_zeroed(n / 2)?
+    var i: Number = 0
+    while i < n:
+        let hi: Number = yaza_db_wal_ring_hex_nibble_v1(text_byte(hex, i))
+        let lo: Number = yaza_db_wal_ring_hex_nibble_v1(text_byte(hex, i + 1))
+        if hi < 0 or lo < 0:
+            return err("YDBv1 WAL ring hex payload contains invalid digit")
+        if not bytes_try_set(out, i / 2, hi * 16 + lo):
+            return err("YDBv1 WAL ring hex decode failed")
+        set i = i + 2
+    return ok(out)
+
+fn yaza_db_wal_ring_new_v1(capacity: Number, start_lsn: Number) -> Result[YazaDbWalRingBufferV1, Text]:
+    if capacity < 16 or capacity > 4096 or start_lsn < 0:
+        return err(yaza_db_c_err_text_v1("YDBv1 WAL ring capacity must be between 16 and 4096"))
+    let occ_res: Result[List[Boolean], Text] = list_try_new()
+    let lsn_res: Result[List[Number], Text] = list_try_new()
+    let pay_res: Result[List[Text], Text] = list_try_new()
+    let crc_res: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(occ_res) or not result_is_ok(lsn_res) or not result_is_ok(pay_res) or not result_is_ok(crc_res):
+        return err(yaza_db_c_err_text_v1("YDBv1 WAL ring allocation failed"))
+    let occ: List[Boolean] = result_unwrap(occ_res)
+    let lsns: List[Number] = result_unwrap(lsn_res)
+    let pays: List[Text] = result_unwrap(pay_res)
+    let crcs: List[Number] = result_unwrap(crc_res)
+    let _r1: Boolean = list_try_reserve(occ, capacity)
+    let _r2: Boolean = list_try_reserve(lsns, capacity)
+    let _r3: Boolean = list_try_reserve(pays, capacity)
+    let _r4: Boolean = list_try_reserve(crcs, capacity)
+    let empty_hex: Text = yaza_db_c_err_text_v1("")
+    var i: Number = 0
+    while i < capacity:
+        if not list_try_push(occ, false) or not list_try_push(lsns, 0) or not list_try_push(pays, empty_hex) or not list_try_push(crcs, 0):
+            return err(yaza_db_c_err_text_v1("YDBv1 WAL ring slot initialization failed"))
+        set i = i + 1
+    return ok(YazaDbWalRingBufferV1(capacity, mutex_new(), atomic_create(0), atomic_create(0), atomic_create(start_lsn), atomic_create(0), atomic_create(0), occ, lsns, pays, crcs))
+
+fn yaza_db_wal_ring_reserve_and_append_v1(ring: YazaDbWalRingBufferV1, payload: Bytes) -> Result[YazaDbWalRingAppendResultV1, Text]:
+    let plen: Number = bytes_length(payload)
+    if plen < 1 or plen > 16777216:
+        return err("YDBv1 WAL ring payload length is invalid")
+    let crc: Number = bytes_ydbv1_checksum(payload)
+    let hex_payload: Text = yaza_db_wal_ring_bytes_to_hex_v1(payload)
+    let _lk: Boolean = mutex_lock(ring.lock)
+    let wseq: Number = atomic_load(ring.write_seq)
+    let fseq: Number = atomic_load(ring.flushed_seq)
+    if wseq - fseq >= ring.capacity:
+        let _ul: Boolean = mutex_unlock(ring.lock)
+        return err("YDBv1 WAL ring buffer full (backpressure)")
+    let seq: Number = atomic_fetch_add(ring.write_seq, 1) - 1
+    let lsn: Number = atomic_fetch_add(ring.next_lsn, plen) - plen
+    let idx: Number = seq % ring.capacity
+    let _s1: Boolean = list_try_set(ring.slot_lsns, idx, lsn)
+    let _s2: Boolean = list_try_set(ring.slot_payloads, idx, hex_payload)
+    let _s3: Boolean = list_try_set(ring.slot_crcs, idx, crc)
+    let _s4: Boolean = list_try_set(ring.slot_occupied, idx, true)
+    let _ul: Boolean = mutex_unlock(ring.lock)
+    return ok(YazaDbWalRingAppendResultV1(seq, lsn, crc))
+
+fn yaza_db_wal_ring_flush_to_file_v1(ring: YazaDbWalRingBufferV1, fd: Number) -> Result[YazaDbWalRingFlushReportV1, Text]:
+    if fd < 0:
+        return err("YDBv1 WAL ring flush requires an open file descriptor")
+    let _lk: Boolean = mutex_lock(ring.lock)
+    let start_seq: Number = atomic_load(ring.flushed_seq)
+    let end_seq: Number = atomic_load(ring.write_seq)
+    if start_seq >= end_seq:
+        let _ul: Boolean = mutex_unlock(ring.lock)
+        return ok(YazaDbWalRingFlushReportV1(0, 0, 0, start_seq))
+    let parts_res: Result[List[Bytes], Text] = list_try_new()
+    if not result_is_ok(parts_res):
+        let _ul: Boolean = mutex_unlock(ring.lock)
+        return err("YDBv1 WAL ring flush buffer allocation failed")
+    let parts: List[Bytes] = result_unwrap(parts_res)
+    var count: Number = 0
+    var cur: Number = start_seq
+    while cur < end_seq:
+        let idx: Number = cur % ring.capacity
+        if not list_get(ring.slot_occupied, idx):
+            break
+        let chunk_res: Result[Bytes, Text] = yaza_db_wal_ring_hex_to_bytes_v1(list_get(ring.slot_payloads, idx))
+        if not result_is_ok(chunk_res):
+            let _ul: Boolean = mutex_unlock(ring.lock)
+            return err(result_unwrap_error(chunk_res))
+        let chunk: Bytes = result_unwrap(chunk_res)
+        let stored_crc: Number = list_get(ring.slot_crcs, idx)
+        if bytes_ydbv1_checksum(chunk) != stored_crc:
+            let _ul: Boolean = mutex_unlock(ring.lock)
+            return err("YDBv1 WAL ring slot checksum mismatch before flush")
+        let _p: Boolean = list_try_push(parts, chunk)
+        let _clr: Boolean = list_try_set(ring.slot_occupied, idx, false)
+        set count = count + 1
+        set cur = cur + 1
+    let _ul: Boolean = mutex_unlock(ring.lock)
+    if count == 0:
+        return ok(YazaDbWalRingFlushReportV1(0, 0, 0, start_seq))
+    let joined: Bytes = bytes_join(parts)?
+    let total_len: Number = bytes_length(joined)
+    let f_end_res: Result[Number, Text] = file_size(fd)
+    if not result_is_ok(f_end_res):
+        return err(result_unwrap_error(f_end_res))
+    let offset: Number = atomic_load(ring.total_bytes_flushed)
+    let wr: Number = write_exact(fd, offset, joined)?
+    if wr != total_len:
+        return err("YDBv1 WAL ring short write to WAL file")
+    let sy: Boolean = sync(fd)?
+    if not sy:
+        return err("YDBv1 WAL ring sync failed")
+    let _s1: AtomicNumber = atomic_store(ring.flushed_seq, start_seq + count)
+    let _s2: AtomicNumber = atomic_add(ring.total_bytes_flushed, total_len)
+    let _s3: AtomicNumber = atomic_add(ring.flush_count, 1)
+    return ok(YazaDbWalRingFlushReportV1(count, total_len, 1, start_seq + count))
+
+fn yaza_db_wal_ring_destroy_v1(ring: YazaDbWalRingBufferV1) -> Boolean:
+    return mutex_destroy(ring.lock)
+
+fn yaza_db_cbuf_new_v1(file: Number, db_uuid: Bytes, capacity: Number) -> Result[YazaDbConcurrentBufferPoolV1, Text]:
+    if file < 0 or bytes_length(db_uuid) != 16:
+        return err(yaza_db_c_err_text_v1("YDBv1 concurrent buffer pool requires an open file and 16-byte DB UUID"))
+    if capacity < 64 or capacity > 8192 or capacity % 64 != 0:
+        return err(yaza_db_c_err_text_v1("YDBv1 concurrent buffer pool capacity must be a multiple of 64 between 64 and 8192"))
+    let num_sets: Number = capacity / 4
+    let stripe_count: Number = 16
+    let locks_res: Result[List[Mutex], Text] = list_try_new()
+    let pids_res: Result[List[Number], Text] = list_try_new()
+    let pages_res: Result[List[Bytes], Text] = list_try_new()
+    let hdrs_res: Result[List[YazaDbPageHeaderV1], Text] = list_try_new()
+    let refs_res: Result[List[Number], Text] = list_try_new()
+    let hands_res: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(locks_res) or not result_is_ok(pids_res) or not result_is_ok(pages_res) or not result_is_ok(hdrs_res) or not result_is_ok(refs_res) or not result_is_ok(hands_res):
+        return err(yaza_db_c_err_text_v1("YDBv1 concurrent buffer pool allocation failed"))
+    let locks: List[Mutex] = result_unwrap(locks_res)
+    let pids: List[Number] = result_unwrap(pids_res)
+    let pages: List[Bytes] = result_unwrap(pages_res)
+    let hdrs: List[YazaDbPageHeaderV1] = result_unwrap(hdrs_res)
+    let refs: List[Number] = result_unwrap(refs_res)
+    let hands: List[Number] = result_unwrap(hands_res)
+    let empty_page: Bytes = bytes_empty()
+    let empty_hdr: YazaDbPageHeaderV1 = YazaDbPageHeaderV1(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    var si: Number = 0
+    while si < stripe_count:
+        let _pl: Boolean = list_try_push(locks, mutex_new())
+        set si = si + 1
+    var slot: Number = 0
+    while slot < capacity:
+        let _a1: Boolean = list_try_push(pids, -1)
+        let _a2: Boolean = list_try_push(pages, empty_page)
+        let _a3: Boolean = list_try_push(hdrs, empty_hdr)
+        let _a4: Boolean = list_try_push(refs, 0)
+        set slot = slot + 1
+    var set_i: Number = 0
+    while set_i < num_sets:
+        let _ah: Boolean = list_try_push(hands, 0)
+        set set_i = set_i + 1
+    return ok(YazaDbConcurrentBufferPoolV1(file, db_uuid, capacity, num_sets, stripe_count, locks, pids, pages, hdrs, refs, hands, atomic_create(0), atomic_create(0), atomic_create(0), atomic_create(0)))
+
+fn yaza_db_cbuf_get_v1(pool: YazaDbConcurrentBufferPoolV1, file: Number, db_uuid: Bytes, page_id: Number) -> Option[YazaDbValidatedPageV1]:
+    if page_id < 2 or pool.file != file or pool.num_sets < 1 or not bytes_equal(pool.db_uuid, db_uuid):
+        return none
+    let set_idx: Number = page_id % pool.num_sets
+    let stripe_idx: Number = set_idx % pool.stripe_count
+    let stripe_lock: Mutex = list_get(pool.stripe_locks, stripe_idx)
+    let base: Number = set_idx * 4
+    let _lk: Boolean = mutex_lock(stripe_lock)
+    var way: Number = 0
+    while way < 4:
+        let slot: Number = base + way
+        if list_get(pool.page_ids, slot) == page_id:
+            let _r: Boolean = list_try_set(pool.ref_bits, slot, 1)
+            let p_val: YazaDbValidatedPageV1 = YazaDbValidatedPageV1(list_get(pool.pages, slot), list_get(pool.headers, slot))
+            let _ul: Boolean = mutex_unlock(stripe_lock)
+            let _ah: Number = atomic_fetch_add(pool.hits, 1)
+            return some(p_val)
+        set way = way + 1
+    let _ul: Boolean = mutex_unlock(stripe_lock)
+    let _am: Number = atomic_fetch_add(pool.misses, 1)
+    return none
+
+fn yaza_db_cbuf_put_v1(pool: YazaDbConcurrentBufferPoolV1, file: Number, db_uuid: Bytes, page_id: Number, page: Bytes, header: YazaDbPageHeaderV1) -> Boolean:
+    if page_id < 2 or pool.file != file or pool.num_sets < 1 or not bytes_equal(pool.db_uuid, db_uuid):
+        return false
+    if bytes_length(page) != yaza_db_page_size_v1() or header.page_id != page_id:
+        return false
+    let set_idx: Number = page_id % pool.num_sets
+    let stripe_idx: Number = set_idx % pool.stripe_count
+    let stripe_lock: Mutex = list_get(pool.stripe_locks, stripe_idx)
+    let base: Number = set_idx * 4
+    let copied_res: Result[Bytes, Text] = bytes_try_slice(page, 0, yaza_db_page_size_v1())
+    if not result_is_ok(copied_res):
+        return false
+    let copied_page: Bytes = result_unwrap(copied_res)
+    let _lk: Boolean = mutex_lock(stripe_lock)
+    var empty_slot: Number = -1
+    var way: Number = 0
+    while way < 4:
+        let slot: Number = base + way
+        let existing_id: Number = list_get(pool.page_ids, slot)
+        if existing_id == page_id:
+            let _sp: Boolean = list_try_set(pool.pages, slot, copied_page)
+            let _sh: Boolean = list_try_set(pool.headers, slot, header)
+            let _sr: Boolean = list_try_set(pool.ref_bits, slot, 1)
+            let _ul: Boolean = mutex_unlock(stripe_lock)
+            return true
+        if existing_id < 0 and empty_slot < 0:
+            set empty_slot = slot
+        set way = way + 1
+    if empty_slot >= 0:
+        let _sp: Boolean = list_try_set(pool.pages, empty_slot, copied_page)
+        let _sh: Boolean = list_try_set(pool.headers, empty_slot, header)
+        let _si: Boolean = list_try_set(pool.page_ids, empty_slot, page_id)
+        let _sr: Boolean = list_try_set(pool.ref_bits, empty_slot, 1)
+        let _ul: Boolean = mutex_unlock(stripe_lock)
+        let _ar: Number = atomic_fetch_add(pool.resident_count, 1)
+        return true
+    var hand: Number = list_get(pool.set_hands, set_idx) % 4
+    var steps: Number = 0
+    var victim_slot: Number = base + hand
+    while steps < 8:
+        let slot: Number = base + hand
+        if list_get(pool.ref_bits, slot) == 0:
+            set victim_slot = slot
+            set hand = (hand + 1) % 4
+            break
+        let _cr: Boolean = list_try_set(pool.ref_bits, slot, 0)
+        set hand = (hand + 1) % 4
+        set steps = steps + 1
+    let _sp: Boolean = list_try_set(pool.pages, victim_slot, copied_page)
+    let _sh: Boolean = list_try_set(pool.headers, victim_slot, header)
+    let _si: Boolean = list_try_set(pool.page_ids, victim_slot, page_id)
+    let _sr: Boolean = list_try_set(pool.ref_bits, victim_slot, 1)
+    let _shnd: Boolean = list_try_set(pool.set_hands, set_idx, hand)
+    let _ul: Boolean = mutex_unlock(stripe_lock)
+    let _ae: Number = atomic_fetch_add(pool.evictions, 1)
+    return true
+
+fn yaza_db_cbuf_invalidate_page_v1(pool: YazaDbConcurrentBufferPoolV1, page_id: Number) -> Boolean:
+    if page_id < 2 or pool.num_sets < 1:
+        return false
+    let set_idx: Number = page_id % pool.num_sets
+    let stripe_idx: Number = set_idx % pool.stripe_count
+    let stripe_lock: Mutex = list_get(pool.stripe_locks, stripe_idx)
+    let base: Number = set_idx * 4
+    let _lk: Boolean = mutex_lock(stripe_lock)
+    var way: Number = 0
+    while way < 4:
+        let slot: Number = base + way
+        if list_get(pool.page_ids, slot) == page_id:
+            let _si: Boolean = list_try_set(pool.page_ids, slot, -1)
+            let _sr: Boolean = list_try_set(pool.ref_bits, slot, 0)
+            let _ul: Boolean = mutex_unlock(stripe_lock)
+            let _ar: Number = atomic_fetch_add(pool.resident_count, -1)
+            return true
+        set way = way + 1
+    let _ul: Boolean = mutex_unlock(stripe_lock)
+    return false
+
+fn yaza_db_cbuf_stats_v1(pool: YazaDbConcurrentBufferPoolV1) -> YazaDbBufferPoolStatsV1:
+    return YazaDbBufferPoolStatsV1(pool.capacity, atomic_load(pool.hits), atomic_load(pool.misses), atomic_load(pool.evictions), 0, atomic_load(pool.resident_count))
+
+fn yaza_db_cbuf_destroy_v1(pool: YazaDbConcurrentBufferPoolV1) -> Boolean:
+    var i: Number = 0
+    while i < list_count(pool.stripe_locks):
+        let _d: Boolean = mutex_destroy(list_get(pool.stripe_locks, i))
+        set i = i + 1
+    return true
+
+fn yaza_db_concurrent_default_config_v1() -> YazaDbConcurrentEngineConfigV1:
+    return YazaDbConcurrentEngineConfigV1(512, 128, 1, 4)
+
+fn yaza_db_concurrent_engine_new_v1(session: YazaDbSessionV1, config: YazaDbConcurrentEngineConfigV1) -> Result[YazaDbConcurrentEngineV1, Text]:
+    if not session.is_open:
+        return err(yaza_db_c_err_text_v1("YDBv1 concurrent engine requires an open session"))
+    if config.max_queue_depth < 4 or config.max_queue_depth > 4096 or config.max_batch_size < 1 or config.max_batch_size > 1024:
+        return err(yaza_db_c_err_text_v1("YDBv1 concurrent engine queue/batch bounds are invalid"))
+    let box_res: Result[List[YazaDbSessionV1], Text] = list_try_new()
+    let sql_res: Result[List[Text], Text] = list_try_new()
+    let wr_res: Result[List[Boolean], Text] = list_try_new()
+    let chn_res: Result[List[AsyncChannel], Text] = list_try_new()
+    let rok_res: Result[List[Boolean], Text] = list_try_new()
+    let raff_res: Result[List[Number], Text] = list_try_new()
+    let rts_res: Result[List[Number], Text] = list_try_new()
+    let rtxt_res: Result[List[Text], Text] = list_try_new()
+    if not result_is_ok(box_res) or not result_is_ok(sql_res) or not result_is_ok(wr_res) or not result_is_ok(chn_res) or not result_is_ok(rok_res) or not result_is_ok(raff_res) or not result_is_ok(rts_res) or not result_is_ok(rtxt_res):
+        return err(yaza_db_c_err_text_v1("YDBv1 concurrent engine allocation failed"))
+    let box: List[YazaDbSessionV1] = result_unwrap(box_res)
+    let sqls: List[Text] = result_unwrap(sql_res)
+    let is_writes: List[Boolean] = result_unwrap(wr_res)
+    let chns: List[AsyncChannel] = result_unwrap(chn_res)
+    let roks: List[Boolean] = result_unwrap(rok_res)
+    let raffs: List[Number] = result_unwrap(raff_res)
+    let rtss: List[Number] = result_unwrap(rts_res)
+    let rtxts: List[Text] = result_unwrap(rtxt_res)
+    let cur_res: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(cur_res):
+        return err(yaza_db_c_err_text_v1("YDBv1 concurrent engine cursor allocation failed"))
+    let cursors: List[Number] = result_unwrap(cur_res)
+    let _c0: Boolean = list_try_push(cursors, 0) # [0] = head
+    let _c1: Boolean = list_try_push(cursors, 0) # [1] = count
+    let _rbox: Boolean = list_try_push(box, session)
+    let dummy_chan: AsyncChannel = AsyncChannel(-1, 1, true, 0)
+    let empty_msg: Text = yaza_db_c_err_text_v1("")
+    var si: Number = 0
+    while si < config.max_queue_depth:
+        let _psq: Boolean = list_try_push(sqls, empty_msg)
+        let _pwr: Boolean = list_try_push(is_writes, true)
+        let _pch: Boolean = list_try_push(chns, dummy_chan)
+        let _pok: Boolean = list_try_push(roks, false)
+        let _paf: Boolean = list_try_push(raffs, 0)
+        let _pts: Boolean = list_try_push(rtss, 0)
+        let _ptx: Boolean = list_try_push(rtxts, empty_msg)
+        set si = si + 1
+    let wake_chan: AsyncChannel = async_channel_create(config.max_queue_depth + 16)
+    let close_chan: AsyncChannel = async_channel_create(2)
+    return ok(YazaDbConcurrentEngineV1(config, box, mutex_new(), wake_chan, close_chan, atomic_create(0), atomic_create(0), atomic_create(1), atomic_create(0), atomic_create(0), atomic_create(0), atomic_create(0), atomic_create(0), atomic_create(0), sqls, is_writes, chns, cursors, roks, raffs, rtss, rtxts, atomic_create(0)))
+
+fn yaza_db_concurrent_publish_slot_v1(engine: YazaDbConcurrentEngineV1, rchan: AsyncChannel, is_ok: Boolean, aff: Number, cts: Number, msg: Text) -> Unit:
+    let slot_idx: Number = (atomic_fetch_add(engine.next_slot_seq, 1) - 1) % engine.config.max_queue_depth
+    let _s1: Boolean = list_try_set(engine.result_ok, slot_idx, is_ok)
+    let _s2: Boolean = list_try_set(engine.result_affected, slot_idx, aff)
+    let _s3: Boolean = list_try_set(engine.result_commit_ts, slot_idx, cts)
+    let _s4: Boolean = list_try_set(engine.result_text, slot_idx, msg)
+    let _sent: Boolean = async_channel_send(rchan, slot_idx)
+    return
+
+shape YazaDbConcurrentDrainOutcomeV1:
+    session: YazaDbSessionV1
+    processed: Number
+
+fn yaza_db_concurrent_drain_actor_batch_v1(engine: YazaDbConcurrentEngineV1, cur_sess: YazaDbSessionV1) -> Result[YazaDbConcurrentDrainOutcomeV1, Text]:
+    let _qlk: Boolean = mutex_lock(engine.queue_mutex)
+    let head: Number = list_get(engine.queue_cursors, 0)
+    let pending_len: Number = list_get(engine.queue_cursors, 1)
+    if pending_len == 0:
+        let _qu: Boolean = mutex_unlock(engine.queue_mutex)
+        return ok(YazaDbConcurrentDrainOutcomeV1(cur_sess, 0))
+    var take: Number = pending_len
+    if take > engine.config.max_batch_size:
+        set take = engine.config.max_batch_size
+
+    let w_batch: List[YazaDbGroupCommitItemV1] = List[YazaDbGroupCommitItemV1]()
+    let w_chans: List[AsyncChannel] = List[AsyncChannel]()
+    let r_sqls: List[Text] = List[Text]()
+    let r_chans: List[AsyncChannel] = List[AsyncChannel]()
+    let empty_params: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+
+    var i: Number = 0
+    while i < take:
+        let qidx: Number = (head + i) % engine.config.max_queue_depth
+        let s: Text = list_get(engine.pending_sqls, qidx)
+        let is_w: Boolean = list_get(engine.pending_is_write, qidx)
+        let ch: AsyncChannel = list_get(engine.pending_done_chans, qidx)
+        if is_w:
+            let _pb: Boolean = list_try_push(w_batch, YazaDbGroupCommitItemV1(s, empty_params))
+            let _pc: Boolean = list_try_push(w_chans, ch)
+        else:
+            let _ps: Boolean = list_try_push(r_sqls, s)
+            let _prc: Boolean = list_try_push(r_chans, ch)
+        set i = i + 1
+    let new_head: Number = (head + take) % engine.config.max_queue_depth
+    let new_len: Number = pending_len - take
+    let _sh: Boolean = list_try_set(engine.queue_cursors, 0, new_head)
+    let _sl: Boolean = list_try_set(engine.queue_cursors, 1, new_len)
+    let _qu: Boolean = mutex_unlock(engine.queue_mutex)
+
+    var next_sess: YazaDbSessionV1 = cur_sess
+
+    # Coalesce queued writes into a single group-commit transaction + fsync
+    let nw: Number = list_count(w_batch)
+    if nw > 0:
+        let gc_res: Result[YazaDbGroupCommitBatchResultV1, Text] = yaza_db_group_commit_execute_v1(next_sess, w_batch)
+        if result_is_ok(gc_res):
+            let gc: YazaDbGroupCommitBatchResultV1 = result_unwrap(gc_res)
+            set next_sess = gc.session
+            let _ac: Number = atomic_fetch_add(engine.total_commits, gc.committed_count)
+            let _ab: Number = atomic_fetch_add(engine.total_batches, 1)
+            let _af: Number = atomic_fetch_add(engine.total_fsyncs, gc.fsync_count)
+            let _ae: Number = atomic_fetch_add(engine.snapshot_epoch, 1)
+            var j: Number = 0
+            while j < nw:
+                let ch: AsyncChannel = list_get(w_chans, j)
+                var ok_f: Boolean = false
+                var aff_n: Number = 0
+                var cts_n: Number = 0
+                var err_t: Text = yaza_db_c_err_text_v1("missing batch slot")
+                if j < list_count(gc.results):
+                    let res_i: YazaDbGroupCommitItemResultV1 = list_get(gc.results, j)
+                    set ok_f = res_i.ok
+                    set aff_n = res_i.affected_rows
+                    set cts_n = res_i.commit_ts
+                    set err_t = res_i.error_message
+                yaza_db_concurrent_publish_slot_v1(engine, ch, ok_f, aff_n, cts_n, err_t)
+                set j = j + 1
+        else:
+            let b_err: Text = result_unwrap_error(gc_res)
+            var j: Number = 0
+            while j < nw:
+                yaza_db_concurrent_publish_slot_v1(engine, list_get(w_chans, j), false, 0, 0, b_err)
+                set j = j + 1
+
+    # Execute queued reads linearly on writer-owned session
+    let nr: Number = list_count(r_sqls)
+    var ri: Number = 0
+    while ri < nr:
+        let r_sql: Text = list_get(r_sqls, ri)
+        let r_ch: AsyncChannel = list_get(r_chans, ri)
+        let st_res: Result[YazaDbSessionStatementV1, Text] = yaza_db_session_execute_v1(next_sess, r_sql, empty_params)
+        if result_is_ok(st_res):
+            let st: YazaDbSessionStatementV1 = result_unwrap(st_res)
+            set next_sess = st.session
+            if option_is_some(st.statement.query_result):
+                let _tr: Number = atomic_fetch_add(engine.total_reads, 1)
+                let qr: YazaSqlQueryResultV1 = option_unwrap(st.statement.query_result)
+                yaza_db_concurrent_publish_slot_v1(engine, r_ch, true, list_count(qr.rows), 0, yaza_api_select_json(qr))
+            else:
+                yaza_db_concurrent_publish_slot_v1(engine, r_ch, false, 0, 0, yaza_db_c_err_text_v1("read produced no query result"))
+        else:
+            yaza_db_concurrent_publish_slot_v1(engine, r_ch, false, 0, 0, result_unwrap_error(st_res))
+        set ri = ri + 1
+
+    return ok(YazaDbConcurrentDrainOutcomeV1(next_sess, take))
+
+async fn yaza_db_concurrent_writer_loop_v1(engine: YazaDbConcurrentEngineV1) -> Result[Number, Text]:
+    var batches_processed: Number = 0
+    var cur_sess: YazaDbSessionV1 = list_get(engine.session_box, 0)
+    while true:
+        let sig: Option[Number] = async_channel_recv(engine.wakeup_chan)
+        var drained_any: Boolean = true
+        while drained_any:
+            let drained_res: Result[YazaDbConcurrentDrainOutcomeV1, Text] = yaza_db_concurrent_drain_actor_batch_v1(engine, cur_sess)
+            if not result_is_ok(drained_res):
+                set drained_any = false
+            else:
+                let out: YazaDbConcurrentDrainOutcomeV1 = result_unwrap(drained_res)
+                set cur_sess = out.session
+                if out.processed == 0:
+                    set drained_any = false
+                else:
+                    set batches_processed = batches_processed + 1
+        if atomic_load(engine.shutdown_flag) == 1:
+            let _qlk: Boolean = mutex_lock(engine.queue_mutex)
+            let rem: Number = list_get(engine.queue_cursors, 1)
+            let _qu: Boolean = mutex_unlock(engine.queue_mutex)
+            if rem == 0:
+                break
+        if not option_is_some(sig) and atomic_load(engine.shutdown_flag) == 1:
+            break
+
+    # Close session exclusively on its owning writer thread
+    let cl_res: Result[Boolean, Text] = yaza_db_session_close_v1(cur_sess)
+    if result_is_ok(cl_res) and result_unwrap(cl_res):
+        let _cok: AtomicNumber = atomic_store(engine.close_ok, 1)
+    let _cdn: Boolean = async_channel_send(engine.close_done_chan, 1)
+    return ok(batches_processed)
+
+fn yaza_db_concurrent_enqueue_and_wait_v1(engine: YazaDbConcurrentEngineV1, sql: Text, is_write: Boolean) -> Result[YazaDbGroupCommitItemResultV1, Text]:
+    if atomic_load(engine.shutdown_flag) == 1:
+        return err("YDBv1 concurrent engine is shutting down")
+    let done_chan: AsyncChannel = async_channel_create(2)
+    let _qlk: Boolean = mutex_lock(engine.queue_mutex)
+    let cur_head: Number = list_get(engine.queue_cursors, 0)
+    let cur_len: Number = list_get(engine.queue_cursors, 1)
+    if cur_len >= engine.config.max_queue_depth:
+        let _qu: Boolean = mutex_unlock(engine.queue_mutex)
+        let _ab: Number = atomic_fetch_add(engine.backpressure_rejects, 1)
+        let _dc: AsyncChannel = async_channel_close(done_chan)
+        return err("YDBv1 concurrent queue is full (backpressure)")
+    let tail_idx: Number = (cur_head + cur_len) % engine.config.max_queue_depth
+    let _p1: Boolean = list_try_set(engine.pending_sqls, tail_idx, sql)
+    let _p2: Boolean = list_try_set(engine.pending_is_write, tail_idx, is_write)
+    let _p3: Boolean = list_try_set(engine.pending_done_chans, tail_idx, done_chan)
+    let _sl: Boolean = list_try_set(engine.queue_cursors, 1, cur_len + 1)
+    let _qu: Boolean = mutex_unlock(engine.queue_mutex)
+    let _sw: Boolean = async_channel_send(engine.wakeup_chan, 1)
+
+    let sig: Option[Number] = async_channel_recv(done_chan)
+    let _dc: AsyncChannel = async_channel_close(done_chan)
+    if not option_is_some(sig):
+        return err("YDBv1 concurrent wait aborted cleanly")
+    let slot_idx: Number = option_unwrap(sig)
+    let is_ok: Boolean = list_get(engine.result_ok, slot_idx)
+    let aff: Number = list_get(engine.result_affected, slot_idx)
+    let cts: Number = list_get(engine.result_commit_ts, slot_idx)
+    let msg: Text = list_get(engine.result_text, slot_idx)
+    if not is_ok:
+        return err(msg)
+    return ok(YazaDbGroupCommitItemResultV1(slot_idx, true, 0, cts, aff, msg))
+
+fn yaza_db_concurrent_submit_write_v1(engine: YazaDbConcurrentEngineV1, sql: Text, parameters: List[YazaSqlValueV1]) -> Result[YazaDbGroupCommitItemResultV1, Text]:
+    if list_count(parameters) > 0:
+        return err("YDBv1 concurrent actor expects inline SQL text")
+    return yaza_db_concurrent_enqueue_and_wait_v1(engine, sql, true)
+
+fn yaza_db_concurrent_execute_read_json_v1(engine: YazaDbConcurrentEngineV1, sql: Text) -> Result[Text, Text]:
+    if yaza_db_server_sql_is_write_v1(sql):
+        return err("YDBv1 concurrent read path rejected write SQL statement")
+    let _ir1: Number = atomic_fetch_add(engine.in_flight_readers, 1)
+    let res: Result[YazaDbGroupCommitItemResultV1, Text] = yaza_db_concurrent_enqueue_and_wait_v1(engine, sql, false)
+    let _ir2: Number = atomic_fetch_add(engine.in_flight_readers, -1)
+    if not result_is_ok(res):
+        return err(result_unwrap_error(res))
+    return ok(result_unwrap(res).error_message)
+
+fn yaza_db_concurrent_execute_read_v1(engine: YazaDbConcurrentEngineV1, sql: Text, parameters: List[YazaSqlValueV1]) -> Result[YazaSqlQueryResultV1, Text]:
+    if list_count(parameters) > 0:
+        return err("YDBv1 concurrent actor read expects inline SQL text")
+    let json_txt: Text = yaza_db_concurrent_execute_read_json_v1(engine, sql)?
+    return ok(YazaSqlQueryResultV1(List[YazaSqlBoundProjectionV1](), List[List[YazaSqlValueV1]](), 0, 0, 0, text_length(json_txt)))
+
+fn yaza_db_concurrent_shutdown_v1(engine: YazaDbConcurrentEngineV1) -> Boolean:
+    let _sf: AtomicNumber = atomic_store(engine.shutdown_flag, 1)
+    let _sw: Boolean = async_channel_send(engine.wakeup_chan, 0)
+    return true
+
+fn yaza_db_concurrent_stats_v1(engine: YazaDbConcurrentEngineV1) -> YazaDbConcurrentEngineStatsV1:
+    return YazaDbConcurrentEngineStatsV1(atomic_load(engine.snapshot_epoch), atomic_load(engine.in_flight_readers), atomic_load(engine.total_commits), atomic_load(engine.total_batches), atomic_load(engine.total_fsyncs), atomic_load(engine.total_reads), atomic_load(engine.backpressure_rejects))
+
+fn yaza_db_concurrent_handle_http_client_v1(engine: YazaDbConcurrentEngineV1, conn: Number, auth_secret: Text) -> Result[Boolean, Text]:
+    let raw_res: Result[Bytes, Text] = yaza_api_read_full_http_request(conn, 1048576)
+    if not result_is_ok(raw_res):
+        let err_resp: HttpResponse = http_response_bad_request(result_unwrap_error(raw_res), true)
+        let _wr: Result[Number, Text] = tcp_write(conn, http_format_response(err_resp), 3000)
+        return ok(true)
+    let parsed_res: Result[HttpRequest, Text] = http_parse_request(result_unwrap(raw_res))
+    if not result_is_ok(parsed_res):
+        let err_resp: HttpResponse = http_response_bad_request(result_unwrap_error(parsed_res), true)
+        let _wr: Result[Number, Text] = tcp_write(conn, http_format_response(err_resp), 3000)
+        return ok(true)
+    let req: HttpRequest = result_unwrap(parsed_res)
+    if req.path == "/livez":
+        let _wr: Result[Number, Text] = tcp_write(conn, http_format_response(http_response_ok_json("{\"status\":\"alive\"}")), 3000)
+        return ok(true)
+    let auth_err: Option[HttpResponse] = yaza_api_verify_auth(req, auth_secret)
+    if option_is_some(auth_err):
+        let _wr: Result[Number, Text] = tcp_write(conn, http_format_response(option_unwrap(auth_err)), 3000)
+        return ok(true)
+    if req.path == "/api/v1/sql" and req.method == "POST":
+        let sql_opt: Option[Text] = json_extract_string(req.body_text, "sql")
+        if not option_is_some(sql_opt):
+            let _wr: Result[Number, Text] = tcp_write(conn, http_format_response(http_response_bad_request("missing sql string", true)), 3000)
+            return ok(true)
+        let sql_text: Text = option_unwrap(sql_opt)
+        if yaza_db_server_sql_is_write_v1(sql_text):
+            let wres: Result[YazaDbGroupCommitItemResultV1, Text] = yaza_db_concurrent_submit_write_v1(engine, sql_text, List[YazaSqlValueV1]())
+            if not result_is_ok(wres):
+                let _wr: Result[Number, Text] = tcp_write(conn, http_format_response(http_response_service_unavailable(result_unwrap_error(wres), true)), 3000)
+                return ok(true)
+            let wi: YazaDbGroupCommitItemResultV1 = result_unwrap(wres)
+            let ok_json: Text = "{\"status\":\"ok\",\"affected_rows\":" + number_text(wi.affected_rows) + ",\"commit_ts\":" + number_text(wi.commit_ts) + "}"
+            let _wr: Result[Number, Text] = tcp_write(conn, http_format_response(http_response_ok_json(ok_json)), 3000)
+            return ok(true)
+        let rres: Result[Text, Text] = yaza_db_concurrent_execute_read_json_v1(engine, sql_text)
+        if not result_is_ok(rres):
+            let _wr: Result[Number, Text] = tcp_write(conn, http_format_response(http_response_bad_request(result_unwrap_error(rres), true)), 3000)
+            return ok(true)
+        let _wr: Result[Number, Text] = tcp_write(conn, http_format_response(http_response_ok_json(result_unwrap(rres))), 3000)
+        return ok(true)
+    let _wr: Result[Number, Text] = tcp_write(conn, http_format_response(http_response_not_found("unknown concurrent endpoint", true)), 3000)
+    return ok(true)
+
+async fn yaza_db_concurrent_http_worker_v1(engine: YazaDbConcurrentEngineV1, listener: Number, accept_lock: Mutex, auth_secret: Text, served_atomic: AtomicNumber, max_requests: Number) -> Number:
+    var local_count: Number = 0
+    while true:
+        if max_requests > 0 and atomic_load(served_atomic) >= max_requests:
+            break
+        let _lk: Boolean = mutex_lock(accept_lock)
+        if max_requests > 0 and atomic_load(served_atomic) >= max_requests:
+            let _ul0: Boolean = mutex_unlock(accept_lock)
+            break
+        let acc_res: Result[Number, Text] = tcp_accept(listener, 100)
+        if result_is_ok(acc_res):
+            let _as: Number = atomic_fetch_add(served_atomic, 1)
+            let _ul: Boolean = mutex_unlock(accept_lock)
+            let client: Number = result_unwrap(acc_res)
+            let _hc: Result[Boolean, Text] = yaza_db_concurrent_handle_http_client_v1(engine, client, auth_secret)
+            let _cc: Result[Boolean, Text] = tcp_close(client)
+            set local_count = local_count + 1
+        else:
+            let _ul2: Boolean = mutex_unlock(accept_lock)
+    return local_count
+
+fn yaza_db_concurrent_engine_close_v1(engine: YazaDbConcurrentEngineV1) -> Result[Boolean, Text]:
+    let _sd: Boolean = yaza_db_concurrent_shutdown_v1(engine)
+    let _done: Option[Number] = async_channel_recv(engine.close_done_chan)
+    let _cw: AsyncChannel = async_channel_close(engine.wakeup_chan)
+    let _cc: AsyncChannel = async_channel_close(engine.close_done_chan)
+    let _d1: Boolean = mutex_destroy(engine.queue_mutex)
+    if atomic_load(engine.close_ok) != 1:
+        return err("YDBv1 concurrent engine writer actor failed while closing session")
+    return ok(true)

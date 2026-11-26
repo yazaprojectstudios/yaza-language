@@ -8,6 +8,7 @@ use "../../yazabase/catalog_init_v1"
 use "../../yazabase/plan_cache_v1"
 use "../../yazabase/session_v1"
 use "../../yazabase/sql_executor_v1"
+use "../../yazabase/sync_engine_v1"
 
 shape YazaBaseEmbeddedSessionV1:
     session: YazaDbSessionV1
@@ -18,6 +19,13 @@ shape YazaBaseEmbeddedSessionV1:
 shape YazaBaseEmbeddedStatementV1:
     database: YazaBaseEmbeddedSessionV1
     statement: YazaDbSqlStatementResultV1
+
+shape YazaBaseEmbeddedSyncApplyV1:
+    database: YazaBaseEmbeddedSessionV1
+    applied_count: Number
+    skipped_duplicates: Number
+    conflicts: List[YazaDbSyncConflictV1]
+    new_remote_seq: Number
 
 fn yaza_db_embedded_create_close_v1(created: YazaDbCatalogBootstrapV1, root: Number) -> Result[Boolean, Text]:
     let wal_closed: Result[Boolean, Text] = yaza_db_wal_log_close_v1(created.wal)
@@ -115,6 +123,20 @@ fn yaza_db_embedded_sync_scalars_v1(database: YazaBaseEmbeddedSessionV1, checkpo
         set next_cat = some(yaza_db_session_catalog_at_current_version_v1(option_unwrap(next_cat), s))
     let next_sess: YazaDbSessionV1 = YazaDbSessionV1(database.session.root, s, w, next_cat, next_idx, database.session.buffer_pool, database.session.explicit_tx, database.session.is_open, next_plan_cache)
     return YazaBaseEmbeddedSessionV1(next_sess, database.root_path, database.database_name, database.created_new)
+
+fn yaza_db_embedded_sync_pull_v1(database: YazaBaseEmbeddedSessionV1, origin_id: Text, from_lsn: Number, max_changes: Number) -> Result[YazaDbSyncBatchV1, Text]:
+    if not database.session.is_open: return err("YDBv1 embedded database session is closed")
+    return yaza_db_sync_extract_delta_v1(database.session, origin_id, from_lsn, max_changes)
+
+fn yaza_db_embedded_sync_push_v1(database: YazaBaseEmbeddedSessionV1, batch: YazaDbSyncBatchV1, policy: Number) -> Result[YazaBaseEmbeddedSyncApplyV1, Text]:
+    if not database.session.is_open: return err("YDBv1 embedded database session is closed")
+    let applied: YazaDbSyncApplyResultV1 = yaza_db_sync_apply_delta_with_role_v1(database.session, batch, policy, false)?
+    let next_db: YazaBaseEmbeddedSessionV1 = YazaBaseEmbeddedSessionV1(applied.session, database.root_path, database.database_name, database.created_new)
+    return ok(YazaBaseEmbeddedSyncApplyV1(next_db, applied.applied_count, applied.skipped_duplicates, applied.conflicts, applied.new_remote_seq))
+
+fn yaza_db_embedded_sync_watermarks_v1(database: YazaBaseEmbeddedSessionV1, origin_id: Text) -> Result[List[YazaDbSyncWatermarkV1], Text]:
+    if not database.session.is_open: return err("YDBv1 embedded database session is closed")
+    return yaza_db_sync_get_watermarks_v1(database.session, origin_id)
 
 fn yaza_db_embedded_close_v1(database: YazaBaseEmbeddedSessionV1) -> Result[Boolean, Text]:
     if not database.session.is_open: return err("YDBv1 embedded database session is already closed")

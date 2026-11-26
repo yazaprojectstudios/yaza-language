@@ -1,0 +1,560 @@
+# Tier 2.2: Native Vector Search (YDV1 binary vector codec, Cosine/L2/Inner Product,
+# Exact Flat baseline, HNSW graph index, and durable YDBv1 session persistence).
+# Embedding tables use YDBv1 B+Tree + overflow storage and inherit ARIES recovery.
+
+use "std/json"
+use "std/math"
+use "./page_v1"
+use "./replication_v1"
+use "./session_v1"
+use "./sql_executor_v1"
+
+shape YazaDbVectorV1:
+    dim: Number
+    values: List[Float64]
+
+shape YazaDbVectorHitV1:
+    row_id: Number
+    distance: Float64
+    vector_index: Number
+
+shape YazaDbHnswNodeV1:
+    row_id: Number
+    level: Number
+    deleted: Boolean
+    vector: YazaDbVectorV1
+    neighbors_by_level: List[List[Number]]
+
+shape YazaDbHnswIndexV1:
+    metric: Number
+    m: Number
+    ef_construction: Number
+    ef_search: Number
+    entry_index: Number
+    max_level: Number
+    rng_state: Number
+    nodes: List[YazaDbHnswNodeV1]
+
+shape YazaDbHnswCandidateV1:
+    node_idx: Number
+    dist: Float64
+
+fn yaza_db_vector_metric_cosine_v1() -> Number:
+    return 1
+
+fn yaza_db_vector_metric_l2_v1() -> Number:
+    return 2
+
+fn yaza_db_vector_metric_ip_v1() -> Number:
+    return 3
+
+fn yaza_db_vector_magic_v1() -> Number:
+    return 827737177 # "YDV1" LE
+
+fn yaza_db_vector_header_size_v1() -> Number:
+    return 16
+
+fn yaza_db_vector_new_v1(values: List[Float64]) -> Result[YazaDbVectorV1, Text]:
+    let dim: Number = list_count(values)
+    if dim < 1 or dim > 4096:
+        return err(yaza_db_vec_err_text_v1("YDBv1 VECTOR dimension must be between 1 and 4096"))
+    var i: Number = 0
+    while i < dim:
+        let v: Float64 = list_get(values, i)
+        if not math_is_finite_float64(v):
+            return err(yaza_db_vec_err_text_v1("YDBv1 VECTOR components must be finite Float64 numbers"))
+        set i = i + 1
+    return ok(YazaDbVectorV1(dim, values))
+
+fn yaza_db_vector_encode_v1(vec: YazaDbVectorV1) -> Result[Bytes, Text]:
+    if vec.dim < 1 or vec.dim > 4096 or list_count(vec.values) != vec.dim:
+        return err(yaza_db_vec_err_text_v1("YDBv1 VECTOR dimension mismatch"))
+    let total_len: Number = yaza_db_vector_header_size_v1() + vec.dim * 8
+    let out: Bytes = bytes_try_new_zeroed(total_len)?
+    if not yaza_db_write_uint_le_v1(out, 0, yaza_db_vector_magic_v1(), 4) or not yaza_db_write_uint_le_v1(out, 4, 1, 2) or not yaza_db_write_uint_le_v1(out, 6, vec.dim, 2) or not yaza_db_write_uint_le_v1(out, 12, 0, 4):
+        return err(yaza_db_vec_err_text_v1("YDBv1 VECTOR header encode failed"))
+    var i: Number = 0
+    while i < vec.dim:
+        let v: Float64 = list_get(vec.values, i)
+        if not math_is_finite_float64(v):
+            return err(yaza_db_vec_err_text_v1("YDBv1 VECTOR cannot encode NaN/Inf"))
+        let bits: Number = float64_bits(v)
+        if not yaza_db_write_int_le_v1(out, yaza_db_vector_header_size_v1() + i * 8, bits, 8):
+            return err(yaza_db_vec_err_text_v1("YDBv1 VECTOR float64 encode failed"))
+        set i = i + 1
+    let payload_slice: Bytes = bytes_try_slice(out, yaza_db_vector_header_size_v1(), vec.dim * 8)?
+    let crc: Number = bytes_ydbv1_checksum(payload_slice)
+    if not yaza_db_write_uint_le_v1(out, 8, crc, 4):
+        return err(yaza_db_vec_err_text_v1("YDBv1 VECTOR CRC write failed"))
+    return ok(out)
+
+fn yaza_db_vector_decode_v1(raw: Bytes) -> Result[YazaDbVectorV1, Text]:
+    let n: Number = bytes_length(raw)
+    if n < yaza_db_vector_header_size_v1() + 8:
+        return err(yaza_db_vec_err_text_v1("YDBv1 VECTOR payload is truncated"))
+    let magic_r: Result[Number, Text] = yaza_db_read_uint_le_v1(raw, 0, 4)
+    let ver_r: Result[Number, Text] = yaza_db_read_uint_le_v1(raw, 4, 2)
+    let dim_r: Result[Number, Text] = yaza_db_read_uint_le_v1(raw, 6, 2)
+    let crc_r: Result[Number, Text] = yaza_db_read_uint_le_v1(raw, 8, 4)
+    let res_r: Result[Number, Text] = yaza_db_read_uint_le_v1(raw, 12, 4)
+    if not result_is_ok(magic_r) or not result_is_ok(ver_r) or not result_is_ok(dim_r) or not result_is_ok(crc_r) or not result_is_ok(res_r):
+        return err(yaza_db_vec_err_text_v1("YDBv1 VECTOR header read failed"))
+    let magic: Number = result_unwrap(magic_r)
+    let ver: Number = result_unwrap(ver_r)
+    let dim: Number = result_unwrap(dim_r)
+    let stored_crc: Number = result_unwrap(crc_r)
+    let reserved: Number = result_unwrap(res_r)
+    if magic != yaza_db_vector_magic_v1() or ver != 1 or reserved != 0 or dim < 1 or dim > 4096:
+        return err(yaza_db_vec_err_text_v1("YDBv1 VECTOR header metadata is invalid"))
+    if n != yaza_db_vector_header_size_v1() + dim * 8:
+        return err(yaza_db_vec_err_text_v1("YDBv1 VECTOR byte length does not match dimension"))
+    let payload_res: Result[Bytes, Text] = bytes_try_slice(raw, yaza_db_vector_header_size_v1(), dim * 8)
+    if not result_is_ok(payload_res):
+        return err(yaza_db_vec_err_text_v1(result_unwrap_error(payload_res)))
+    let payload_slice: Bytes = result_unwrap(payload_res)
+    if bytes_ydbv1_checksum(payload_slice) != stored_crc:
+        return err(yaza_db_vec_err_text_v1("YDBv1 VECTOR CRC32C checksum mismatch"))
+    let vals_res: Result[List[Float64], Text] = list_try_new()
+    if not result_is_ok(vals_res):
+        return err(yaza_db_vec_err_text_v1("YDBv1 VECTOR decode list allocation failed"))
+    let vals: List[Float64] = result_unwrap(vals_res)
+    let _rv: Boolean = list_try_reserve(vals, dim)
+    var i: Number = 0
+    while i < dim:
+        let bits_r: Result[Number, Text] = yaza_db_read_int_le_v1(raw, yaza_db_vector_header_size_v1() + i * 8, 8)
+        if not result_is_ok(bits_r):
+            return err(yaza_db_vec_err_text_v1(result_unwrap_error(bits_r)))
+        let f: Float64 = float64_from_bits(result_unwrap(bits_r))
+        if not math_is_finite_float64(f):
+            return err(yaza_db_vec_err_text_v1("YDBv1 VECTOR decoded non-finite component"))
+        let _pv: Boolean = list_try_push(vals, f)
+        set i = i + 1
+    return ok(YazaDbVectorV1(dim, vals))
+
+fn yaza_db_vector_distance_v1(a: YazaDbVectorV1, b: YazaDbVectorV1, metric: Number) -> Result[Float64, Text]:
+    if a.dim != b.dim or a.dim < 1:
+        return err(yaza_db_vec_err_text_v1("YDBv1 VECTOR dimension mismatch in distance calculation"))
+    if metric != 1 and metric != 2 and metric != 3:
+        return err(yaza_db_vec_err_text_v1("YDBv1 VECTOR unsupported distance metric (1=Cosine, 2=L2, 3=IP)"))
+    var dot: Float64 = 0.0
+    var norm_a: Float64 = 0.0
+    var norm_b: Float64 = 0.0
+    var sum_sq: Float64 = 0.0
+    var i: Number = 0
+    while i < a.dim:
+        let va: Float64 = list_get(a.values, i)
+        let vb: Float64 = list_get(b.values, i)
+        if metric == 2:
+            let d: Float64 = va - vb
+            set sum_sq = sum_sq + d * d
+        else:
+            set dot = dot + va * vb
+            if metric == 1:
+                set norm_a = norm_a + va * va
+                set norm_b = norm_b + vb * vb
+        set i = i + 1
+    if metric == 2:
+        return ok(math_sqrt_float64(sum_sq))
+    if metric == 3:
+        return ok(0.0 - dot)
+    if norm_a <= 0.0 or norm_b <= 0.0:
+        return ok(1.0)
+    let denom: Float64 = math_sqrt_float64(norm_a) * math_sqrt_float64(norm_b)
+    if denom <= 0.0:
+        return ok(1.0)
+    return ok(1.0 - (dot / denom))
+
+fn yaza_db_vector_sort_hits_v1(hits: List[YazaDbVectorHitV1]) -> Unit:
+    let n: Number = list_count(hits)
+    var i: Number = 1
+    while i < n:
+        let cur: YazaDbVectorHitV1 = list_get(hits, i)
+        var j: Number = i - 1
+        while j >= 0:
+            let prev: YazaDbVectorHitV1 = list_get(hits, j)
+            var swap_needed: Boolean = false
+            if prev.distance > cur.distance:
+                set swap_needed = true
+            elif prev.distance == cur.distance and prev.row_id > cur.row_id:
+                set swap_needed = true
+            if not swap_needed:
+                break
+            let _s1: Boolean = list_try_set(hits, j + 1, prev)
+            set j = j - 1
+        let _s2: Boolean = list_try_set(hits, j + 1, cur)
+        set i = i + 1
+    return
+
+fn yaza_db_vector_flat_search_v1(vectors: List[YazaDbVectorV1], ids: List[Number], deleted: List[Boolean], query: YazaDbVectorV1, k: Number, metric: Number) -> Result[List[YazaDbVectorHitV1], Text]:
+    let n: Number = list_count(vectors)
+    if list_count(ids) != n or (list_count(deleted) != 0 and list_count(deleted) != n):
+        return err(yaza_db_vec_err_text_v1("YDBv1 flat vector search array lengths mismatch"))
+    if k < 1:
+        return err(yaza_db_vec_err_text_v1("YDBv1 vector top-k must be positive"))
+    let all_res: Result[List[YazaDbVectorHitV1], Text] = list_try_new()
+    if not result_is_ok(all_res):
+        return err(yaza_db_vec_err_text_v1("YDBv1 flat search allocation failed"))
+    let all_hits: List[YazaDbVectorHitV1] = result_unwrap(all_res)
+    var i: Number = 0
+    while i < n:
+        var is_del: Boolean = false
+        if list_count(deleted) == n:
+            set is_del = list_get(deleted, i)
+        if not is_del:
+            let dist: Float64 = yaza_db_vector_distance_v1(list_get(vectors, i), query, metric)?
+            let _ph: Boolean = list_try_push(all_hits, YazaDbVectorHitV1(list_get(ids, i), dist, i))
+        set i = i + 1
+    yaza_db_vector_sort_hits_v1(all_hits)
+    let out_res: Result[List[YazaDbVectorHitV1], Text] = list_try_new()
+    if not result_is_ok(out_res):
+        return err(yaza_db_vec_err_text_v1("YDBv1 flat search top-k allocation failed"))
+    let out: List[YazaDbVectorHitV1] = result_unwrap(out_res)
+    var limit: Number = k
+    if list_count(all_hits) < limit:
+        set limit = list_count(all_hits)
+    set i = 0
+    while i < limit:
+        let _po: Boolean = list_try_push(out, list_get(all_hits, i))
+        set i = i + 1
+    return ok(out)
+
+fn yaza_db_vec_err_text_v1(msg: Text) -> Text:
+    return "" + msg
+
+fn yaza_db_hnsw_new_v1(metric: Number, m: Number, ef_construction: Number, ef_search: Number) -> Result[YazaDbHnswIndexV1, Text]:
+    if metric != 1 and metric != 2 and metric != 3:
+        return err(yaza_db_vec_err_text_v1("YDBv1 HNSW invalid metric"))
+    if m < 2 or m > 64 or ef_construction < m or ef_search < 1:
+        return err(yaza_db_vec_err_text_v1("YDBv1 HNSW hyperparameters out of bounds"))
+    let nodes_res: Result[List[YazaDbHnswNodeV1], Text] = list_try_new()
+    if not result_is_ok(nodes_res):
+        return err(yaza_db_vec_err_text_v1("YDBv1 HNSW node list allocation failed"))
+    return ok(YazaDbHnswIndexV1(metric, m, ef_construction, ef_search, -1, 0, 123456789, result_unwrap(nodes_res)))
+
+fn yaza_db_hnsw_next_level_v1(idx: YazaDbHnswIndexV1) -> YazaDbHnswIndexV1:
+    let next_rng: Number = (idx.rng_state * 1103515245 + 12345) % 2147483647
+    return YazaDbHnswIndexV1(idx.metric, idx.m, idx.ef_construction, idx.ef_search, idx.entry_index, idx.max_level, next_rng, idx.nodes)
+
+fn yaza_db_hnsw_pick_level_from_rng_v1(rng: Number) -> Number:
+    var r: Number = rng % 1024
+    if r < 0: set r = -r
+    var lvl: Number = 0
+    if r < 256: set lvl = 1
+    if r < 64: set lvl = 2
+    if r < 16: set lvl = 3
+    if r < 4: set lvl = 4
+    return lvl
+
+fn yaza_db_hnsw_sort_candidates_v1(cands: List[YazaDbHnswCandidateV1]) -> Unit:
+    let n: Number = list_count(cands)
+    var i: Number = 1
+    while i < n:
+        let cur: YazaDbHnswCandidateV1 = list_get(cands, i)
+        var j: Number = i - 1
+        while j >= 0:
+            let prev: YazaDbHnswCandidateV1 = list_get(cands, j)
+            if prev.dist <= cur.dist:
+                break
+            let _s1: Boolean = list_try_set(cands, j + 1, prev)
+            set j = j - 1
+        let _s2: Boolean = list_try_set(cands, j + 1, cur)
+        set i = i + 1
+    return
+
+fn yaza_db_hnsw_contains_idx_v1(items: List[Number], target: Number) -> Boolean:
+    var i: Number = 0
+    while i < list_count(items):
+        if list_get(items, i) == target:
+            return true
+        set i = i + 1
+    return false
+
+fn yaza_db_hnsw_greedy_descend_v1(idx: YazaDbHnswIndexV1, query: YazaDbVectorV1, start_idx: Number, level: Number) -> Result[Number, Text]:
+    var cur: Number = start_idx
+    var cur_dist: Float64 = yaza_db_vector_distance_v1(list_get(idx.nodes, cur).vector, query, idx.metric)?
+    var improved: Boolean = true
+    while improved:
+        set improved = false
+        let node: YazaDbHnswNodeV1 = list_get(idx.nodes, cur)
+        if level < list_count(node.neighbors_by_level):
+            let nbrs: List[Number] = list_get(node.neighbors_by_level, level)
+            var i: Number = 0
+            while i < list_count(nbrs):
+                let nb_idx: Number = list_get(nbrs, i)
+                let nd: Float64 = yaza_db_vector_distance_v1(list_get(idx.nodes, nb_idx).vector, query, idx.metric)?
+                if nd < cur_dist:
+                    set cur = nb_idx
+                    set cur_dist = nd
+                    set improved = true
+                set i = i + 1
+    return ok(cur)
+
+fn yaza_db_hnsw_search_layer_v1(idx: YazaDbHnswIndexV1, query: YazaDbVectorV1, entry_idx: Number, level: Number, ef: Number) -> Result[List[YazaDbHnswCandidateV1], Text]:
+    let visited_res: Result[List[Number], Text] = list_try_new()
+    let cands_res: Result[List[YazaDbHnswCandidateV1], Text] = list_try_new()
+    let best_res: Result[List[YazaDbHnswCandidateV1], Text] = list_try_new()
+    if not result_is_ok(visited_res) or not result_is_ok(cands_res) or not result_is_ok(best_res):
+        return err(yaza_db_vec_err_text_v1("YDBv1 HNSW search layer allocation failed"))
+    let visited: List[Number] = result_unwrap(visited_res)
+    let cands: List[YazaDbHnswCandidateV1] = result_unwrap(cands_res)
+    var best: List[YazaDbHnswCandidateV1] = result_unwrap(best_res)
+
+    let edist: Float64 = yaza_db_vector_distance_v1(list_get(idx.nodes, entry_idx).vector, query, idx.metric)?
+    let _pv: Boolean = list_try_push(visited, entry_idx)
+    let _pc: Boolean = list_try_push(cands, YazaDbHnswCandidateV1(entry_idx, edist))
+    let _pb: Boolean = list_try_push(best, YazaDbHnswCandidateV1(entry_idx, edist))
+
+    var head: Number = 0
+    while head < list_count(cands):
+        let cur: YazaDbHnswCandidateV1 = list_get(cands, head)
+        set head = head + 1
+        let worst_best: Float64 = list_get(best, list_count(best) - 1).dist
+        if cur.dist > worst_best and list_count(best) >= ef:
+            break
+        let node: YazaDbHnswNodeV1 = list_get(idx.nodes, cur.node_idx)
+        if level < list_count(node.neighbors_by_level):
+            let nbrs: List[Number] = list_get(node.neighbors_by_level, level)
+            var ni: Number = 0
+            while ni < list_count(nbrs):
+                let nb_idx: Number = list_get(nbrs, ni)
+                if not yaza_db_hnsw_contains_idx_v1(visited, nb_idx):
+                    let _pv2: Boolean = list_try_push(visited, nb_idx)
+                    let nd: Float64 = yaza_db_vector_distance_v1(list_get(idx.nodes, nb_idx).vector, query, idx.metric)?
+                    let cur_worst: Float64 = list_get(best, list_count(best) - 1).dist
+                    if list_count(best) < ef or nd < cur_worst:
+                        let _pc2: Boolean = list_try_push(cands, YazaDbHnswCandidateV1(nb_idx, nd))
+                        let _pb2: Boolean = list_try_push(best, YazaDbHnswCandidateV1(nb_idx, nd))
+                        yaza_db_hnsw_sort_candidates_v1(best)
+                        if list_count(best) > ef:
+                            let trimmed_res: Result[List[YazaDbHnswCandidateV1], Text] = list_try_new()
+                            if result_is_ok(trimmed_res):
+                                let trimmed: List[YazaDbHnswCandidateV1] = result_unwrap(trimmed_res)
+                                var ti: Number = 0
+                                while ti < ef:
+                                    let _pt: Boolean = list_try_push(trimmed, list_get(best, ti))
+                                    set ti = ti + 1
+                                set best = trimmed
+                        yaza_db_hnsw_sort_candidates_v1(cands)
+                set ni = ni + 1
+    return ok(best)
+
+fn yaza_db_hnsw_prune_neighbors_v1(idx: YazaDbHnswIndexV1, center_vec: YazaDbVectorV1, nbrs: List[Number], max_deg: Number) -> Result[List[Number], Text]:
+    if list_count(nbrs) <= max_deg:
+        return ok(nbrs)
+    let cands_res: Result[List[YazaDbHnswCandidateV1], Text] = list_try_new()
+    let out_res: Result[List[Number], Text] = list_try_new()
+    if not result_is_ok(cands_res) or not result_is_ok(out_res):
+        return err(yaza_db_vec_err_text_v1("YDBv1 HNSW prune allocation failed"))
+    let cands: List[YazaDbHnswCandidateV1] = result_unwrap(cands_res)
+    let out: List[Number] = result_unwrap(out_res)
+    var i: Number = 0
+    while i < list_count(nbrs):
+        let nb: Number = list_get(nbrs, i)
+        let d: Float64 = yaza_db_vector_distance_v1(center_vec, list_get(idx.nodes, nb).vector, idx.metric)?
+        let _pc: Boolean = list_try_push(cands, YazaDbHnswCandidateV1(nb, d))
+        set i = i + 1
+    yaza_db_hnsw_sort_candidates_v1(cands)
+    var k: Number = 0
+    while k < max_deg and k < list_count(cands):
+        let _po: Boolean = list_try_push(out, list_get(cands, k).node_idx)
+        set k = k + 1
+    return ok(out)
+
+fn yaza_db_hnsw_insert_v1(idx: YazaDbHnswIndexV1, row_id: Number, vec: YazaDbVectorV1) -> Result[YazaDbHnswIndexV1, Text]:
+    let stepped: YazaDbHnswIndexV1 = yaza_db_hnsw_next_level_v1(idx)
+    let lvl: Number = yaza_db_hnsw_pick_level_from_rng_v1(stepped.rng_state)
+    let new_idx: Number = list_count(stepped.nodes)
+
+    let nbrs_lvls_res: Result[List[List[Number]], Text] = list_try_new()
+    if not result_is_ok(nbrs_lvls_res):
+        return err(yaza_db_vec_err_text_v1("YDBv1 HNSW node levels allocation failed"))
+    let nbrs_lvls: List[List[Number]] = result_unwrap(nbrs_lvls_res)
+    var l: Number = 0
+    while l <= lvl:
+        let nl_res: Result[List[Number], Text] = list_try_new()
+        if not result_is_ok(nl_res):
+            return err(yaza_db_vec_err_text_v1("YDBv1 HNSW neighbor list allocation failed"))
+        let _pn: Boolean = list_try_push(nbrs_lvls, result_unwrap(nl_res))
+        set l = l + 1
+    let new_node: YazaDbHnswNodeV1 = YazaDbHnswNodeV1(row_id, lvl, false, vec, nbrs_lvls)
+    if not list_try_push(stepped.nodes, new_node):
+        return err(yaza_db_vec_err_text_v1("YDBv1 HNSW node append failed"))
+
+    if stepped.entry_index < 0:
+        return ok(YazaDbHnswIndexV1(stepped.metric, stepped.m, stepped.ef_construction, stepped.ef_search, new_idx, lvl, stepped.rng_state, stepped.nodes))
+
+    var cur_entry: Number = stepped.entry_index
+    var lc: Number = stepped.max_level
+    while lc > lvl:
+        let desc_res: Result[Number, Text] = yaza_db_hnsw_greedy_descend_v1(stepped, vec, cur_entry, lc)
+        if not result_is_ok(desc_res):
+            return err(yaza_db_vec_err_text_v1(result_unwrap_error(desc_res)))
+        set cur_entry = result_unwrap(desc_res)
+        set lc = lc - 1
+
+    var top_connect: Number = lvl
+    if stepped.max_level < top_connect:
+        set top_connect = stepped.max_level
+    set l = top_connect
+    while l >= 0:
+        let found_res: Result[List[YazaDbHnswCandidateV1], Text] = yaza_db_hnsw_search_layer_v1(stepped, vec, cur_entry, l, stepped.ef_construction)
+        if not result_is_ok(found_res):
+            return err(yaza_db_vec_err_text_v1(result_unwrap_error(found_res)))
+        let found: List[YazaDbHnswCandidateV1] = result_unwrap(found_res)
+        var max_deg: Number = stepped.m
+        if l == 0:
+            set max_deg = stepped.m * 2
+        let my_nbrs: List[Number] = list_get(list_get(stepped.nodes, new_idx).neighbors_by_level, l)
+        var fi: Number = 0
+        while fi < list_count(found) and list_count(my_nbrs) < max_deg:
+            let nb_idx: Number = list_get(found, fi).node_idx
+            if nb_idx != new_idx and not yaza_db_hnsw_contains_idx_v1(my_nbrs, nb_idx):
+                let _pm: Boolean = list_try_push(my_nbrs, nb_idx)
+                let nb_node: YazaDbHnswNodeV1 = list_get(stepped.nodes, nb_idx)
+                if l < list_count(nb_node.neighbors_by_level):
+                    let nb_list: List[Number] = list_get(nb_node.neighbors_by_level, l)
+                    if not yaza_db_hnsw_contains_idx_v1(nb_list, new_idx):
+                        let _pnb: Boolean = list_try_push(nb_list, new_idx)
+                        if list_count(nb_list) > max_deg:
+                            let pruned_res: Result[List[Number], Text] = yaza_db_hnsw_prune_neighbors_v1(stepped, nb_node.vector, nb_list, max_deg)
+                            if not result_is_ok(pruned_res):
+                                return err(yaza_db_vec_err_text_v1(result_unwrap_error(pruned_res)))
+                            let _snl: Boolean = list_try_set(nb_node.neighbors_by_level, l, result_unwrap(pruned_res))
+            set fi = fi + 1
+        if list_count(found) > 0:
+            set cur_entry = list_get(found, 0).node_idx
+        set l = l - 1
+
+    var next_entry: Number = stepped.entry_index
+    var next_max_lvl: Number = stepped.max_level
+    if lvl > next_max_lvl:
+        set next_entry = new_idx
+        set next_max_lvl = lvl
+    return ok(YazaDbHnswIndexV1(stepped.metric, stepped.m, stepped.ef_construction, stepped.ef_search, next_entry, next_max_lvl, stepped.rng_state, stepped.nodes))
+
+fn yaza_db_hnsw_delete_v1(idx: YazaDbHnswIndexV1, row_id: Number) -> Boolean:
+    var i: Number = 0
+    while i < list_count(idx.nodes):
+        let n: YazaDbHnswNodeV1 = list_get(idx.nodes, i)
+        if n.row_id == row_id and not n.deleted:
+            let _sn: Boolean = list_try_set(idx.nodes, i, YazaDbHnswNodeV1(n.row_id, n.level, true, n.vector, n.neighbors_by_level))
+            return true
+        set i = i + 1
+    return false
+
+fn yaza_db_hnsw_search_v1(idx: YazaDbHnswIndexV1, query: YazaDbVectorV1, k: Number, ef_override: Number) -> Result[List[YazaDbVectorHitV1], Text]:
+    let out_res: Result[List[YazaDbVectorHitV1], Text] = list_try_new()
+    if not result_is_ok(out_res):
+        return err(yaza_db_vec_err_text_v1("YDBv1 HNSW search output allocation failed"))
+    let out: List[YazaDbVectorHitV1] = result_unwrap(out_res)
+    if k < 1:
+        return err(yaza_db_vec_err_text_v1("YDBv1 HNSW top-k must be positive"))
+    if idx.entry_index < 0 or list_count(idx.nodes) == 0:
+        return ok(out)
+    var cur: Number = idx.entry_index
+    var l: Number = idx.max_level
+    while l > 0:
+        set cur = yaza_db_hnsw_greedy_descend_v1(idx, query, cur, l)?
+        set l = l - 1
+    var ef: Number = idx.ef_search
+    if ef_override > ef:
+        set ef = ef_override
+    if ef < k * 4:
+        set ef = k * 4
+    let layer0: List[YazaDbHnswCandidateV1] = yaza_db_hnsw_search_layer_v1(idx, query, cur, 0, ef)?
+    var i: Number = 0
+    while i < list_count(layer0) and list_count(out) < k:
+        let c: YazaDbHnswCandidateV1 = list_get(layer0, i)
+        let node: YazaDbHnswNodeV1 = list_get(idx.nodes, c.node_idx)
+        if not node.deleted:
+            let _po: Boolean = list_try_push(out, YazaDbVectorHitV1(node.row_id, c.dist, c.node_idx))
+        set i = i + 1
+    return ok(out)
+
+fn yaza_db_hnsw_persist_to_session_v1(session: YazaDbSessionV1, index_name: Text, idx: YazaDbHnswIndexV1) -> Result[YazaDbSessionV1, Text]:
+    if not session.is_open or index_name == "":
+        return err(yaza_db_vec_err_text_v1("YDBv1 HNSW persist requires open session and index name"))
+    let tbl: Text = "_ydb_vec_" + index_name
+    var cur: YazaDbSessionV1 = session
+    let drp: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(cur, "DROP TABLE IF EXISTS " + tbl, List[YazaSqlValueV1]())?
+    set cur = drp.session
+    let crt: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(cur, "CREATE TABLE " + tbl + " (id BIGINT PRIMARY KEY, meta_json TEXT, vec_blob BLOB)", List[YazaSqlValueV1]())?
+    set cur = crt.session
+
+    let hdr_meta: Text = "{\"metric\":" + number_text(idx.metric) + ",\"m\":" + number_text(idx.m) + ",\"ef_c\":" + number_text(idx.ef_construction) + ",\"ef_s\":" + number_text(idx.ef_search) + ",\"entry\":" + number_text(idx.entry_index) + ",\"max_lvl\":" + number_text(idx.max_level) + "}"
+    let hdr_params: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+    let hv0: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, -1)?
+    let hv2: YazaSqlValueV1 = yaza_sql_value_blob_v1(bytes_from_text("META"))?
+    let _hp1: Boolean = list_try_push(hdr_params, hv0)
+    let _hp2: Boolean = list_try_push(hdr_params, yaza_sql_value_text_v1(hdr_meta))
+    let _hp3: Boolean = list_try_push(hdr_params, hv2)
+    let ins_hdr: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(cur, "INSERT INTO " + tbl + " (id, meta_json, vec_blob) VALUES ($1, $2, $3)", hdr_params)?
+    set cur = ins_hdr.session
+
+    var i: Number = 0
+    while i < list_count(idx.nodes):
+        let n: YazaDbHnswNodeV1 = list_get(idx.nodes, i)
+        if not n.deleted:
+            let enc: Bytes = yaza_db_vector_encode_v1(n.vector)?
+            let np: Text = "{\"row_id\":" + number_text(n.row_id) + "}"
+            let vp: List[YazaSqlValueV1] = List[YazaSqlValueV1]()
+            let vv0: YazaSqlValueV1 = yaza_sql_value_integer_v1(4, i)?
+            let vv2: YazaSqlValueV1 = yaza_sql_value_blob_v1(enc)?
+            let _vp1: Boolean = list_try_push(vp, vv0)
+            let _vp2: Boolean = list_try_push(vp, yaza_sql_value_text_v1(np))
+            let _vp3: Boolean = list_try_push(vp, vv2)
+            let ins_n: YazaDbSessionStatementV1 = yaza_db_session_execute_v1(cur, "INSERT INTO " + tbl + " (id, meta_json, vec_blob) VALUES ($1, $2, $3)", vp)?
+            set cur = ins_n.session
+        set i = i + 1
+    return ok(cur)
+
+fn yaza_db_hnsw_build_from_cols_v1(hdr_json: Text, rids: List[Number], blobs: List[Bytes]) -> Result[YazaDbHnswIndexV1, Text]:
+    let metric: Number = option_unwrap(json_extract_number(hdr_json, "metric"))
+    let m: Number = option_unwrap(json_extract_number(hdr_json, "m"))
+    let ef_c: Number = option_unwrap(json_extract_number(hdr_json, "ef_c"))
+    let ef_s: Number = option_unwrap(json_extract_number(hdr_json, "ef_s"))
+    let idx_res: Result[YazaDbHnswIndexV1, Text] = yaza_db_hnsw_new_v1(metric, m, ef_c, ef_s)
+    if not result_is_ok(idx_res):
+        return err(yaza_db_vec_err_text_v1(result_unwrap_error(idx_res)))
+    var idx: YazaDbHnswIndexV1 = result_unwrap(idx_res)
+    var i: Number = 0
+    while i < list_count(rids):
+        let vec_res: Result[YazaDbVectorV1, Text] = yaza_db_vector_decode_v1(list_get(blobs, i))
+        if not result_is_ok(vec_res):
+            return err(yaza_db_vec_err_text_v1(result_unwrap_error(vec_res)))
+        let ins_res: Result[YazaDbHnswIndexV1, Text] = yaza_db_hnsw_insert_v1(idx, list_get(rids, i), result_unwrap(vec_res))
+        if not result_is_ok(ins_res):
+            return err(yaza_db_vec_err_text_v1(result_unwrap_error(ins_res)))
+        set idx = result_unwrap(ins_res)
+        set i = i + 1
+    return ok(idx)
+
+fn yaza_db_hnsw_load_from_session_v1(session: YazaDbSessionV1, index_name: Text) -> Result[YazaDbHnswIndexV1, Text]:
+    if not session.is_open or index_name == "":
+        return err(yaza_db_vec_err_text_v1("YDBv1 HNSW load requires open session and index name"))
+    let tbl: Text = "_ydb_vec_" + index_name
+    let sel_res: Result[YazaDbSessionStatementV1, Text] = yaza_db_session_execute_v1(session, "SELECT id, meta_json, vec_blob FROM " + tbl + " ORDER BY id ASC", List[YazaSqlValueV1]())
+    if not result_is_ok(sel_res):
+        return err(yaza_db_vec_err_text_v1(result_unwrap_error(sel_res)))
+    let sel: YazaDbSessionStatementV1 = result_unwrap(sel_res)
+    let qr: YazaSqlQueryResultV1 = option_unwrap(sel.statement.query_result)
+    let rows: List[List[YazaSqlValueV1]] = qr.rows
+    if list_count(rows) < 1:
+        return err(yaza_db_vec_err_text_v1("YDBv1 HNSW table contains no metadata row"))
+    let hdr_row: List[YazaSqlValueV1] = list_get(rows, 0)
+    let hdr_json: Text = "" + list_get(hdr_row, 1).text_value
+    let rids: List[Number] = List[Number]()
+    let blobs: List[Bytes] = List[Bytes]()
+    var r: Number = 1
+    while r < list_count(rows):
+        let row: List[YazaSqlValueV1] = list_get(rows, r)
+        let row_meta: Text = list_get(row, 1).text_value
+        let rid: Number = option_unwrap(json_extract_number(row_meta, "row_id"))
+        let raw_b: Bytes = list_get(row, 2).bytes_value
+        let copy_res: Result[Bytes, Text] = bytes_try_slice(raw_b, 0, bytes_length(raw_b))
+        if not result_is_ok(copy_res):
+            return err(yaza_db_vec_err_text_v1(result_unwrap_error(copy_res)))
+        let _p1: Boolean = list_try_push(rids, rid)
+        let _p2: Boolean = list_try_push(blobs, result_unwrap(copy_res))
+        set r = r + 1
+    return yaza_db_hnsw_build_from_cols_v1(hdr_json, rids, blobs)

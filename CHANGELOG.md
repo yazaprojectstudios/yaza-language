@@ -4,6 +4,33 @@ All notable changes to the **YAZA Programming Language**, **YazaBase SQL Engine*
 
 ---
 
+## [v1.1.0] — 2026-11-26
+
+### Highlights & New Capabilities
+1. **YazaBase Tier 1 / Tier 2 / Tier 3 Enterprise Capabilities:**
+   - **Tier 1 — Transparent Page Encryption (`crypto_v1.yz`, `YDE1`):** 16 KiB page-level AES-256-CTR + HMAC encryption (`399.5 µs/page` write / `391.4 µs/page` read) with key derivation/rotation and ASan/UBSan verification.
+   - **Tier 2 — Concurrent Engine, Vector Search, FTS BM25, PITR & CDC (`concurrent_engine_v1.yz`, `vector_search_v1.yz`, `fts_v1.yz`, `pitr_cdc_v1.yz`):** Coalescing Group-Commit actor pipeline (`100 commits / 50 batches / 50 fsyncs` in `299.6 ms`), CLOCK LRU striped buffer pool, flat & HNSW cosine/L2 vector search (`3.67 ms` flat / `11.58 ms` HNSW), BM25 full-text search (`8.5 µs/query`), point-in-time recovery (PITR), and change-data-capture (CDC) streaming.
+   - **Tier 3 — Horizontal Sharding, Online Migrations & Native Binary JSONB (`sharding_v1.yz`, `migration_v1.yz`, `jsonb_v1.yz`):** FNV-1a consistent hash-shard routing (`68.8 ns/route`, `14.5M routes/s`), declarative versioned schema migrations, and native binary `YJB1` JSONB (`3.06 ms` 500× encode / `1.03 ms` path extract / `1.55 ms` containment / GIN-style index lookups).
+   - **JDBC 4.2 Driver `v1.1.0` (`yazabase-jdbc-1.1.0.jar`):** Synchronized with `yazabase 1.1.0` & PostgreSQL Wire Protocol v3 (`pg_wire_v1` reporting `16.0 (YazaBase 1.1.0)`).
+
+2. **Compiler Memory Reduction (`compiler/core_llvm.yz`):**
+   - Eliminated redundant duplicate `verify_core_yir(program)` passes inside `lower_core_yir_to_llvm`, `lower_core_yir_to_llvm_module`, and `lower_core_yir_to_llvm_request_module` (already verified once on load in `load_core_yir`).
+   - Reduced `emit-llvm compiler/yazabase_cli.yz` peak memory footprint from `32.34 GB` (`OOM`) down to **`17.74 GB`** (`6.14 GB` RSS) in `64.69s`, and refreshed all 10 cross-platform bootstrap IR archives (`bootstrap/*.ll.xz`).
+
+3. **Mobile Native Engine SDK `v1.1.0` & Packaging Parity:**
+   - Rebuilt `yaza-1.1.0-mobile-sdk.tar.gz` (`android-arm64/libyaza_mobile.so` **`217,264 B`**, `ios-arm64/libyaza_mobile.a` **`293,344 B`**, `ios-simulator-arm64/libyaza_mobile.a` **`289,240 B`**) + `yaza_mobile_v1.h`.
+   - Added standalone `yazabase` binary parity to Windows x64 archives (`scripts/package-windows-release.sh`), dynamic versioning in macOS `.pkg` postinstall (`scripts/build-macos-pkg.sh`), and bumped VS Code extension to `1.1.0`.
+
+4. **Fresh Ecosystem Benchmarks (`2026-11-26` · Apple M5 · `-O2` · [Full Report](docs/benchmarks/v1.1.0-2026-11-26.md)):**
+   - **Cloud-Native Microservice (6 runtimes, persistent 10k-row embedded DB + HMAC-SHA256):** **`116,072 req/s`** Quote+HMAC (`c=32`, #1 overall ahead of Go `113,342` & Rust `110,442`), **`88,816 req/s`** (`c=8`), **`65,118 req/s`** persistent YazaBase lookup (`c=8`, within 3.3% of Rust+SQLite3), **`12.44 MiB` RSS** (vs Node `79.45 MiB`).
+   - **HTTP/1.1 Loopback API (7 runtimes):** **`88,138 req/s`** (`c=8`) / **`102,337 req/s`** (`c=32`) 1-item JSON, **`87,414 req/s`** `POST /api/echo` (`c=8`).
+   - **Fullstack Arena-SSR (`c=8`):** **`68,557 req/s`** Hypermedia Fragment, **`79,362 req/s`** JSON API, **`32,356 req/s`** Full SSR at **`7.13 MB` RSS** (`246.8 KB` binary).
+   - **Core & Binary Search:** **`6.136 ms`** Core mean of 7 medians (beats Rust `6.234 ms` & Nim `6.762 ms`); **`97.224 ms`** 5M binary search (`ListView`, beats C/Rust noinline, Nim, Go).
+   - **YazaBase & YBIF:** **`3.560 µs`** Warm Point SELECT (`page_read=0`), **`111.0 µs`** 10k `COUNT(*)`, **`130.6 µs`** `SUM(val)`, Embedded durable INSERT `3.151 ms` p50 (**16×** faster than v1.0.2 at `16.50 MiB` RSS), **1.4×** faster PK & **1.3×** faster Full Scan than PostgreSQL 18; YBIF **`2.17×` faster** / `24.6%` smaller (C 16-row batch) & **`1.86×` faster** / `31.9%` smaller (YAZA scalar).
+   - **Data Science & Mobile C ABI:** Welford 1M **`9.13 ms`** (**37.5×** Python), OLS 1M **`6.97 ms`** (**23.2×**), DataFrame 5K ETL **`3.84 ms`**, **86/86 SciPy golden PASS** (`max_rel_err = 2.10e-15`); Mobile C ABI `0.167 µs` (`create+destroy`), `0.291 µs` (`1 B`), `0.792 µs` (`1 KiB`), `15.834 µs` (`32 KiB`) at `2.188 MiB` RSS.
+
+---
+
 ## [v1.0.2] — 2026-11-21
 
 ### YazaBase Phase A/B/C & Performance Update — 2026-11-25

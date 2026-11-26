@@ -1,0 +1,84 @@
+use "std/fs"
+use "../yazabase/delta_wal_v1"
+
+fn check_delta_storage(root_path: Text) -> Result[Boolean, Text]:
+    let root: Number = root_open(root_path)?
+    let uuid: Bytes = bytes_from_text("delta-wal-test01")
+    let initial: YazaDbFileHeaderV1 = YazaDbFileHeaderV1(uuid, 0, 1, 1, 0, 2, 1)
+    let storage: YazaDbStorageHandleV1 = yaza_db_storage_create_empty_v1(root, "delta-smoke.ydb", initial)?
+    let bitmap: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, 2)?
+    let allocated: Boolean = yaza_db_bitmap_page_set_page_allocated_v1(bitmap, 3, true, 10, 2)?
+    if not allocated: return err("delta fixture could not allocate leaf")
+    let bitmap_written: Number = yaza_db_storage_write_page_v1(storage.file, storage.header, bitmap)?
+    if bitmap_written != yaza_db_page_size_v1(): return err("delta fixture bitmap write failed")
+
+    let key: Bytes = bytes_from_text("a")
+    let building: Bytes = yaza_db_page_new_v1(3, 10, 1, 0)?
+    let slot: Number = yaza_db_page_add_slot_v1(building, key, bytes_from_text("old"))?
+    let before: Bytes = yaza_db_page_finalize_v1(building)?
+    let leaf_written: Number = yaza_db_storage_write_page_v1(storage.file, storage.header, before)?
+    if leaf_written != yaza_db_page_size_v1(): return err("delta fixture leaf write failed")
+
+    let entries: List[YazaDbWalLeafSlotDeltaEntryV1] = [YazaDbWalLeafSlotDeltaEntryV1(key, bytes_from_text("new"), bytes_from_text("old"))]
+    let payload: Bytes = yaza_db_wal_leaf_slot_delta_encode_v1(yaza_db_wal_type_leaf_update_v1(), 3, entries)?
+    let record: YazaDbWalRecordV1 = YazaDbWalRecordV1(100, 0, 1, yaza_db_wal_type_leaf_slot_delta_v1(), 0, payload)
+    let wal_end: Number = 100 + yaza_db_wal_header_size_v1() + bytes_length(payload)
+    let first: Boolean = yaza_db_storage_redo_leaf_slot_delta_v1(storage, record, wal_end)?
+    let updated: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, 3)?
+    let expected: Bytes = yaza_db_page_replace_leaf_slot_v1(before, 100, key, bytes_from_text("new"))?
+    if not first or not bytes_equal(updated, expected): return err("delta file-backed redo mismatch")
+
+    let replay: Boolean = yaza_db_storage_redo_leaf_slot_delta_v1(storage, record, wal_end)?
+    let replayed: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, 3)?
+    if not replay or not bytes_equal(replayed, expected): return err("delta replay is not idempotent")
+
+    let decoded: YazaDbWalLeafSlotDeltaV1 = yaza_db_wal_leaf_slot_delta_decode_v1(record)?
+    let undo_image: Bytes = yaza_db_delta_wal_build_undo_image_v1(storage, 150, decoded)?
+    if not yaza_db_delta_wal_validate_clr_image_v1(decoded, undo_image): return err("delta undo image failed CLR validation")
+    let expected_undo: Bytes = yaza_db_page_replace_leaf_slot_v1(expected, 150, key, bytes_from_text("old"))?
+    if not bytes_equal(undo_image, expected_undo): return err("delta undo did not restore old row")
+
+    let undo_written: Number = yaza_db_storage_write_page_v1(storage.file, storage.header, undo_image)?
+    if undo_written != yaza_db_page_size_v1(): return err("delta fixture undo write failed")
+    let key_b: Bytes = bytes_from_text("b")
+    let insert_entries: List[YazaDbWalLeafSlotDeltaEntryV1] = [YazaDbWalLeafSlotDeltaEntryV1(key_b, bytes_from_text("row-b"), bytes_empty())]
+    let insert_payload: Bytes = yaza_db_wal_leaf_slot_delta_encode_v1(yaza_db_wal_type_leaf_insert_v1(), 3, insert_entries)?
+    let insert_record: YazaDbWalRecordV1 = YazaDbWalRecordV1(200, 100, 2, yaza_db_wal_type_leaf_slot_delta_v1(), 0, insert_payload)
+    let insert_end: Number = 200 + yaza_db_wal_header_size_v1() + bytes_length(insert_payload)
+    let insert_ok: Boolean = yaza_db_storage_redo_leaf_slot_delta_v1(storage, insert_record, insert_end)?
+    let inserted: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, 3)?
+    let insert_delta: YazaDbWalLeafSlotDeltaV1 = yaza_db_wal_leaf_slot_delta_decode_v1(insert_record)?
+    let insert_undo: Bytes = yaza_db_delta_wal_build_undo_image_v1(storage, 250, insert_delta)?
+    let insert_expected_undo: Bytes = yaza_db_page_delete_leaf_slot_v1(inserted, 250, key_b)?
+    if not insert_ok or not bytes_equal(insert_undo, insert_expected_undo) or not yaza_db_delta_wal_validate_clr_image_v1(insert_delta, insert_undo): return err("delta INSERT redo/undo mismatch")
+
+    let insert_undo_written: Number = yaza_db_storage_write_page_v1(storage.file, storage.header, insert_undo)?
+    if insert_undo_written != yaza_db_page_size_v1(): return err("delta fixture INSERT undo write failed")
+    let delete_entries: List[YazaDbWalLeafSlotDeltaEntryV1] = [YazaDbWalLeafSlotDeltaEntryV1(key, bytes_empty(), bytes_from_text("old"))]
+    let delete_payload: Bytes = yaza_db_wal_leaf_slot_delta_encode_v1(yaza_db_wal_type_leaf_delete_v1(), 3, delete_entries)?
+    let delete_record: YazaDbWalRecordV1 = YazaDbWalRecordV1(300, 200, 3, yaza_db_wal_type_leaf_slot_delta_v1(), 0, delete_payload)
+    let delete_end: Number = 300 + yaza_db_wal_header_size_v1() + bytes_length(delete_payload)
+    let delete_ok: Boolean = yaza_db_storage_redo_leaf_slot_delta_v1(storage, delete_record, delete_end)?
+    let deleted: Bytes = yaza_db_storage_read_page_v1(storage.file, storage.header, 3)?
+    let delete_delta: YazaDbWalLeafSlotDeltaV1 = yaza_db_wal_leaf_slot_delta_decode_v1(delete_record)?
+    let delete_undo: Bytes = yaza_db_delta_wal_build_undo_image_v1(storage, 350, delete_delta)?
+    let delete_expected_undo: Bytes = yaza_db_page_insert_sorted_slot_v1(deleted, key, bytes_from_text("old"))?
+    if not yaza_db_write_uint_le_v1(delete_expected_undo, 0, 350, 8): return err("delta fixture DELETE undo LSN stamp failed")
+    let finalized_delete_expected: Bytes = yaza_db_page_finalize_v1(delete_expected_undo)?
+    if not delete_ok or not bytes_equal(delete_undo, finalized_delete_expected) or not yaza_db_delta_wal_validate_clr_image_v1(delete_delta, delete_undo): return err("delta DELETE redo/undo mismatch")
+
+    let closed: Boolean = yaza_db_storage_close_v1(storage)?
+    if not closed: return err("delta fixture could not close storage")
+    let removed: Boolean = remove(root, "delta-smoke.ydb")?
+    if not removed: return err("delta fixture could not remove storage")
+    let synced: Boolean = sync_directory(root)?
+    let root_closed: Boolean = close(root)?
+    if not synced or not root_closed: return err("delta fixture could not close root")
+    return ok(true)
+
+start:
+    let outcome: Result[Boolean, Text] = check_delta_storage(arg(1))
+    if result_is_ok(outcome):
+        say "delta WAL storage smoke passed"
+    else:
+        fail(result_unwrap_error(outcome))

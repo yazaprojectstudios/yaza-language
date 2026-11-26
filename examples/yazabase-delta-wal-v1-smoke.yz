@@ -1,0 +1,45 @@
+use "../yazabase/delta_wal_v1"
+
+fn check_delta() -> Result[Boolean, Text]:
+    let key_a: Bytes = bytes_from_text("a")
+    let key_b: Bytes = bytes_from_text("b")
+    let original: Bytes = yaza_db_page_new_v1(3, 10, 1, 0)?
+    let added: Number = yaza_db_page_add_slot_v1(original, key_a, bytes_from_text("old"))?
+    let before: Bytes = yaza_db_page_finalize_v1(original)?
+    let entries: List[YazaDbWalLeafSlotDeltaEntryV1] = [YazaDbWalLeafSlotDeltaEntryV1(key_a, bytes_from_text("new"), bytes_from_text("old"))]
+    let payload: Bytes = yaza_db_wal_leaf_slot_delta_encode_v1(yaza_db_wal_type_leaf_update_v1(), 3, entries)?
+    if bytes_length(payload) >= yaza_db_page_size_v1(): return err("delta did not reduce WAL payload")
+    let record: YazaDbWalRecordV1 = YazaDbWalRecordV1(100, 0, 1, yaza_db_wal_type_leaf_slot_delta_v1(), 0, payload)
+    let wire: Bytes = yaza_db_wal_encode_v1(record)?
+    let framed: YazaDbWalRecordV1 = yaza_db_wal_decode_v1(wire, 100)?
+    let decoded: YazaDbWalLeafSlotDeltaV1 = yaza_db_wal_leaf_slot_delta_decode_v1(framed)?
+    let truncated_payload: Bytes = bytes_try_slice(payload, 0, bytes_length(payload) - 1)?
+    let truncated_record: YazaDbWalRecordV1 = YazaDbWalRecordV1(100, 0, 1, yaza_db_wal_type_leaf_slot_delta_v1(), 0, truncated_payload)
+    if result_is_ok(yaza_db_wal_leaf_slot_delta_decode_v1(truncated_record)): return err("truncated delta payload accepted")
+    let trailing_parts: List[Bytes] = List[Bytes]()
+    list_push(trailing_parts, payload)
+    list_push(trailing_parts, bytes_from_text("x"))
+    let trailing_payload: Bytes = bytes_join(trailing_parts)?
+    let trailing_record: YazaDbWalRecordV1 = YazaDbWalRecordV1(100, 0, 1, yaza_db_wal_type_leaf_slot_delta_v1(), 0, trailing_payload)
+    if result_is_ok(yaza_db_wal_leaf_slot_delta_decode_v1(trailing_record)): return err("trailing delta bytes accepted")
+    let updated: Bytes = yaza_db_delta_wal_apply_to_page_v1(before, decoded.operation, 100, decoded.entries)?
+    let expected: Bytes = yaza_db_page_replace_leaf_slot_v1(before, 100, key_a, bytes_from_text("new"))?
+    if not bytes_equal(updated, expected): return err("delta update does not match page mutation")
+    let bad_before: List[YazaDbWalLeafSlotDeltaEntryV1] = [YazaDbWalLeafSlotDeltaEntryV1(key_a, bytes_from_text("new"), bytes_from_text("wrong"))]
+    if result_is_ok(yaza_db_delta_wal_apply_to_page_v1(before, yaza_db_wal_type_leaf_update_v1(), 100, bad_before)): return err("delta accepted a mismatched before payload")
+    let inserted_entries: List[YazaDbWalLeafSlotDeltaEntryV1] = [YazaDbWalLeafSlotDeltaEntryV1(key_b, bytes_from_text("row-b"), bytes_empty())]
+    let inserted: Bytes = yaza_db_delta_wal_apply_to_page_v1(updated, yaza_db_wal_type_leaf_insert_v1(), 110, inserted_entries)?
+    let removed_entries: List[YazaDbWalLeafSlotDeltaEntryV1] = [YazaDbWalLeafSlotDeltaEntryV1(key_b, bytes_empty(), bytes_from_text("row-b"))]
+    let removed: Bytes = yaza_db_delta_wal_apply_to_page_v1(inserted, yaza_db_wal_type_leaf_delete_v1(), 120, removed_entries)?
+    let hdr: YazaDbPageHeaderV1 = yaza_db_page_header_decode_v1(removed, 3)?
+    if hdr.count != 1 or hdr.page_lsn != 120: return err("delta insert/delete page state mismatch")
+    let bad_order: List[YazaDbWalLeafSlotDeltaEntryV1] = [YazaDbWalLeafSlotDeltaEntryV1(key_b, bytes_from_text("x"), bytes_empty()), YazaDbWalLeafSlotDeltaEntryV1(key_a, bytes_from_text("y"), bytes_empty())]
+    if result_is_ok(yaza_db_wal_leaf_slot_delta_encode_v1(yaza_db_wal_type_leaf_insert_v1(), 3, bad_order)): return err("unordered delta keys accepted")
+    return ok(true)
+
+start:
+    let result: Result[Boolean, Text] = check_delta()
+    if not result_is_ok(result):
+        fail(result_unwrap_error(result))
+    else:
+        say "delta WAL smoke passed"

@@ -10,10 +10,13 @@ use "./btree_scan_v1"
 use "./plan_cache_v1"
 use "./query_v1"
 use "./row_v1"
+use "./sql_delete_query_v1"
 use "./sql_dispatch_v1"
 use "./sql_executor_v1"
+use "./sql_insert_query_v1"
 use "./sql_lexer_v1"
 use "./sql_parser_v2"
+use "./sql_update_query_v1"
 use "./storage_v1"
 use "./transaction_v1"
 use "./wal_v1"
@@ -83,7 +86,7 @@ fn yaza_db_session_buffer_pool_stats_v1(session: YazaDbSessionV1) -> YazaDbBuffe
 fn yaza_db_session_plan_cache_stats_v1(session: YazaDbSessionV1) -> YazaDbSelectPlanCacheV1:
     if option_is_some(session.plan_cache):
         return option_unwrap(session.plan_cache)
-    return YazaDbSelectPlanCacheV1(0, List[YazaDbSelectPlanCacheEntryV1](), 0, 0, 0)
+    return yaza_db_select_plan_cache_empty_v1()
 
 fn yaza_db_session_invalidate_plan_cache_v1(plan_cache: Option[YazaDbSelectPlanCacheV1]) -> Option[YazaDbSelectPlanCacheV1]:
     if option_is_some(plan_cache):
@@ -314,6 +317,46 @@ fn yaza_db_session_execute_with_state_profiled_v1(session: YazaDbSessionV1, sour
                 return yaza_db_session_finish_statement_with_plan_cache_v1(session, hit_stmt, next_catalog_cache, next_index_rows_cache, next_buffer_pool, next_plan_cache, none)
             elif arena_live_scopes() == 0:
                 set next_plan_cache = some(yaza_db_select_plan_cache_invalidate_v1(option_unwrap(next_plan_cache)))
+    if not option_is_some(session.explicit_tx) and option_is_some(next_plan_cache) and option_is_some(session.catalog_cache) and option_is_some(session.index_rows_cache) and session.storage.header.catalog_root > 0:
+        let wp_peek: Option[YazaDbWritePlanCacheEntryV1] = yaza_db_write_plan_cache_peek_v1(option_unwrap(next_plan_cache), source, session.storage.header.catalog_root)
+        if option_is_some(wp_peek):
+            let ce: YazaDbWritePlanCacheEntryV1 = option_unwrap(wp_peek)
+            let snapshot: YazaDbCatalogSnapshotWithRootsV1 = yaza_db_session_catalog_at_current_version_v1(option_unwrap(session.catalog_cache), session.storage)
+            let idx_rows: List[YazaDbRowV1] = option_unwrap(session.index_rows_cache)
+            if ce.table_index >= 0 and ce.table_index < list_count(snapshot.sql_snapshot.tables) and ce.table_index < list_count(snapshot.root_page_ids) and ce.table_index < list_count(snapshot.table_schema_versions) and list_get(snapshot.sql_snapshot.tables, ce.table_index).table_id == ce.table_id and list_get(snapshot.root_page_ids, ce.table_index) == ce.table_root_page_id and list_get(snapshot.table_schema_versions, ce.table_index) == ce.table_schema_version:
+                let write_ok_res: Result[Boolean, Text] = yaza_db_sql_write_allowed_during_index_build_with_cache_v1(session.storage, some(idx_rows))
+                if not result_is_ok(write_ok_res):
+                    return yaza_db_session_mark_tx_failed_or_closed_v1(session, result_unwrap_error(write_ok_res))
+                if not result_unwrap(write_ok_res):
+                    return yaza_db_session_mark_tx_failed_or_closed_v1(session, "YDBv1 writes are fenced while a secondary index build is incomplete")
+                let wp_lookup: YazaDbWritePlanLookupV1 = yaza_db_write_plan_cache_lookup_v1(option_unwrap(next_plan_cache), source, session.storage.header.catalog_root)
+                var hit_commit_res: Result[YazaDbWriteCommitV1, Text] = err("YDBv1 cached write plan kind is unsupported")
+                var hit_stmt_kind: Number = yaza_db_sql_statement_kind_insert_v1()
+                if ce.stmt_kind == 1:
+                    set hit_stmt_kind = yaza_db_sql_statement_kind_insert_v1()
+                    let r: Result[YazaDbSqlInsertCachedCommitV1, Text] = yaza_db_execute_insert_with_plan_cache_v1(session.storage, session.wal, source, parameters, true, true, some(snapshot), some(idx_rows), some(ce))
+                    if result_is_ok(r): set hit_commit_res = ok(result_unwrap(r).commit)
+                    else: set hit_commit_res = err(result_unwrap_error(r))
+                elif ce.stmt_kind == 2:
+                    set hit_stmt_kind = yaza_db_sql_statement_kind_update_v1()
+                    let r: Result[YazaDbSqlUpdateCachedCommitV1, Text] = yaza_db_execute_update_with_overlay_and_cache_v1(session.storage, session.wal, source, parameters, true, true, some(snapshot), some(idx_rows), some(ce), none)
+                    if result_is_ok(r): set hit_commit_res = ok(result_unwrap(r).commit)
+                    else: set hit_commit_res = err(result_unwrap_error(r))
+                elif ce.stmt_kind == 3:
+                    set hit_stmt_kind = yaza_db_sql_statement_kind_delete_v1()
+                    let r: Result[YazaDbSqlDeleteCachedCommitV1, Text] = yaza_db_execute_delete_with_overlay_and_cache_profiled_v1(session.storage, session.wal, source, parameters, true, true, some(snapshot), some(idx_rows), some(ce), none, profile_ns)
+                    if result_is_ok(r): set hit_commit_res = ok(result_unwrap(r).commit)
+                    else: set hit_commit_res = err(result_unwrap_error(r))
+                if not result_is_ok(hit_commit_res):
+                    return yaza_db_session_mark_tx_failed_or_closed_v1(session, result_unwrap_error(hit_commit_res))
+                let w_commit: YazaDbWriteCommitV1 = result_unwrap(hit_commit_res)
+                if arena_live_scopes() == 0:
+                    set next_plan_cache = some(wp_lookup.cache)
+                    set next_catalog_cache = some(snapshot)
+                let hit_stmt: YazaDbSqlStatementResultV1 = YazaDbSqlStatementResultV1(hit_stmt_kind, none, some(w_commit), none, w_commit.storage, w_commit.wal)
+                return yaza_db_session_finish_statement_with_plan_cache_v1(session, hit_stmt, next_catalog_cache, next_index_rows_cache, next_buffer_pool, next_plan_cache, none)
+            elif arena_live_scopes() == 0:
+                set next_plan_cache = some(yaza_db_select_plan_cache_invalidate_v1(option_unwrap(next_plan_cache)))
     var lex_started_ns: Number = 0
     if list_count(profile_ns) >= 4: set lex_started_ns = monotonic_ns()
     let tokens_result: Result[List[YazaSqlTokenV1], Text] = yaza_sql_lex_v1(source)
@@ -408,7 +451,56 @@ fn yaza_db_session_execute_with_state_profiled_v1(session: YazaDbSessionV1, sour
                         set next_catalog_cache = some(snapshot)
                         set next_index_rows_cache = some(index_rows)
         if not cache_load_failed:
-            set executed = yaza_db_execute_session_statement_with_cache_profiled_v1(session.storage, session.wal, source, parameters, active_catalog_cache, active_index_rows_cache, profile_ns)
+            if is_dml:
+                let write_ok_res: Result[Boolean, Text] = yaza_db_sql_write_allowed_during_index_build_with_cache_v1(session.storage, active_index_rows_cache)
+                if not result_is_ok(write_ok_res):
+                    set executed = err(result_unwrap_error(write_ok_res))
+                elif not result_unwrap(write_ok_res):
+                    set executed = err("YDBv1 writes are fenced while a secondary index build is incomplete")
+                else:
+                    var dml_commit_res: Result[YazaDbWriteCommitV1, Text] = err("YDBv1 session DML dispatch did not run")
+                    var dml_kind: Number = yaza_db_sql_statement_kind_insert_v1()
+                    var produced_entry: Option[YazaDbWritePlanCacheEntryV1] = none
+                    if yaza_sql_v2_is_keyword(source, tokens, 0, "INSERT"):
+                        set dml_kind = yaza_db_sql_statement_kind_insert_v1()
+                        let r: Result[YazaDbSqlInsertCachedCommitV1, Text] = yaza_db_execute_insert_with_plan_cache_v1(session.storage, session.wal, source, parameters, true, true, active_catalog_cache, active_index_rows_cache, none)
+                        if result_is_ok(r):
+                            let ic: YazaDbSqlInsertCachedCommitV1 = result_unwrap(r)
+                            set dml_commit_res = ok(ic.commit)
+                            set produced_entry = ic.cache_entry
+                        else:
+                            set dml_commit_res = err(result_unwrap_error(r))
+                    elif yaza_sql_v2_is_keyword(source, tokens, 0, "UPDATE"):
+                        set dml_kind = yaza_db_sql_statement_kind_update_v1()
+                        let r: Result[YazaDbSqlUpdateCachedCommitV1, Text] = yaza_db_execute_update_with_overlay_and_cache_v1(session.storage, session.wal, source, parameters, true, true, active_catalog_cache, active_index_rows_cache, none, none)
+                        if result_is_ok(r):
+                            let uc: YazaDbSqlUpdateCachedCommitV1 = result_unwrap(r)
+                            set dml_commit_res = ok(uc.commit)
+                            set produced_entry = uc.cache_entry
+                        else:
+                            set dml_commit_res = err(result_unwrap_error(r))
+                    else:
+                        set dml_kind = yaza_db_sql_statement_kind_delete_v1()
+                        let r: Result[YazaDbSqlDeleteCachedCommitV1, Text] = yaza_db_execute_delete_with_overlay_and_cache_profiled_v1(session.storage, session.wal, source, parameters, true, true, active_catalog_cache, active_index_rows_cache, none, none, profile_ns)
+                        if result_is_ok(r):
+                            let dc: YazaDbSqlDeleteCachedCommitV1 = result_unwrap(r)
+                            set dml_commit_res = ok(dc.commit)
+                            set produced_entry = dc.cache_entry
+                        else:
+                            set dml_commit_res = err(result_unwrap_error(r))
+                    if result_is_ok(dml_commit_res):
+                        let wc: YazaDbWriteCommitV1 = result_unwrap(dml_commit_res)
+                        if arena_live_scopes() == 0 and option_is_some(next_plan_cache):
+                            let w_miss: YazaDbWritePlanLookupV1 = yaza_db_write_plan_cache_lookup_v1(option_unwrap(next_plan_cache), source, session.storage.header.catalog_root)
+                            var updated_pc: YazaDbSelectPlanCacheV1 = w_miss.cache
+                            if option_is_some(produced_entry):
+                                set updated_pc = yaza_db_write_plan_cache_put_v1(updated_pc, option_unwrap(produced_entry))
+                            set next_plan_cache = some(updated_pc)
+                        set executed = ok(YazaDbSqlStatementResultV1(dml_kind, none, some(wc), none, wc.storage, wc.wal))
+                    else:
+                        set executed = err(result_unwrap_error(dml_commit_res))
+            else:
+                set executed = yaza_db_execute_session_statement_with_cache_profiled_v1(session.storage, session.wal, source, parameters, active_catalog_cache, active_index_rows_cache, profile_ns)
     if not result_is_ok(executed):
         return yaza_db_session_mark_tx_failed_or_closed_v1(session, result_unwrap_error(executed))
     return yaza_db_session_finish_statement_with_plan_cache_v1(session, result_unwrap(executed), next_catalog_cache, next_index_rows_cache, next_buffer_pool, next_plan_cache, none)
